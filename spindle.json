@@ -1,0 +1,22 @@
+{
+  "version": "0.0.1",
+  "name": "LumiAH",
+  "identifier": "lumi_ah",
+  "author": "TheLiquorPriest",
+  "github": "https://github.com/TheLiquorPriest/LumiAH",
+  "homepage": "https://github.com/TheLiquorPriest/LumiAH",
+  "description": "An agent harness for Lumiverse: a main agent with tools answers the chats you switch it on for, through a loopback connection and a runtime that runs beside Lumiverse.",
+  "permissions": [
+    "generation",
+    "interceptor",
+    "generation_parameters",
+    "chats",
+    "chat_mutation",
+    "world_books",
+    "presets",
+    "characters",
+    "personas"
+  ],
+  "entry_backend": "dist/backend.js",
+  "entry_frontend": "dist/frontend.js"
+}

@@ -18,8 +18,8 @@ const sha = git(["rev-parse", "--short=8", "HEAD"]);
 const dirty = sha !== null && (git(["status", "--porcelain", "--", "src", "package.json", "bun.lock"]) ?? "") !== "";
 const id = sha === null ? String(seconds) : dirty ? `${sha}-dirty.${seconds}` : sha;
 
-function bundle(entry: string, out: string, target: "bun" | "browser"): void {
-  const run = Bun.spawnSync([process.execPath, "build", entry, "--outfile", out, "--target", target, "--define", `process.env.LAH_BUILD_ID=${JSON.stringify(id)}`], { cwd: ROOT, stdout: "inherit", stderr: "inherit" });
+function bundle(entry: string, out: string, target: "bun" | "browser", flags: readonly string[] = []): void {
+  const run = Bun.spawnSync([process.execPath, "build", entry, "--outfile", out, "--target", target, ...flags, "--define", `process.env.LAH_BUILD_ID=${JSON.stringify(id)}`], { cwd: ROOT, stdout: "inherit", stderr: "inherit" });
   if (run.exitCode !== 0) {
     console.error(`build: ${entry} failed`);
     process.exit(1);
@@ -27,7 +27,9 @@ function bundle(entry: string, out: string, target: "bun" | "browser"): void {
 }
 
 bundle("src/extension/backend/main.ts", "dist/backend.js", "bun");
-bundle("src/extension/frontend/main.tsx", "dist/frontend.js", "browser");
+// Only the page's bundle is minified: every page load fetches it. The backend and the runtime stay
+// readable, for the install scan and for stack traces.
+bundle("src/extension/frontend/main.tsx", "dist/frontend.js", "browser", ["--minify"]);
 bundle("src/runtime/main.ts", "dist/lumiah.js", "bun");
 
 // The runtime must start under the Bun that built it.

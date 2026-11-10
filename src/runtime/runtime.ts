@@ -1,0 +1,164 @@
+// A runtime, put together from its config (DESIGN §1): the link's client end, the streams it reads,
+// the core's host over the link, the turns, and the loopback endpoint Lumiverse calls. `serve` runs
+// one under Bun.serve; the tests run one against a fake Lumiverse, calling its handler directly.
+
+import type { HarnessHost, JsonObject, LogLevel } from "../core/ports";
+import type { ConnectionPush } from "../link/contract";
+import { MODEL_ID, runtimeBase } from "../link/contract";
+import type { RuntimeTuning } from "../link/settings";
+import type { RuntimeConfig } from "./config";
+import type { OpenSocket } from "./connection";
+import { linkHost } from "./host";
+import { LinkClient } from "./link";
+import type { Http, StoredLogin } from "./lumiverse";
+import { addConnectionProfile, connectionProfiles, loopbackProfile, setConnectionKey } from "./lumiverse";
+import { Relay } from "./relay";
+import { RuntimeSettings } from "./settings";
+import { Streams } from "./streams";
+import { TraceSink } from "./trace";
+import type { Harness } from "./turn";
+import { Turns } from "./turn";
+
+/** The name `up` gives the loopback connection it makes. */
+export const CONNECTION_NAME = "LumiAH";
+
+export interface RuntimeDeps {
+  http: Http;
+  openSocket: OpenSocket;
+  now(): number;
+  log(text: string): void;
+  build: string;
+  /** How it runs, for the Runtime page's lines: the Bun binary, its own script, the unit running it. */
+  ran: { bun: string | null; script: string; unit: string | null };
+  host: string;
+  /** The sign-in to use now: read again whenever the link opens. */
+  credentials(): StoredLogin | null;
+  /** The relay's secret now, and what keeps a new one. */
+  secret(): string;
+  rotated(secret: string): void;
+  /** Keeps the limits and timings the user's settings now hold. */
+  keepTuning(tuning: RuntimeTuning): void;
+  /** The core's harness over a host (`createHarness`). `settings` gives the core's own section of the user's settings and their texts, read at the start of every turn. */
+  harness(host: HarnessHost, settings: () => Promise<{ values: unknown; texts: unknown }>): Harness;
+  /** The writer's connection, from the settings' values; null: the user's default. */
+  writerConnection(values: JsonObject): string | null;
+}
+
+export interface Runtime {
+  /** The loopback endpoint's handler (Bun.serve's `fetch`). */
+  fetch(req: Request): Promise<Response>;
+  /** Every second: the link, the streams and the answers' keep-alives. */
+  tick(): void;
+  /** Ends every request under way with words the chat shows; the caller closes the link once they have gone out. */
+  shutdown(): void;
+  close(): void;
+  readonly link: LinkClient;
+  readonly relay: Relay;
+  readonly turns: Turns;
+}
+
+const hex = (bytes: number): string => [...crypto.getRandomValues(new Uint8Array(bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+export function createRuntime(config: RuntimeConfig, deps: RuntimeDeps): Runtime {
+  let settings: RuntimeSettings | null = null;
+  const tuning = (): RuntimeTuning => settings?.tuning() ?? config.tuning;
+  const link = new LinkClient({
+    base: config.base,
+    credentials: deps.credentials,
+    http: deps.http,
+    openSocket: deps.openSocket,
+    relay: config.relay,
+    secret: deps.secret,
+    rotated: deps.rotated,
+    name: config.name,
+    build: deps.build,
+    runtime: deps.ran,
+    host: deps.host,
+    listen: config.listen,
+    port: config.port,
+    tuning,
+    now: deps.now,
+    log: deps.log,
+  });
+  settings = new RuntimeSettings(link, { tuning: config.tuning, keep: deps.keepTuning, log: deps.log });
+  const held = settings;
+  const streams = new Streams(link, { now: deps.now, log: deps.log, tuning });
+  const trace = new TraceSink(link, { now: deps.now, log: deps.log, tuning });
+  // The turns and the host need each other: the host names the turn a model call serves.
+  let turns: Turns | null = null;
+  const host = linkHost({
+    link,
+    streams,
+    id: () => hex(16),
+    now: deps.now,
+    tuning,
+    log: (level: LogLevel, message: string) => deps.log(level === "info" || level === "debug" ? message : `${level}: ${message}`),
+    trace: (record) => trace.event(record),
+    delta: (delta) => trace.delta(delta),
+    turn: () => turns?.current() ?? null,
+    chat: () => turns?.currentChat() ?? null,
+  });
+  const harness = deps.harness(host, async () => {
+    const snapshot = await held.get();
+    return { values: snapshot.values.core, texts: snapshot.texts };
+  });
+  const running = new Turns(link, harness, held, trace, { now: deps.now, log: deps.log, tuning, writerConnection: deps.writerConnection });
+  turns = running;
+  const relay = new Relay(link, streams, running, { listen: config.listen, port: config.port }, { now: deps.now, id: () => hex(16), log: deps.log, tuning });
+
+  /**
+   * First-time setup, and every new loopback key (the `connection` push): the key goes into the
+   * user's loopback connection, made here when they have none. The key is used for that and let go.
+   */
+  async function connection(push: ConnectionPush): Promise<void> {
+    const url = runtimeBase(config.listen, config.port);
+    let made: { id: string; name: string } | null = null;
+    let problem: string | null = null;
+    try {
+      const token = deps.credentials()?.token;
+      if (token === undefined) throw new Error("the runtime isn't signed in to Lumiverse");
+      const found = loopbackProfile(await connectionProfiles(deps.http, config.base, token, tuning().connectionsRead), url, MODEL_ID);
+      if (found !== null) {
+        await setConnectionKey(deps.http, config.base, token, found.id, push.key);
+        made = { id: found.id, name: found.name };
+      } else {
+        const added = await addConnectionProfile(deps.http, config.base, token, { name: CONNECTION_NAME, provider: "custom", apiUrl: url, model: MODEL_ID, apiKey: push.key });
+        made = { id: added.id, name: added.name };
+      }
+      deps.log(`put the loopback key in the connection "${made.name}"`);
+    } catch (error) {
+      problem = error instanceof Error ? error.message : String(error);
+      deps.log(`couldn't put the loopback key in a connection: ${problem}`);
+    }
+    await link.request("setup.connection", { ref: push.ref, connection: made, problem }, tuning().lostMs).catch((error: unknown) => deps.log(`couldn't tell LumiAH about the connection: ${error instanceof Error ? error.message : String(error)}`));
+  }
+
+  link.attach({
+    chunk: (push) => streams.chunk(push),
+    open: () => streams.open(),
+    lost: (ids) => streams.lost(ids),
+    stopped: (why, detail) => streams.stopped(why, detail),
+    stop: (push) => running.stop(push),
+    settings: (revision) => held.note(revision),
+    connection: (push) => void connection(push),
+    turns: () => running.ids(),
+  });
+
+  return {
+    fetch: relay.fetch,
+    tick() {
+      link.tick();
+      streams.tick();
+      relay.tick();
+    },
+    shutdown() {
+      running.shutdown();
+      relay.shutdown();
+      streams.shutdown();
+    },
+    close: () => link.close(),
+    link,
+    relay,
+    turns: running,
+  };
+}

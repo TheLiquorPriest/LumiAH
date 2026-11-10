@@ -1,0 +1,801 @@
+// The `lumiah` command (DESIGN §1: the runtime runs beside Lumiverse): the runtime's one-line start,
+// its service and its upkeep.
+//
+//   up      signs in (or reuses the runtime's saved sign-in), registers the runtime with LumiAH, puts
+//           its address in the account's scheduler exclusions, writes its config, makes the loopback
+//           connection when the user has none, and serves; with --systemd it installs a stable copy
+//           of itself and a user unit that runs it instead
+//   serve   what the unit runs: the runtime from its config, until stopped
+//   login   a new session for the runtime when its own ended (the Runtime page says so)
+//   status  the runtime's config, unit, link and session
+//   down    stops and removes the unit
+//
+// It runs only from files no other account can change (Bun, this bundle, and every directory above
+// them): whoever else could change one would choose the code it runs as this account. Otherwise it
+// refuses, and says what to do. It needs Bun: the server is Bun.serve with `idleTimeout: 0`, and the
+// unit runs the same Bun by its absolute path. Everything it does to the machine goes through
+// RuntimeIO, which main.ts supplies, so the tests run every command against a fake machine.
+
+import type { HarnessHost, JsonObject } from "../core/ports";
+import { MODEL_ID, RUNTIME_NAME, runtimeBase, shellWord, unitName } from "../link/contract";
+import { isRecord } from "../link/json";
+import { RUNTIME_DEFAULTS } from "../link/settings";
+import type { RuntimeConfig } from "./config";
+import { configDir, configOf, configPathOf, configText } from "./config";
+import type { OpenSocket } from "./connection";
+import { HostConnection, LinkError } from "./connection";
+import type { Http, StoredLogin } from "./lumiverse";
+import { addConnectionProfile, connectionProfiles, editAndSendPrefersActive, excludeOrigins, inClear, LiveError, loopbackProfile, normalizeBase, runtimeOrigins, sessionOf, signIn } from "./lumiverse";
+import { CONNECTION_NAME, createRuntime } from "./runtime";
+import type { Harness } from "./turn";
+
+export interface ServeOptions {
+  hostname: string;
+  port: number;
+  fetch(req: Request): Promise<Response>;
+}
+
+/** A running server. */
+export interface Served {
+  stop(): void;
+}
+
+/** An entry's owner, group and mode. */
+export interface OwnedEntry {
+  uid: number;
+  gid: number;
+  mode: number;
+}
+
+/** The disk as the command needs it; main.ts supplies Node's. */
+export interface RuntimeFiles {
+  /** The file's text, or null when there is none. */
+  read(path: string): string | null;
+  /** Writes it whole and renames it into place with `mode`, making its directory with `dirMode` when missing. */
+  write(path: string, text: string, mode: number, dirMode: number): void;
+  copy(from: string, to: string, mode: number): void;
+  exists(path: string): boolean;
+  /** A directory's file names; empty when there is none. */
+  list(dir: string): string[];
+  remove(path: string): void;
+  /** Its owner, group and mode, symlinks followed; null where the system has none (Windows). */
+  stat(path: string): OwnedEntry | null;
+  /** The path with every symlink in it resolved. */
+  real(path: string): string;
+}
+
+/** The machine as the command needs it. */
+export interface RuntimeIO {
+  out(text: string): void;
+  err(text: string): void;
+  env: Readonly<Record<string, string | undefined>>;
+  /** A question on the terminal; `hidden` echoes nothing. Null when there is no terminal to ask on. */
+  ask(question: string, hidden: boolean): Promise<string | null>;
+  http: Http;
+  openSocket: OpenSocket;
+  /** Bun.serve with `idleTimeout: 0`; null where there is no Bun. It throws when the port is taken. */
+  serve: ((options: ServeOptions) => Served) | null;
+  /** Resolves with the signal's name when the process is asked to stop. */
+  stopped(): Promise<string>;
+  /** The absolute path of the Bun running this, or null under another runtime. */
+  bun: string | null;
+  /** This bundle's own path (…/dist/lumiah.js): `up --systemd` copies it. */
+  self: string;
+  /** The process's uid; null on Windows. */
+  uid: number | null;
+  hostname: string;
+  platform: string;
+  home: string;
+  files: RuntimeFiles;
+  /** Runs a program (systemctl, loginctl, id, getent) with `env` over this process's environment. */
+  run(command: string, args: readonly string[], env?: Readonly<Record<string, string>>): Promise<{ code: number; out: string; err: string }>;
+  sleep(ms: number): Promise<void>;
+  now(): number;
+  /** This build's id and the package's version. */
+  build: string;
+  version: string;
+  /** The core's harness over a host, and where the core's settings name the writer's connection. */
+  harness(host: HarnessHost, settings: () => Promise<{ values: unknown; texts: unknown }>): Harness;
+  writerConnection(values: JsonObject): string | null;
+}
+
+interface Args {
+  positionals: string[];
+  values: Record<string, string>;
+  flags: Record<string, true>;
+}
+
+const FLAGS: Readonly<Record<string, true>> = { "--systemd": true, "--allow-http": true, "--help": true, "--version": true };
+
+/** The first and last port `up` tries when none is given: a small range beside Lumiverse's own 7860. `--port` names any other, so these are the default and not a limit. */
+const DEFAULT_PORT = 7871;
+const LAST_PORT = 7899;
+const LISTEN = "127.0.0.1";
+/** The memory a unit's runtime may hold before systemd stops and restarts it, unless `--memory` says otherwise. */
+const DEFAULT_MEMORY = "1G";
+/** A directory's sticky bit: no one but an entry's owner, the directory's or root may rename or remove the entry (/tmp). */
+const STICKY = 0o1000;
+/** Write bits for the entry's group, and for everyone else. */
+const GROUP_WRITE = 0o020;
+const OTHERS_WRITE = 0o002;
+
+export const USAGE = `lumiah: LumiAH's runtime, which answers Lumiverse's loopback connection.
+
+  lumiah up --url <address> [--port <n>] [--name <name>] [--systemd]
+                        Sign in, register with LumiAH, and serve on 127.0.0.1. --systemd installs it as
+                        a service of your account instead, so it survives logout and reboot.
+                        More: --listen <host>, --username <name>, --allow-http, --memory <size> (the
+                        service's memory cap, ${DEFAULT_MEMORY} by default), --bun <path>
+  lumiah serve --config <file> | --name <name>
+                        Run the runtime from its config (what the service runs)
+  lumiah login | status | down [--name <name>]
+                        Sign the runtime in again; how it is; stop and remove its service
+  lumiah --version
+`;
+
+class UsageError extends Error {}
+
+function parse(argv: readonly string[]): Args {
+  const args: Args = { positionals: [], values: {}, flags: {} };
+  for (let i = 0; i < argv.length; i++) {
+    const word = argv[i] ?? "";
+    if (!word.startsWith("--")) {
+      args.positionals.push(word);
+      continue;
+    }
+    const eq = word.indexOf("=");
+    const name = eq < 0 ? word : word.slice(0, eq);
+    if (Object.hasOwn(FLAGS, name)) {
+      args.flags[name] = true;
+      continue;
+    }
+    const value = eq < 0 ? argv[++i] : word.slice(eq + 1);
+    if (value === undefined) throw new UsageError(`${name} needs a value.\n\n${USAGE}`);
+    args.values[name] = value;
+  }
+  return args;
+}
+
+function only(a: Args, sub: string, options: readonly string[], flags: readonly string[]): void {
+  const stray = [...Object.keys(a.values).filter((o) => !options.includes(o)), ...Object.keys(a.flags).filter((f) => !flags.includes(f) && f !== "--help")];
+  if (stray.length > 0) throw new UsageError(`lumiah ${sub} doesn't take ${stray.join(", ")}.\n\n${USAGE}`);
+  if (a.positionals.length > 1) throw new UsageError(`lumiah ${sub} takes no argument (${a.positionals.slice(1).join(" ")}).\n\n${USAGE}`);
+}
+
+/** Runs `lumiah <argv>`; resolves with the exit code. */
+export async function lumiah(argv: readonly string[], io: RuntimeIO): Promise<number> {
+  try {
+    const a = parse(argv);
+    const sub = a.positionals[0];
+    if (a.flags["--version"] === true) {
+      io.out(`lumiah ${io.version} (build ${io.build})`);
+      return 0;
+    }
+    if (sub === undefined || a.flags["--help"] === true) {
+      io.out(USAGE);
+      return sub === undefined && a.flags["--help"] !== true ? 2 : 0;
+    }
+    // Before anything it would do: it runs only what no other account can change.
+    const refused = sub === "up" || sub === "serve" || sub === "login" || sub === "status" || sub === "down" ? await refusal(a, io) : null;
+    if (refused !== null) throw new Error(refused);
+    switch (sub) {
+      case "up":
+        only(a, "up", ["--url", "--port", "--listen", "--name", "--username", "--memory", "--bun"], ["--systemd", "--allow-http"]);
+        return await up(a, io);
+      case "serve": {
+        only(a, "serve", ["--config", "--name"], []);
+        const path = configPath(a, io);
+        return await serve(configOf(io.files.read(path), path), path, io);
+      }
+      case "login":
+        only(a, "login", ["--config", "--name", "--username"], []);
+        return await login(a, io);
+      case "status":
+        only(a, "status", ["--config", "--name"], []);
+        return await status(a, io);
+      case "down":
+        only(a, "down", ["--name"], []);
+        return await down(a, io);
+      default:
+        throw new UsageError(`There is no lumiah ${sub}: up, serve, login, status or down.\n\n${USAGE}`);
+    }
+  } catch (error) {
+    io.err(error instanceof Error ? error.message : String(error));
+    return error instanceof UsageError ? 2 : 1;
+  }
+}
+
+// ---------------------------------------------------------------- where things go
+
+/** Where a runtime's files go: its config, the stable copy its unit runs, and the unit. All the account's own (the XDG directories). */
+interface Place {
+  config: string;
+  data: string;
+  unit: string;
+  unitName: string;
+}
+
+function placeOf(name: string, io: RuntimeIO): Place {
+  const xdg = (variable: string, fallback: string): string => {
+    const v = io.env[variable];
+    return v !== undefined && v.startsWith("/") ? v : `${io.home}/${fallback}`;
+  };
+  const name_ = unitName(name);
+  return { config: configPathOf(configDir(io.env, io.home), name), data: `${xdg("XDG_DATA_HOME", ".local/share")}/lumiah`, unit: `${xdg("XDG_CONFIG_HOME", ".config")}/systemd/user/${name_}`, unitName: name_ };
+}
+
+/** How systemctl reaches the account's units: `--user`, whose manager it finds by XDG_RUNTIME_DIR, which `sudo -u <account>` leaves unset (the account's is /run/user/<uid>). */
+function ctlOf(io: RuntimeIO): { args: string[]; env: Record<string, string> } {
+  const runtime = io.env.XDG_RUNTIME_DIR ?? (io.uid !== null ? `/run/user/${io.uid}` : undefined);
+  return { args: ["--user"], env: runtime !== undefined ? { XDG_RUNTIME_DIR: runtime } : {} };
+}
+
+// ---------------------------------------------------------------- whose files it runs
+
+/** A group's name, and the accounts in it (its listed members and every account whose primary group it is); null when they can't all be named. */
+type GroupOf = (gid: number) => Promise<{ name: string; uids: number[] | null }>;
+
+/** The groups `getent` names, each asked once. Where there is no getent (macOS), or a member it can't name, the group's accounts are unknown, so its write counts as another account's. */
+function groupsOf(io: RuntimeIO): GroupOf {
+  const asked = new Map<number, Promise<{ name: string; uids: number[] | null }>>();
+  const ask = async (gid: number): Promise<{ name: string; uids: number[] | null }> => {
+    const group = await io.run("getent", ["group", String(gid)]);
+    const [name = "", , id, listed = ""] = (group.out.split("\n")[0] ?? "").trim().split(":");
+    if (group.code !== 0 || name === "" || id !== String(gid)) return { name: String(gid), uids: null };
+    const passwd = await io.run("getent", ["passwd"]);
+    if (passwd.code !== 0) return { name, uids: null };
+    const accounts = passwd.out.split("\n").flatMap((line) => {
+      const [account = "", , uid = "", primary = ""] = line.trim().split(":");
+      return account !== "" && /^\d+$/.test(uid) ? [{ account, uid: Number(uid), primary }] : [];
+    });
+    const uids = accounts.filter((x) => x.primary === String(gid)).map((x) => x.uid);
+    for (const member of listed.split(",").filter((m) => m !== "")) {
+      const found = accounts.find((x) => x.account === member);
+      if (found === undefined) return { name, uids: null };
+      uids.push(found.uid);
+    }
+    return { name, uids };
+  };
+  return (gid) => {
+    let answer = asked.get(gid);
+    if (answer === undefined) asked.set(gid, (answer = ask(gid)));
+    return answer;
+  };
+}
+
+/** No account but its owner is in its group: Lumiverse makes its directories under a umask of 0002, group-writable, in its account's own group. */
+async function ownersGroup(entry: OwnedEntry, groupOf: GroupOf): Promise<boolean> {
+  const { uids } = await groupOf(entry.gid);
+  return uids !== null && uids.length > 0 && uids.every((u) => u === entry.uid);
+}
+
+/** Only `uid` or root can change it: one of theirs, writable by no one else, its group's write counting for nothing in its owner's own group. */
+async function onlyTheirs(entry: OwnedEntry, uid: number, groupOf: GroupOf): Promise<boolean> {
+  if ((entry.uid !== uid && entry.uid !== 0) || (entry.mode & OTHERS_WRITE) !== 0) return false;
+  return (entry.mode & GROUP_WRITE) === 0 || (await ownersGroup(entry, groupOf));
+}
+
+/**
+ * The entries, from the file at `path` (its symlinks resolved) up through every directory above it,
+ * that someone other than `uid` or root can change: each of `uid`'s or root's its group or everyone
+ * else can write, then the first of another account's, where it stops. A directory with its sticky
+ * bit (/tmp), `uid`'s or root's, lets no one else rename or remove an entry of `uid`'s or root's in
+ * it, so what is below it stays as safe as that entry.
+ */
+async function changeable(io: RuntimeIO, path: string, uid: number, groupOf: GroupOf): Promise<{ path: string; entry: OwnedEntry }[]> {
+  const found: { path: string; entry: OwnedEntry }[] = [];
+  let below: OwnedEntry | null = null;
+  for (let at = io.files.real(path); ; at = at.slice(0, at.lastIndexOf("/")) || "/") {
+    const entry = io.files.stat(at);
+    const sticky = entry !== null && below !== null && (entry.mode & STICKY) !== 0 && (entry.uid === uid || entry.uid === 0) && (below.uid === uid || below.uid === 0);
+    if (entry !== null && !sticky && !(await onlyTheirs(entry, uid, groupOf))) {
+      found.push({ path: at, entry });
+      if (entry.uid !== uid && entry.uid !== 0) return found;
+    }
+    if (at === "/") return found;
+    below = entry;
+  }
+}
+
+/**
+ * Why this account won't run this, or null when it may: this bundle, the Bun it runs on and the one
+ * `--bun` names for its unit must be no one else's to change but root's, as must every directory
+ * above them, or whoever else can change one would run code as this account through it. The refusal
+ * names each; for one of this account's or root's that its group or everyone else can write, the
+ * `chmod` that takes that write away, and for one of another account's, how to run the runtime as
+ * that account.
+ */
+async function refusal(a: Args, io: RuntimeIO): Promise<string | null> {
+  const me = io.uid;
+  if (me === null) return null;
+  const groupOf = groupsOf(io);
+  const unsafe: { path: string; uid: number | null; why: string | null; entry?: OwnedEntry }[] = [];
+  for (const path of new Set([io.self, io.bun, a.values["--bun"]])) {
+    if (path === null || path === undefined) continue;
+    let found: { path: string; entry: OwnedEntry }[];
+    try {
+      found = await changeable(io, path, me, groupOf);
+    } catch (error) {
+      unsafe.push({ path, uid: null, why: `can't be checked (${error instanceof Error ? error.message : String(error)})` });
+      continue;
+    }
+    for (const f of found) if (!unsafe.some((u) => u.path === f.path)) unsafe.push({ path: f.path, uid: f.entry.uid, why: null, entry: f.entry });
+  }
+  if (unsafe.length === 0) return null;
+  const names = new Map<number, string>();
+  for (const { uid } of unsafe) if (uid !== null && uid !== 0 && uid !== me && !names.has(uid)) names.set(uid, (await io.run("id", ["-nu", String(uid)])).out.trim() || String(uid));
+  // Of this account's or root's, who can write it: its group (unless no one but its owner is in it), everyone else, or both; and the chmod that stops them.
+  const shared = new Map<string, { why: string; chmod: string }>();
+  for (const { path, uid, entry } of unsafe) {
+    if (entry === undefined || (uid !== me && uid !== 0)) continue;
+    const group = (entry.mode & GROUP_WRITE) !== 0 && !(await ownersGroup(entry, groupOf)) ? (await groupOf(entry.gid)).name : null;
+    const others = (entry.mode & OTHERS_WRITE) !== 0;
+    const why = group !== null ? `its group, ${group}, ${others ? "and everyone else " : ""}can change it` : "everyone else can change it";
+    shared.set(path, { why, chmod: `  ${uid === 0 && me !== 0 ? "sudo " : ""}chmod ${group !== null ? "g" : ""}${others ? "o" : ""}-w ${shellWord(path)}` });
+  }
+  const who = me === 0 ? "root" : (await io.run("id", ["-nu"])).out.trim() || String(me);
+  const listed = unsafe.map(({ path, uid, why }) => `  ${path}: ${why ?? shared.get(path)?.why ?? `${names.get(uid ?? -1) ?? uid} can change it`}`);
+  const chmods = unsafe.flatMap((u) => shared.get(u.path)?.chmod ?? []);
+  const head = `Refusing to run as ${who}: another account can change these, and would then run code as ${who} through this command.`;
+  // Only that write stands in the way: the chmods, then the same line again.
+  if (unsafe.every((u) => shared.has(u.path))) return [head, ...listed, "Take that write away, then run it again:", ...chmods].join("\n");
+  const account = names.values().next().value ?? null;
+  const as = account !== null ? shellWord(account) : "<the account Lumiverse runs as>";
+  return [head, ...listed, ...(chmods.length > 0 ? ["First take away the write that isn't its owner's:", ...chmods] : []), `Run the runtime as ${as} instead, the account its files belong to:`, `  sudo -u ${as} <the same line>`].join("\n");
+}
+
+// ---------------------------------------------------------------- the config
+
+/** The runtime's name from a username: lowercase letters, digits, `_` and `-`. */
+function nameFrom(username: string): string {
+  const name = username.toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^[-_]+/, "").slice(0, 40);
+  return RUNTIME_NAME.test(name) ? name : "runtime";
+}
+
+function givenName(a: Args): string | undefined {
+  const name = a.values["--name"];
+  if (name !== undefined && !RUNTIME_NAME.test(name)) throw new UsageError(`--name is "${name}": use lowercase letters, digits, _ and -, up to 40.`);
+  return name;
+}
+
+/** The names of the runtimes set up here. */
+function configured(io: RuntimeIO): string[] {
+  return io.files
+    .list(configDir(io.env, io.home))
+    .filter((f) => f.endsWith(".json") && RUNTIME_NAME.test(f.slice(0, -5)))
+    .map((f) => f.slice(0, -5))
+    .sort();
+}
+
+/** `--config`, else the config of `--name`, else the only runtime configured here. */
+function configPath(a: Args, io: RuntimeIO): string {
+  const given = a.values["--config"];
+  if (given !== undefined) return given;
+  const dir = configDir(io.env, io.home);
+  const name = givenName(a);
+  if (name !== undefined) return configPathOf(dir, name);
+  const found = configured(io);
+  if (found.length === 1 && found[0] !== undefined) return configPathOf(dir, found[0]);
+  throw new UsageError(found.length === 0 ? `No runtime is set up here (${dir}). Start one with: lumiah up --url <the address you open Lumiverse at>` : `Several runtimes are set up here (${found.join(", ")}): pick one with --name.`);
+}
+
+function writeConfig(path: string, config: RuntimeConfig, io: RuntimeIO): void {
+  io.files.write(path, configText(config), 0o600, 0o700);
+}
+
+// ---------------------------------------------------------------- sign-in
+
+/** A new session: the password from LUMIVERSE_PASSWORD or a hidden prompt, never kept. */
+async function signInFor(base: string, io: RuntimeIO, username: string | undefined, allowHttp: boolean): Promise<StoredLogin> {
+  const clear = inClear(base);
+  if (clear && !allowHttp) throw new UsageError(`${base} is plain http to another machine: the password, and the runtime's session on every call after, would cross the network in clear. Use Lumiverse's https address, or accept that with --allow-http.`);
+  // Asked as nobody first: a redirect, an untrusted host or a lockout stops here, before a password is sent.
+  await sessionOf(io.http, base, null);
+  const user = username ?? io.env.LUMIVERSE_USERNAME ?? (await io.ask("Lumiverse username for the runtime: ", false));
+  if (user === null || user.trim() === "") throw new UsageError("The runtime needs your Lumiverse username: --username <name>, or LUMIVERSE_USERNAME.");
+  const password = io.env.LUMIVERSE_PASSWORD ?? (await io.ask(`Password for ${user.trim()} at ${base}: `, true));
+  if (password === null || password === "") throw new UsageError("No password: run this in a terminal and type it at the prompt, or set LUMIVERSE_PASSWORD.");
+  const token = await signIn(io.http, base, user.trim(), password);
+  return { username: user.trim(), token, savedAt: io.now(), ...(clear ? { allowHttp: true as const } : {}) };
+}
+
+/** The sign-in the runtime set up here before still holds, else a new one. */
+async function sessionFor(base: string, a: Args, io: RuntimeIO, previous: RuntimeConfig | null): Promise<StoredLogin> {
+  const asked = a.values["--username"];
+  const saved = previous !== null && previous.base === base ? previous.session : null;
+  if (saved !== null && (asked === undefined || asked === saved.username)) {
+    const state = await sessionOf(io.http, base, saved.token).catch(() => null);
+    if (state?.valid === true) {
+      io.out(`Using the runtime's saved sign-in to ${base} as ${saved.username}.`);
+      return saved;
+    }
+  }
+  return signInFor(base, io, asked ?? saved?.username, a.flags["--allow-http"] === true || saved?.allowHttp === true);
+}
+
+// ---------------------------------------------------------------- up
+
+/** Whether the port is free to serve on, by serving on it for a moment. */
+function portFree(io: RuntimeIO, listen: string, port: number): boolean {
+  const serve = io.serve;
+  if (serve === null) return false;
+  try {
+    serve({ hostname: listen, port, fetch: async () => new Response(null, { status: 503 }) }).stop();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function portOf(a: Args, io: RuntimeIO, listen: string, previous: RuntimeConfig | null): number {
+  const given = a.values["--port"];
+  if (given !== undefined) {
+    const port = Number(given);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new UsageError(`--port is "${given}": give a port number.`);
+    // The runtime already set up there holds it: `up` restarts that one.
+    if (previous?.port !== port && !portFree(io, listen, port)) throw new Error(`Port ${port} on ${listen} is taken. Pick another with --port.`);
+    return port;
+  }
+  if (previous !== null && previous.listen === listen) return previous.port;
+  for (let port = DEFAULT_PORT; port <= LAST_PORT; port++) if (portFree(io, listen, port)) return port;
+  throw new Error(`No port from ${DEFAULT_PORT} to ${LAST_PORT} is free on ${listen}: pick one with --port.`);
+}
+
+/** In a container (the official compose runs Lumiverse in one), where systemd isn't and 127.0.0.1 is the container's own. */
+function inContainer(io: RuntimeIO): boolean {
+  return io.files.exists("/.dockerenv") || io.files.exists("/run/.containerenv");
+}
+
+function containerGuide(bun: string, self: string, config: string, base: string): string {
+  return [
+    "Lumiverse runs in a container here: there is no systemd, and Lumiverse's 127.0.0.1 is the container's own.",
+    "Run the runtime inside Lumiverse's container, as a second process:",
+    `  ${bun} ${self} up --url ${base}`,
+    "or as a compose service that shares Lumiverse's network (127.0.0.1 is then the same for both):",
+    "  lumiah:",
+    "    image: <Lumiverse's image>",
+    '    network_mode: "service:lumiverse"',
+    "    volumes: [<Lumiverse's data volume, mounted where it is in Lumiverse's service>]",
+    `    command: ["${bun}", "${self}", "serve", "--config", "${config}"]`,
+    "    restart: always",
+    "    mem_limit: 1g",
+    `(run \`up\` once inside the container first, so ${config} exists).`,
+  ].join("\n");
+}
+
+/** A word of a unit's ExecStart: quoted when it must be, `%` and `$` escaped (systemd.service(5)). */
+function unitWord(word: string): string {
+  const escaped = word.replace(/%/g, "%%").replace(/\$/g, "$$$$");
+  return /^[A-Za-z0-9_@%+=:,./$-]+$/.test(escaped) ? escaped : `"${escaped.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+}
+
+/** A memory size as systemd reads one: a number of bytes, or one with K, M, G or T. */
+const MEMORY = /^[1-9][0-9]*[KMGT]?$/;
+
+export function unitText(u: { name: string; bun: string; script: string; config: string; memory: string }): string {
+  return [
+    `# Written by \`lumiah up --systemd\`: LumiAH's runtime. \`lumiah down --name ${u.name}\` removes it.`,
+    "[Unit]",
+    `Description=LumiAH runtime (${u.name})`,
+    // It reconnects until Lumiverse answers, however long Lumiverse takes to start: never give up on it.
+    "StartLimitIntervalSec=0",
+    "",
+    "[Service]",
+    "Type=simple",
+    `ExecStart=${[u.bun, u.script, "serve", "--config", u.config].map(unitWord).join(" ")}`,
+    "Restart=always",
+    "RestartSec=2",
+    // The cap: past it systemd stops the runtime (and starts it again) rather than let it take the machine's memory from Lumiverse.
+    `MemoryMax=${u.memory}`,
+    "",
+    "[Install]",
+    "WantedBy=default.target",
+    "",
+  ].join("\n");
+}
+
+async function must(io: RuntimeIO, command: string, args: readonly string[], env?: Readonly<Record<string, string>>): Promise<string> {
+  const r = await io.run(command, args, env);
+  if (r.code !== 0) throw new Error(`${command} ${args.join(" ")} failed (${r.code}): ${(r.err || r.out).trim()}`);
+  return r.out.trim();
+}
+
+/** The address `up` reaches Lumiverse at: `--url`, LUMIVERSE_URL, the one the runtime of this name (or the only one here) was set up with, else asked for. */
+async function baseFor(a: Args, io: RuntimeIO): Promise<string> {
+  const given = a.values["--url"] ?? io.env.LUMIVERSE_URL;
+  if (given !== undefined) return normalizeBase(given);
+  const names = configured(io);
+  const name = givenName(a) ?? (names.length === 1 ? names[0] : undefined);
+  if (name !== undefined) {
+    try {
+      const path = configPathOf(configDir(io.env, io.home), name);
+      return configOf(io.files.read(path), path).base;
+    } catch {
+      // None set up under that name: asked for below.
+    }
+  }
+  const asked = await io.ask("Lumiverse address (as you open it in a browser): ", false);
+  if (asked === null || asked.trim() === "") throw new UsageError("lumiah up needs Lumiverse's address: --url <address>, or LUMIVERSE_URL.");
+  return normalizeBase(asked);
+}
+
+async function up(a: Args, io: RuntimeIO): Promise<number> {
+  if (io.serve === null || io.bun === null) throw new UsageError("LumiAH's runtime runs on Bun (Bun.serve, idleTimeout 0): run this line with Bun, as LumiAH's Runtime page shows it.");
+  const systemd = a.flags["--systemd"] === true;
+  const base = await baseFor(a, io);
+  const listen = a.values["--listen"] ?? LISTEN;
+  if (listen !== LISTEN && listen !== "localhost") io.err(`Warning: the runtime will listen on ${listen}, where other machines can reach it, not only this one. Every call still needs your loopback key and must be addressed to ${listen} itself, unless that is a wildcard address (0.0.0.0, ::), which answers any name; nothing else stands between them and it.`);
+  const bun = a.values["--bun"] ?? io.bun;
+  if (!bun.startsWith("/")) throw new UsageError(`--bun must be an absolute path (systemd searches no PATH that has Bun): ${bun}`);
+  const memory = a.values["--memory"] ?? DEFAULT_MEMORY;
+  if (!MEMORY.test(memory)) throw new UsageError(`--memory is "${memory}": give a size as systemd reads one, such as 768M or 2G.`);
+  if (systemd && io.platform !== "linux") throw new Error(`--systemd installs a systemd service, and this is ${io.platform}. Run the runtime in the foreground instead (leave out --systemd), under your own service manager.`);
+  if (systemd && io.uid === 0) throw new Error("--systemd installs a service of your own account, and root's account has none on most systems. Run the runtime as the account Lumiverse runs as (sudo -u <account> …): it needs no more rights than that.");
+  if (systemd && inContainer(io)) throw new Error(containerGuide(bun, io.self, placeOf(givenName(a) ?? "runtime", io).config, base));
+  if (systemd && /\.ts$/.test(io.self)) throw new Error(`The service runs a built runtime, and this runs from source (${io.self}). Build first (bun run build), then run dist/lumiah.js.`);
+
+  // A runtime set up here before under this name keeps its sign-in, its port and the limits it last read.
+  const readPrevious = (name: string): RuntimeConfig | null => {
+    try {
+      const path = placeOf(name, io).config;
+      return configOf(io.files.read(path), path);
+    } catch {
+      return null;
+    }
+  };
+  const named = givenName(a);
+  const names = configured(io);
+  const session = await sessionFor(base, a, io, readPrevious(named ?? (names.length === 1 && names[0] !== undefined ? names[0] : "")));
+  const name = named ?? nameFrom(session.username);
+  const place = placeOf(name, io);
+  const previous = readPrevious(name);
+  const port = portOf(a, io, listen, previous);
+
+  // The limits it last read here, else the defaults: its own settings aren't read until it has linked.
+  const tuning = previous?.tuning ?? { ...RUNTIME_DEFAULTS };
+  // Registered before anything is written: a refusal leaves the machine as it was.
+  const conn = new HostConnection({ base, credentials: () => session, http: io.http, openSocket: io.openSocket, limits: () => tuning, now: io.now });
+  let registered: { relay: string; secret: string; model: string; user: string };
+  try {
+    await conn.ensureOpen();
+    registered = await conn.request("register", { name, build: io.build, host: io.hostname, listen, port });
+  } catch (error) {
+    if (error instanceof LinkError) throw new Error(`LumiAH didn't register the runtime: ${error.message}`);
+    if (error instanceof LiveError && error.problem === "timeout") throw new Error(`LumiAH on ${base} didn't answer the runtime's registration. Check that it's running in Lumiverse's Extensions tab.`);
+    throw error;
+  } finally {
+    conn.close();
+  }
+  const who = session.username;
+  io.out(`Registered the runtime "${name}" with LumiAH: it answers ${who}'s replies.`);
+
+  const origins = runtimeOrigins(listen, port);
+  const scheduler = await excludeOrigins(io.http, base, session.token, origins);
+  // Lumiverse reads the scheduler's setting through a short cache: a turn begun within a few seconds may still wait behind the old one.
+  if (scheduler === "excluded") io.out(`Its address (${origins.join(", ")}) is in ${who}'s local-inference scheduler exclusions, so the scheduler never holds a turn's own calls behind it.`);
+  else if (scheduler === "unavailable") io.out("This Lumiverse has no local-inference scheduler: nothing to exclude.");
+  else io.err(`Couldn't put ${origins.join(" and ")} in ${who}'s local-inference scheduler exclusions. Before turning the scheduler on, add them under Settings → Inference scheduler → Excluded origins: a turn would otherwise wait on its own calls.`);
+
+  const config: RuntimeConfig = { name, base, listen, port, relay: registered.relay, secret: registered.secret, session, tuning };
+  const connection = await loopbackConnection(io, base, session.token, runtimeBase(listen, port), registered.model || MODEL_ID, config.tuning.connectionsRead);
+  // Lumiverse's "always use the active connection" acts on Edit and Send only: there it overrides a chat's pin to the loopback.
+  if ((await editAndSendPrefersActive(io.http, base, session.token)) === true) io.err(`${who} has "always use the active connection" on for Edit and Send: a message sent with Edit and Send goes on the active connection, not a chat's pin to the loopback, and LumiAH answers it only when the active connection is the loopback.`);
+
+  if (!systemd) {
+    writeConfig(place.config, config, io);
+    io.out(`Saved the runtime's config in ${place.config} (readable only by you).`);
+    io.out(connection);
+    if (inContainer(io)) io.out(containerGuide(bun, io.self, place.config, base));
+    return serve(config, place.config, io);
+  }
+
+  writeConfig(place.config, config, io);
+  // A stable copy the unit owns: an update of LumiAH removes and replaces its install.
+  const script = `${place.data}/${io.self.slice(io.self.lastIndexOf("/") + 1)}`;
+  io.files.copy(io.self, script, 0o644);
+  io.files.write(place.unit, unitText({ name, bun, script, config: place.config, memory }), 0o644, 0o755);
+  const ctl = ctlOf(io);
+  // Before the unit starts: lingering also starts the user's service manager, which `systemctl --user` needs.
+  const user = await must(io, "id", ["-nu"]);
+  const lingering = await linger(io, user);
+  try {
+    await must(io, "systemctl", [...ctl.args, "daemon-reload"], ctl.env);
+  } catch (error) {
+    // No user manager to reach: lingering is off, and the account has no session of its own (`sudo -u`).
+    if (lingering) throw error;
+    throw new Error(`${user}'s service manager isn't running (lingering is off, and ${user} isn't logged in), so the runtime's service can't start. Turn lingering on with: sudo loginctl enable-linger ${user}, then run this again.`);
+  }
+  await must(io, "systemctl", [...ctl.args, "enable", place.unitName], ctl.env);
+  if (previous !== null) await drain(previous, io);
+  await must(io, "systemctl", [...ctl.args, "restart", place.unitName], ctl.env);
+  const when = lingering ? "it is started, and starts at boot and keeps running when you log out" : "it is started, but only runs while you are logged in (see above)";
+  io.out(`Installed the runtime in ${place.data} and the unit ${place.unitName} (memory cap ${memory}); ${when}.`);
+  io.out(connection);
+  return 0;
+}
+
+/**
+ * A user unit starts at boot and outlives a logout only with lingering on (systemd-logind): on
+ * already, turned on now (logind lets a user do it for themself where its policy allows), or the
+ * line that does it. Whether it is on in the end.
+ */
+async function linger(io: RuntimeIO, user: string): Promise<boolean> {
+  const on = async (): Promise<boolean> => (await io.run("loginctl", ["show-user", user, "--property=Linger", "--value"])).out.trim() === "yes";
+  if (await on()) return true;
+  const asked = await io.run("loginctl", ["enable-linger", user]);
+  if (asked.code === 0 && (await on())) {
+    io.out(`Turned lingering on for ${user}, so the runtime's service starts at boot and keeps running after you log out.`);
+    return true;
+  }
+  io.err(`Lingering is off for ${user} and couldn't be turned on from here${asked.err.trim() !== "" ? ` (${asked.err.trim()})` : ""}: the runtime's service won't start at boot and stops when you log out. Turn it on with: sudo loginctl enable-linger ${user}`);
+  return false;
+}
+
+/**
+ * The loopback's Custom connection: the user's own where one is already (Custom, on the runtime's
+ * address or the loopback's model), else added for them with their own session, since Spindle gives
+ * an extension no way to add one. It's added without a key: minting the key on the Runtime page puts
+ * it in, through the running runtime. The line says what to do next.
+ */
+async function loopbackConnection(io: RuntimeIO, base: string, token: string, url: string, model: string, read: number): Promise<string> {
+  try {
+    const found = loopbackProfile(await connectionProfiles(io.http, base, token, read), url, model);
+    if (found !== null) return `Your connection "${found.name}" is the loopback (${url}, model ${model}). Its API key is your loopback key: mint one on LumiAH's Runtime page and it is put in for you.`;
+    const made = await addConnectionProfile(io.http, base, token, { name: CONNECTION_NAME, provider: "custom", apiUrl: url, model });
+    return `Added the connection "${made.name}" to Lumiverse: Custom (OpenAI-compatible), base URL ${url}, model ${model}. Mint your loopback key on LumiAH's Runtime page next: it is put in the connection for you.`;
+  } catch (error) {
+    return `Couldn't add the loopback connection for you (${error instanceof Error ? error.message : String(error)}). In Lumiverse, the loopback is a Custom (OpenAI-compatible) connection: base URL ${url}, model ${model}, and as its API key your loopback key (LumiAH's Runtime page).`;
+  }
+}
+
+// ---------------------------------------------------------------- serve
+
+/** Runs the runtime until the process is asked to stop. `path` is its config, read again for the session whenever the link opens, so `lumiah login` takes effect without a restart. */
+export async function serve(config: RuntimeConfig, path: string, io: RuntimeIO): Promise<number> {
+  const start = io.serve;
+  if (start === null) throw new UsageError("LumiAH's runtime runs on Bun (Bun.serve, idleTimeout 0): run it with Bun.");
+  const log = (text: string): void => io.err(`[lumiah ${config.name}] ${text}`);
+  // The session is read from the file again whenever it is needed; the secret and the limits are this process's own to change.
+  let current = config;
+  const session = (): StoredLogin => {
+    try {
+      current = { ...current, session: configOf(io.files.read(path), path).session };
+    } catch {
+      // The file went or broke under it: the sign-in it started with stands.
+    }
+    return current.session;
+  };
+  const keep = (change: Partial<RuntimeConfig>): void => {
+    session();
+    current = { ...current, ...change };
+    try {
+      writeConfig(path, current, io);
+    } catch (error) {
+      log(`couldn't write ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  // systemd marks what it runs with INVOCATION_ID: then the unit is the one `up` names for this runtime.
+  const unit = io.env.INVOCATION_ID !== undefined ? unitName(config.name) : null;
+  const runtime = createRuntime(config, {
+    http: io.http,
+    openSocket: io.openSocket,
+    now: io.now,
+    log,
+    build: io.build,
+    ran: { bun: io.bun, script: io.self, unit },
+    host: io.hostname,
+    credentials: session,
+    secret: () => current.secret,
+    rotated: (secret) => keep({ secret }),
+    keepTuning: (tuning) => keep({ tuning }),
+    harness: io.harness,
+    writerConnection: io.writerConnection,
+  });
+  let server: Served;
+  try {
+    server = start({ hostname: config.listen, port: config.port, fetch: runtime.fetch });
+  } catch (error) {
+    throw new Error(`The runtime can't serve on ${config.listen}:${config.port}: ${error instanceof Error ? error.message : String(error)}. Is another runtime running there?`);
+  }
+  log(`serving ${runtimeBase(config.listen, config.port)} for ${config.base} as ${config.session.username} (build ${io.build})`);
+  void runtime.link.fix();
+  const timer = setInterval(() => runtime.tick(), 1_000);
+  const signal = await io.stopped();
+  log(`stopping (${signal})`);
+  clearInterval(timer);
+  runtime.shutdown();
+  // A moment for the error chunks and cancels to go out.
+  await io.sleep(current.tuning.stopGraceMs);
+  server.stop();
+  runtime.close();
+  return 0;
+}
+
+// ---------------------------------------------------------------- login, status, down
+
+/** The turns the runtime running with this config has under way, from its /healthz; 0 when it doesn't answer. */
+async function turnsUnderWay(config: RuntimeConfig, io: RuntimeIO): Promise<number> {
+  try {
+    const reply = await io.http({ method: "GET", url: `${runtimeBase(config.listen, config.port).replace(/\/v1$/, "")}/healthz`, headers: { Accept: "application/json" } });
+    const body: unknown = JSON.parse(reply.text);
+    return isRecord(body) && typeof body.requests === "number" ? body.requests : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Before `up` restarts a running runtime: a restart cuts the replies it answers, so it waits for them to finish, up to `drainMs`. */
+async function drain(config: RuntimeConfig, io: RuntimeIO): Promise<void> {
+  const { drainMs, drainPollMs } = config.tuning;
+  let turns = await turnsUnderWay(config, io);
+  if (turns === 0) return;
+  io.out(`The running runtime has ${turns} request(s) under way: waiting up to ${Math.round(drainMs / 60_000)} minutes for them to finish before restarting it.`);
+  for (let waited = 0; waited < drainMs && turns > 0; waited += drainPollMs) {
+    await io.sleep(drainPollMs);
+    turns = await turnsUnderWay(config, io);
+  }
+  if (turns > 0) io.err(`${turns} request(s) still under way after ${Math.round(drainMs / 60_000)} minutes: restarting the runtime ends them.`);
+}
+
+async function login(a: Args, io: RuntimeIO): Promise<number> {
+  const path = configPath(a, io);
+  const config = configOf(io.files.read(path), path);
+  const session = await signInFor(config.base, io, a.values["--username"] ?? config.session.username, config.session.allowHttp === true);
+  writeConfig(path, { ...config, session }, io);
+  io.out(`The runtime "${config.name}" is signed in to ${config.base} as ${session.username} again.`);
+  const place = placeOf(config.name, io);
+  if (!io.files.exists(place.unit)) io.out("A runtime running in the foreground takes the new sign-in when it next connects.");
+  else {
+    const ctl = ctlOf(io);
+    await must(io, "systemctl", [...ctl.args, "restart", place.unitName], ctl.env);
+    io.out(`Restarted ${place.unitName}.`);
+  }
+  return 0;
+}
+
+async function status(a: Args, io: RuntimeIO): Promise<number> {
+  const path = configPath(a, io);
+  const config = configOf(io.files.read(path), path);
+  const place = placeOf(config.name, io);
+  io.out(`Runtime "${config.name}" for ${config.base} as ${config.session.username}, at ${runtimeBase(config.listen, config.port)}.`);
+  if (io.files.exists(place.unit)) {
+    const ctl = ctlOf(io);
+    const active = await io.run("systemctl", [...ctl.args, "is-active", place.unitName], ctl.env);
+    io.out(`Service ${place.unitName}: ${active.out.trim() || "unknown"}.`);
+  } else io.out("No service: it runs only while `lumiah up` or `lumiah serve` does.");
+  let healthy = false;
+  try {
+    const reply = await io.http({ method: "GET", url: `${runtimeBase(config.listen, config.port).replace(/\/v1$/, "")}/healthz`, headers: { Accept: "application/json" } });
+    const body: unknown = JSON.parse(reply.text);
+    if (isRecord(body)) {
+      healthy = body.ok === true && body.link === "up";
+      io.out(`It answers: link to LumiAH ${String(body.link)}, ${String(body.turns)} turn(s) under way${typeof body.problem === "string" ? `. ${body.problem}` : ""}.`);
+    }
+  } catch (error) {
+    io.out(`It doesn't answer on ${config.listen}:${config.port} (${error instanceof Error ? error.message : String(error)}).`);
+  }
+  try {
+    const session = await sessionOf(io.http, config.base, config.session.token);
+    io.out(session.valid === false ? `Its Lumiverse session has ended: lumiah login --name ${config.name}` : `Its Lumiverse session holds${session.expiresAt !== null ? ` until ${session.expiresAt} unused (the runtime renews it daily)` : ""}.`);
+    if (session.valid === false) healthy = false;
+  } catch (error) {
+    io.out(`Couldn't ask ${config.base} about its session: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return healthy ? 0 : 1;
+}
+
+async function down(a: Args, io: RuntimeIO): Promise<number> {
+  const path = configPath(a, io);
+  const name = givenName(a) ?? configOf(io.files.read(path), path).name;
+  const place = placeOf(name, io);
+  if (!io.files.exists(place.unit)) {
+    io.out(`There is no unit ${place.unitName}: nothing to stop.`);
+    return 0;
+  }
+  const ctl = ctlOf(io);
+  await must(io, "systemctl", [...ctl.args, "disable", "--now", place.unitName], ctl.env);
+  io.files.remove(place.unit);
+  await must(io, "systemctl", [...ctl.args, "daemon-reload"], ctl.env);
+  io.out(`Stopped and removed ${place.unitName}. Its config, with the runtime's session, stays in ${place.config}: delete it to forget the runtime here.`);
+  return 0;
+}

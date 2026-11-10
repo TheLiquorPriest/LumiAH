@@ -2,6 +2,8 @@
 
 LumiAH is an agent harness for Lumiverse. A main agent works in a loop with tools, sub-agents, sessions, a workspace and guidance files, and answers Lumiverse's main generation through a loopback connection. This document is the contract the code is built to. Where the code and this document disagree, one of them is wrong and gets fixed.
 
+**What is built:** §1 to §8. §11 to §21 are the contract for what is being built next; a section moves into this line when its code and tests are in.
+
 ## 1. Parts and where they run
 
 | Part | Source | Runs | Owns |
@@ -106,8 +108,8 @@ The runtime is a client of Lumiverse like any other: it signs in as the user, fi
 - **Versioned.** Both ends say their link version in `hello`; a mismatch is refused in plain words that name which side to update.
 - **Three secrets, three jobs.** The runtime's Lumiverse session lets it reach the extension. The relay secret, minted when the runtime registers, proves a request comes from that runtime. The loopback key, which the user puts in the connection, proves a completion request comes from that user's Lumiverse. The extension stores only hashes of the last two.
 - **Streams are numbered.** A reply or a model call's deltas arrive as chunks numbered from 1, acknowledged in batches, and asked for again after a gap.
-- **The runtime asks, the extension answers:** check a tag and begin a turn; make a model call; read and write blobs, documents, anchors; read the chat, lore and preset; push trace events; commit a turn.
-- **The extension tells the runtime:** stop a turn; settings changed.
+- **The runtime asks, the extension answers:** check a tag and begin a turn; make a model call, or pass an untagged request through; read and write blobs, documents and anchors (a turn's own record on commit, and a record rewritten later, as a rollback does); read the chat, lore, the preset and the connections; read the settings; push trace events; commit a turn; say what became of a connection it was asked to make.
+- **The extension tells the runtime:** stop a turn; settings changed; a new relay secret, when the user rotates it on the Runtime page; and a loopback key to put in the user's loopback connection, making the connection when there is none. Spindle gives an extension no way to make a connection, so the runtime does it with its own Lumiverse session, says what it did, and never keeps the key.
 
 ## 7. Extension backend
 
@@ -138,3 +140,93 @@ One drawer tab. Every surface works at phone width (360 px) and uses the room on
 
 ## 10. Credits
 See `NOTICE`.
+
+## 11. The workspace
+
+The workspace is the agents' only file system: markdown and other text files they keep for themselves and for each other.
+
+- **Three areas.**
+  - The chat's area (`/`) follows the story path, like the session.
+  - `learned/` is kept with the chat itself: a swipe or an edit never changes it, and a branch copies it.
+  - `~/` is the user's own area, shared by all their chats.
+- **Storage.** A file's body is a blob. An area is an index: path to hash, size, when it was last written and by whom (an agent's id, a job's, or the user).
+- **Anchoring.** Each turn's record holds the hash of the chat area's index as it stood when the turn ended. The chat area at a turn is the index of the latest record on the active path, plus what jobs on that path wrote since (§15).
+- **Versioned writes.** A write or an edit names the hash of the version it was based on, or says the file is new. A mismatch is refused with the current hash, so the agent reads again. That is what lets the main agent, sub-agents and jobs work on the same files.
+- **History.** The difference between two records' indexes is a turn's change set. The page shows a file's history, compares two versions and restores one.
+- **Tools.** `workspace_list`, `workspace_read`, `workspace_grep`, `workspace_write`, `workspace_edit` (replace an exact match), `workspace_move`, `workspace_delete`, `workspace_pin` (a pinned file is put in the agent's context each turn, under a size setting).
+- **Bounds.** A path is checked and normalized; one that leaves its area is refused. Nothing reaches the host's disk. File size, file count and total size have settings.
+- **The user** reads and edits every file on the page. A user's edit is a versioned write like any other, recorded as the user's.
+
+## 12. Guidance
+
+A guidance file is markdown an agent is given as part of its instructions, every turn.
+
+- **Three levels:** the user's (`~/GUIDANCE.md`), a middle level (for a plain chat, the character's; an extension may name its own, such as a world's), and the chat's (`learned/GUIDANCE.md`).
+- **Loaded** into every agent's system prompt in that order, under a size setting, with each level named so an agent knows whose words they are.
+- **Edited** by the user on the page. An agent may edit the chat's level when a setting allows.
+
+## 13. Agents, skills and tools as definitions
+
+- **An agent definition:** id, name, description (what a delegating agent reads when choosing), instructions, tools (by name or family), connection, model, effort, budgets, and what it is given (the whole request, or only its task).
+- **A skill:** id, name, description and a markdown body: a procedure an agent may follow. An agent's prompt lists the skills it may load, by name and description; `skill_load` returns a body. Nothing in the code decides when a skill applies.
+- **A tool:** name, family, tier (read, write or external), description, parameters, and where it runs: in the runtime, or in the extension over the link (`tool.call`), which is how an extension's own tools and MCP tools run.
+- **Three sources for each:** built in, an extension's, the user's. A user's definition with the id of a built-in or an extension's overrides it, and a reset restores the original. The user makes, copies, edits, switches off and deletes definitions on the page.
+- **The registry** the runtime uses for a turn is the merge of the three, read at the turn's start.
+
+## 14. Delegation
+
+- `delegate({agent, task, files?})` starts a registered agent as a sub-agent with its own session. Its answer is the tool's result. Several calls in one round run at once, under a setting.
+- **The handle lives until the turn ends:** `agent_message({handle, text})` continues that agent, under a revision cap.
+- **A depth setting** decides whether a sub-agent may delegate.
+- **A sub-agent's writes** are its own versioned writes. Its tools are its definition's, never more than the agent that started it may grant.
+- Every sub-agent's session appears in the live view under the agent that started it, and is kept with the turn's transcript.
+
+## 15. Jobs
+
+A job is an agent run that outlives the reply.
+
+- **Tools.** `job_start({agent, task, when})` with `when` as `now` (it runs beside the turn) or `after_reply`; `job_list`, `job_read`, `job_cancel`.
+- **Nothing starts a job except an agent's `job_start` call or the user on the page.** A test fails if any other code does.
+- **Limits, all settings:** jobs at once, tokens per job, time per job, tokens per day; and the user's controls: off, pause, cancel.
+- **Basis.** A job belongs to the record of the turn that started it. Its report is a blob listed with that record. Its workspace writes are versioned writes, made when they happen.
+- **Off the path.** When its basis is no longer on the chat's active path at the moment it would write or report, the job stops, and its report is marked off the path. Writes it already made to the chat area stay with the path they were made on.
+- **Hearing about it.** At the start of its next turn the main agent is told which jobs finished or failed since, with each report's opening and how to read the whole. The page lists every job with its state, agent, spend and report, and tells the user when one finishes or needs them.
+- **A runtime restart** leaves a running job marked interrupted, with what it had done kept. The user or an agent may start it again.
+
+## 16. MCP tools
+
+A server the user has set up in Lumiverse appears in the tool registry once the user switches it on for agents, each tool as `mcp:<server>:<tool>` with the tier `external`. Calls go through Lumiverse on the extension's side.
+
+## 17. Approval
+
+- **Settings decide for each tier,** with an override per tool: allow, or ask.
+- **"Ask" holds the call** and shows a card in the live view with the tool, its arguments and the agent asking: approve once, approve for this chat, or refuse (with a reason the agent is given). A setting bounds the wait; when it runs out the call is refused and the agent is told why.
+
+## 18. Talking to a working agent
+
+- **Say something:** a note the main agent receives at its next round, marked as the user's.
+- **Pause and resume:** holds every agent of the turn at its next round.
+- **Stop** (already there) ends the turn.
+
+## 19. Side sessions
+
+A side session is a conversation with an agent that is not a reply in the chat: the page's own chat with the main agent, or with any agent the user picks, about a chat or about nothing in particular. It has the same tools, workspace, guidance and live view. It is kept in the store, not anchored to a message, and it never writes to the chat's messages.
+
+## 20. Spend and upkeep
+
+- **Spend.** Every model call is recorded with its agent, connection, model, tokens and cost. The page shows spend by day, chat, agent and connection, and the caps in force. A cap that is reached refuses the next call in plain words that name the setting.
+- **Upkeep.** Prompts, transcripts and the spans a compaction replaced are kept for a time that is a setting. A sweep removes blobs nothing refers to. The page shows what is stored and how big it is, and can run the sweep.
+
+## 21. An extension that uses LumiAH
+
+Another extension builds LumiAH into itself (§1). What it may supply:
+
+- **Tools,** which run in its own backend (§13).
+- **Agent definitions, skills and guidance levels,** as its defaults; the user's still override them.
+- **A main agent** for the chats it claims, in place of LumiAH's.
+- **The anchor** (§5), when it keeps its own record per message.
+- **The writer's request:** it may rewrite the messages the writer is sent, to place what it prepared where the user's preset expects it.
+- **Hooks on the turn:** when a turn begins, when the reply has been written, and when the turn ends.
+- **Pages:** LumiAH's pages are components it mounts in its own drawer.
+
+LumiAH's own tests include a sample extension that supplies one of each, so this surface is exercised without any real extension.

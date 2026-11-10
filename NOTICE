@@ -5,9 +5,15 @@ Moved from LumiRPEngine (https://github.com/TheLiquorPriest/LumiRPEngine), by th
 
   - The agent loop, the provider session, usage, sessions, compaction and blobs
     (LumiRPEngine src/backend/agents) -> LumiAH src/core.
+  - The lexical search index, the tool that reads an earlier turn's work, the receipt a turn leaves
+    for the next, and the memo a compaction writes (LumiRPEngine src/engine/lexical.ts and
+    src/backend/agents) -> LumiAH src/core.
   - The loopback relay, its stream writer, the link to the extension and the command line that
     installs and runs them (LumiRPEngine src/cli, src/shared/loopback.ts, src/backend/loopback)
     -> LumiAH src/runtime, src/link and src/extension/backend.
+  - The drawer's store, scrolling, chat-head measuring, design tokens, component styles and icons,
+    and the preview harness (LumiRPEngine src/frontend, dev) -> LumiAH src/extension/frontend,
+    dev/preview.
 
 Design taken from LumiAgent by AMousePad (https://github.com/AMousePad/LumiAgent, MIT):
 
@@ -15,6 +21,13 @@ Design taken from LumiAgent by AMousePad (https://github.com/AMousePad/LumiAgent
     fed back until the model answers, tool calls a model writes as text recovered, large tool
     results clipped with the rest readable from scratch, a detector for repeated identical calls,
     and request and token throttles.
+
+Carried from LumiAgent by AMousePad (https://github.com/AMousePad/LumiAgent), under its licence,
+which is reproduced at the end of this file:
+
+  - The list of providers that refuse the parallel_tool_calls flag (LumiAgent src/backend.ts,
+    PARALLEL_TOOLS_INCOMPATIBLE_PROVIDERS) -> LumiAH src/extension/backend/connections.ts,
+    NO_PARALLEL_FLAG.
 
 Design taken from Warp by japolino (https://github.com/japolino/warp), with no Warp code retained:
 
@@ -27,3 +40,24 @@ Studio code retained:
 
   - The pattern of one pure core shared by a command line and a server, with only the entry
     touching the file system, by way of LumiRPEngine's command line.
+
+
+LumiAgent's licence
+-------------------
+
+Copyright 2026 AMousePad
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the "Software"), to deal in the Software without restriction,
+including without limitation the rights to use, copy, modify, merge, publish, distribute,
+sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or
+substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
+NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
+DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
+OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
