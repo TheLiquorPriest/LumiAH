@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs and build-tool output
+*.log
+coverage/
+.cache/
+*.tsbuildinfo
+
+# Scratch files
+*.tmp
+*.bak
+scratch/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
