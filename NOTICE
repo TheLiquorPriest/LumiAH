@@ -1,0 +1,29 @@
+LumiAH
+======
+
+Moved from LumiRPEngine (https://github.com/TheLiquorPriest/LumiRPEngine), by the same author:
+
+  - The agent loop, the provider session, usage, sessions, compaction and blobs
+    (LumiRPEngine src/backend/agents) -> LumiAH src/core.
+  - The loopback relay, its stream writer, the link to the extension and the command line that
+    installs and runs them (LumiRPEngine src/cli, src/shared/loopback.ts, src/backend/loopback)
+    -> LumiAH src/runtime, src/link and src/extension/backend.
+
+Design taken from LumiAgent by AMousePad (https://github.com/AMousePad/LumiAgent, MIT):
+
+  - The ideas of an agent loop over the host's generation call: tool calls run and their results
+    fed back until the model answers, tool calls a model writes as text recovered, large tool
+    results clipped with the rest readable from scratch, a detector for repeated identical calls,
+    and request and token throttles.
+
+Design taken from Warp by japolino (https://github.com/japolino/warp), with no Warp code retained:
+
+  - The pattern of a per-swipe turn record kept in message metadata, with a path hash chained over
+    the messages before it so a record knows whether it is on the current path. LumiAH's anchors
+    follow it by way of LumiRPEngine's ledger.
+
+Design taken from Warp Studio by japolino (https://github.com/japolino/warp-studio), with no Warp
+Studio code retained:
+
+  - The pattern of one pure core shared by a command line and a server, with only the entry
+    touching the file system, by way of LumiRPEngine's command line.
