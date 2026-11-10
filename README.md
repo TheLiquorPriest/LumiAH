@@ -11,3 +11,6 @@ LumiAH is an agent harness for [Lumiverse](https://github.com/prolix-oc/Lumivers
 
 ## Credits
 [LumiAgent](https://github.com/AMousePad/LumiAgent) by AMousePad (MIT) is a design reference.
+
+## Licence
+MIT. See [LICENSE](LICENSE).

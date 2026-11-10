@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Lumiverse Agentic Harness: a main agent with tools, sub-agents, sessions and a workspace that answers Lumiverse's main generation.",
+  "license": "MIT",
   "repository": "github:TheLiquorPriest/LumiAH",
   "engines": {
     "bun": ">=1.4"
