@@ -39,7 +39,19 @@ export interface AgentDefinition extends AgentSettings {
    * Absent: Settings' "What a sub-agent may be given" decides.
    */
   grant?: "own" | "definition";
+  /**
+   * The fields an extension keeps as its own (§13), on a definition it supplies: where the user
+   * keeps a version of the agent, each field named here comes from the extension's definition as it
+   * is now (`instructions` with the text it names), and the user's version keeps the rest. A save
+   * of the user's version stores none of them. Only an extension's definition says it.
+   */
+  owns?: readonly OwnedField[];
 }
+
+/** A field of an agent definition an extension may keep as its own (`AgentDefinition.owns`). */
+export type OwnedField = "instructions" | "tools" | "name" | "description";
+
+export const OWNED_FIELDS: readonly OwnedField[] = ["instructions", "tools", "name", "description"];
 
 /** A definition as one run runs it: the user's settings over what it runs with by default, its connection and model resolved. */
 export interface ResolvedAgent {

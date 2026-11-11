@@ -11,11 +11,12 @@ import type { AgentDefinition } from "../../src/core/agents";
 import { mergeDefinitions, type StoredDefinitions } from "../../src/core/definitions";
 import { createHarness } from "../../src/core/harness";
 import type { ModelRequest, RemoteTool } from "../../src/core/ports";
-import { ADDED_TOOLS, defaultSettings, newAgentSettings, type Settings } from "../../src/core/settings";
+import { ADDED_TOOLS, defaultSettings, newAgentSettings, type Settings, SUMMARIZER_TOOLS } from "../../src/core/settings";
+import type { Skill } from "../../src/core/skills";
 import type { ToolDefinition } from "../../src/core/tools";
 import { renderDefault, TEXT } from "../../src/core/texts";
 import { call, MemoryHost, runTurn, type Script } from "./support/host";
-import { HARBOUR, LOG_SKILL, READER, sampleExtension, TIDES } from "./support/sample-extension";
+import { HARBOUR, KEEPER, LOG_SKILL, READER, type SampleExtension, sampleExtension, TIDES } from "./support/sample-extension";
 
 /** A chat the sample extension doesn't claim: LumiAH's own main agent answers it. */
 const CHAT = "chat-1";
@@ -49,7 +50,7 @@ function rig(answers: Script, change: (s: Settings) => void = () => undefined) {
   change(stored.values);
   const harness = createHarness(host, { settings: async () => structuredClone(stored), extension: sample.extension });
   const view = () => harness.definitions.get({ chatId: CHAT });
-  return { host, harness, stored, view, turn: () => runTurn(host, harness, CHAT) };
+  return { host, harness, stored, view, sample, turn: () => runTurn(host, harness, CHAT) };
 }
 
 describe("the three sources", () => {
@@ -211,5 +212,109 @@ describe("the tools the user added", () => {
     // A family's name still gives the family, built in or not.
     expect(definitions.names(["@wire"])).toEqual(["harbour_wire", "registered_beside"]);
     expect(definitions.scope().tools).toContain(ADDED_TOOLS);
+  });
+});
+
+/** What a tool call was answered with, as its model read it in the request that followed. */
+function resultOf(host: MemoryHost, callId: string): { content: string; failed: boolean } | undefined {
+  for (const request of host.calls) for (const message of request.messages) for (const part of message.parts ?? []) if (part.type === "tool_result" && part.toolUseId === callId) return { content: part.content, failed: part.isError === true };
+  return undefined;
+}
+
+describe("what an extension keeps as its own", () => {
+  const TODAY = "Read today's tide table and the harbour's ledger, then answer with the times alone.";
+  /** The extension's reader as it ships now: it keeps its instructions and its tools as its own. */
+  const OWNING: AgentDefinition = { ...READER, instructions: TODAY, tools: [`@${HARBOUR.family}`, HARBOUR.search, "chat_read"], owns: ["instructions", "tools"] };
+  const supplying = (sample: SampleExtension, agents: AgentDefinition[], skills: Skill[] = [LOG_SKILL]): void => {
+    sample.extension.definitions = async () => ({ agents: [KEEPER, ...agents], skills });
+  };
+
+  test("a version the user saved before the extension changed runs with the extension's instructions and tools as they are now, and keeps its own model and limits", async () => {
+    const r = rig(script(HARBOUR.reader));
+    supplying(r.sample, [OWNING]);
+    // Saved when the reader had other instructions and other tools, to run on a model of the user's with one revision.
+    const budget = { ...READER.budget, revisions: 1 };
+    r.stored.definitions = { agents: { [HARBOUR.reader]: { ...READER, instructions: "Read the tide table aloud, slowly.", tools: [HARBOUR.withdrawn], model: "tide-model-9", budget } } };
+    const reader = (await r.view()).agents.find((a) => a.id === HARBOUR.reader);
+    expect(reader).toMatchObject({ source: "user", over: "extension", owns: ["instructions", "tools"], name: READER.name, instructions: TODAY, tools: OWNING.tools, model: "tide-model-9", budget });
+    // The tools are the extension's to keep, so nothing is said to be lacking.
+    expect(reader?.lacks).toBeUndefined();
+    await r.turn();
+    const sub = r.host.calls.find((request) => from(request) === "sub");
+    expect(system(sub)).toContain(TODAY);
+    expect(offered(sub)).toContain("chat_read");
+    expect(sub?.model).toBe("tide-model-9");
+
+    // As the page saves it now: without the fields the extension keeps. It stands all the same.
+    const { instructions: _i, tools: _t, ...saved } = { ...READER, model: "tide-model-9", budget };
+    r.stored.definitions = { agents: { [HARBOUR.reader]: saved as AgentDefinition } };
+    expect((await r.view()).agents.find((a) => a.id === HARBOUR.reader)).toMatchObject({ source: "user", over: "extension", instructions: TODAY, tools: OWNING.tools, model: "tide-model-9" });
+  });
+
+  test("tools set in Settings for it before don't hold: it runs with the extension's tools as they are now, and its model and limits there still apply", async () => {
+    const budget = { ...READER.budget, revisions: 1 };
+    const r = rig(script(HARBOUR.reader), (s) => (s.agents[HARBOUR.reader] = { connectionId: null, model: "settings-model", effort: READER.effort, toolCalls: READER.toolCalls, tools: [HARBOUR.withdrawn], budget }));
+    supplying(r.sample, [OWNING]);
+    expect((await r.view()).agents.find((a) => a.id === HARBOUR.reader)).toMatchObject({ source: "extension", tools: OWNING.tools, model: "settings-model", budget });
+    expect((await r.harness.definitions.held({ chatId: CHAT })).agents.find((a) => a.id === HARBOUR.reader)?.holds).toEqual([HARBOUR.tides, HARBOUR.search, "chat_read"]);
+    await r.turn();
+    const sub = r.host.calls.find((request) => from(request) === "sub");
+    expect(offered(sub)).toContain("chat_read");
+    expect(sub?.model).toBe("settings-model");
+  });
+
+  test("a skill the extension keeps as its own is the extension's, whatever the user kept under its id", async () => {
+    const r = rig(script());
+    supplying(r.sample, [READER], [{ ...LOG_SKILL, owned: true }]);
+    r.stored.definitions = { skills: { [HARBOUR.skill]: { ...LOG_SKILL, body: "Write the hour first." } } };
+    expect((await r.view()).skills.find((s) => s.id === HARBOUR.skill)).toEqual({ ...LOG_SKILL, owned: true, source: "extension", off: false });
+  });
+
+  test("a user's version over a built-in says which of the original's tools it lacks now, and a tool it gives by its family isn't lacking", async () => {
+    // As after the page's save: Settings hold nothing of the summarizer's own, so it runs with what the user's version names.
+    const r = rig(script(), (s) => delete s.agents.summarizer);
+    const [dropped, ...kept] = SUMMARIZER_TOOLS;
+    r.stored.definitions = { agents: { summarizer: { ...newAgentSettings(), id: "summarizer", name: "Summarizer", description: "Answers in a line.", instructions: "Answer in one line.", given: "task", tools: kept } } };
+    expect((await r.view()).agents.find((a) => a.id === "summarizer")?.lacks).toEqual([dropped]);
+    // A tool the user's version gives by its family isn't lacking.
+    r.stored.definitions = { agents: { summarizer: { ...newAgentSettings(), id: "summarizer", name: "Summarizer", description: "Answers in a line.", instructions: "Answer in one line.", given: "task", tools: ["@chat", ...kept] } } };
+    expect((await r.view()).agents.find((a) => a.id === "summarizer")?.lacks).toBeUndefined();
+  });
+});
+
+describe("whom a skill is for", () => {
+  const SCOUT_SKILLS: AgentDefinition = { ...SCOUT, tools: ["chat_read", "skill_load"] };
+  /** The main agent loads the harbour's log skill and hands the scout a task; the scout loads the skill too. */
+  const loading: Script = (request) => {
+    if (from(request) === "writer") return "Brann squints at the water.";
+    const answered = request.messages.some((m) => m.parts?.some((part) => part.type === "tool_result"));
+    if (from(request) === "sub") return answered ? "The log says the Gannet came in at dusk." : { toolCalls: [call("skill_load", { skill: HARBOUR.skill }, "k2")] };
+    return answered ? { toolCalls: [call("write_reply", { brief: "The Gannet came in at dusk." }, "w1")] } : { toolCalls: [call("skill_load", { skill: HARBOUR.skill }, "k1"), call("delegate", { agent: "scout", task: "When did the Gannet come in?" }, "d1")] };
+  };
+
+  test("a skill for one agent is listed to that agent and loaded by it, and another is neither told of it nor given it; a skill that names nobody is offered to both", async () => {
+    const r = rig(loading);
+    r.sample.extension.definitions = async () => ({ agents: [KEEPER, READER], skills: [{ ...LOG_SKILL, agents: ["scout"] }] });
+    r.stored.definitions = { agents: { scout: SCOUT_SKILLS }, skills: { knots: KNOTS } };
+    await r.turn();
+    const main = r.host.calls.find((request) => from(request) === "main");
+    const sub = r.host.calls.find((request) => from(request) === "sub");
+    const line = `- ${HARBOUR.skill}: ${LOG_SKILL.name}. ${LOG_SKILL.description}`;
+    expect(system(main)).not.toContain(line);
+    expect(system(sub)).toContain(line);
+    expect(resultOf(r.host, "k1")).toEqual({ content: `The skill ${HARBOUR.skill} is for scout, not for you. The skills you can load are: chronicle-keep, story-learn, knots.`, failed: true });
+    expect(resultOf(r.host, "k2")?.content).toStartWith(`[Skill ${HARBOUR.skill}: ${LOG_SKILL.name},`);
+    for (const request of [main, sub]) expect(system(request)).toContain(`- knots: ${KNOTS.name}. ${KNOTS.description}`);
+    expect((await r.view()).skills.find((s) => s.id === HARBOUR.skill)?.agents).toEqual(["scout"]);
+  });
+
+  test("the chronicler's two skills aren't offered at all where the backend leaves the chronicler and the story reader out", async () => {
+    const r = rig(script());
+    const recall = ["chronicle-keep", "story-learn"];
+    expect((await r.view()).skills.map((s) => s.id)).toEqual(expect.arrayContaining(recall));
+    r.stored.definitions = { without: ["chronicler", "story-reader"] };
+    expect((await r.view()).skills.filter((s) => recall.includes(s.id))).toEqual([]);
+    await r.turn();
+    for (const id of recall) expect(system(r.host.calls[0])).not.toContain(`- ${id}:`);
   });
 });

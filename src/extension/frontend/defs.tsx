@@ -11,7 +11,7 @@ import type { DefsView, Skill, UiProblem } from "../../shared/ui";
 import { type App, errorWords, useApp } from "./app";
 import { UiRequestError } from "./client";
 import { Badge, Banner, Button, Editor, Empty, Field, IconButton, SearchField, Section, useBusy } from "./components";
-import { type AgentDraft, copyId, countWords, type Def, filterDefs, idProblem, type KindWords, newKey, ownProblems, removeAsk, savedWords, saveLabel, saveStatus, sourceWords, standingWords, titleOf } from "./defs-model";
+import { type AgentDraft, copyId, countWords, type Def, filterDefs, idProblem, type KindWords, newKey, ownedWords, ownProblems, removeAsk, savedWords, saveLabel, saveStatus, sourceWords, standingWords, titleOf } from "./defs-model";
 import { Icon, type IconName } from "./icons";
 import { revealInScroller } from "./scroll";
 import { createStore, type Store, useSelect } from "./store";
@@ -132,7 +132,13 @@ export interface KindFieldsProps<V, D> {
   busy: boolean;
   /** What the backend refused of the last save that isn't about the id, the name or the description. */
   problems: readonly UiProblem[];
+  /** The fields the extension keeps as its own: shown, not edited. */
+  owned: readonly string[];
+  /** There are edits not saved yet. */
+  dirty: boolean;
   onChange(next: D): void;
+  /** Takes the definitions as a change the fields made themselves left them. */
+  onTake(view: DefsView): void;
 }
 
 /** A kind of definition the frame shows: an agent or a skill, as `V` when kept and as `D` while edited. */
@@ -156,6 +162,8 @@ export interface DefKind<V extends Def, D extends DraftHead> {
   help: { newId: string; madeId: string; name: string; description: string };
   /** The fields that are this kind's own, under the ones every definition has. */
   Fields: ComponentType<KindFieldsProps<V, D>>;
+  /** The fields of a kept one the extension keeps as its own (`ownedFields`). */
+  owned(saved: V): readonly string[];
 }
 
 /** What the backend said of a save it refused, and of which definition. */
@@ -202,6 +210,7 @@ function DefDetail<V extends Def, D extends DraftHead>(props: {
   onCopy(): void;
   onSwitch(off: boolean): void;
   onRemove(): void;
+  onTake(view: DefsView): void;
 }) {
   const { kind: k, saved, draft } = props;
   const idBox = useId();
@@ -211,6 +220,8 @@ function DefDetail<V extends Def, D extends DraftHead>(props: {
   const { own, rest } = ownProblems(props.refused?.problems ?? [], ["id", "name", "description"]);
   const named = draft.name.trim() !== "" || draft.id !== "";
   const removal = saved !== null && saved.source === "user" ? removeAsk(saved, k.words, props.dirty) : null;
+  const owned = saved !== null ? k.owned(saved) : [];
+  const ownedLine = ownedWords(owned, k.words);
   return (
     <>
       <div class="lah-pane-head">
@@ -233,6 +244,12 @@ function DefDetail<V extends Def, D extends DraftHead>(props: {
         <Icon name="info" size={14} />
         <span>{standingWords(saved, k.words)}</span>
       </p>
+      {ownedLine !== null ? (
+        <p class="lah-line" data-lah-owned>
+          <Icon name="shield" size={14} />
+          <span>{ownedLine}</span>
+        </p>
+      ) : null}
       {saved !== null ? (
         <div class="lah-actions" data-lah-def-actions>
           <Button icon="copy" onClick={props.onCopy}>
@@ -258,14 +275,28 @@ function DefDetail<V extends Def, D extends DraftHead>(props: {
             <code class="lah-code">{saved.id}</code>
           </Field>
         )}
-        <Field label="Name" for={nameBox} help={k.help.name} error={own.get("name")}>
-          <input id={nameBox} class="lah-input" value={draft.name} autocomplete="off" aria-invalid={own.has("name") || undefined} disabled={props.saving} onInput={(event) => props.onChange({ ...draft, name: event.currentTarget.value })} />
-        </Field>
-        <Field label="Description" for={descriptionBox} help={k.help.description} error={own.get("description")}>
-          <Editor id={descriptionBox} label="Description" prose rows={3} value={draft.description} invalid={own.has("description")} disabled={props.saving} onInput={(description) => props.onChange({ ...draft, description })} />
-        </Field>
+        {owned.includes("name") ? (
+          <Field label="Name" help={k.help.name}>
+            <span data-lah-owned-field="name">{draft.name}</span>
+          </Field>
+        ) : (
+          <Field label="Name" for={nameBox} help={k.help.name} error={own.get("name")}>
+            <input id={nameBox} class="lah-input" value={draft.name} autocomplete="off" aria-invalid={own.has("name") || undefined} disabled={props.saving} onInput={(event) => props.onChange({ ...draft, name: event.currentTarget.value })} />
+          </Field>
+        )}
+        {owned.includes("description") ? (
+          <Field label="Description" help={k.help.description}>
+            <div class="lah-text" data-lah-owned-field="description">
+              {draft.description}
+            </div>
+          </Field>
+        ) : (
+          <Field label="Description" for={descriptionBox} help={k.help.description} error={own.get("description")}>
+            <Editor id={descriptionBox} label="Description" prose rows={3} value={draft.description} invalid={own.has("description")} disabled={props.saving} onInput={(description) => props.onChange({ ...draft, description })} />
+          </Field>
+        )}
       </Section>
-      <k.Fields draft={draft} saved={saved} view={props.view} busy={props.saving} problems={rest} onChange={props.onChange} />
+      <k.Fields draft={draft} saved={saved} view={props.view} busy={props.saving} problems={rest} owned={owned} dirty={props.dirty} onChange={props.onChange} onTake={props.onTake} />
       <div class="lah-defs-save" data-lah-save data-state={props.refused !== null ? "refused" : props.dirty ? "unsaved" : "saved"} role="group" aria-label={`Save this ${k.words.one}`}>
         <span class="lah-defs-save-text" role="status">
           {props.refused !== null ? <Icon name="alert" size={16} /> : null}
@@ -464,6 +495,7 @@ export function DefsFrame<V extends Def, D extends DraftHead>(props: { kind: Def
             onCopy={() => start(k.copy(shown, copyId(shown.id, [...ids, ...news.map(([, made]) => made.id)])))}
             onSwitch={flip}
             onRemove={remove}
+            onTake={take}
           />
         ) : (
           <Empty icon={k.icon} title={`Pick ${k.words.a}`}>

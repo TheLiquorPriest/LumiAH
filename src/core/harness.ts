@@ -15,7 +15,7 @@ import { forgetApproval, type KeptApproval, keptApprovals } from "./approved";
 import { Areas, chatFolder } from "./areas";
 import { Blobs } from "./blobs";
 import { CompactionMemo } from "./compaction";
-import type { AgentView, SkillView, ToolView } from "./definitions";
+import type { AgentView, HeldTools, SkillView, ToolView } from "./definitions";
 import { type GuidanceId, type GuidanceRead, guidanceGuard, readGuidance } from "./guidance";
 import { jobEnded } from "./job-words";
 import { Jobs } from "./jobs";
@@ -208,6 +208,8 @@ export interface Harness {
   definitions: {
     /** Every definition as a run about `chatId` would have it (none: about no chat). */
     get(input: { chatId?: string | null }): Promise<DefinitionsAnswer>;
+    /** Each agent that can run in `chatId`, with the tools it holds there and each tool it names that it can't use, with why. */
+    held(input: { chatId: string }): Promise<{ agents: HeldTools[] }>;
   };
   session: {
     /** Rolls back the summary made at a turn (§5). Refused in plain words where it would change nothing. */
@@ -502,6 +504,10 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
         const setup = await readSetup(shared, isRecord(input) && typeof input.chatId === "string" ? input.chatId : "");
         const scope = setup.definitions.scope();
         return { ...setup.definitions.view(setup.settings, setup.texts), agentSchema: agentRunSchema(scope.tools), agentDefaults: newAgentSettings(), scope };
+      },
+      async held(input) {
+        const setup = await readSetup(shared, isRecord(input) && typeof input.chatId === "string" ? input.chatId : "");
+        return { agents: setup.definitions.held(setup.settings) };
       },
     },
 

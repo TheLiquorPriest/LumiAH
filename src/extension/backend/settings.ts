@@ -21,6 +21,8 @@ export interface SettingsSection {
   schema: JsonObject;
   /** What the section refuses of its values, for a user: a section whose names depend on what that user has (the core's: their extension's tools, their own agents) may ask for it first. */
   check(values: unknown, userId: string): UiProblem[] | Promise<UiProblem[]>;
+  /** The settings of the section that aren't the user's to set, for a user (the tools of an agent an extension keeps as its own): a change never stores a value there. */
+  fixed?(userId: string): Promise<readonly SettingPath[]>;
 }
 
 /** The texts a model is sent: their definitions, and what a text of the user's own is refused for (null: it is taken). */
@@ -251,6 +253,18 @@ export class SettingsStore {
       const problem = known(path) ?? (path.length === 0 ? { path: [], message: "A value is put at a setting, not over all of them." } : null);
       if (problem) problems.push(problem);
       else place([...path], clone(value));
+    }
+    // What isn't the user's to set is never kept: a value put there, or one kept from before, goes; one put whole above it keeps the rest.
+    for (const section of this.sections) {
+      for (const tail of (await section.fixed?.(userId)) ?? []) {
+        const fixed = [section.key, ...tail];
+        own = own.filter((o) => !within(o.path, fixed));
+        for (const o of own) {
+          if (!within(fixed, o.path)) continue;
+          const parent = at(o.value, fixed.slice(o.path.length, -1));
+          if (isRecord(parent)) delete parent[fixed.at(-1) ?? ""];
+        }
+      }
     }
     const values = this.valuesOf(own);
     for (const section of this.sections) for (const p of await section.check(values[section.key], userId)) problems.push({ path: [section.key, ...p.path], message: p.message });

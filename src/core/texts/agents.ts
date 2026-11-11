@@ -20,6 +20,7 @@ export const AGENTS_TEXT = {
   skillsMore: "agents.skills.more",
   skillBody: "agents.skill_load.body",
   skillNone: "agents.skill_load.none",
+  skillNotYours: "agents.skill_load.not_yours",
   remoteNothing: "agents.remote.nothing",
   choice: "agents.choice",
   task: "agents.task",
@@ -79,6 +80,7 @@ export const AGENTS_TEXTS: TextDef[] = [
   }),
   { id: AGENTS_TEXT.skillBody, group: ANSWERS, label: "skill_load: a skill", note: "What skill_load returns: one page of a skill's body.", text: "[Skill {{id}}: {{name}}, characters {{from}} to {{to}} of {{total}}.]\n{{text}}", vars: [v("id", "the skill's id", true), v("name", "its name"), v("from", "the first character returned"), v("to", "the character after the last one returned"), v("total", "the body's length"), v("text", "the characters read", true)] },
   { id: AGENTS_TEXT.skillNone, group: ANSWERS, label: "skill_load: no such skill", note: "skill_load's answer to an id that names no skill.", text: "There's no skill {{id}}. The skills are: {{skills}}. Give one of those.", vars: [v("id", "the id asked for"), v("skills", "the ids there are", true)] },
+  { id: AGENTS_TEXT.skillNotYours, group: ANSWERS, label: "skill_load: a skill for other agents", note: "skill_load's answer to the id of a skill that is offered only to other agents.", text: "The skill {{id}} is for {{agents}}, not for you. The skills you can load are: {{skills}}.", vars: [v("id", "the id asked for", true), v("agents", "the agents it is for, by id", true), v("skills", "the ids of the skills this agent can load")] },
   { id: AGENTS_TEXT.remoteNothing, group: ANSWERS, label: "A tool that runs outside LumiAH and gave nothing", note: "The result of a call to a tool that runs in the extension (its own, or an MCP server's) when what came back holds no result.", text: "{{tool}} gave no result: it runs outside LumiAH, and what came back from there isn't one. Go on without it, or say in your answer what you needed it for.", vars: [v("tool", "the tool", true)] },
   {
     id: toolId(TOOL.delegate),

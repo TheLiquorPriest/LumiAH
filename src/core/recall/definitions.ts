@@ -242,18 +242,20 @@ Then the next round. Stop delegating when \`delegate\` answers that no more sub-
 4. Answer with your report: the stretches readers read, those taken from summaries, those unread (\`[!]\`), how many are left to read (\`[ ]\`), and where the files are.
 `;
 
-/** The skills lore and history ship: the chronicler's two procedures. Each body is written for a model, short and exact; each description is what a listing shows, and every agent that holds `skill_load` reads it each turn. */
+/** The skills lore and history ship: the chronicler's two procedures. Each body is written for a model, short and exact; each description is what a listing shows, and every agent that holds `skill_load` reads it each turn. Each has the chronicler and the story reader at work, so neither is offered where the backend leaves either out. */
 export const RECALL_SKILLS: Skill[] = [
   {
     id: RECALL_SKILL.keep,
     name: "Keep the chronicle",
     description: "For the chronicler: how to bring the chronicle up to date from a message on. The main agent doesn't load it: upkeep never costs the reply a round. When the turn's note says a job is worth it, job_start goes in the same answer as write_reply, with the task the note gives.",
     body: KEEP,
+    starts: [CHRONICLER, READER],
   },
   {
     id: RECALL_SKILL.learn,
     name: "Learn an existing story",
     description: "For the chronicler, as a job the user starts on a chat that already has a long history: plan within the job's allowance, have story readers read the chat a stretch each, and build the chronicle (learned/chronicle/) with a citation on every line.",
     body: LEARN,
+    starts: [CHRONICLER, READER],
   },
 ];

@@ -7,7 +7,7 @@ import { useId, useState } from "preact/hooks";
 import type { Skill, SkillView } from "../../../shared/ui";
 import { Editor, Field, Section, Seg, type SegOption } from "../components";
 import { type DefKind, DefsFrame, type KindFieldsProps, libraryOf } from "../defs";
-import { copySkill, newSkill, ownProblems, SKILL_WORDS, sameSkill, skillDraft, skillToSave } from "../defs-model";
+import { copySkill, newSkill, ownedFields, ownProblems, SKILL_WORDS, sameSkill, skillDraft, skillForWords, skillToSave } from "../defs-model";
 import { Icon } from "../icons";
 
 type BodyView = "write" | "read";
@@ -17,17 +17,24 @@ const BODY_VIEWS: readonly SegOption<BodyView>[] = [
   { value: "read", label: "Read" },
 ];
 
-/** A skill's own field: its body, to write or to read as an agent is given it. */
+/** A skill's own field: its body, to write or to read as an agent is given it; and whom it is offered to. */
 function SkillFields(props: KindFieldsProps<SkillView, Skill>) {
   const { draft } = props;
   const box = useId();
-  const [mode, setMode] = useState<BodyView>("write");
+  const [chosen, setMode] = useState<BodyView>("write");
+  // A skill the extension keeps as its own is read here, never written.
+  const ownedBody = props.owned.includes("body");
+  const mode = ownedBody ? "read" : chosen;
   const { own, rest } = ownProblems(props.problems, ["body"]);
   return (
-    <Section title="What it says" id="body" aside={<Seg<BodyView> label="The body: write it, or read it" value={mode} options={BODY_VIEWS} onChange={setMode} />}>
+    <Section title="What it says" id="body" aside={ownedBody ? undefined : <Seg<BodyView> label="The body: write it, or read it" value={mode} options={BODY_VIEWS} onChange={setMode} />}>
       <p class="lah-line">
         <Icon name="info" size={14} />
-        <span>An agent that holds skill_load is told this skill's name and description. When it loads the skill, this body is what comes back, as written. Nothing in the code decides when a skill applies: the agent does.</span>
+        <span>An agent that holds skill_load is told the name and description of each skill offered to it. When it loads the skill, this body is what comes back, as written. Nothing in the code decides when a skill applies: the agent does.</span>
+      </p>
+      <p class="lah-line" data-lah-skill-for>
+        <Icon name="user" size={14} />
+        <span>{skillForWords(draft, props.view.agents)}</span>
       </p>
       {mode === "write" ? (
         <Field label="Body" for={box} help="Markdown: the steps to follow, in the order to follow them." error={own.get("body")}>
@@ -64,6 +71,7 @@ const SKILLS: DefKind<SkillView, Skill> = {
   copy: copySkill,
   same: sameSkill,
   save: (app, draft) => app.client.request("lah.skill.save", { skill: skillToSave(draft) }),
+  owned: ownedFields,
   about: "An agent is shown each skill's name and description, and loads the whole of one when it decides it applies: nothing else decides when.",
   help: {
     newId: 'What skill_load takes: lower-case letters, digits, "-" and "_". It is fixed once the skill is made.',

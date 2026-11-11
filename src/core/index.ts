@@ -9,9 +9,9 @@ export { HarnessRefusal, type RefusalCode, type RefusalProblem } from "./refusal
 export { type AgentDeps, type AgentHandle, type AgentReply, type AgentSpec, type AgentTrace, type AgentTranscript, AgentTurn, type ApprovalGate, cutShort, type RunWords, startAgent } from "./loop";
 export { type AgentTool, type ChatView, type DelegateChoice, type Delegation, type JobRead, type JobStart, type JobStarted, type JobTools, type LoreItem, type LoreView, type PastTurn, type ReplyStream, type RunInfo, type ToolCtx, type ToolDefinition, type ToolEnv, type ToolOutcome, ToolRegistry } from "./tools";
 export { BASE_TOOLS } from "./tools/base";
-export { type AgentDefinition, AgentRegistry, baseAgents, type ResolvedAgent } from "./agents";
+export { type AgentDefinition, AgentRegistry, baseAgents, type OwnedField, type ResolvedAgent } from "./agents";
 export { type Skill, SkillRegistry } from "./skills";
-export { type AgentView, checkAgent, checkSkill, type DefinitionsView, type SkillView, type Sourced, type StoredDefinitions, type ToolView } from "./definitions";
+export { type AgentView, checkAgent, checkSkill, type DefinitionsView, type HeldTools, type SkillView, type Sourced, type StoredDefinitions, type ToolView, type UnusableWhy } from "./definitions";
 export { approvalOf } from "./approval";
 export { ADDED_TOOLS, AGENT, type AgentBudget, type AgentSettings, type ApprovalRule, agentRunSchema, agentSettings, type BriefPlace, CORE_AGENTS, checkSettings, type ConnectionThrottle, defaultSettings, isEffort, MAIN_TOOLS, type ModelPrice, newAgentSettings, type Settings, SETTINGS_SCHEMA, type SettingsProblem, type SettingsScope, settingsOf, settingsSchema, type ToolCalls, type TurnBudget } from "./settings";
 export { checkText, FAMILY, renderDefault, SCRATCH_READ, TEXT, TEXT_DEFS, type TextDef, type TextVar, Texts, textDef, textsOf, TOOL } from "./texts";

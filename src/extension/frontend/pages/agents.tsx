@@ -7,9 +7,9 @@
 import { useId, useMemo, useRef } from "preact/hooks";
 import type { AgentView, ConnectionView, TextsView } from "../../../shared/ui";
 import { useApp } from "../app";
-import { Editor, Field, Section } from "../components";
+import { Banner, Button, Editor, Field, Section, useBusy } from "../components";
 import { type DefKind, DefsFrame, type KindFieldsProps, libraryOf } from "../defs";
-import { AGENT_WORDS, type AgentDraft, agentDraft, agentForm, agentToSave, applyAgentForm, copyAgent, followsWords, grantSettingWords, instructionsNote, instructionsShown, newAgent, ownProblems, sameAgent, typedInstructions } from "../defs-model";
+import { AGENT_WORDS, type AgentDraft, agentDraft, agentForm, agentToSave, applyAgentForm, copyAgent, followsWords, grantSettingWords, instructionsNote, instructionsShown, lacksToSave, lacksWords, newAgent, ownedFields, ownProblems, sameAgent, titleOf, typedInstructions, withTools } from "../defs-model";
 import { Icon } from "../icons";
 import { formOf, problemsByPath, valueAt } from "../settings-model";
 import { useSelect } from "../store";
@@ -34,7 +34,23 @@ function AgentFields(props: KindFieldsProps<AgentView, AgentDraft>) {
   const wrong = [own.get("instructions"), own.get("text")].filter((p) => p !== undefined).join(" ");
   // What Settings say a sub-agent may be given, for the choice that leaves it to them.
   const settingsSay = useMemo(() => (settings !== null ? grantSettingWords(settings) : null), [settings]);
-  const form = useMemo(() => formOf(agentForm(view, draft.rest, settingsSay)), [view.agentSchema, view.agentDefaults, draft.rest, settingsSay]);
+  const toolsOwned = props.owned.includes("tools");
+  const form = useMemo(() => formOf(agentForm(view, draft.rest, settingsSay, toolsOwned)), [view.agentSchema, view.agentDefaults, draft.rest, settingsSay, toolsOwned]);
+  const [adding, runAdd] = useBusy();
+  const lacks = saved?.lacks ?? [];
+  // Adds what the user's version lacks and saves it at once; edits not saved yet get the same tools, so saving them later doesn't take them away again.
+  const addLacking = (): void =>
+    runAdd(async () => {
+      if (saved === null) return;
+      try {
+        if (props.dirty) props.onChange(withTools(draft, lacks));
+        props.onTake(await app.client.request("lah.agent.save", { agent: lacksToSave(saved) }));
+        app.toast(`Added to your ${titleOf(saved)}: ${lacks.join(", ")}.`);
+      } catch (error) {
+        app.fail(error);
+      }
+    });
+  const tools = Array.isArray(draft.rest.tools) ? draft.rest.tools.filter((tool): tool is string => typeof tool === "string") : [];
   const follows = followsWords(draft.rest, view.agents);
   const ctx: FormCtx = {
     // The form keeps a change by handing it here: it goes into the edits, and Save sends the whole definition.
@@ -59,16 +75,39 @@ function AgentFields(props: KindFieldsProps<AgentView, AgentDraft>) {
   return (
     <>
       <Section title="What it is told" id="instructions">
-        {note !== null ? (
-          <p class={note.tone === "warn" ? "lah-line lah-is-warn" : "lah-line"} data-lah-instructions-note={note.tone} role={note.tone === "warn" ? "alert" : undefined}>
-            <Icon name={note.tone === "warn" ? "alert" : "info"} size={14} />
-            <span>{note.words}</span>
-          </p>
-        ) : null}
-        <Field label="Instructions" for={box} help="Its system prompt: sent at the head of every call it makes." error={wrong !== "" ? wrong : null}>
-          <Editor id={box} label="Instructions" rows={12} value={instructionsShown(draft.instructions, texts.own)} invalid={wrong !== ""} disabled={props.busy} onInput={(typed) => props.onChange({ ...draft, instructions: typedInstructions(typed, kept, texts.own) })} />
-        </Field>
+        {props.owned.includes("instructions") ? (
+          <Field label="Instructions" help="Its system prompt: sent at the head of every call it makes.">
+            <div class="lah-text lah-defs-reading" data-lah-owned-field="instructions">
+              {instructionsShown(draft.instructions, texts.own)}
+            </div>
+          </Field>
+        ) : (
+          <>
+            {note !== null ? (
+              <p class={note.tone === "warn" ? "lah-line lah-is-warn" : "lah-line"} data-lah-instructions-note={note.tone} role={note.tone === "warn" ? "alert" : undefined}>
+                <Icon name={note.tone === "warn" ? "alert" : "info"} size={14} />
+                <span>{note.words}</span>
+              </p>
+            ) : null}
+            <Field label="Instructions" for={box} help="Its system prompt: sent at the head of every call it makes." error={wrong !== "" ? wrong : null}>
+              <Editor id={box} label="Instructions" rows={12} value={instructionsShown(draft.instructions, texts.own)} invalid={wrong !== ""} disabled={props.busy} onInput={(typed) => props.onChange({ ...draft, instructions: typedInstructions(typed, kept, texts.own) })} />
+            </Field>
+          </>
+        )}
       </Section>
+      {lacks.length > 0 ? (
+        <Banner
+          tone="warn"
+          title="Tools the original has now"
+          actions={
+            <Button icon="plus" busy={adding} disabled={props.busy} onClick={addLacking}>
+              Add these tools
+            </Button>
+          }
+        >
+          <span data-lah-lacks>{lacksWords(lacks)}</span>
+        </Banner>
+      ) : null}
       <section class="lah-section lah-defs-form" data-lah-section="runs">
         <div class="lah-section-head">
           <span class="lah-section-title">What it is given, and what it runs with</span>
@@ -79,6 +118,13 @@ function AgentFields(props: KindFieldsProps<AgentView, AgentDraft>) {
             <Icon name="info" size={14} />
             <span>{follows}</span>
           </p>
+        ) : null}
+        {toolsOwned ? (
+          <Field label="Tools">
+            <span class="lah-inline" data-lah-owned-field="tools">
+              {tools.length > 0 ? tools.map((tool) => <code key={tool}>{tool}</code>) : "None."}
+            </span>
+          </Field>
         ) : null}
         <FieldNode node={form} ctx={ctx} top />
       </section>
@@ -98,6 +144,7 @@ const AGENTS: DefKind<AgentView, AgentDraft> = {
   copy: copyAgent,
   same: sameAgent,
   save: (app, draft) => app.client.request("lah.agent.save", { agent: agentToSave(draft) }),
+  owned: ownedFields,
   about: "The main agent works on every reply and hands work to the others; a job or a conversation starts with one. Open one to see what it is told, the tools it is given and the model it runs with.",
   help: {
     newId: 'What delegate, a job and a conversation name it by: lower-case letters, digits, "-" and "_". It is fixed once the agent is made.',

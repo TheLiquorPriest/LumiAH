@@ -211,7 +211,7 @@ export interface ToolEnv {
   reply?: ReplyStream;
   /** The workspace as this agent may use it (§11). */
   workspace?: WorkspaceView;
-  /** The skills it may load (§13). */
+  /** Every skill switched on (§13): `skill_load` offers those for `agent`, and says whom any other is for. */
   skills?: readonly Skill[];
   /** Absent where this agent may not delegate (§14: Depth). */
   delegation?: Delegation;

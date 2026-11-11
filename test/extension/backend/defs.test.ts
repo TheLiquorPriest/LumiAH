@@ -2,13 +2,16 @@
 // kept with their settings and reaches the core with them, a definition the core refuses isn't
 // kept, what a tool's calls do is the same setting Settings holds, and the jobs' two switches are
 // settings too. The definitions are about no chat, so the core built in answers for them (§25); its
-// part (merging and checking in a run) is scripted here.
+// part (merging and checking in a run) is scripted here, but where an extension's own definitions
+// are saved over and what each agent can use in a chat is read, which the core itself answers.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import type { AgentDefinition } from "../../../src/core/agents";
 import type { Harness as Core } from "../../../src/core/harness";
 import { defaultSettings, newAgentSettings } from "../../../src/core/settings";
+import type { Skill } from "../../../src/core/skills";
 import type { JsonObject } from "../../../src/core/ports";
+import type { BackendExtension } from "../../../src/extension/backend/extension";
 import { UiFailure } from "../../support/fake-lumiverse";
 import { type Rig, rig, USER } from "../../support/rig";
 
@@ -22,7 +25,7 @@ function scripted(seen: { definitions: unknown[] }): NonNullable<Parameters<type
         seen.definitions.push(read.definitions);
         return { agents: [], skills: [], tools: [{ name: "chat_search", family: "chat", tier: "read", description: "Searches the chat.", runs: "runtime", source: "builtin", off: false }], agentSchema: { type: "object" }, agentDefaults: newAgentSettings(), scope: { tools: ["chat_search", "@chat", "@added"], agents: [] } };
       },
-    } satisfies Core["definitions"],
+    } satisfies Pick<Core["definitions"], "get">,
   });
 }
 
@@ -106,5 +109,60 @@ describe("the switches over all jobs", () => {
     expect(state.jobs).toMatchObject({ off: true, paused: true });
     expect((state.settings.values.core as JsonObject).jobs).toMatchObject({ enabled: false });
     expect((state.settings.values.transport as JsonObject).jobs).toEqual({ paused: true });
+  });
+});
+
+describe("an extension's own definitions", () => {
+  const TIDE = "Read today's tide table, then answer with the times alone.";
+  /** The extension's agent: it keeps its instructions and tools as its own, and names a tool of LumiAH's it withdraws, one the user switches off, and one nobody registered. */
+  const reader: AgentDefinition = { ...newAgentSettings(), id: "tide_reader", name: "Tide reader", description: "Reads the tide table for a day.", instructions: TIDE, given: "task", tools: ["chat_read", "chat_grep", "lore_grep", "no_such_tool"], owns: ["instructions", "tools"] };
+  const ledger: Skill = { id: "harbour_ledger", name: "The harbour's ledger", description: "How a berth is entered.", body: "Name the ship, then her berth.", owned: true };
+  const extension: BackendExtension = { name: "Harbour", definitions: async () => ({ agents: [reader], skills: [ledger] }), claim: async () => ({ withdraw: ["lore_grep"] }) };
+
+  async function harbour(): Promise<Rig> {
+    const it = await rig({ backend: { extension } });
+    open = it;
+    return it;
+  }
+
+  test("a save of the user's version keeps their model and limits and stores none of the fields the extension keeps, which stay the extension's", async () => {
+    const it = await harbour();
+    const budget = { ...reader.budget, revisions: 1 };
+    // Sent as a page of an older build would: with instructions of its own, other tools, and `owns`.
+    await it.page.request("lah.agent.save", { agent: { ...reader, instructions: "Read it aloud.", tools: ["chat_read"], model: "tide-model-9", budget } });
+    const stored = ((await it.backend.settings.snapshot(USER)).definitions as JsonObject).agents as JsonObject;
+    expect(stored[reader.id]).toEqual({ id: reader.id, name: reader.name, description: reader.description, given: "task", connectionId: null, model: "tide-model-9", effort: reader.effort, toolCalls: reader.toolCalls, budget });
+    const shown = (await it.page.request("lah.defs.get", {})).agents.find((a) => a.id === reader.id);
+    expect(shown).toMatchObject({ source: "user", over: "extension", owns: ["instructions", "tools"], instructions: TIDE, tools: reader.tools, model: "tide-model-9", budget });
+  });
+
+  test("a skill the extension keeps as its own can't be saved over", async () => {
+    const it = await harbour();
+    const refused = await it.page.request("lah.skill.save", { skill: { id: ledger.id, name: ledger.name, description: ledger.description, body: "Write the hour first." } }).catch((error: unknown) => error);
+    expect((refused as UiFailure).error).toMatchObject({ code: "forbidden", message: "This skill belongs to the extension. You change it on that extension's own pages." });
+    expect((await it.backend.settings.snapshot(USER)).definitions).toEqual({});
+  });
+
+  test("Settings keep no tools for it: a tools value sent there isn't stored, and its model is", async () => {
+    const it = await harbour();
+    await it.page.request("lah.settings.set", { set: [{ path: ["core", "agents", reader.id, "tools"], value: ["chat_read"] }, { path: ["core", "agents", reader.id, "model"], value: "tide-model-9" }], reset: [] });
+    expect((((await it.backend.settings.snapshot(USER)).values.core as JsonObject).agents as JsonObject)[reader.id]).toEqual({ model: "tide-model-9" });
+  });
+
+  test("held says, for each agent of a chat, the tools it holds and why it can't use each other tool it names", async () => {
+    const it = await harbour();
+    const chatId = await it.setUpBuiltin();
+    await it.page.request("lah.def.switch", { kind: "tool", id: "chat_grep", off: true });
+    const held = (await it.backend.agents.held(USER, chatId)).find((agent) => agent.id === reader.id);
+    expect(held).toEqual({
+      id: reader.id,
+      name: reader.name,
+      holds: ["chat_read"],
+      cannot: [
+        { tool: "chat_grep", why: "off" },
+        { tool: "lore_grep", why: "withdrawn" },
+        { tool: "no_such_tool", why: "unknown" },
+      ],
+    });
   });
 });

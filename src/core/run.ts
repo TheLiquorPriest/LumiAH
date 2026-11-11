@@ -580,7 +580,7 @@ export class Run {
     const tools: AgentTool[] = this.definitions.build(names, env);
     for (const tool of tools) held.add(tool.name);
     const own = how.system ?? instructionsOf(definition, texts);
-    const system = [own, how.about ?? "", !how.plain && held.has(TOOL.skillLoad) ? this.skillList() : ""].filter((part) => part !== "").join("\n\n");
+    const system = [own, how.about ?? "", !how.plain && held.has(TOOL.skillLoad) ? this.skillList(definition.id) : ""].filter((part) => part !== "").join("\n\n");
     // The extension may say which model this agent runs on (§21); asked only where it supplies the hook, so a run without it starts its agents as it always did.
     const chosen = shared.options.extension?.agentModel ? await this.modelOf({ definition: definition.id, as: how.as ?? null, standing: how.standing ?? (info.kind === "job" ? "job" : "turn"), by: how.by ?? null }) : {};
     const agent = startAgent(
@@ -631,10 +631,10 @@ export class Run {
     };
   }
 
-  /** The skills an agent may load, as its instructions list them: as many as Settings give room for, and how many more there are. */
-  private skillList(): string {
+  /** The skills the agent definition `agent` may load, as its instructions list them: as many as Settings give room for, and how many more there are. */
+  private skillList(agent: string): string {
     const { texts } = this;
-    const skills = this.definitions.skills();
+    const skills = this.definitions.skills(agent);
     if (skills.length === 0) return "";
     const lines: string[] = [];
     let used = 0;

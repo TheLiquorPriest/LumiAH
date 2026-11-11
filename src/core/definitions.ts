@@ -12,13 +12,13 @@
 // What an agent runs with (connection, model, effort, tools, budget) is a setting, kept under the
 // definition's id; the definition's own values are what it runs with until the user sets others.
 
-import { type AgentDefinition, type ResolvedAgent, resolveAgent } from "./agents";
+import { type AgentDefinition, OWNED_FIELDS, type OwnedField, type ResolvedAgent, resolveAgent } from "./agents";
 import type { ChatClaim } from "./extension";
 import type { DefinitionSource, HarnessHost, JsonObject, RemoteTool, ToolTier } from "./ports";
 import { isRecord } from "./ports";
 import type { RefusalProblem } from "./refusal";
 import { ADDED_TOOLS, AGENT, type AgentSettings, CORE_AGENTS, newAgentSettings, readAgentSettings, type Settings, type SettingsScope } from "./settings";
-import type { Skill } from "./skills";
+import { offeredTo, type Skill } from "./skills";
 import { toolId } from "./text-def";
 import { TEXT, type Texts, textDef } from "./texts";
 import type { AgentTool, ToolDefinition, ToolEnv } from "./tools";
@@ -38,8 +38,12 @@ export interface Sourced {
   off: boolean;
 }
 
-/** An agent definition with where it comes from. What it runs with is given as it stands under Settings. */
-export type AgentView = AgentDefinition & Sourced;
+/**
+ * An agent definition with where it comes from. What it runs with is given as it stands under
+ * Settings. `lacks`: for a user's definition over a built-in or an extension's that doesn't keep its
+ * tools as its own (`owns`), the tools the original names now that the user's doesn't give.
+ */
+export type AgentView = AgentDefinition & Sourced & { lacks?: string[] };
 
 export type SkillView = Skill & Sourced;
 
@@ -61,17 +65,31 @@ export interface DefinitionsView {
   tools: ToolView[];
 }
 
+/** Why an agent can't use a tool it names: the user switched it off, the extension's claim withdraws it in this chat, or no tool of that name is registered here. */
+export type UnusableWhy = "off" | "withdrawn" | "unknown";
+
+/** An agent that can run in a chat, with what it can use there: the tools it holds, and each tool it names that it can't use, with why (a family's name where nothing of that family is registered). */
+export interface HeldTools {
+  id: string;
+  name: string;
+  holds: string[];
+  cannot: { tool: string; why: UnusableWhy }[];
+}
+
 // ---------------------------------------------------------------- the user's own, as stored
 
 /**
  * The user's definitions as the host keeps them, a stored format: their own agent definitions and
- * skills by id, each whole, and what they switched off, by id (a tool by its name). Nothing here
- * changes a built-in or an extension's definition: it stands over one, or switches one off.
+ * skills by id, each whole but for the fields an extension keeps as its own (`owns`), and what they
+ * switched off, by id (a tool by its name). Nothing here changes a built-in or an extension's
+ * definition: it stands over one, or switches one off. `without`: the built-in agents the backend
+ * leaves out, handed over with the rest (`BackendOptions.withoutAgents`).
  */
 export interface StoredDefinitions {
   agents?: Record<string, AgentDefinition>;
   skills?: Record<string, Skill>;
   off?: { agents?: string[]; skills?: string[]; tools?: string[] };
+  without?: string[];
 }
 
 /**
@@ -117,9 +135,11 @@ export function checkAgent(value: unknown, tools: readonly string[]): { agent: A
   const run: JsonObject = {};
   for (const key of ["connectionId", "model", "effort", "tools", "toolCalls", "budget"]) if (hasOwn(value, key)) run[key] = value[key] as JsonObject;
   const settings = readAgentSettings(run, tools, newAgentSettings(), [], problems);
+  const owns = value.owns === undefined ? [] : Array.isArray(value.owns) && value.owns.every((field) => OWNED_FIELDS.includes(field as OwnedField)) ? [...new Set(value.owns as OwnedField[])] : null;
+  if (owns === null) problems.push({ path: ["owns"], message: `It may name only these fields: ${OWNED_FIELDS.join(", ")}.` });
   if (problems.length > 0) return { agent: null, problems };
   const grant = value.grant === "own" || value.grant === "definition" ? value.grant : undefined;
-  return { agent: { id, name, description, instructions: value.instructions as string, ...(text(value.text) ? { text: value.text } : {}), given: value.given as "request" | "task", ...(text(value.follows) ? { follows: value.follows } : {}), ...(grant !== undefined ? { grant } : {}), ...settings }, problems };
+  return { agent: { id, name, description, instructions: value.instructions as string, ...(text(value.text) ? { text: value.text } : {}), given: value.given as "request" | "task", ...(text(value.follows) ? { follows: value.follows } : {}), ...(grant !== undefined ? { grant } : {}), ...(owns !== null && owns.length > 0 ? { owns } : {}), ...settings }, problems };
 }
 
 /** A skill from what the page (or the store) holds, checked: the skill, or null with what is wrong. */
@@ -137,7 +157,17 @@ export function checkSkill(value: unknown): { skill: Skill | null; problems: Ref
   const name = need("name", "a name");
   const description = need("description", "a description: it is what an agent reads when it chooses a skill");
   const body = need("body", "a body: the procedure itself");
-  return problems.length > 0 ? { skill: null, problems } : { skill: { id, name, description, body }, problems };
+  // Agent definitions by id: whom it is offered to, and whom its procedure starts.
+  const ids = (key: string, message: string): string[] | undefined | null => {
+    const v = value[key];
+    if (v === undefined) return undefined;
+    if (Array.isArray(v) && v.every((agent) => text(agent) && ID.test(agent))) return [...new Set(v as string[])];
+    problems.push({ path: [key], message });
+    return null;
+  };
+  const agents = ids("agents", "It must name the agents it is for by their ids, or be left out for every agent.");
+  const starts = ids("starts", "It must name the agents its procedure starts by their ids, or be left out.");
+  return problems.length > 0 ? { skill: null, problems } : { skill: { id, name, description, body, ...(value.owned === true ? { owned: true as const } : {}), ...(agents ? { agents } : {}), ...(starts ? { starts } : {}) }, problems };
 }
 
 const strings = (value: unknown): string[] => (Array.isArray(value) ? value.filter(text) : []);
@@ -216,8 +246,8 @@ function unused(log: HarnessHost["log"], what: string, given: Given, problems: r
   log("warn", `[LumiAH] ${given.source === "user" ? "your" : "the extension's"} ${what}${id === null ? "" : ` "${id}"`} isn't used: ${why}`);
 }
 
-/** The tools a run has, by name, before the user's own are read: built-ins, what was registered beside them, and the extension's, under the claim's rule. */
-function mergeTools(sources: DefinitionSources, host: Pick<HarnessHost, "tools" | "log">): Map<string, ToolRow> {
+/** The tools a run has, by name, before the user's own are read: built-ins, what was registered beside them, and the extension's, under the claim's rule; and the built-ins the claim withdrew, each with its family. */
+function mergeTools(sources: DefinitionSources, host: Pick<HarnessHost, "tools" | "log">): { rows: Map<string, ToolRow>; withdrawn: Map<string, string> } {
   const rows = new Map<string, ToolRow>();
   for (const definition of sources.code.tools) rows.set(definition.name, { definition, source: sources.core.tools.has(definition.name) ? "builtin" : "extension", runs: "runtime", off: false });
   for (const tool of sources.remote) {
@@ -227,11 +257,22 @@ function mergeTools(sources: DefinitionSources, host: Pick<HarnessHost, "tools" 
     if (tool.source === "user" && rows.has(tool.name) && rows.get(tool.name)?.source !== "user") continue;
     rows.set(tool.name, { definition: remoteDefinition(tool, host), source: tool.source, runs: "extension", off: false, remote: tool });
   }
+  const withdrawn = new Map<string, string>();
   for (const name of sources.claim?.withdraw ?? []) {
-    if (rows.get(name)?.source === "builtin") rows.delete(name);
-    else host.log("debug", `[LumiAH] the extension withdrew "${name}", which is no tool of LumiAH's here: nothing was withdrawn`);
+    const row = rows.get(name);
+    if (row?.source === "builtin") {
+      withdrawn.set(name, row.definition.family);
+      rows.delete(name);
+    } else host.log("debug", `[LumiAH] the extension withdrew "${name}", which is no tool of LumiAH's here: nothing was withdrawn`);
   }
-  return rows;
+  return { rows, withdrawn };
+}
+
+/** Whether the name an agent's tools hold gives `row`: by the tool's own name, by its family's, or, for `@added`, as a tool that isn't built in. */
+function gives(name: string, tool: string, row: ToolRow): boolean {
+  if (!name.startsWith("@")) return name === tool;
+  // `@added` is read first: it is no family's name, whatever an extension calls a family of its own.
+  return name === ADDED_TOOLS ? row.source !== "builtin" : `@${row.definition.family}` === name;
 }
 
 /** Every tool and every family `rows` hold, as an agent's tools may name them, and the name that stands for every tool that isn't built in. */
@@ -246,9 +287,27 @@ function runOf(d: AgentDefinition): AgentSettings {
   return { connectionId: d.connectionId, model: d.model, effort: d.effort, tools: [...d.tools], toolCalls: d.toolCalls, budget: { ...d.budget } };
 }
 
+/**
+ * A user's stored agent definition as it is checked: without `owns`, which only an extension's
+ * definition says, and with each field the original keeps as its own taken from the original as it
+ * is now (instructions with the text they name), so a version the user saved long ago still holds
+ * what the extension gives today.
+ */
+function userAgent(value: unknown, original: AgentDefinition | undefined, owns: readonly OwnedField[]): unknown {
+  if (!isRecord(value)) return value;
+  const { owns: _claimed, ...out } = value;
+  if (original === undefined) return out;
+  for (const field of owns) out[field] = field === "tools" ? [...original.tools] : original[field];
+  if (owns.includes("instructions")) {
+    if (original.text !== undefined) out.text = original.text;
+    else delete out.text;
+  }
+  return out;
+}
+
 /** The definitions of one run, merged from their sources. */
 export function mergeDefinitions(sources: DefinitionSources, host: Pick<HarnessHost, "tools" | "log">): Definitions {
-  const tools = mergeTools(sources, host);
+  const { rows: tools, withdrawn } = mergeTools(sources, host);
   const names = namesOf(tools);
   const stored = isRecord(sources.user) ? sources.user : {};
   const off = isRecord(stored.off) ? stored.off : {};
@@ -256,16 +315,23 @@ export function mergeDefinitions(sources: DefinitionSources, host: Pick<HarnessH
   for (const [name, row] of tools) row.off = offTools.includes(name);
 
   const agents = new Map<string, AgentView>();
+  /** The tools each original names, by the id of the user's definition that stands over it, where the original doesn't keep its tools as its own: what the page says the user's lacks. */
+  const originals = new Map<string, readonly string[]>();
   for (const d of sources.code.agents) agents.set(d.id, { ...d, source: sources.core.agents.has(d.id) ? "builtin" : "extension", off: false });
   for (const given of givenOf(sources.extension.agents, stored.agents)) {
+    const original = given.key !== undefined ? agents.get(given.key) : undefined;
+    const owns = original?.source === "extension" ? (original.owns ?? []) : [];
+    const value = given.source === "user" ? userAgent(given.value, original, owns) : given.value;
     // A definition was checked against the tools there were when it was written. A tool it names that this run doesn't have (an MCP server switched off since, a built-in the extension withdraws in this chat, a tool the port didn't list this time) is no reason to lose the agent: the name stays, and gives nothing (`Definitions.names`).
-    const { agent, problems } = checkAgent(given.value, [...names, ...strings(isRecord(given.value) ? given.value.tools : undefined)]);
+    const { agent, problems } = checkAgent(value, [...names, ...strings(isRecord(value) ? value.tools : undefined)]);
     if (!agent || (given.key !== undefined && agent.id !== given.key)) {
       unused(host.log, "agent definition", given, problems);
       continue;
     }
-    const under = agents.get(agent.id);
-    agents.set(agent.id, { ...agent, source: given.source, ...(given.source === "user" && under && under.source !== "user" ? { over: under.source } : {}), off: false });
+    const over = given.source === "user" && original && original.source !== "user" ? original.source : undefined;
+    // The user's version keeps what the original keeps as its own, so the page shows those fields as the extension's.
+    agents.set(agent.id, { ...agent, ...(owns.length > 0 ? { owns } : {}), source: given.source, ...(over !== undefined ? { over } : {}), off: false });
+    if (over !== undefined && original && !owns.includes("tools")) originals.set(agent.id, original.tools);
   }
   // The three a turn can't do without are never off, whatever is stored.
   const offAgents = strings(off.agents);
@@ -277,17 +343,25 @@ export function mergeDefinitions(sources: DefinitionSources, host: Pick<HarnessH
   const skills = new Map<string, SkillView>();
   for (const s of sources.code.skills) skills.set(s.id, { ...s, source: sources.core.skills.has(s.id) ? "builtin" : "extension", off: false });
   for (const given of givenOf(sources.extension.skills, stored.skills)) {
+    const original = given.key !== undefined ? skills.get(given.key) : undefined;
+    if (given.source === "user" && original?.source === "extension" && original.owned === true) {
+      host.log("debug", `[LumiAH] your skill "${given.key}" isn't used: the extension keeps that skill as its own`);
+      continue;
+    }
     const { skill, problems } = checkSkill(given.value);
     if (!skill || (given.key !== undefined && skill.id !== given.key)) {
       unused(host.log, "skill", given, problems);
       continue;
     }
-    const under = skills.get(skill.id);
-    skills.set(skill.id, { ...skill, source: given.source, ...(given.source === "user" && under && under.source !== "user" ? { over: under.source } : {}), off: false });
+    // Only an extension's skill is its own: a user's that says so is the user's all the same.
+    const { owned: _claimed, ...kept } = skill;
+    skills.set(skill.id, { ...(given.source === "user" ? kept : skill), source: given.source, ...(given.source === "user" && original && original.source !== "user" ? { over: original.source } : {}), off: false });
   }
+  // A skill whose procedure starts an agent the backend leaves out would send its reader after nobody: it isn't offered here.
+  for (const [id, view] of skills) if (view.starts?.some((agent) => without.includes(agent))) skills.delete(id);
   const offSkills = strings(off.skills);
   for (const [id, view] of skills) view.off = offSkills.includes(id);
-  return new Definitions(agents, skills, tools, new Set(without));
+  return new Definitions(agents, skills, tools, new Set(without), originals, withdrawn);
 }
 
 /** One run's definitions. */
@@ -297,7 +371,11 @@ export class Definitions {
     private readonly skillRows: ReadonlyMap<string, SkillView>,
     private readonly toolRows: ReadonlyMap<string, ToolRow>,
     /** The built-in agents the backend leaves out: a call that names one is told it isn't offered here. */
-    readonly without: ReadonlySet<string> = new Set(),
+    readonly without: ReadonlySet<string>,
+    /** The tools each original names, by the id of the user's definition over it (`mergeDefinitions`). */
+    private readonly originals: ReadonlyMap<string, readonly string[]>,
+    /** The built-ins the claim withdrew, each with its family. */
+    private readonly withdrawn: ReadonlyMap<string, string>,
   ) {}
 
   /** An agent definition by its id; undefined for none, and for one switched off. */
@@ -326,16 +404,16 @@ export class Definitions {
     return this.agents().filter((d) => d.id !== AGENT.main && d.id !== AGENT.writer && d.id !== but);
   }
 
-  /** Every skill that is switched on. */
-  skills(): Skill[] {
-    return [...this.skillRows.values()].filter((view) => !view.off).map(({ id, name, description, body }) => ({ id, name, description, body }));
+  /** Every skill that is switched on; for `agent`, those offered to it (`Skill.agents`). */
+  skills(agent?: string): Skill[] {
+    return [...this.skillRows.values()].filter((view) => !view.off && (agent === undefined || offeredTo(view, agent))).map(({ id, name, description, body, agents }) => ({ id, name, description, body, ...(agents !== undefined ? { agents } : {}) }));
   }
 
   /** What Settings are read against for this run: every tool and family an agent may be given, and every definition with what it runs with by default. */
   scope(): SettingsScope {
     return {
       tools: namesOf(this.toolRows),
-      agents: [...this.agentRows.values()].filter((view) => !CORE_AGENTS.includes(view.id) || view.source !== "builtin").map((view) => ({ id: view.id, label: view.name, note: view.description, defaults: runOf(view) })),
+      agents: [...this.agentRows.values()].filter((view) => !CORE_AGENTS.includes(view.id) || view.source !== "builtin").map((view) => ({ id: view.id, label: view.name, note: view.description, defaults: runOf(view), ...(view.owns !== undefined ? { owns: view.owns } : {}) })),
     };
   }
 
@@ -350,12 +428,51 @@ export class Definitions {
   names(names: readonly string[]): string[] {
     const out = new Set<string>();
     for (const name of names) {
-      if (name.startsWith("@")) {
-        // `@added` is read first: it is no family's name, whatever an extension calls a family of its own.
-        for (const [tool, row] of this.toolRows) if (!row.off && (name === ADDED_TOOLS ? row.source !== "builtin" : `@${row.definition.family}` === name)) out.add(tool);
-      } else if (this.toolRows.get(name)?.off === false) out.add(name);
+      if (!name.startsWith("@")) {
+        if (this.toolRows.get(name)?.off === false) out.add(name);
+      } else for (const [tool, row] of this.toolRows) if (!row.off && gives(name, tool, row)) out.add(tool);
     }
     return [...out];
+  }
+
+  /**
+   * Each agent that can run here, with the tools it holds under `settings` and each tool it names
+   * that it can't use, with why: the user switched it off, the claim withdraws it, or nothing of
+   * that name is registered (a family's name stands for itself where none of its tools is).
+   */
+  held(settings: Readonly<Settings>): HeldTools[] {
+    return this.agents().map((definition) => {
+      const named = resolveAgent(definition, settings).tools;
+      const holds = this.names(named);
+      const cannot = new Map<string, UnusableWhy>();
+      const mark = (tool: string, why: UnusableWhy): void => {
+        if (!holds.includes(tool) && !cannot.has(tool)) cannot.set(tool, why);
+      };
+      for (const name of named) {
+        let found = false;
+        for (const [tool, row] of this.toolRows) {
+          if (!gives(name, tool, row)) continue;
+          found = true;
+          if (row.off) mark(tool, "off");
+        }
+        for (const [tool, family] of this.withdrawn) {
+          if (name !== tool && name !== `@${family}`) continue;
+          found = true;
+          mark(tool, "withdrawn");
+        }
+        // `@added` names whatever was added, which may be nothing.
+        if (!found && name !== ADDED_TOOLS) mark(name, "unknown");
+      }
+      return { id: definition.id, name: definition.name, holds, cannot: [...cannot].map(([tool, why]) => ({ tool, why })) };
+    });
+  }
+
+  /** The tools the original of the user's definition `id` names that `tools` (what the user's runs with) don't give: none where it stands over nothing, or over one that keeps its tools as its own. */
+  private lacking(id: string, tools: readonly string[]): string[] {
+    const original = this.originals.get(id);
+    if (original === undefined) return [];
+    const holds = new Set(this.names(tools));
+    return original.filter((name) => !tools.includes(name) && this.names([name]).some((tool) => !holds.has(tool)));
   }
 
   /** The tools `names` give, built for one agent of a run: one with nothing to offer there is left out. */
@@ -371,7 +488,11 @@ export class Definitions {
   /** Every definition, for the page: an agent with what it runs with as it stands under `settings`, a tool with the description a model is given (the user's text for a built-in's, its placeholders unfilled). */
   view(settings: Readonly<Settings>, texts: Texts): DefinitionsView {
     return {
-      agents: [...this.agentRows.values()].map((view) => ({ ...view, ...resolveSettings(view, settings) })),
+      agents: [...this.agentRows.values()].map((view) => {
+        const run = resolveSettings(view, settings);
+        const lacks = this.lacking(view.id, run.tools);
+        return { ...view, ...run, ...(lacks.length > 0 ? { lacks } : {}) };
+      }),
       skills: [...this.skillRows.values()],
       tools: [...this.toolRows.entries()].map(([name, row]) => ({
         name,

@@ -74,7 +74,7 @@ function scripted(s: Script): NonNullable<Parameters<typeof rig>[0]>["harness"] 
         turns: async ({ id }) => ({ side: { id, chatId: s.sideChat, agent: "scout", title: "The tide tables", createdAt: 1, lastAt: 1, turns: 0 }, turns: [] }),
       },
       definitions: { get: async () => ({ agents: [], skills: [], tools: [], agentSchema: { type: "object" }, agentDefaults: newAgentSettings(), scope: { tools: [], agents: [] } }) },
-    } satisfies { workspace: Pick<Core["workspace"], "read" | "write">; sides: Pick<Core["sides"], "list" | "turns">; definitions: Core["definitions"] };
+    } satisfies { workspace: Pick<Core["workspace"], "read" | "write">; sides: Pick<Core["sides"], "list" | "turns">; definitions: Pick<Core["definitions"], "get"> };
     const harness = {
       async answer(turn, sink, signal) {
         trace(turn.generationId, turn.chatId, { kind: "turn_started", turn: turn.generationId, chatId: turn.chatId, generation: turn.kind, messageId: turn.target.messageId, at: 1 });

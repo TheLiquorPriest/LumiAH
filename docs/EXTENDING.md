@@ -230,6 +230,10 @@ definitions: async () => ({ agents: [DICE_CLERK], skills: [CONTESTED_ROLL] }),
 
 They are your defaults. On the pages they show as the extension's, and a user's own definition with the same id stands over yours.
 
+A user who saves a version of your agent to change its model keeps that version until they reset it. To keep fields of your agent your own, name them in `owns` (`instructions`, `tools`, `name`, `description`): a user's version then takes them from your definition as it is at each run, keeps its own model and limits, and never stores them. Tools you own also stand over Settings: a tools value there for that agent is neither read nor stored. A skill marked `owned: true` is yours alone: a user's copy of it is not used. A skill may name the agents it is for (`agents: ["dice_clerk"]`); left out, every agent that holds `skill_load` is offered it.
+
+To see what each agent can really use in a chat, call `backend.agents.held(userId, chatId)` on the backend `createBackend` returns: for each agent, the tools it holds, and each tool it names that it can't use, with why (`off`, `withdrawn` or `unknown`).
+
 ### The pages
 
 The frontend's entry puts LumiAH's pages in a drawer tab under your name:

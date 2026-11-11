@@ -8,6 +8,7 @@
 // refuses reads as its default, and a key the schema doesn't have is left out, so settings written
 // by another build never break a turn.
 
+import type { OwnedField } from "./agents";
 import type { JsonObject, JsonValue, ModelEffort, ToolTier } from "./ports";
 import { isRecord } from "./ports";
 import { defaultRecallSettings, RECALL_SETTINGS_SCHEMA, type RecallSettings } from "./recall/settings";
@@ -476,7 +477,7 @@ const BUDGET_SCHEMA: JsonObject = {
   },
 };
 
-function agentSchema(title: string, description: string, noConnection: string, noModel: string, tools: readonly string[]): JsonObject {
+function agentSchema(title: string, description: string, noConnection: string, noModel: string, tools: readonly string[], toolsOwned = false): JsonObject {
   return {
     title,
     description,
@@ -486,7 +487,10 @@ function agentSchema(title: string, description: string, noConnection: string, n
       model: { title: "Model", description: "A model of that connection to use instead of the connection's own.", type: ["string", "null"], format: "model", "x-none": noModel },
       effort: choice("Effort", "How hard its model reasons on each call.", EFFORTS),
       toolCalls: choice("Tool calls", "How its tools are offered to its model.", TOOL_CALLS),
-      tools: { title: "Tools", description: "The tools it is given: each by its name, or @family for every tool of a family, those added to it later too. @added is every tool you added: those of the MCP servers you switched on for agents, and an extension's. scratch_read comes with any of them, for results that come back clipped.", type: "array", items: { type: "string", enum: [...tools] }, uniqueItems: true },
+      // Tools an extension keeps as its agent's own are its to set: shown, never read from what is stored (`read`).
+      tools: toolsOwned
+        ? { title: "Tools", description: "Its tools belong to the extension. You change them on that extension's own pages, not here.", type: "array", items: { type: "string" }, readOnly: true }
+        : { title: "Tools", description: "The tools it is given: each by its name, or @family for every tool of a family, those added to it later too. @added is every tool you added: those of the MCP servers you switched on for agents, and an extension's. scratch_read comes with any of them, for results that come back clipped.", type: "array", items: { type: "string", enum: [...tools] }, uniqueItems: true },
       budget: BUDGET_SCHEMA,
     },
   };
@@ -498,11 +502,11 @@ const price = (title: string, description: string): JsonObject => ({ title, desc
  * What a schema is written for beyond the core's own: every tool an agent may be given (each tool
  * the run has, and each family), and every agent definition the run has, each with what it runs
  * with by default: an extension's and the user's own, and any of the core's three that one of
- * theirs stands over.
+ * theirs stands over; and, for an extension's, the fields it keeps as its own (`owns`).
  */
 export interface SettingsScope {
   tools: readonly string[];
-  agents: readonly { id: string; label: string; note: string; defaults: AgentSettings }[];
+  agents: readonly { id: string; label: string; note: string; defaults: AgentSettings; owns?: readonly OwnedField[] }[];
 }
 
 const CORE_SCOPE: SettingsScope = { tools: CORE_TOOLS, agents: [] };
@@ -522,7 +526,7 @@ function agentsSchema(scope: SettingsScope): JsonObject {
       [AGENT.main]: agentSchema("Main agent", "Works out what each reply needs, with tools, then briefs the writer or writes the reply itself.", "Your default connection", "The connection's own", scope.tools),
       [AGENT.writer]: agentSchema("Writer", "Writes the reply from the prompt Lumiverse assembled and the main agent's brief. Its sampling and answer length are your preset's. It has no tools unless you give it some; with tools, whatever it writes beside its calls is part of the reply.", "Your default connection", "The connection's own", scope.tools),
       [AGENT.summarizer]: agentSchema("Summarizer", "Summarizes the main agent's notes once they grow past Summarize past (that call takes no tools), and whatever another agent delegates to it. With no connection of its own it runs where the main agent does.", "The main agent's", "The main agent's, or its own connection's", scope.tools),
-      ...Object.fromEntries(scope.agents.filter((a) => !CORE_AGENTS.includes(a.id)).map((a) => [a.id, agentSchema(a.label, a.note, "Your default connection", "The connection's own", scope.tools)])),
+      ...Object.fromEntries(scope.agents.filter((a) => !CORE_AGENTS.includes(a.id)).map((a) => [a.id, agentSchema(a.label, a.note, "Your default connection", "The connection's own", scope.tools, a.owns?.includes("tools") === true)])),
     },
   };
 }
@@ -847,10 +851,11 @@ function clone<T extends JsonValue>(value: T): T {
 /**
  * `value` read against `schema`: itself where the schema takes it, else `fallback` with the reason in
  * `problems`. An object is read key by key, so one bad value costs only itself; a key the schema
- * doesn't have is a problem and is left out. Absent, a value is its fallback and no problem.
+ * doesn't have is a problem and is left out. Absent, a value is its fallback and no problem; so is
+ * one at a setting the schema marks `readOnly` (another's to set: an extension's agent's own tools).
  */
 function read(schema: JsonObject, fallback: JsonValue, value: unknown, path: (string | number)[], problems: SettingsProblem[]): JsonValue {
-  if (value === undefined) return clone(fallback);
+  if (value === undefined || schema.readOnly === true) return clone(fallback);
   const refuse = (message: string): JsonValue => {
     problems.push({ path, message });
     return clone(fallback);

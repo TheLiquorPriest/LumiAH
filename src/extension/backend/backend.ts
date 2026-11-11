@@ -4,6 +4,7 @@
 // in the tests).
 
 import type { ClaimAsk } from "../../core/extension";
+import type { HeldTools } from "../../core/definitions";
 import { checkSettings, defaultSettings, SETTINGS_SCHEMA, type SettingsScope, settingsOf } from "../../core/settings";
 import { checkText, TEXT_DEFS } from "../../core/texts";
 import type { JsonObject } from "../../core/ports";
@@ -42,6 +43,7 @@ import { StreamRegistry } from "./streams";
 import { ChatSwitch } from "./switch";
 import { INTERCEPTOR_PRIORITY, TAGGED_TYPES, Turns } from "./turns";
 import { Ui } from "./ui";
+import { heldView } from "./views";
 
 export interface BackendEnv {
   now(): number;
@@ -75,6 +77,11 @@ export function settingsSections(scope?: (userId: string) => Promise<SettingsSco
         // The user's scope is there to take more names, never fewer: a value is refused only when it is refused both ways. Checked by the scope alone, a tool the core has but this place doesn't offer just now (a port its Lumiverse lacks) would refuse the defaults that name it, and with them every change of any setting.
         const refused = new Set(plain.map((problem) => JSON.stringify(problem.path)));
         return checkSettings(values, known).filter((problem) => refused.has(JSON.stringify(problem.path)));
+      },
+      // The tools of an agent an extension keeps as its own are the extension's to set.
+      async fixed(userId) {
+        const known = await scope?.(userId);
+        return (known?.agents ?? []).filter((agent) => agent.owns?.includes("tools") === true).map((agent) => ["agents", agent.id, "tools"]);
       },
     },
     { key: TRANSPORT_KEY, defaults: transportDefaults, schema: TRANSPORT_SCHEMA, check: checkTransport },
@@ -126,6 +133,13 @@ export interface Backend {
   readonly jobs: JobsBoard;
   readonly defs: Definitions;
   readonly builtin: Builtin;
+  /**
+   * What each agent can really use in a chat, for the pages of an extension that builds LumiAH in:
+   * each agent that can run there, the tools it holds, and each tool it names that it can't use,
+   * with why (`off`: the user switched it off; `withdrawn`: the extension's claim withdraws it;
+   * `unknown`: nothing of that name is registered). Asked of the place the chat runs in.
+   */
+  readonly agents: { held(userId: string, chatId: string): Promise<HeldTools[]> };
   readonly hosted: HostedTurns;
   /**
    * A user's runtime, for the pages of an extension that builds LumiAH in: whether it is linked
@@ -605,6 +619,9 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     jobs,
     defs,
     builtin,
+    agents: {
+      held: async (userId, chatId) => heldView(await asks.ask(userId, "definitions.held", { chatId }, { chat: chatId })),
+    },
     hosted,
     runtimeState,
     onRuntime(listener) {

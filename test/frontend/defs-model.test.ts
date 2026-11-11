@@ -28,6 +28,8 @@ import {
   idProblem,
   instructionsNote,
   instructionsShown,
+  lacksToSave,
+  lacksWords,
   mcpAbout,
   mcpCountWords,
   mcpServerOf,
@@ -35,6 +37,8 @@ import {
   NO_TOOL_FILTER,
   newAgent,
   newSkill,
+  ownedFields,
+  ownedWords,
   ownProblems,
   paramsOf,
   removeAsk,
@@ -45,6 +49,7 @@ import {
   saveLabel,
   saveStatus,
   skillDraft,
+  skillForWords,
   skillToSave,
   soundFilter,
   sourceWords,
@@ -56,6 +61,7 @@ import {
   toolFacts,
   toolGroups,
   typedInstructions,
+  withTools,
   typeWords,
 } from "../../src/extension/frontend/defs-model";
 import { childrenOf, formOf, valueWords } from "../../src/extension/frontend/settings-model";
@@ -402,5 +408,44 @@ describe("where the settings keep approval", () => {
   test("is nowhere when the settings shown have no such group", () => {
     expect(approvalSettingPath({ type: "object", properties: { sample: { type: "object", properties: { approval: { type: "string" } } } } })).toBeNull();
     expect(approvalSettingPath({})).toBeNull();
+  });
+});
+
+describe("what the extension keeps, and what a version lacks", () => {
+  const SUMMARIZER = baseAgents()[2];
+  if (!SUMMARIZER) throw new Error("The core ships the summarizer.");
+  /** The user's summarizer, saved before the built-in was given two more tools, on a model of their own. */
+  const mine: AgentView = { ...SUMMARIZER, tools: ["chat_read"], model: "tide-model-9", source: "user", over: "builtin", off: false, lacks: ["chat_search", "lore_read"] };
+
+  test("a version over a built-in says which tools it lacks, and its button saves it with them added and nothing else changed", () => {
+    expect(lacksWords(["chat_search", "lore_read"])).toBe("The original has tools your version lacks: chat_search and lore_read. Nothing is added unless you add them.");
+    const sent = lacksToSave(mine);
+    expect(sent).toEqual({ ...agentToSave(agentDraft(mine)), tools: ["chat_read", "chat_search", "lore_read"] });
+    expect(sent.model).toBe("tide-model-9");
+    // What the page shows of where it comes from and what it lacks is never saved as the definition's own.
+    for (const key of ["lacks", "owns", "source", "over", "off"]) expect(sent).not.toHaveProperty(key);
+    // Edits not saved yet get the same tools, once each.
+    expect(withTools(withTools(agentDraft(mine), ["chat_search"]), ["chat_search", "lore_read"]).rest.tools).toEqual(["chat_read", "chat_search", "lore_read"]);
+  });
+
+  test("the fields the extension keeps are named on the page, and the form leaves out tools the extension keeps", () => {
+    const owning: AgentView = { ...cartographer, owns: ["instructions", "tools"] };
+    expect(ownedFields(owning)).toEqual(["instructions", "tools"]);
+    expect(ownedWords(ownedFields(owning), AGENT_WORDS)).toBe("Its instructions and tools belong to the extension. You change them on that extension's own pages, not here.");
+    expect(ownedWords(ownedFields(skill({ source: "extension", owned: true })), SKILL_WORDS)).toBe("This skill belongs to the extension. You change it on that extension's own pages, not here.");
+    expect(ownedWords(ownedFields(main), AGENT_WORDS)).toBeNull();
+    const view = { agentSchema: { type: "object", properties: { tools: { type: "array" }, model: { type: ["string", "null"] } } }, agentDefaults: {} };
+    expect(Object.keys(agentForm(view, agentDraft(owning).rest, null, true).schema.properties as JsonObject)).toEqual(["grant", "model"]);
+    expect(agentDraft(owning).rest).not.toHaveProperty("owns");
+  });
+
+  test("whom a skill is for, in words, and kept through an edit", () => {
+    const agents = [main, cartographer];
+    expect(skillForWords(skill({}), agents)).toBe("Offered to every agent that holds skill_load.");
+    const forTwo = skill({ agents: ["cartographer", "harbour-clerk"] });
+    expect(skillForWords(forTwo, agents)).toBe("Offered only to Cartographer and harbour-clerk.");
+    const draft = skillDraft(forTwo);
+    expect(skillToSave(draft).agents).toEqual(["cartographer", "harbour-clerk"]);
+    expect(sameSkill(draft, skillDraft(skill({})))).toBe(false);
   });
 });

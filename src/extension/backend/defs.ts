@@ -140,33 +140,49 @@ export class Definitions {
   /**
    * `lah.agent.save`: the user's own agent definition, new or in place of theirs of that id; one
    * with the id of a built-in or an extension's stands over it. Refused (`invalid`) with what the
-   * core finds wrong with it. What an agent runs with is the user's Settings for it over its
-   * definition's own, so the Settings they had for this id are taken away with the save: what the
-   * page just saved is in force, and a later change in Settings stands over it again.
+   * core finds wrong with it. The fields an extension's definition keeps as its own (`owns`) are not
+   * stored: the core takes them from the extension's definition as it is at each run. What an agent
+   * runs with is the user's Settings for it over its definition's own, so the Settings they had for
+   * this id are taken away with the save: what the page just saved is in force, and a later change
+   * in Settings stands over it again.
    */
   async saveAgent(userId: string, agent: AgentDefinition): Promise<DefsView> {
     const id = idOf(agent.id, "An agent");
-    const tools = (await this.merged(userId)).tools;
+    const merged = await this.merged(userId);
+    const tools = merged.tools;
     // A definition may name a tool, a whole family (`@chat`, `@mcp:<server>`) or every tool that isn't built in (`@added`), as the core's own check takes them.
     const names = [...new Set([...(Array.isArray(tools) ? tools : []).flatMap((t) => (isRecord(t) && typeof t.name === "string" ? [t.name, ...(typeof t.family === "string" && t.family !== "" ? [`@${t.family}`] : [])] : [])), ADDED_TOOLS])];
-    const checked = checkAgent(agent, names);
+    // What the extension keeps of its own agent, as the core merged it: the user's version stands over the extension's (or is the user's already) under the same id.
+    const row = (Array.isArray(merged.agents) ? merged.agents : []).find((a) => isRecord(a) && a.id === id);
+    const owned = isRecord(row) && (row.source === "extension" || row.over === "extension") && Array.isArray(row.owns) ? row.owns.filter((field): field is string => typeof field === "string") : [];
+    // Those fields are the extension's to give: what the page sent of them is set aside, the check reads the extension's own, and its tools aren't checked at all (a tool it names may be one this place doesn't list now).
+    const given: Record<string, unknown> = { ...agent };
+    for (const field of owned) if (field !== "tools" && isRecord(row)) given[field] = row[field];
+    if (owned.includes("tools")) delete given.tools;
+    const checked = checkAgent(given, names);
     const kept = checked.agent;
     if (kept === null || checked.problems.length > 0) throw new UiRefused("invalid", "The agent wasn't saved: it has something the core refuses.", checked.problems.map((p) => ({ path: [...p.path], message: p.message })));
-    await this.edit(userId, (stored) => {
-      stored.agents[id] = kept as unknown as JsonObject;
+    const { owns: _owns, ...stored } = kept as unknown as JsonObject;
+    for (const field of owned) delete stored[field];
+    if (owned.includes("instructions")) delete stored.text;
+    await this.edit(userId, (defs) => {
+      defs.agents[id] = stored;
     });
     await this.deps.settings.change(userId, [], [[this.deps.coreKey, "agents", id]]);
     return this.view(userId);
   }
 
-  /** `lah.skill.save`. */
+  /** `lah.skill.save`. Refused (`forbidden`) for a skill the extension keeps as its own. */
   async saveSkill(userId: string, skill: Skill): Promise<DefsView> {
     const id = idOf(skill.id, "A skill");
+    const skills = (await this.merged(userId)).skills;
+    if ((Array.isArray(skills) ? skills : []).some((s) => isRecord(s) && s.id === id && s.owned === true)) throw new UiRefused("forbidden", "This skill belongs to the extension. You change it on that extension's own pages.");
     const checked = checkSkill(skill);
     const kept = checked.skill;
     if (kept === null || checked.problems.length > 0) throw new UiRefused("invalid", "The skill wasn't saved: it has something the core refuses.", checked.problems.map((p) => ({ path: [...p.path], message: p.message })));
-    await this.edit(userId, (stored) => {
-      stored.skills[id] = kept as unknown as JsonObject;
+    const { owned: _owned, ...stored } = kept;
+    await this.edit(userId, (defs) => {
+      defs.skills[id] = stored as unknown as JsonObject;
     });
     return this.view(userId);
   }

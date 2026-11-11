@@ -1,9 +1,11 @@
 // skill_load (DESIGN §13): gives an agent the body of a skill it chose from the list its
 // instructions hold, a page at a time; with no skill named, the list itself, for an agent whose
 // instructions had room for only part of it. The tool decides nothing: which skill applies is the
-// agent's own reading of each one's description.
+// agent's own reading of each one's description. A skill for other agents only is neither listed
+// nor loaded, and the answer says whom it is for.
 
 import type { JsonObject } from "../ports";
+import { offeredTo } from "../skills";
 import { FAMILY, TEXT, TOOL } from "../texts";
 import type { ToolDefinition, ToolEnv, ToolOutcome } from "../tools";
 import { textArg } from "../util";
@@ -14,9 +16,11 @@ const skillLoad: ToolDefinition = {
   family: FAMILY.skills,
   tier: "read",
   build(env: ToolEnv) {
-    const { texts, skills } = env;
+    const { texts } = env;
+    const all = env.skills ?? [];
+    const skills = all.filter((skill) => offeredTo(skill, env.agent));
     // With no skill to load the tool would only ever say so: an agent isn't offered it.
-    if (!skills || skills.length === 0) return null;
+    if (skills.length === 0) return null;
     const p = pagerOf(env, TOOL.skillLoad);
     return {
       name: TOOL.skillLoad,
@@ -45,7 +49,12 @@ const skillLoad: ToolDefinition = {
         }
         const skill = skills.find((s) => s.id === id);
         // The id asked for is said back clipped: a model that sends a page of text for an id doesn't get the page back.
-        if (!skill) return { text: saidBack(p, id, (said) => fitted(p, skills.map((s) => s.id).join(", "), (list) => texts.render(TEXT.agents.skillNone, { id: said, skills: list }))), error: true };
+        if (!skill) {
+          const ids = skills.map((s) => s.id).join(", ");
+          const others = all.find((s) => s.id === id)?.agents;
+          if (others !== undefined) return { text: saidBack(p, id, (said) => fitted(p, ids, (list) => texts.render(TEXT.agents.skillNotYours, { id: said, agents: others.join(", "), skills: list }))), error: true };
+          return { text: saidBack(p, id, (said) => fitted(p, ids, (list) => texts.render(TEXT.agents.skillNone, { id: said, skills: list }))), error: true };
+        }
         return textPage(p, {
           text: skill.body,
           from: cursor.at,

@@ -97,7 +97,7 @@ function scripted(s: Script): NonNullable<Parameters<typeof rig>[0]>["harness"] 
       set: async (input) => asked("guidance.set", input, { levels: s.levels, limit: 8000, agentsEdit: false }),
     } satisfies Core["guidance"];
     // Asked for the names it holds alone, so it isn't counted among what a test checks was asked.
-    const definitions = { get: async () => ({ agents: [SCOUT], skills: [], tools: [], agentSchema: { type: "object" }, agentDefaults: newAgentSettings(), scope: { tools: [], agents: [] } }) } satisfies Core["definitions"];
+    const definitions = { get: async () => ({ agents: [SCOUT], skills: [], tools: [], agentSchema: { type: "object" }, agentDefaults: newAgentSettings(), scope: { tools: [], agents: [] } }) } satisfies Pick<Core["definitions"], "get">;
     const jobs = {
       run: async () => undefined,
       recover: async () => ({ interrupted: [], paused: [], queued: [] }),

@@ -12,6 +12,8 @@
 // says its method answers, so a change of the core's answer fails the build here before it reaches
 // a page. Every function here is pure.
 
+import type { OwnedField } from "../../core/agents";
+import type { HeldTools, UnusableWhy } from "../../core/definitions";
 import { characterGuidance } from "../../core/guidance";
 import type { Harness } from "../../core/harness";
 import type { AgentUsage, DefinitionSource, FileAuthor, JobState, JobView, JsonObject, JsonValue, ToolTier, TraceRecord, TurnRecord, TurnStatus, WorkspaceArea } from "../../core/ports";
@@ -61,6 +63,8 @@ const TIERS: Readonly<Record<ToolTier, true>> = { read: true, write: true, exter
 const JOB_STATES: Readonly<Record<JobState, true>> = { queued: true, running: true, done: true, failed: true, cancelled: true, interrupted: true, off_path: true, spent: true, paused: true };
 const TURN_ENDS: Readonly<Record<TurnStatus, true>> = { done: true, failed: true, stopped: true };
 const LEVELS: Readonly<Record<GuidanceLevelId, true>> = { user: true, middle: true, chat: true };
+const OWNED: Readonly<Record<OwnedField, true>> = { instructions: true, tools: true, name: true, description: true };
+const UNUSABLE: Readonly<Record<UnusableWhy, true>> = { off: true, withdrawn: true, unknown: true };
 
 /** Things the core names by id and name: the agent definitions an area's files may be pinned for, or a job given to. */
 function namedOf(v: Raw, what: string): { id: string; name: string }[] {
@@ -253,12 +257,13 @@ function isSourced(o: Readonly<Record<string, unknown>>): boolean {
 function isAgent(v: unknown): v is Defs["agents"][number] {
   if (!isRecord(v) || !isSourced(v)) return false;
   const runsWith = (v.connectionId === null || isText(v.connectionId)) && (v.model === null || isText(v.model)) && isText(v.effort) && isText(v.toolCalls) && Array.isArray(v.tools) && v.tools.every(isText) && isRecord(v.budget);
-  return runsWith && isText(v.id) && isText(v.name) && isText(v.description) && isText(v.instructions) && (v.given === "request" || v.given === "task");
+  const page = (v.owns === undefined || (Array.isArray(v.owns) && v.owns.every((field) => isText(field) && Object.hasOwn(OWNED, field)))) && (v.lacks === undefined || (Array.isArray(v.lacks) && v.lacks.every(isText)));
+  return runsWith && page && isText(v.id) && isText(v.name) && isText(v.description) && isText(v.instructions) && (v.given === "request" || v.given === "task");
 }
 
 /** A skill with where it comes from, passed on as an agent definition is. */
 function isSkill(v: unknown): v is Defs["skills"][number] {
-  return isRecord(v) && isSourced(v) && isText(v.id) && isText(v.name) && isText(v.description) && isText(v.body);
+  return isRecord(v) && isSourced(v) && isText(v.id) && isText(v.name) && isText(v.description) && isText(v.body) && (v.owned === undefined || v.owned === true) && (v.agents === undefined || (Array.isArray(v.agents) && v.agents.every(isText)));
 }
 
 function toolOf(v: Raw): Defs["tools"][number] {
@@ -309,6 +314,23 @@ export function defsView(raw: JsonValue, approval: Approvals, mcp: McpServerView
 export function agentNames(raw: JsonValue): Map<string, string> {
   const what = "the definitions";
   return new Map(namedOf(record(raw, what).agents, what).map((agent) => [agent.id, agent.name]));
+}
+
+/** The backend's `agents.held`: each agent that can run in a chat, with the tools it holds there and each one it names that it can't use, with why. */
+export function heldView(raw: JsonValue): HeldTools[] {
+  const what = "what each agent holds";
+  return list(record(raw, what).agents, what).map((one): HeldTools => {
+    const o = record(one, what);
+    return {
+      id: text(o.id, what),
+      name: text(o.name, what),
+      holds: list(o.holds, what).map((tool) => text(tool, what)),
+      cannot: list(o.cannot, what).map((row) => {
+        const r = record(row, what);
+        return { tool: text(r.tool, what), why: oneOf(r.why, UNUSABLE, what) };
+      }),
+    };
+  });
 }
 
 // ---------------------------------------------------------------- jobs (§15)

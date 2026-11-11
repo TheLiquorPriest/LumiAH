@@ -750,11 +750,13 @@ export interface Sourced {
  * An agent definition as core has it (its id, name and description, which is what a delegating
  * agent reads when choosing; its instructions; what it is given; and what it runs with: its tools
  * by name or `@family`, connection, model, effort and budget), with where it comes from. The page
- * edits what it runs with through `DefsView.agentSchema`, as it builds Settings.
+ * edits what it runs with through `DefsView.agentSchema`, as it builds Settings. `owns`: the fields
+ * the extension keeps as its own, which the page shows and doesn't edit. `lacks`: for the user's
+ * version over an original, the tools the original names now that the user's doesn't give.
  */
-export type AgentView = AgentDefinition & Sourced;
+export type AgentView = AgentDefinition & Sourced & { lacks?: string[] };
 
-/** A skill: a procedure an agent may load by name (`skill_load` returns `body`), with where it comes from. */
+/** A skill: a procedure an agent may load by name (`skill_load` returns `body`), with where it comes from, whom it is for (`agents`), and whether the extension keeps it as its own (`owned`). */
 export type SkillView = Skill & Sourced;
 
 /** A tool of the registry: its family and tier, what a model is told it does, its arguments' schema, where it runs, where it comes from, whether it is off, the user's own approval choice for it (null: its tier's), and whether its calls wait for the user now. An MCP server's tool is named `mcp:<server>:<tool>`. */

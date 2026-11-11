@@ -66,6 +66,7 @@ const PAGE_OPS: Readonly<Record<string, true>> = {
   "guidance.get": true,
   "guidance.set": true,
   "definitions.get": true,
+  "definitions.held": true,
   "session.summarize": true,
   "jobs.list": true,
   "jobs.start": true,

@@ -143,6 +143,27 @@ export function removeAsk(def: Pick<Def, "id" | "name" | "over">, words: KindWor
   };
 }
 
+/** A list in words: "a", "a and b", "a, b and c". */
+function listWords(items: readonly string[]): string {
+  return items.length < 2 ? (items[0] ?? "") : `${items.slice(0, -1).join(", ")} and ${items.at(-1)}`;
+}
+
+/**
+ * The fields of a definition the extension keeps as its own, which the page shows and doesn't let
+ * the user change: an agent's `owns`, and the whole of a skill the extension keeps (`owned`).
+ */
+export function ownedFields(def: { owns?: readonly string[]; owned?: true } | null): readonly string[] {
+  if (def === null) return [];
+  return def.owned === true ? ["name", "description", "body"] : (def.owns ?? []);
+}
+
+/** The line over a definition whose fields the extension keeps as its own; null where it keeps none. */
+export function ownedWords(fields: readonly string[], words: KindWords): string | null {
+  if (fields.length === 0) return null;
+  if (words === SKILL_WORDS) return "This skill belongs to the extension. You change it on that extension's own pages, not here.";
+  return `Its ${listWords(fields)} belong to the extension. You change ${fields.length === 1 ? "it" : "them"} on that extension's own pages, not here.`;
+}
+
 /**
  * A refused save's problems, each where the page shows it: at one of the fields the page draws
  * itself (`fields`: the definition's keys those are; a problem goes by its path's first key), or
@@ -180,9 +201,9 @@ export interface AgentDraft {
 /** A copy that shares nothing with what it was made from, as JSON: a value left out (an optional field) is left out of the copy too. */
 const jsonOf = (value: unknown): JsonObject => JSON.parse(JSON.stringify(value)) as JsonObject;
 
-/** A definition as the page edits it. */
+/** A definition as the page edits it. What the extension keeps as its own and what the user's version lacks are the page's to show, never a save's to send. */
 export function agentDraft(view: AgentView): AgentDraft {
-  const { id, name, description, instructions, text, source: _source, over: _over, off: _off, ...rest } = view;
+  const { id, name, description, instructions, text, source: _source, over: _over, off: _off, owns: _owns, lacks: _lacks, ...rest } = view;
   return { id, name, description, instructions: text !== undefined ? { kind: "text", id: text, shipped: instructions } : { kind: "own", text: instructions }, rest: jsonOf(rest) };
 }
 
@@ -204,6 +225,22 @@ export function sameAgent(a: AgentDraft, b: AgentDraft): boolean {
 export function instructionsShown(instructions: Instructions, ownTexts: Readonly<Record<string, string>>): string {
   if (instructions.kind === "own") return instructions.text;
   return Object.hasOwn(ownTexts, instructions.id) ? (ownTexts[instructions.id] ?? instructions.shipped) : instructions.shipped;
+}
+
+/** What the page says over the tools the original agent has now that the user's version lacks. */
+export function lacksWords(lacks: readonly string[]): string {
+  return `The original ${lacks.length === 1 ? "has a tool" : "has tools"} your version lacks: ${listWords(lacks)}. Nothing is added unless you add ${lacks.length === 1 ? "it" : "them"}.`;
+}
+
+/** An agent's edits with `tools` added to the tools it is given, each once, after those it has. */
+export function withTools(draft: AgentDraft, tools: readonly string[]): AgentDraft {
+  const now = Array.isArray(draft.rest.tools) ? draft.rest.tools : [];
+  return { ...draft, rest: { ...draft.rest, tools: [...now, ...tools.filter((tool) => !now.includes(tool))] } };
+}
+
+/** What "Add these tools" saves: the user's version as it is kept, with the tools it lacks added. */
+export function lacksToSave(saved: AgentView): AgentDefinition {
+  return agentToSave(withTools(agentDraft(saved), saved.lacks ?? []));
 }
 
 /**
@@ -326,8 +363,9 @@ export function grantSettingWords(settings: Pick<SettingsView, "schema" | "value
  * member it leaves out where Settings are to decide, which no value of a schema can say, so the
  * page adds the choice itself, after the tools it is about, with "left out" as none.
  * `settings`: what Settings say now (`grantSettingWords`), said under the choice that leaves it to them.
+ * `toolsOwned`: the extension keeps the agent's tools as its own, so the form leaves them out and the page shows them.
  */
-export function agentForm(view: Pick<DefsView, "agentSchema" | "agentDefaults">, rest: JsonObject, settings: string | null): SettingsView {
+export function agentForm(view: Pick<DefsView, "agentSchema" | "agentDefaults">, rest: JsonObject, settings: string | null, toolsOwned = false): SettingsView {
   // What "left out" is called: in the list, and where the form names the choice's default (a new agent's).
   const left = "As Settings say";
   const choice: JsonObject = {
@@ -342,7 +380,7 @@ export function agentForm(view: Pick<DefsView, "agentSchema" | "agentDefaults">,
   };
   const properties: JsonObject = {};
   for (const [key, property] of Object.entries(isRecord(view.agentSchema.properties) ? view.agentSchema.properties : {})) {
-    properties[key] = property as JsonValue;
+    if (!(toolsOwned && key === "tools")) properties[key] = property as JsonValue;
     if (key === "tools") properties[GRANT] = choice;
   }
   // A schema with no tools to stand after still gets the choice, last.
@@ -360,9 +398,9 @@ export function applyAgentForm(rest: JsonObject, defaults: JsonObject, set: read
 
 // ---------------------------------------------------------------- skills
 
-/** A skill as the page edits it: the skill itself, without where it comes from. */
+/** A skill as the page edits it: the skill itself, whom it is for and whom its procedure starts, without where it comes from. */
 export function skillDraft(view: SkillView): Skill {
-  return { id: view.id, name: view.name, description: view.description, body: view.body };
+  return { id: view.id, name: view.name, description: view.description, body: view.body, ...(view.agents !== undefined ? { agents: [...view.agents] } : {}), ...(view.starts !== undefined ? { starts: [...view.starts] } : {}) };
 }
 
 export function newSkill(): Skill {
@@ -375,7 +413,18 @@ export function copySkill(shown: Skill, id: string): Skill {
 }
 
 export function sameSkill(a: Skill, b: Skill): boolean {
-  return a.id === b.id && a.name === b.name && a.description === b.description && a.body === b.body;
+  return a.id === b.id && a.name === b.name && a.description === b.description && a.body === b.body && JSON.stringify(a.agents ?? null) === JSON.stringify(b.agents ?? null);
+}
+
+/** Whom a skill is offered to, in words, by the agents' names where the page has them. */
+export function skillForWords(skill: Pick<Skill, "agents">, agents: readonly { id: string; name: string }[]): string {
+  if (skill.agents === undefined) return "Offered to every agent that holds skill_load.";
+  if (skill.agents.length === 0) return "Offered to no agent.";
+  const names = skill.agents.map((id) => {
+    const agent = agents.find((a) => a.id === id);
+    return agent ? titleOf(agent) : id;
+  });
+  return `Offered only to ${listWords(names)}.`;
 }
 
 /** The skill a save sends: its name and description without the blank space around them, its body as written. */
