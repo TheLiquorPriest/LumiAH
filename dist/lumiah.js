@@ -497,7 +497,7 @@ function defaultSettings() {
       [AGENT.summarizer]: { connectionId: null, model: null, effort: "inherit", tools: [...SUMMARIZER_TOOLS], toolCalls: "auto", budget: { ...unlimited, callTokensOut: 16000, toolTurns: 12, revisions: 1, concurrency: 4 } }
     },
     turn: { tokensIn: null, tokensOut: null, toolTurns: null, wallMs: null },
-    loop: { repeats: 3, clipChars: 6000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000, answerFloor: 256, warnRounds: 2 },
+    loop: { repeats: 3, clipChars: 6000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000, answerFloor: 256, warnRounds: 2, cutRoomFactor: 2, cutRoomTokens: 64000 },
     cache: { breakpoints: true, key: "" },
     connections: { atOnce: null, throttles: {}, toolRefusalMinutes: 60 },
     prices: {},
@@ -670,7 +670,9 @@ var SETTINGS_SCHEMA = {
         retries: whole2("Retries", "A model call that fails in passing (a timeout, a rate limit, a provider error in the 500s, a stream that drops) is made again up to this many times, each shown in the live view. Never once part of the reply has reached you, and never a call one of your own limits stopped. 0 turns retries off.", 0, "retries"),
         retryWaitMs: whole2("Wait before a retry", "How long to wait before a failed call is made again. The agent's and the turn's time limits still run while it waits.", 0, "ms", TIMER_MAX_MS),
         answerFloor: whole2("Least answer room", "A call isn't made with less room for its answer than this. An agent whose answer tokens (its own, or its turn's) are that close to spent stops and says so, instead of writing an answer that would be cut.", 1, "tokens"),
-        warnRounds: whole2("Rounds left warning", "An agent is told when it has this many rounds of tool calls left, so it can finish with what it has. 0 for never.", 0, "rounds")
+        warnRounds: whole2("Rounds left warning", "An agent is told when it has this many rounds of tool calls left, so it can finish with what it has. 0 for never.", 0, "rounds"),
+        cutRoomFactor: whole2("More room after a cut answer", "When a model's answer runs out of room while it is still thinking, before it writes anything or calls a tool, the call is made once more with its room times this, and the model is told to think briefly and act. 1 gives it the same room.", 1, "times"),
+        cutRoomTokens: whole2("Most room after a cut answer", "The most answer room that second go may have.", 1, "tokens")
       }
     },
     cache: {
@@ -2490,6 +2492,7 @@ var WORKSPACE_TEXTS = [
 var TEXT = {
   runtime: {
     scratchRead: "runtime.scratch_read",
+    cutThinking: "runtime.cut_thinking",
     scratchHandle: "runtime.scratch_read.handle",
     scratchOffset: "runtime.scratch_read.offset",
     scratchLength: "runtime.scratch_read.length",
@@ -2692,6 +2695,7 @@ var SESSION = GROUP.session;
 var ANSWERS6 = GROUP.answers;
 var PROGRESS = GROUP.progress;
 var RUNTIME_TEXTS = [
+  { id: TEXT.runtime.cutThinking, group: RUNTIME, label: "An answer that ran out while thinking", note: "Told to an agent whose last answer ran out of room while its model was still thinking, before it wrote anything or called a tool, as the same call is made again with more room.", text: "[Your last answer ran out of room while you were still thinking, so nothing came of it. Think briefly, then act: call a tool or answer.]", vars: [] },
   { id: TEXT.runtime.scratchRead, group: RUNTIME, label: "scratch_read: what it does", note: "The description of the built-in tool that reads the rest of a clipped tool result.", text: "Read more of a tool result that came back clipped. Give the scratch handle the clipped result names and where to start; you get the next part.", vars: [] },
   { id: TEXT.runtime.scratchHandle, group: RUNTIME, label: "scratch_read: handle", note: "The description of scratch_read's handle argument.", text: "The scratch handle the clipped result names, such as s1.", vars: [] },
   { id: TEXT.runtime.scratchOffset, group: RUNTIME, label: "scratch_read: offset", note: "The description of scratch_read's offset argument.", text: "The character to start from; 0 is the start.", vars: [] },
@@ -5248,6 +5252,7 @@ class Agent {
     let said = "";
     let finish;
     let retried = 0;
+    let room = null;
     for (;; ) {
       if (turn?.paused) {
         const stopped = await this.heldUp(turn, signal);
@@ -5271,7 +5276,7 @@ class Agent {
       if (cap instanceof AgentStop)
         return this.end(used, cap, said, finish);
       const outLeft = Math.min(limitOf(budget.tokensOut) - this.total.out, turn ? limitOf(turn.budget.tokensOut) - turn.usage.out : Number.POSITIVE_INFINITY);
-      const request = requestOf(this.callSpec, prepared, Math.min(budget.callTokensOut, outLeft), settings);
+      const request = requestOf(this.callSpec, prepared, Math.min(room ?? budget.callTokensOut, outLeft), settings);
       const kept = turn?.trace?.prompt(this.id, request).catch(() => {
         return;
       }) ?? Promise.resolve(undefined);
@@ -5331,6 +5336,14 @@ class Agent {
         ...prompt !== undefined ? { prompt } : {}
       });
       this.spec.onCall?.({ text: reply.text, calls: reply.calls.length });
+      if (cutShort(reply.finishReason) && reply.text.trim() === "" && reply.calls.length === 0 && room === null) {
+        room = Math.min(Math.ceil(request.maxTokens * settings.loop.cutRoomFactor), settings.loop.cutRoomTokens);
+        const told = this.text(TEXT.runtime.cutThinking);
+        this.tell(told);
+        this.record({ kind: "notice", text: told, at: this.now() });
+        continue;
+      }
+      room = null;
       if (reply.calls.length === 0) {
         this.answered = true;
         this.conversation.push({ role: "assistant", content: reply.text });
@@ -21300,7 +21313,7 @@ if (process.versions.bun === undefined) {
 `);
   process.exit(1);
 }
-var BUILD = "0efcfee9";
+var BUILD = "0ef2e5fd";
 var http = async (request) => {
   const response = await fetch(request.url, { method: request.method, headers: request.headers, ...request.body !== undefined ? { body: request.body } : {}, redirect: "manual" });
   const text3 = await response.text();
