@@ -513,7 +513,7 @@ var BUDGET_SCHEMA = {
     concurrency: whole2("Tool calls at once", "How many of one answer's tool calls run at the same time.", 1, "calls")
   }
 };
-function agentSchema(title, description, noConnection, noModel, tools) {
+function agentSchema(title, description, noConnection, noModel, tools, toolsOwned = false) {
   return {
     title,
     description,
@@ -523,7 +523,7 @@ function agentSchema(title, description, noConnection, noModel, tools) {
       model: { title: "Model", description: "A model of that connection to use instead of the connection's own.", type: ["string", "null"], format: "model", "x-none": noModel },
       effort: choice("Effort", "How hard its model reasons on each call.", EFFORTS),
       toolCalls: choice("Tool calls", "How its tools are offered to its model.", TOOL_CALLS),
-      tools: { title: "Tools", description: "The tools it is given: each by its name, or @family for every tool of a family, those added to it later too. @added is every tool you added: those of the MCP servers you switched on for agents, and an extension's. scratch_read comes with any of them, for results that come back clipped.", type: "array", items: { type: "string", enum: [...tools] }, uniqueItems: true },
+      tools: toolsOwned ? { title: "Tools", description: "Its tools belong to the extension. You change them on that extension's own pages, not here.", type: "array", items: { type: "string" }, readOnly: true } : { title: "Tools", description: "The tools it is given: each by its name, or @family for every tool of a family, those added to it later too. @added is every tool you added: those of the MCP servers you switched on for agents, and an extension's. scratch_read comes with any of them, for results that come back clipped.", type: "array", items: { type: "string", enum: [...tools] }, uniqueItems: true },
       budget: BUDGET_SCHEMA
     }
   };
@@ -543,7 +543,7 @@ function agentsSchema(scope) {
       [AGENT.main]: agentSchema("Main agent", "Works out what each reply needs, with tools, then briefs the writer or writes the reply itself.", "Your default connection", "The connection's own", scope.tools),
       [AGENT.writer]: agentSchema("Writer", "Writes the reply from the prompt Lumiverse assembled and the main agent's brief. Its sampling and answer length are your preset's. It has no tools unless you give it some; with tools, whatever it writes beside its calls is part of the reply.", "Your default connection", "The connection's own", scope.tools),
       [AGENT.summarizer]: agentSchema("Summarizer", "Summarizes the main agent's notes once they grow past Summarize past (that call takes no tools), and whatever another agent delegates to it. With no connection of its own it runs where the main agent does.", "The main agent's", "The main agent's, or its own connection's", scope.tools),
-      ...Object.fromEntries(scope.agents.filter((a) => !CORE_AGENTS.includes(a.id)).map((a) => [a.id, agentSchema(a.label, a.note, "Your default connection", "The connection's own", scope.tools)]))
+      ...Object.fromEntries(scope.agents.filter((a) => !CORE_AGENTS.includes(a.id)).map((a) => [a.id, agentSchema(a.label, a.note, "Your default connection", "The connection's own", scope.tools, a.owns?.includes("tools") === true)]))
     }
   };
 }
@@ -852,7 +852,7 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 function read(schema, fallback, value, path, problems) {
-  if (value === undefined)
+  if (value === undefined || schema.readOnly === true)
     return clone(fallback);
   const refuse = (message) => {
     problems.push({ path, message });
@@ -976,6 +976,7 @@ var AGENTS_TEXT = {
   skillsMore: "agents.skills.more",
   skillBody: "agents.skill_load.body",
   skillNone: "agents.skill_load.none",
+  skillNotYours: "agents.skill_load.not_yours",
   remoteNothing: "agents.remote.nothing",
   choice: "agents.choice",
   task: "agents.task",
@@ -1041,6 +1042,7 @@ var AGENTS_TEXTS = [
   { id: AGENTS_TEXT.skillBody, group: ANSWERS, label: "skill_load: a skill", note: "What skill_load returns: one page of a skill's body.", text: `[Skill {{id}}: {{name}}, characters {{from}} to {{to}} of {{total}}.]
 {{text}}`, vars: [v("id", "the skill's id", true), v("name", "its name"), v("from", "the first character returned"), v("to", "the character after the last one returned"), v("total", "the body's length"), v("text", "the characters read", true)] },
   { id: AGENTS_TEXT.skillNone, group: ANSWERS, label: "skill_load: no such skill", note: "skill_load's answer to an id that names no skill.", text: "There's no skill {{id}}. The skills are: {{skills}}. Give one of those.", vars: [v("id", "the id asked for"), v("skills", "the ids there are", true)] },
+  { id: AGENTS_TEXT.skillNotYours, group: ANSWERS, label: "skill_load: a skill for other agents", note: "skill_load's answer to the id of a skill that is offered only to other agents.", text: "The skill {{id}} is for {{agents}}, not for you. The skills you can load are: {{skills}}.", vars: [v("id", "the id asked for", true), v("agents", "the agents it is for, by id", true), v("skills", "the ids of the skills this agent can load")] },
   { id: AGENTS_TEXT.remoteNothing, group: ANSWERS, label: "A tool that runs outside LumiAH and gave nothing", note: "The result of a call to a tool that runs in the extension (its own, or an MCP server's) when what came back holds no result.", text: "{{tool}} gave no result: it runs outside LumiAH, and what came back from there isn't one. Go on without it, or say in your answer what you needed it for.", vars: [v("tool", "the tool", true)] },
   {
     id: toolId(TOOL.delegate),
@@ -4365,6 +4367,7 @@ class Asks {
 }
 
 // src/core/agents.ts
+var OWNED_FIELDS = ["instructions", "tools", "name", "description"];
 function baseAgents() {
   const defaults = defaultSettings().agents;
   const of = (id) => defaults[id];
@@ -7837,6 +7840,22 @@ async function readBook(host, chatId) {
   }
 }
 
+// src/core/skills.ts
+function offeredTo(skill, agent) {
+  return skill.agents === undefined || skill.agents.includes(agent);
+}
+
+class SkillRegistry {
+  byId = new Map;
+  register(...skills) {
+    for (const s of skills)
+      this.byId.set(s.id, s);
+  }
+  all() {
+    return [...this.byId.values()];
+  }
+}
+
 // src/core/definitions.ts
 var ID = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
 var text = (value) => typeof value === "string";
@@ -7872,10 +7891,13 @@ function checkAgent(value, tools) {
     if (hasOwn(value, key))
       run[key] = value[key];
   const settings = readAgentSettings(run, tools, newAgentSettings(), [], problems);
+  const owns = value.owns === undefined ? [] : Array.isArray(value.owns) && value.owns.every((field) => OWNED_FIELDS.includes(field)) ? [...new Set(value.owns)] : null;
+  if (owns === null)
+    problems.push({ path: ["owns"], message: `It may name only these fields: ${OWNED_FIELDS.join(", ")}.` });
   if (problems.length > 0)
     return { agent: null, problems };
   const grant = value.grant === "own" || value.grant === "definition" ? value.grant : undefined;
-  return { agent: { id, name, description, instructions: value.instructions, ...text(value.text) ? { text: value.text } : {}, given: value.given, ...text(value.follows) ? { follows: value.follows } : {}, ...grant !== undefined ? { grant } : {}, ...settings }, problems };
+  return { agent: { id, name, description, instructions: value.instructions, ...text(value.text) ? { text: value.text } : {}, given: value.given, ...text(value.follows) ? { follows: value.follows } : {}, ...grant !== undefined ? { grant } : {}, ...owns !== null && owns.length > 0 ? { owns } : {}, ...settings }, problems };
 }
 function checkSkill(value) {
   const problems = [];
@@ -7894,7 +7916,18 @@ function checkSkill(value) {
   const name = need("name", "a name");
   const description = need("description", "a description: it is what an agent reads when it chooses a skill");
   const body = need("body", "a body: the procedure itself");
-  return problems.length > 0 ? { skill: null, problems } : { skill: { id, name, description, body }, problems };
+  const ids = (key, message) => {
+    const v2 = value[key];
+    if (v2 === undefined)
+      return;
+    if (Array.isArray(v2) && v2.every((agent) => text(agent) && ID.test(agent)))
+      return [...new Set(v2)];
+    problems.push({ path: [key], message });
+    return null;
+  };
+  const agents = ids("agents", "It must name the agents it is for by their ids, or be left out for every agent.");
+  const starts = ids("starts", "It must name the agents its procedure starts by their ids, or be left out.");
+  return problems.length > 0 ? { skill: null, problems } : { skill: { id, name, description, body, ...value.owned === true ? { owned: true } : {}, ...agents ? { agents } : {}, ...starts ? { starts } : {} }, problems };
 }
 var strings = (value) => Array.isArray(value) ? value.filter(text) : [];
 function remoteDefinition(tool, host) {
@@ -7943,13 +7976,21 @@ function mergeTools(sources, host) {
       continue;
     rows.set(tool.name, { definition: remoteDefinition(tool, host), source: tool.source, runs: "extension", off: false, remote: tool });
   }
+  const withdrawn = new Map;
   for (const name of sources.claim?.withdraw ?? []) {
-    if (rows.get(name)?.source === "builtin")
+    const row = rows.get(name);
+    if (row?.source === "builtin") {
+      withdrawn.set(name, row.definition.family);
       rows.delete(name);
-    else
+    } else
       host.log("debug", `[LumiAH] the extension withdrew "${name}", which is no tool of LumiAH's here: nothing was withdrawn`);
   }
-  return rows;
+  return { rows, withdrawn };
+}
+function gives(name, tool, row) {
+  if (!name.startsWith("@"))
+    return name === tool;
+  return name === ADDED_TOOLS ? row.source !== "builtin" : `@${row.definition.family}` === name;
 }
 function namesOf(rows) {
   const families = new Set([ADDED_TOOLS]);
@@ -7960,8 +8001,24 @@ function namesOf(rows) {
 function runOf(d) {
   return { connectionId: d.connectionId, model: d.model, effort: d.effort, tools: [...d.tools], toolCalls: d.toolCalls, budget: { ...d.budget } };
 }
+function userAgent(value, original, owns) {
+  if (!isRecord(value))
+    return value;
+  const { owns: _claimed, ...out } = value;
+  if (original === undefined)
+    return out;
+  for (const field of owns)
+    out[field] = field === "tools" ? [...original.tools] : original[field];
+  if (owns.includes("instructions")) {
+    if (original.text !== undefined)
+      out.text = original.text;
+    else
+      delete out.text;
+  }
+  return out;
+}
 function mergeDefinitions(sources, host) {
-  const tools = mergeTools(sources, host);
+  const { rows: tools, withdrawn } = mergeTools(sources, host);
   const names = namesOf(tools);
   const stored = isRecord(sources.user) ? sources.user : {};
   const off = isRecord(stored.off) ? stored.off : {};
@@ -7969,16 +8026,22 @@ function mergeDefinitions(sources, host) {
   for (const [name, row] of tools)
     row.off = offTools.includes(name);
   const agents = new Map;
+  const originals = new Map;
   for (const d of sources.code.agents)
     agents.set(d.id, { ...d, source: sources.core.agents.has(d.id) ? "builtin" : "extension", off: false });
   for (const given of givenOf(sources.extension.agents, stored.agents)) {
-    const { agent, problems } = checkAgent(given.value, [...names, ...strings(isRecord(given.value) ? given.value.tools : undefined)]);
+    const original = given.key !== undefined ? agents.get(given.key) : undefined;
+    const owns = original?.source === "extension" ? original.owns ?? [] : [];
+    const value = given.source === "user" ? userAgent(given.value, original, owns) : given.value;
+    const { agent, problems } = checkAgent(value, [...names, ...strings(isRecord(value) ? value.tools : undefined)]);
     if (!agent || given.key !== undefined && agent.id !== given.key) {
       unused(host.log, "agent definition", given, problems);
       continue;
     }
-    const under = agents.get(agent.id);
-    agents.set(agent.id, { ...agent, source: given.source, ...given.source === "user" && under && under.source !== "user" ? { over: under.source } : {}, off: false });
+    const over = given.source === "user" && original && original.source !== "user" ? original.source : undefined;
+    agents.set(agent.id, { ...agent, ...owns.length > 0 ? { owns } : {}, source: given.source, ...over !== undefined ? { over } : {}, off: false });
+    if (over !== undefined && original && !owns.includes("tools"))
+      originals.set(agent.id, original.tools);
   }
   const offAgents = strings(off.agents);
   for (const [id, view] of agents)
@@ -7990,18 +8053,26 @@ function mergeDefinitions(sources, host) {
   for (const s of sources.code.skills)
     skills.set(s.id, { ...s, source: sources.core.skills.has(s.id) ? "builtin" : "extension", off: false });
   for (const given of givenOf(sources.extension.skills, stored.skills)) {
+    const original = given.key !== undefined ? skills.get(given.key) : undefined;
+    if (given.source === "user" && original?.source === "extension" && original.owned === true) {
+      host.log("debug", `[LumiAH] your skill "${given.key}" isn't used: the extension keeps that skill as its own`);
+      continue;
+    }
     const { skill, problems } = checkSkill(given.value);
     if (!skill || given.key !== undefined && skill.id !== given.key) {
       unused(host.log, "skill", given, problems);
       continue;
     }
-    const under = skills.get(skill.id);
-    skills.set(skill.id, { ...skill, source: given.source, ...given.source === "user" && under && under.source !== "user" ? { over: under.source } : {}, off: false });
+    const { owned: _claimed, ...kept } = skill;
+    skills.set(skill.id, { ...given.source === "user" ? kept : skill, source: given.source, ...given.source === "user" && original && original.source !== "user" ? { over: original.source } : {}, off: false });
   }
+  for (const [id, view] of skills)
+    if (view.starts?.some((agent) => without.includes(agent)))
+      skills.delete(id);
   const offSkills = strings(off.skills);
   for (const [id, view] of skills)
     view.off = offSkills.includes(id);
-  return new Definitions(agents, skills, tools, new Set(without));
+  return new Definitions(agents, skills, tools, new Set(without), originals, withdrawn);
 }
 
 class Definitions {
@@ -8009,11 +8080,15 @@ class Definitions {
   skillRows;
   toolRows;
   without;
-  constructor(agentRows, skillRows, toolRows, without = new Set) {
+  originals;
+  withdrawn;
+  constructor(agentRows, skillRows, toolRows, without, originals, withdrawn) {
     this.agentRows = agentRows;
     this.skillRows = skillRows;
     this.toolRows = toolRows;
     this.without = without;
+    this.originals = originals;
+    this.withdrawn = withdrawn;
   }
   agent(id) {
     const view = this.agentRows.get(id);
@@ -8029,13 +8104,13 @@ class Definitions {
   workers(but) {
     return this.agents().filter((d) => d.id !== AGENT.main && d.id !== AGENT.writer && d.id !== but);
   }
-  skills() {
-    return [...this.skillRows.values()].filter((view) => !view.off).map(({ id, name, description, body }) => ({ id, name, description, body }));
+  skills(agent) {
+    return [...this.skillRows.values()].filter((view) => !view.off && (agent === undefined || offeredTo(view, agent))).map(({ id, name, description, body, agents }) => ({ id, name, description, body, ...agents !== undefined ? { agents } : {} }));
   }
   scope() {
     return {
       tools: namesOf(this.toolRows),
-      agents: [...this.agentRows.values()].filter((view) => !CORE_AGENTS.includes(view.id) || view.source !== "builtin").map((view) => ({ id: view.id, label: view.name, note: view.description, defaults: runOf(view) }))
+      agents: [...this.agentRows.values()].filter((view) => !CORE_AGENTS.includes(view.id) || view.source !== "builtin").map((view) => ({ id: view.id, label: view.name, note: view.description, defaults: runOf(view), ...view.owns !== undefined ? { owns: view.owns } : {} }))
     };
   }
   resolve(id, settings) {
@@ -8047,14 +8122,52 @@ class Definitions {
   names(names) {
     const out = new Set;
     for (const name of names) {
-      if (name.startsWith("@")) {
+      if (!name.startsWith("@")) {
+        if (this.toolRows.get(name)?.off === false)
+          out.add(name);
+      } else
         for (const [tool, row] of this.toolRows)
-          if (!row.off && (name === ADDED_TOOLS ? row.source !== "builtin" : `@${row.definition.family}` === name))
+          if (!row.off && gives(name, tool, row))
             out.add(tool);
-      } else if (this.toolRows.get(name)?.off === false)
-        out.add(name);
     }
     return [...out];
+  }
+  held(settings) {
+    return this.agents().map((definition) => {
+      const named = resolveAgent(definition, settings).tools;
+      const holds = this.names(named);
+      const cannot = new Map;
+      const mark = (tool, why) => {
+        if (!holds.includes(tool) && !cannot.has(tool))
+          cannot.set(tool, why);
+      };
+      for (const name of named) {
+        let found = false;
+        for (const [tool, row] of this.toolRows) {
+          if (!gives(name, tool, row))
+            continue;
+          found = true;
+          if (row.off)
+            mark(tool, "off");
+        }
+        for (const [tool, family] of this.withdrawn) {
+          if (name !== tool && name !== `@${family}`)
+            continue;
+          found = true;
+          mark(tool, "withdrawn");
+        }
+        if (!found && name !== ADDED_TOOLS)
+          mark(name, "unknown");
+      }
+      return { id: definition.id, name: definition.name, holds, cannot: [...cannot].map(([tool, why]) => ({ tool, why })) };
+    });
+  }
+  lacking(id, tools) {
+    const original = this.originals.get(id);
+    if (original === undefined)
+      return [];
+    const holds = new Set(this.names(tools));
+    return original.filter((name) => !tools.includes(name) && this.names([name]).some((tool) => !holds.has(tool)));
   }
   build(names, env) {
     return this.names(names).flatMap((name) => {
@@ -8065,7 +8178,11 @@ class Definitions {
   }
   view(settings, texts) {
     return {
-      agents: [...this.agentRows.values()].map((view) => ({ ...view, ...resolveSettings(view, settings) })),
+      agents: [...this.agentRows.values()].map((view) => {
+        const run = resolveSettings(view, settings);
+        const lacks = this.lacking(view.id, run.tools);
+        return { ...view, ...run, ...lacks.length > 0 ? { lacks } : {} };
+      }),
       skills: [...this.skillRows.values()],
       tools: [...this.toolRows.entries()].map(([name, row]) => ({
         name,
@@ -10514,7 +10631,7 @@ class Run {
     for (const tool of tools)
       held.add(tool.name);
     const own = how.system ?? instructionsOf(definition, texts);
-    const system = [own, how.about ?? "", !how.plain && held.has(TOOL.skillLoad) ? this.skillList() : ""].filter((part) => part !== "").join(`
+    const system = [own, how.about ?? "", !how.plain && held.has(TOOL.skillLoad) ? this.skillList(definition.id) : ""].filter((part) => part !== "").join(`
 
 `);
     const chosen = shared.options.extension?.agentModel ? await this.modelOf({ definition: definition.id, as: how.as ?? null, standing: how.standing ?? (info.kind === "job" ? "job" : "turn"), by: how.by ?? null }) : {};
@@ -10558,9 +10675,9 @@ class Run {
       ...isEffort(answer.effort) ? { effort: answer.effort } : {}
     };
   }
-  skillList() {
+  skillList(agent) {
     const { texts } = this;
-    const skills = this.definitions.skills();
+    const skills = this.definitions.skills(agent);
     if (skills.length === 0)
       return "";
     const lines = [];
@@ -11471,13 +11588,15 @@ var RECALL_SKILLS = [
     id: RECALL_SKILL.keep,
     name: "Keep the chronicle",
     description: "For the chronicler: how to bring the chronicle up to date from a message on. The main agent doesn't load it: upkeep never costs the reply a round. When the turn's note says a job is worth it, job_start goes in the same answer as write_reply, with the task the note gives.",
-    body: KEEP
+    body: KEEP,
+    starts: [CHRONICLER, READER]
   },
   {
     id: RECALL_SKILL.learn,
     name: "Learn an existing story",
     description: "For the chronicler, as a job the user starts on a chat that already has a long history: plan within the job's allowance, have story readers read the chat a stretch each, and build the chronicle (learned/chronicle/) with a citation on every line.",
-    body: LEARN
+    body: LEARN,
+    starts: [CHRONICLER, READER]
   }
 ];
 
@@ -12919,18 +13038,6 @@ ${first.content}` }, ...rest], lead: null } : { messages: [], lead };
       host.log("warn", `the side session's turn couldn't be kept (${errorText(error)}): it was answered, and the session won't remember it`);
       return null;
     }
-  }
-}
-
-// src/core/skills.ts
-class SkillRegistry {
-  byId = new Map;
-  register(...skills) {
-    for (const s of skills)
-      this.byId.set(s.id, s);
-  }
-  all() {
-    return [...this.byId.values()];
   }
 }
 
@@ -15639,8 +15746,10 @@ var skillLoad = {
   family: FAMILY.skills,
   tier: "read",
   build(env) {
-    const { texts, skills } = env;
-    if (!skills || skills.length === 0)
+    const { texts } = env;
+    const all = env.skills ?? [];
+    const skills = all.filter((skill) => offeredTo(skill, env.agent));
+    if (skills.length === 0)
       return null;
     const p = pagerOf(env, TOOL.skillLoad);
     return {
@@ -15670,8 +15779,13 @@ var skillLoad = {
           });
         }
         const skill = skills.find((s) => s.id === id);
-        if (!skill)
-          return { text: saidBack(p, id, (said) => fitted(p, skills.map((s) => s.id).join(", "), (list) => texts.render(TEXT.agents.skillNone, { id: said, skills: list }))), error: true };
+        if (!skill) {
+          const ids = skills.map((s) => s.id).join(", ");
+          const others = all.find((s) => s.id === id)?.agents;
+          if (others !== undefined)
+            return { text: saidBack(p, id, (said) => fitted(p, ids, (list) => texts.render(TEXT.agents.skillNotYours, { id: said, agents: others.join(", "), skills: list }))), error: true };
+          return { text: saidBack(p, id, (said) => fitted(p, ids, (list) => texts.render(TEXT.agents.skillNone, { id: said, skills: list }))), error: true };
+        }
         return textPage(p, {
           text: skill.body,
           from: cursor.at,
@@ -18109,6 +18223,10 @@ function createHarness(host, options) {
         const setup = await readSetup(shared, isRecord(input) && typeof input.chatId === "string" ? input.chatId : "");
         const scope = setup.definitions.scope();
         return { ...setup.definitions.view(setup.settings, setup.texts), agentSchema: agentRunSchema(scope.tools), agentDefaults: newAgentSettings(), scope };
+      },
+      async held(input) {
+        const setup = await readSetup(shared, isRecord(input) && typeof input.chatId === "string" ? input.chatId : "");
+        return { agents: setup.definitions.held(setup.settings) };
       }
     },
     session: {
@@ -18299,6 +18417,7 @@ var PAGE_OPS = {
   "guidance.get": true,
   "guidance.set": true,
   "definitions.get": true,
+  "definitions.held": true,
   "session.summarize": true,
   "jobs.list": true,
   "jobs.start": true,
@@ -19296,6 +19415,8 @@ var TIERS2 = { read: true, write: true, external: true };
 var JOB_STATES2 = { queued: true, running: true, done: true, failed: true, cancelled: true, interrupted: true, off_path: true, spent: true, paused: true };
 var TURN_ENDS = { done: true, failed: true, stopped: true };
 var LEVELS = { user: true, middle: true, chat: true };
+var OWNED = { instructions: true, tools: true, name: true, description: true };
+var UNUSABLE = { off: true, withdrawn: true, unknown: true };
 function namedOf(v2, what) {
   return list(v2, what).map((one) => {
     const o = record(one, what);
@@ -19427,10 +19548,11 @@ function isAgent(v2) {
   if (!isRecord2(v2) || !isSourced(v2))
     return false;
   const runsWith = (v2.connectionId === null || isText2(v2.connectionId)) && (v2.model === null || isText2(v2.model)) && isText2(v2.effort) && isText2(v2.toolCalls) && Array.isArray(v2.tools) && v2.tools.every(isText2) && isRecord2(v2.budget);
-  return runsWith && isText2(v2.id) && isText2(v2.name) && isText2(v2.description) && isText2(v2.instructions) && (v2.given === "request" || v2.given === "task");
+  const page = (v2.owns === undefined || Array.isArray(v2.owns) && v2.owns.every((field) => isText2(field) && Object.hasOwn(OWNED, field))) && (v2.lacks === undefined || Array.isArray(v2.lacks) && v2.lacks.every(isText2));
+  return runsWith && page && isText2(v2.id) && isText2(v2.name) && isText2(v2.description) && isText2(v2.instructions) && (v2.given === "request" || v2.given === "task");
 }
 function isSkill(v2) {
-  return isRecord2(v2) && isSourced(v2) && isText2(v2.id) && isText2(v2.name) && isText2(v2.description) && isText2(v2.body);
+  return isRecord2(v2) && isSourced(v2) && isText2(v2.id) && isText2(v2.name) && isText2(v2.description) && isText2(v2.body) && (v2.owned === undefined || v2.owned === true) && (v2.agents === undefined || Array.isArray(v2.agents) && v2.agents.every(isText2));
 }
 function toolOf2(v2) {
   const what = "a tool";
@@ -19466,6 +19588,21 @@ function defsView(raw, approval, mcp) {
 function agentNames(raw) {
   const what = "the definitions";
   return new Map(namedOf(record(raw, what).agents, what).map((agent) => [agent.id, agent.name]));
+}
+function heldView(raw) {
+  const what = "what each agent holds";
+  return list(record(raw, what).agents, what).map((one) => {
+    const o = record(one, what);
+    return {
+      id: text2(o.id, what),
+      name: text2(o.name, what),
+      holds: list(o.holds, what).map((tool) => text2(tool, what)),
+      cannot: list(o.cannot, what).map((row) => {
+        const r = record(row, what);
+        return { tool: text2(r.tool, what), why: oneOf(r.why, UNUSABLE, what) };
+      })
+    };
+  });
 }
 function isJob(v2) {
   if (!isRecord2(v2) || !isRecord2(v2.by))
@@ -19933,26 +20070,44 @@ class Definitions2 {
   }
   async saveAgent(userId, agent) {
     const id = idOf(agent.id, "An agent");
-    const tools = (await this.merged(userId)).tools;
+    const merged2 = await this.merged(userId);
+    const tools = merged2.tools;
     const names = [...new Set([...(Array.isArray(tools) ? tools : []).flatMap((t) => isRecord2(t) && typeof t.name === "string" ? [t.name, ...typeof t.family === "string" && t.family !== "" ? [`@${t.family}`] : []] : []), ADDED_TOOLS])];
-    const checked = checkAgent(agent, names);
+    const row = (Array.isArray(merged2.agents) ? merged2.agents : []).find((a) => isRecord2(a) && a.id === id);
+    const owned = isRecord2(row) && (row.source === "extension" || row.over === "extension") && Array.isArray(row.owns) ? row.owns.filter((field) => typeof field === "string") : [];
+    const given2 = { ...agent };
+    for (const field of owned)
+      if (field !== "tools" && isRecord2(row))
+        given2[field] = row[field];
+    if (owned.includes("tools"))
+      delete given2.tools;
+    const checked = checkAgent(given2, names);
     const kept = checked.agent;
     if (kept === null || checked.problems.length > 0)
       throw new UiRefused("invalid", "The agent wasn't saved: it has something the core refuses.", checked.problems.map((p) => ({ path: [...p.path], message: p.message })));
-    await this.edit(userId, (stored) => {
-      stored.agents[id] = kept;
+    const { owns: _owns, ...stored } = kept;
+    for (const field of owned)
+      delete stored[field];
+    if (owned.includes("instructions"))
+      delete stored.text;
+    await this.edit(userId, (defs) => {
+      defs.agents[id] = stored;
     });
     await this.deps.settings.change(userId, [], [[this.deps.coreKey, "agents", id]]);
     return this.view(userId);
   }
   async saveSkill(userId, skill) {
     const id = idOf(skill.id, "A skill");
+    const skills = (await this.merged(userId)).skills;
+    if ((Array.isArray(skills) ? skills : []).some((s) => isRecord2(s) && s.id === id && s.owned === true))
+      throw new UiRefused("forbidden", "This skill belongs to the extension. You change it on that extension's own pages.");
     const checked = checkSkill(skill);
     const kept = checked.skill;
     if (kept === null || checked.problems.length > 0)
       throw new UiRefused("invalid", "The skill wasn't saved: it has something the core refuses.", checked.problems.map((p) => ({ path: [...p.path], message: p.message })));
-    await this.edit(userId, (stored) => {
-      stored.skills[id] = kept;
+    const { owned: _owned, ...stored } = kept;
+    await this.edit(userId, (defs) => {
+      defs.skills[id] = stored;
     });
     return this.view(userId);
   }
@@ -22618,6 +22773,19 @@ class SettingsStore {
       else
         place([...path], clone2(value));
     }
+    for (const section of this.sections) {
+      for (const tail of await section.fixed?.(userId) ?? []) {
+        const fixed = [section.key, ...tail];
+        own = own.filter((o) => !within(o.path, fixed));
+        for (const o of own) {
+          if (!within(fixed, o.path))
+            continue;
+          const parent = at(o.value, fixed.slice(o.path.length, -1));
+          if (isRecord2(parent))
+            delete parent[fixed.at(-1) ?? ""];
+        }
+      }
+    }
     const values = this.valuesOf(own);
     for (const section of this.sections)
       for (const p of await section.check(values[section.key], userId))
@@ -24347,6 +24515,10 @@ function settingsSections(scope) {
           return plain;
         const refused3 = new Set(plain.map((problem) => JSON.stringify(problem.path)));
         return checkSettings(values, known).filter((problem) => refused3.has(JSON.stringify(problem.path)));
+      },
+      async fixed(userId) {
+        const known = await scope?.(userId);
+        return (known?.agents ?? []).filter((agent) => agent.owns?.includes("tools") === true).map((agent) => ["agents", agent.id, "tools"]);
       }
     },
     { key: TRANSPORT_KEY, defaults: transportDefaults, schema: TRANSPORT_SCHEMA, check: checkTransport }
@@ -24744,6 +24916,9 @@ function createBackend(host, env, options = {}) {
     jobs,
     defs,
     builtin,
+    agents: {
+      held: async (userId, chatId) => heldView(await asks.ask(userId, "definitions.held", { chatId }, { chat: chatId }))
+    },
     hosted,
     runtimeState,
     onRuntime(listener) {
@@ -25576,7 +25751,7 @@ function createSpindleHost(identifier = EXTENSION_IDENTIFIER) {
 }
 
 // src/extension/backend/main.ts
-var BUILD = "0ef2e5fd";
+var BUILD = "e5b45bb8";
 var TICK_MS = 1000;
 var host = createSpindleHost();
 var backend = createBackend(host, {
