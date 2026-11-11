@@ -307,3 +307,68 @@ describe("a runtime fit to be required", () => {
     expect(state.words).toContain("update the runtime by running its start line on LumiAH's Runtime page again");
   });
 });
+
+describe("an agent with no connection of its own, in a chat that plays in the runtime", () => {
+  test("runs on the connection the chat was on before its pin, though the account has no default; with neither, the reply fails saying both", async () => {
+    const it = (r = await rig());
+    // No connection of the account's is its default, as on the test bed.
+    for (const c of it.host.connectionList) c.isDefault = false;
+    it.host.addConnection({ id: "conn-own", name: "Own", provider: "openai", model: "model-own", isDefault: false });
+    await it.runtime.link.connect();
+    it.key = (await it.page.request("lah.key", { op: "mint" })).key ?? "";
+    const chat = it.host.addChat(USER, "Harbour light");
+    chat.metadata.connection_profile_id = "conn-own";
+    it.host.say(chat.id, "user", "Who keeps the harbour light now?");
+    await it.page.request("lah.chat.set", { chatId: chat.id, on: true, place: "runtime" });
+    it.host.script = [{ toolCalls: [toolCall("write_reply", { brief: "Okoro keeps the light." })] }, "Okoro keeps it now."];
+
+    const out = await it.generate(chat.id);
+    expect(out.error).toBeNull();
+    expect(out.content).toBe("Okoro keeps it now.");
+    // The main agent and the writer both ran on the chat's own earlier connection, never the loopback it is pinned to now.
+    expect(it.host.calls.map((c) => (c.kind === "call" ? c.request.connectionId : "passed"))).toEqual(["conn-own", "conn-own"]);
+
+    // A chat that had no connection of its own before its pin, on an account with no default: nothing runs, and the words say both.
+    const bare = it.host.addChat(USER, "The fish market");
+    it.host.say(bare.id, "user", "What does Brann sell on market day?");
+    await it.page.request("lah.chat.set", { chatId: bare.id, on: true, place: "runtime" });
+    const failed = await it.generate(bare.id);
+    expect(failed.error?.message ?? "").toContain("it has none of its own, its chat had none before it was set to play in the runtime, and Lumiverse has no default connection");
+    expect(it.host.calls).toHaveLength(2);
+  });
+});
+
+describe("a backend that plays every chat only in the runtime", () => {
+  test("names itself on the Runtime view, sets each chat to the runtime and refuses built in, and its runtime's health names it", async () => {
+    const it = (r = await rig({ backend: { identity: { identifier: "harbour_play", name: "Harbour Play", connectionName: "Harbour Play loopback" }, place: "runtime" } }));
+    const chatId = await it.setUp();
+    expect((await it.page.request("lah.hello", {})).runtime.only).toBe("Harbour Play");
+    expect((await it.page.request("lah.chat.get", { chatId })).chat).toMatchObject({ on: true, place: "runtime", needsRuntime: { by: "Harbour Play" } });
+    await expect(it.page.request("lah.chat.set", { chatId, on: true, place: "builtin" })).rejects.toThrow("Harbour Play plays this chat only in your runtime, so it can't run built in.");
+    const health = await it.runtime.fetch(new Request(`http://127.0.0.1:${PORT}/healthz`, { headers: { host: `127.0.0.1:${PORT}` } }));
+    expect(await health.json()).toMatchObject({ link: "up", backend: "Harbour Play" });
+  });
+});
+
+describe("a backend that leaves built-in agents out", () => {
+  test("lists them nowhere, and job_start and delegate in a runtime turn are told they aren't offered here", async () => {
+    const it = (r = await rig({ backend: { withoutAgents: ["chronicler", "story-reader"] } }));
+    const chatId = await it.setUp();
+    const listed = (await it.page.request("lah.defs.get", {})).agents.map((a) => a.id);
+    expect(listed).toContain("summarizer");
+    expect(listed).not.toContain("chronicler");
+    expect(listed).not.toContain("story-reader");
+    it.host.script = [
+      { toolCalls: [toolCall("job_start", { agent: "chronicler", task: "Keep the chronicle up to date.", when: "now" }, "j1"), toolCall("delegate", { agent: "story-reader", task: "Read the chat." }, "d1")] },
+      { toolCalls: [toolCall("write_reply", { brief: "Okoro keeps the light." }, "w1")] },
+      "Okoro keeps it now.",
+    ];
+    const out = await it.generate(chatId);
+    expect(out.error).toBeNull();
+    const told = JSON.stringify(it.host.calls[1]);
+    expect(told).toContain("chronicler isn't offered here");
+    expect(told).toContain("story-reader isn't offered here");
+    // No job was started, so nothing of the chronicler's runs after the reply either.
+    expect(it.backend.jobs.state(USER, false, false).active).toEqual([]);
+  });
+});

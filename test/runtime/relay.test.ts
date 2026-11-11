@@ -389,11 +389,11 @@ describe("GET /healthz", () => {
     // The loopback key is no proof: it says who may send a request, not who may watch the runtime.
     expect(await ask(elsewhere.fetch, there, `Bearer ${it.key}`)).toEqual({ up: true });
     // `lumiah status` and `up` show a hash of the secret in the runtime's config, and are told how it is.
-    expect(await ask(elsewhere.fetch, there, `Bearer ${await healthProof(it.registration.secret)}`)).toEqual({ ok: true, link: "down", turns: 0, requests: 0 });
+    expect(await ask(elsewhere.fetch, there, `Bearer ${await healthProof(it.registration.secret)}`)).toEqual({ ok: true, link: "down", backend: "LumiAH", turns: 0, requests: 0 });
     elsewhere.close();
 
     // On the machine's own loopback address, which only that machine reaches, whoever asks is told.
-    expect(await ask(it.runtime.fetch, `127.0.0.1:${PORT}`)).toEqual({ ok: true, link: "up", turns: 0, requests: 0 });
+    expect(await ask(it.runtime.fetch, `127.0.0.1:${PORT}`)).toEqual({ ok: true, link: "up", backend: "LumiAH", turns: 0, requests: 0 });
   });
 });
 

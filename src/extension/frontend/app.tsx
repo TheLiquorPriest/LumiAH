@@ -119,6 +119,12 @@ export const GROUPS: readonly { id: GroupId; label: string; pages: readonly Page
   },
 ];
 
+/** What a page is for, in words: as `PAGES` says it, but where the extension that builds LumiAH in plays its chats only in a runtime (`RuntimeView.only`), the Runtime page is no option. */
+export function aboutOf(entry: Pick<PageEntry, "id" | "about">, only: string | undefined): string {
+  if (entry.id !== "runtime" || only === undefined) return entry.about;
+  return `Needed. ${only} plays its chats only in a runtime, a program you start beside Lumiverse: none of them plays without it.`;
+}
+
 export const PAGES: readonly PageEntry[] = GROUPS.flatMap((g) => g.pages);
 
 /** The group a page is in. */

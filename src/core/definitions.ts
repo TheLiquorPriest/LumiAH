@@ -270,6 +270,9 @@ export function mergeDefinitions(sources: DefinitionSources, host: Pick<HarnessH
   // The three a turn can't do without are never off, whatever is stored.
   const offAgents = strings(off.agents);
   for (const [id, view] of agents) view.off = offAgents.includes(id) && !CORE_AGENTS.includes(id);
+  // The built-in agents the backend leaves out (`BackendOptions.withoutAgents`, handed over with the user's definitions as `without`): there is no such agent here, to list or to start, for anyone. The three a turn can't do without are never left out.
+  const without = strings(stored.without).filter((id) => !CORE_AGENTS.includes(id));
+  for (const id of without) agents.delete(id);
 
   const skills = new Map<string, SkillView>();
   for (const s of sources.code.skills) skills.set(s.id, { ...s, source: sources.core.skills.has(s.id) ? "builtin" : "extension", off: false });
@@ -284,7 +287,7 @@ export function mergeDefinitions(sources: DefinitionSources, host: Pick<HarnessH
   }
   const offSkills = strings(off.skills);
   for (const [id, view] of skills) view.off = offSkills.includes(id);
-  return new Definitions(agents, skills, tools);
+  return new Definitions(agents, skills, tools, new Set(without));
 }
 
 /** One run's definitions. */
@@ -293,6 +296,8 @@ export class Definitions {
     private readonly agentRows: ReadonlyMap<string, AgentView>,
     private readonly skillRows: ReadonlyMap<string, SkillView>,
     private readonly toolRows: ReadonlyMap<string, ToolRow>,
+    /** The built-in agents the backend leaves out: a call that names one is told it isn't offered here. */
+    readonly without: ReadonlySet<string> = new Set(),
   ) {}
 
   /** An agent definition by its id; undefined for none, and for one switched off. */

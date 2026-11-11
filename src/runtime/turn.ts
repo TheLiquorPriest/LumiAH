@@ -183,7 +183,7 @@ export class Turns implements TurnRunner {
     } catch (error) {
       // A link refused while the tag was checked is said as a request that found it refused is (relay.ts).
       const refused = refusedReply(this.link);
-      const p = refused !== null ? { message: refused, code: "revoked" } : problemOf(error);
+      const p = refused !== null ? { message: refused, code: "revoked" } : problemOf(error, this.link.backendName);
       answer.fail(p.message, p.code === "forbidden" ? "invalid_api_key" : p.code, this.env.now());
       return;
     }
@@ -242,9 +242,9 @@ export class Turns implements TurnRunner {
       else if (result.status !== "done") this.env.log(`turn ${facts.turn.slice(0, 8)} ${result.status}${result.reason !== undefined ? `: ${result.reason}` : ""}`);
     } catch (error) {
       // The harness never rejects; whatever did is the runtime's own failure, said in the chat.
-      const p = problemOf(error);
+      const p = problemOf(error, this.link.backendName);
       this.env.log(`turn ${facts.turn.slice(0, 8)} failed: ${p.message}`);
-      answer.fail(`LumiAH's turn failed: ${p.message}`, p.code, this.env.now());
+      answer.fail(`${this.link.backendName ?? "LumiAH"}'s turn failed: ${p.message}`, p.code, this.env.now());
     } finally {
       request.signal.removeEventListener("abort", closed);
       // The live view hears the turn's end before the turn lets go of its chat.

@@ -8,7 +8,7 @@ import { errorWords, useApp } from "./app";
 import { Badge, Button, CopyButton, Disclosure, Empty, Section } from "./components";
 import { clock, compact, count, counted, duration, money } from "./format";
 import { Icon } from "./icons";
-import { AGENT_STATE_WORDS, type AgentTotals, type CallRow, costWords, heldLine, roleLabel, type Totals, totalCostWords, type TurnTotals, type TurnView } from "./live-model";
+import { AGENT_STATE_WORDS, type AgentTotals, agentLabel, type CallRow, costWords, heldLine, type Totals, totalCostWords, type TurnTotals, type TurnView } from "./live-model";
 import { type Folds, TextBlock } from "./feed-parts";
 
 // ---------------------------------------------------------------- the exact prompt
@@ -181,7 +181,7 @@ function AgentRow(props: { t: AgentTotals }) {
     <div class="lah-trow" role="row" data-lah-agent-totals={a.start.id}>
       <span class="lah-tcell lah-is-lead" data-label="Agent">
         <span>
-          {roleLabel(a.start.role)} <span class="lah-dim lah-small">{AGENT_STATE_WORDS[a.state]}</span>
+          {agentLabel(a.start)} <span class="lah-dim lah-small">{AGENT_STATE_WORDS[a.state]}</span>
         </span>
       </span>
       <SumCells t={props.t} wallMs={props.t.wallMs} />
@@ -231,7 +231,7 @@ function CallRowView(props: { c: CallRow; role: string; start: number; span: num
 export function TotalsView(props: { turn: TurnView; totals: TurnTotals; connection(id: string): string }) {
   const { totals, turn } = props;
   const t = totals.turn;
-  const role = new Map(totals.agents.map((a) => [a.agent.start.id, roleLabel(a.agent.start.role)]));
+  const role = new Map(totals.agents.map((a) => [a.agent.start.id, agentLabel(a.agent.start)]));
   const span = Math.max(1, t.wallMs);
   if (totals.agents.length === 0) return <Empty icon="table">No agent has run in this turn yet, so there is nothing to add up.</Empty>;
   return (

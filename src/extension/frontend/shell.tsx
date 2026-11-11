@@ -10,7 +10,7 @@
 
 import type { ComponentType } from "preact";
 import { useEffect, useId, useMemo, useRef } from "preact/hooks";
-import { type GroupId, groupOf, type PageId, ShownPagesContext, useApp } from "./app";
+import { aboutOf, type GroupId, groupOf, type PageId, ShownPagesContext, useApp } from "./app";
 import { AttentionStrip } from "./attention";
 import { headGutters, watchChatHeads } from "./chat-heads";
 import { Button, Empty, Toasts } from "./components";
@@ -162,7 +162,7 @@ export function Shell(props: { pages?: readonly PageId[] }) {
           {tabbed ? (
             <div ref={tabs} class="lah-pages lah-subpages" role="tablist" aria-label={`${groups.find((g) => g.id === group)?.label ?? ""} pages`}>
               {pages.map((entry, index) => (
-                <button key={entry.id} type="button" role="tab" id={`${bodyId}-tab-${entry.id}`} data-lah-tab={entry.id} title={entry.about} aria-selected={entry.id === page} aria-controls={entry.id === page ? bodyId : undefined} tabIndex={entry.id === page ? 0 : -1} onClick={() => select(entry.id)} onKeyDown={(event) => onKeyDown(event, index)}>
+                <button key={entry.id} type="button" role="tab" id={`${bodyId}-tab-${entry.id}`} data-lah-tab={entry.id} title={aboutOf(entry, state?.runtime.only)} aria-selected={entry.id === page} aria-controls={entry.id === page ? bodyId : undefined} tabIndex={entry.id === page ? 0 : -1} onClick={() => select(entry.id)} onKeyDown={(event) => onKeyDown(event, index)}>
                   <Icon name={PAGE_ICON[entry.id]} size={16} />
                   <span class="lah-pages-label">{entry.label}</span>
                   <MarkDot mark={marks[entry.id]} />
@@ -195,7 +195,7 @@ export function Shell(props: { pages?: readonly PageId[] }) {
             {/* Every page but Home opens with the line that says what it is for, in the words Home leads to it with: a term a newcomer meets (a job, a skill, a runtime) is explained where it first appears. */}
             {page !== "home" ? (
               <p class="lah-page-lead" data-lah-page-lead>
-                {pages.find((p) => p.id === page)?.about}
+                {((entry) => (entry ? aboutOf(entry, state?.runtime.only) : null))(pages.find((p) => p.id === page))}
               </p>
             ) : null}
             <View />

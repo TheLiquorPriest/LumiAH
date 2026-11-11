@@ -42,6 +42,8 @@ export interface RelaysEnv {
   send(frame: LinkFrame, userId: string, session: string): void;
   /** Whether the user has a loopback connection made. */
   hasLoopback(userId: string): Promise<boolean>;
+  /** Every chat of this backend plays only in a runtime (`BackendOptions.place`): its pages say so, by its name. */
+  only: boolean;
 }
 
 const SEP = "\u0000";
@@ -395,6 +397,6 @@ export class Relays {
       });
     const missing = [...(bun === null ? ["the path of Lumiverse's Bun (use the full path of your own bun)"] : []), ...(script === null ? [`where this extension is installed (the runtime is dist/lumiah.js in ${identity.name}'s extension folder)`] : [])];
     const line = (systemd: boolean): string | null => (bun === null || script === null ? null : `${[bun, script, "up", "--url"].map(shellWord).join(" ")} ${[URL_SLOT, ...named.map(shellWord), ...(systemd ? ["--systemd"] : [])].join(" ")}`);
-    return { build: this.env.build, link: LINK_VERSION, model: loopbackModel(identity.identifier), relays, start: { service: line(true), foreground: line(false), missing }, issues, ready: await this.ready(userId) };
+    return { build: this.env.build, link: LINK_VERSION, model: loopbackModel(identity.identifier), relays, start: { service: line(true), foreground: line(false), missing }, issues, ready: await this.ready(userId), ...(this.env.only ? { only: identity.name } : {}) };
   }
 }

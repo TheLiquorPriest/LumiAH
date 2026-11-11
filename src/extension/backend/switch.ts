@@ -110,6 +110,8 @@ export interface SwitchDeps {
   storySetting(userId: string): Promise<StorySetting>;
   /** What the extension that answers this backend's chats says of a chat: its claim, with its name. Null where it claims nothing or gave no answer. Absent where it supplies no claims. */
   claim?(ask: ClaimAsk, userId: string): Promise<{ by: string; claim: ChatClaim } | null>;
+  /** Every chat of this backend plays only in a runtime (`BackendOptions.place`), whatever a claim says. */
+  only?: true;
 }
 
 export class ChatSwitch {
@@ -185,13 +187,31 @@ export class ChatSwitch {
   }
 
   /**
-   * Whether the extension that answers this backend's chats plays a chat only in a runtime (its
-   * claim's `place`), and its name; null where it doesn't, supplies no claims, gave no answer, or
-   * the user has no such chat.
+   * Whether a chat plays only in a runtime, and the name of the extension that says so: every chat
+   * of a backend that plays its chats only there, else a chat whose claim's `place` says so. Null
+   * where neither does, the extension supplies no claims or gave no answer, or the user has no such
+   * chat.
    */
   async needsRuntime(userId: string, chatId: string): Promise<{ by: string } | null> {
+    if (this.deps.only === true) return { by: this.deps.identity.name };
     const claimed = await this.claimed(userId, chatId);
     return claimed?.claim.place === "runtime" ? { by: claimed.by } : null;
+  }
+
+  /**
+   * The connection an agent with none of its own runs on in a run of this chat, which plays in a
+   * runtime (§25): the one the chat was on before it was pinned to the loopback (`chat`), while it
+   * is there and is no loopback; else Lumiverse's default connection (`default`), unless that is a
+   * loopback. Null: neither, and the agent can't run.
+   */
+  async agentConnection(userId: string, chatId: string): Promise<{ id: string; from: "chat" | "default" } | null> {
+    const prior = (await this.docs.get(userId)).on[chatId]?.prior ?? null;
+    const tries: [string | null, "chat" | "default"][] = prior !== null ? [[prior, "chat"], [null, "default"]] : [[null, "default"]];
+    for (const [id, from] of tries) {
+      const found = await this.deps.connections.resolve(userId, id);
+      if (found !== null && !found.loopback) return { id: found.connection.id, from };
+    }
+    return null;
   }
 
   /** The extension's claim on a chat, asked with what a claim is asked with (read here); null without one. */

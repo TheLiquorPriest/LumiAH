@@ -6,6 +6,7 @@ import { MockBackend, type Scenario } from "../../dev/preview/mock-backend";
 import { sampleSettings } from "../../dev/preview/sections";
 import { asksWords, chatStanding, grantReason, neededPermissions, optionalPermissions, PLACE_ABOUT, runtimeBegun, runtimeSteps, runtimeTrouble, setupDone, setupSteps } from "../../src/extension/frontend/setup-model";
 import type { ChatView, PermissionNeed, RelayView, UiState } from "../../src/shared/ui";
+import { aboutOf } from "../../src/extension/frontend/app";
 
 const T0 = Date.UTC(2026, 10, 10, 9, 0, 0);
 const settled = sampleSettings();
@@ -107,6 +108,14 @@ describe("how a chat stands, said under its switch", () => {
     // Trouble with the runtime promises no built-in way where every chat that rests on it plays only there.
     const resting: UiState = { ...unready, chats: [chat({ ...only, chatId: "chat-lamp", connection: LOOPBACK, away: true })] };
     expect(runtimeTrouble(resting)).toBe("1 chat is set to run in the runtime, and none is ready: replies there may fail until one is.");
+  });
+
+  test("inside an extension that plays its chats only in the runtime, a chat that is off is switched on in that extension's own pages, and the Runtime page is needed", () => {
+    const theirs: UiState = { ...ready, runtime: { ...ready.runtime, only: "Harbour Play" } };
+    expect(chatStanding(chat({ on: false, since: null, place: "runtime", needsRuntime: { by: "Harbour Play" } }), theirs)).toEqual({ answered: false, tone: "neutral", line: "Harbour Play plays this chat only in your runtime, and it is off. Switch it on in Harbour Play's own pages.", fix: null, takeover: null });
+    expect(setupSteps({ ...fresh, runtime: theirs.runtime })[0]?.title).toBe("Switch this chat on in Harbour Play's own pages");
+    expect(aboutOf({ id: "runtime", about: "Optional." }, "Harbour Play")).toStartWith("Needed. Harbour Play plays its chats only in a runtime");
+    expect(aboutOf({ id: "runtime", about: "Optional." }, undefined)).toBe("Optional.");
   });
 
   test("each place is said in a line a newcomer can read", () => {

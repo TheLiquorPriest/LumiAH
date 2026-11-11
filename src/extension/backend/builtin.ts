@@ -41,6 +41,8 @@ export type BuiltinHarness = WorkHarness & Pick<Harness, "prepare" | "complete" 
 export type HarnessMaker = (host: HarnessHost, options: HarnessOptions) => BuiltinHarness;
 
 export interface BuiltinDeps {
+  /** The built-in agents this backend leaves out (`BackendOptions.withoutAgents`): handed to the core with the user's definitions. */
+  without?: readonly string[];
   settings: SettingsStore;
   storage: Storage;
   chats: Chats;
@@ -111,7 +113,10 @@ export class Builtin {
     const harness = (deps.harness ?? createHarness)(this.hostFor(userId, made), {
       settings: async () => {
         const snapshot = await deps.settings.snapshot(userId);
-        return { values: snapshot.values[deps.coreKey], texts: snapshot.texts, ...(snapshot.definitions !== undefined ? { definitions: snapshot.definitions } : {}) };
+        const without = deps.without ?? [];
+        const kept = snapshot.definitions;
+        const definitions = without.length > 0 ? { ...(typeof kept === "object" && kept !== null && !Array.isArray(kept) ? kept : {}), without: [...without] } : kept;
+        return { values: snapshot.values[deps.coreKey], texts: snapshot.texts, ...(definitions !== undefined ? { definitions } : {}) };
       },
       ...(extension !== undefined ? { extension } : {}),
       userId,

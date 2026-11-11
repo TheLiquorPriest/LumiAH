@@ -376,7 +376,7 @@ export class Jobs {
     const plan = input.by.who === "user" ? (input.plan ?? kept.plan) : undefined;
     // The user may give a job to any agent, the main agent among them (§22); an agent, to any but the main agent and the writer, whose work is a turn's reply.
     const may = input.by.who === "user" ? definitions.agents().filter((d) => d.id !== AGENT.writer) : definitions.workers();
-    if (!may.some((d) => d.id === agent)) return { refused: texts.render(TEXT.jobs.noAgent, { agent: clip(agent, lineChars), agents: may.map((d) => d.id).join(", ") }) };
+    if (!may.some((d) => d.id === agent)) return { refused: definitions.without.has(agent) ? texts.render(TEXT.agents.notOffered, { agent: clip(agent, lineChars) }) : texts.render(TEXT.jobs.noAgent, { agent: clip(agent, lineChars), agents: may.map((d) => d.id).join(", ") }) };
     if (task.trim() === "") return { refused: texts.render(TEXT.jobs.noTask) };
     if (task.length > settings.jobs.taskChars) return { refused: texts.render(TEXT.jobs.taskLong, { chars: String(task.length), limit: String(settings.jobs.taskChars) }) };
     let allowance = input.allowance;

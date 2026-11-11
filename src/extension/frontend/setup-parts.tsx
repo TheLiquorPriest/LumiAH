@@ -139,7 +139,8 @@ export function ChatSwitch(props: { chat: ChatView; open: boolean; title?: strin
     );
   return (
     <div class="lah-chatswitch" data-lah-chat={chat.chatId} data-answered={standing.answered} data-place={chat.place} data-on={chat.on} data-lah-other={chat.other?.identifier}>
-      <Switch checked={chat.on || wanted} disabled={busy || wanted || chat.other !== undefined} label={<strong>{props.title ?? (props.open ? "Use LumiAH in this chat" : name)}</strong>} help={props.title === undefined && props.open ? name : undefined} onChange={turn} />
+      {/* Where the extension plays its chats only in a runtime, its own pages switch a chat on: LumiAH's switch isn't offered. */}
+      {state.runtime.only === undefined ? <Switch checked={chat.on || wanted} disabled={busy || wanted || chat.other !== undefined} label={<strong>{props.title ?? (props.open ? "Use LumiAH in this chat" : name)}</strong>} help={props.title === undefined && props.open ? name : undefined} onChange={turn} /> : <strong>{props.title ?? name}</strong>}
       {wanted ? (
         <span class="lah-chatswitch-line" data-tone="neutral" role="status">
           <Icon name="hourglass" size={16} />
@@ -148,7 +149,7 @@ export function ChatSwitch(props: { chat: ChatView; open: boolean; title?: strin
       ) : (
         <span class="lah-chatswitch-line" data-tone={standing.tone} role={standing.tone === "warn" ? "alert" : undefined}>
           <Icon name={STANDING_ICON[standing.tone]} size={16} />
-          <span>{!chat.on && !standing.answered && chat.other === undefined ? `${standing.line} Switched on, its agents read up before each reply and brief the model that writes it${chat.place === "builtin" ? ". Nothing to install." : ", in your runtime."}` : standing.line}</span>
+          <span>{!chat.on && !standing.answered && chat.other === undefined && state.runtime.only === undefined ? `${standing.line} Switched on, its agents read up before each reply and brief the model that writes it${chat.place === "builtin" ? ". Nothing to install." : ", in your runtime."}` : standing.line}</span>
         </span>
       )}
       {standing.takeover !== null ? (

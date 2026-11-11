@@ -173,7 +173,7 @@ export class Relay {
     }
     // `link`: up, or why the extension is out of reach (down, silent, stopped, crashed), or refused.
     const out = this.link.out;
-    return json(200, { ok: this.link.refused === null, link: this.link.refused !== null ? "refused" : (out?.why ?? (this.link.up ? "up" : "down")), turns: this.turns.count, requests: this.calls.size, ...(this.link.refused !== null ? { problem: this.link.refused } : {}) });
+    return json(200, { ok: this.link.refused === null, link: this.link.refused !== null ? "refused" : (out?.why ?? (this.link.up ? "up" : "down")), backend: this.link.backendName ?? "LumiAH", turns: this.turns.count, requests: this.calls.size, ...(this.link.refused !== null ? { problem: this.link.refused } : {}) });
   }
 
   /** The bearer a request carries, as it came; null when it carries none. */
@@ -201,7 +201,7 @@ export class Relay {
       const { models } = await this.link.request("models", { key }, this.env.tuning().modelsWaitMs);
       return json(200, { object: "list", data: models.map((m) => ({ id: m.id, object: "model", created: 0, owned_by: "lumiah" })) });
     } catch (error) {
-      const p = problemOf(error);
+      const p = problemOf(error, this.link.backendName);
       // A key the extension refused reads as a bad key to the connection's Test.
       const badKey = error instanceof LinkError && error.code === "forbidden";
       return json(badKey ? 401 : statusOf(p.code), errorJson(p.message, badKey ? "invalid_api_key" : p.code));
@@ -323,7 +323,7 @@ export class Relay {
     void this.turns
       .run({ request: call.id, tag, key, body, answer, signal: stop.signal })
       .catch((error: unknown) => {
-        const p = problemOf(error);
+        const p = problemOf(error, this.link.backendName);
         this.env.log(`a turn failed: ${p.message}`);
         answer.fail(p.message, p.code, this.env.now());
       })

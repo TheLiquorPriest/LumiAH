@@ -159,6 +159,20 @@ export interface BackendOptions {
    * say nothing of it, since there is nothing for the user to grant.
    */
   declined?: readonly string[];
+  /**
+   * Where every chat this backend answers plays: only in a runtime (LumiRPEngine). Each chat then
+   * has no built-in way, as a claim's `place` gives one chat, and the pages say the runtime is
+   * needed, name this extension, and leave switching a chat on to the extension's own pages.
+   * Absent: chats run built in unless the user or a claim says otherwise.
+   */
+  place?: "runtime";
+  /**
+   * The ids of built-in agents this backend leaves out (LumiRPEngine: `chronicler`, `story-reader`).
+   * Such an agent isn't listed on the Agents page and can't be started by `job_start`, `delegate` or
+   * the user, a call that names one is told it isn't offered here, and nothing built in starts it
+   * (the chronicle's upkeep and "Learn this story" are off without the chronicler). None by default.
+   */
+  withoutAgents?: readonly string[];
 }
 
 export function createBackend(host: BackendHost, env: BackendEnv, options: BackendOptions = {}): Backend {
@@ -201,6 +215,7 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     now,
     build,
     identity,
+    only: options.place === "runtime",
     send: (frame, userId, session) => made.server?.send(frame, userId, session),
     hasLoopback: async (userId) => ((await made.connections?.loopbacks(userId)) ?? []).length > 0,
   });
@@ -264,7 +279,18 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
   const recall = new Recall(host, { chats, lore, activated: (userId, chatId, generationId) => turns.activatedInfo(userId, chatId, generationId), now });
   // A turn that fails while a permission LumiAH can't do without is missing fails for that: the live view says so beside the sentence.
   const live = new LiveBuffer(host, { now, transport: (userId) => settings.transport(userId), linkGoneFor: (userId, relay) => relays.goneFor(userId, relay), missing: () => permissions().some((need) => need.needed) });
-  const models = new Models(host, { connections, streams, settings, registry, name });
+  // An agent of a chat that plays in a runtime, with no connection of its own, is lent the one the chat was on before its pin (the switch keeps it), else the default; never a loopback.
+  const models = new Models(host, {
+    connections,
+    streams,
+    settings,
+    registry,
+    name,
+    lend: async (userId, chatId) => {
+      await chats.own(userId, chatId);
+      return (await made.chatSwitch?.agentConnection(userId, chatId)) ?? null;
+    },
+  });
   const keys = new Keys(host, { registry, relays, settings, connectionName: identity.connectionName, now, later });
   /** The extension LumiAH is built into, whose claims say which chats it answers and how. */
   const claimer = options.extension;
@@ -276,6 +302,7 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     blocked,
     identity,
     now,
+    ...(options.place === "runtime" ? { only: true as const } : {}),
     storySetting: async (userId) => settingsOf((await settings.values(userId))[CORE_KEY]).story,
     // A claim that fails is none: the log says so, and the chat is set as any other meanwhile.
     ...(claimer?.claim !== undefined
@@ -301,6 +328,7 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
   const mcp: Mcp = new Mcp(host, { on: (userId) => defs.mcpOn(userId), callMs: async (userId) => (await settings.transport(userId)).mcp.callMs });
   const tools = new RemoteTools(options.tools, mcp, (level, message) => host.log(level, message));
   const builtin = new Builtin(host, {
+    without: options.withoutAgents ?? [],
     settings,
     storage,
     chats,
@@ -372,6 +400,7 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     now,
   });
   const server = new LinkServer(host, {
+    without: options.withoutAgents ?? [],
     relays,
     registry,
     settings,

@@ -6,7 +6,7 @@
 // the other pages. The page (pages/home.tsx) only renders what `homeOf` gives.
 
 import { type ChatView, type HomeView, isReply, type LastTurn, type Notice, type RunPlace, type StoryView, type UiState } from "../../shared/ui";
-import { type PageEntry, type PageId, PAGES } from "./app";
+import { aboutOf, type PageEntry, type PageId, PAGES } from "./app";
 import { estimateWords, storyCard } from "./chronicle-model";
 import { ago, counted, duration } from "./format";
 import type { IconName } from "./icons";
@@ -234,7 +234,7 @@ function learnOf(state: UiState, chat: ChatView | null, story: StoryView | null)
 function waysOf(state: UiState, pages: readonly PageId[] | null | undefined): HomeModel["ways"] {
   const marks = pageMarks(state);
   const shown = PAGES.filter((p) => p.id !== "home" && (pages === null || pages === undefined || pages.includes(p.id)));
-  const way = (p: PageEntry): Way => ({ id: p.id, label: p.label, about: p.about, mark: marks[p.id] ?? null });
+  const way = (p: PageEntry): Way => ({ id: p.id, label: p.label, about: aboutOf(p, state.runtime.only), mark: marks[p.id] ?? null });
   return { main: shown.filter((p) => p.far !== true).map(way), more: shown.filter((p) => p.far === true).map(way) };
 }
 

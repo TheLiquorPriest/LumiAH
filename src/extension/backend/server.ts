@@ -40,7 +40,9 @@ export interface ServerDeps {
   turns: Turns;
   chats: Chats;
   /** A chat as the core reads it, with what decides its story (§24.4), and what a claim on it is asked with. */
-  chatSwitch: Pick<ChatSwitch, "info" | "claimAsk">;
+  chatSwitch: Pick<ChatSwitch, "info" | "claimAsk" | "agentConnection">;
+  /** The built-in agents this backend leaves out (`BackendOptions.withoutAgents`): handed to a runtime's core with the user's definitions. */
+  without: readonly string[];
   storage: Storage;
   lore: Lore;
   presets: Presets;
@@ -310,8 +312,12 @@ export class LinkServer {
         return { last: d.streams.resend(userId, relay, streamId(r.stream), whole(r.from, "chunk number")) };
       case "stream.cancel":
         return { cancelled: d.streams.cancel(userId, relay, streamId(r.stream), typeof r.reason === "string" ? r.reason : "") };
-      case "settings.get":
-        return d.settings.snapshot(userId);
+      case "settings.get": {
+        const snapshot = await d.settings.snapshot(userId);
+        // The built-in agents this backend leaves out reach the runtime's core with the user's definitions, which it reads at each run's start.
+        const kept = snapshot.definitions;
+        return d.without.length > 0 ? { ...snapshot, definitions: { ...(typeof kept === "object" && kept !== null && !Array.isArray(kept) ? kept : {}), without: [...d.without] } } : snapshot;
+      }
       case "trace.push":
         return { taken: await d.live.push(userId, relay, Array.isArray(r.records) ? r.records : []) };
       case "setup.connection": {
@@ -352,8 +358,16 @@ export class LinkServer {
       }
       case "connections.list":
         return { connections: await d.connections.list(userId) };
-      case "connections.get":
-        return { profile: await d.connections.profile(userId, typeof r.connection === "string" && r.connection !== "" ? r.connection : null) };
+      case "connections.get": {
+        const named = typeof r.connection === "string" && r.connection !== "" ? r.connection : null;
+        // An agent of a chat's run, with no connection of its own, is lent the chat's: the one it was on before its pin, else the default, never a loopback (null when neither).
+        if (named === null && typeof r.chat === "string" && r.chat !== "") {
+          await d.chats.own(userId, r.chat);
+          const lent = await d.chatSwitch.agentConnection(userId, r.chat);
+          return { profile: lent === null ? null : await d.connections.profile(userId, lent.id) };
+        }
+        return { profile: await d.connections.profile(userId, named) };
+      }
       // A runtime's frame names whatever chat it likes, and any account can register a runtime: a chat is the caller's own before a tool or the extension LumiAH is built into hears of it (`""`: no chat).
       case "tools.list":
         return { tools: await d.tools.list(userId, typeof r.chat === "string" && r.chat !== "" ? (await d.chats.own(userId, r.chat)).id : "") };

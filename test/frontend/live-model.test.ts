@@ -50,6 +50,7 @@ import {
   turnTotals,
   turnView,
 } from "../../src/extension/frontend/live-model";
+import { agentLabel } from "../../src/extension/frontend/live-model";
 import type { LiveEnded, LivePartial, LiveView } from "../../src/shared/ui";
 
 const T0 = Date.UTC(2026, 10, 10, 9, 0, 0);
@@ -448,10 +449,15 @@ describe("copy and export", () => {
 
   test("tokens, time and cost per call as CSV, a call a row", () => {
     const lines = totalsCsv(turnTotals(turn, T0)).trimEnd().split("\n");
-    expect(lines[0]).toBe("agent,role,call,model,started,ms,in,cached_in,cache_write,out,reasoning_out,estimated,cost_usd,finish,tool_calls,tool_ms,prompt");
+    expect(lines[0]).toBe("agent,role,as,call,model,started,ms,in,cached_in,cache_write,out,reasoning_out,estimated,cost_usd,finish,tool_calls,tool_ms,prompt");
     expect(lines.length).toBe(5);
-    expect(lines[1]).toStartWith("main-1,main,1,deepseek-v4-flash,2026-11-10T09:00:00.040Z,2840,5120,3900,0,212,96,,");
-    expect(lines[4]).toStartWith("writer-1,writer,1,");
+    expect(lines[1]).toStartWith("main-1,main,,1,deepseek-v4-flash,2026-11-10T09:00:00.040Z,2840,5120,3900,0,212,96,,");
+    expect(lines[4]).toStartWith("writer-1,writer,,1,");
+  });
+
+  test("an agent is named with which instance it is, where whoever started it said", () => {
+    expect(agentLabel({ role: "character", as: "okoro" })).toBe("Character (okoro)");
+    expect(agentLabel({ role: "character" })).toBe("Character");
   });
 
   test("an export's file name is safe for any file system, and tells two files of one kind apart", () => {

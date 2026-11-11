@@ -83,6 +83,8 @@ export interface ModelsDeps {
   registry: RegistryStore;
   /** The extension as its pages show it: a call that can't be made says where to pick another connection. */
   name: string;
+  /** The connection an agent with none of its own is lent in a run of this chat, which plays in a runtime (`ChatSwitch.agentConnection`); rejects for a chat that isn't the user's. */
+  lend(userId: string, chatId: string): Promise<{ id: string; from: "chat" | "default" } | null>;
 }
 
 export class Models {
@@ -135,15 +137,23 @@ export class Models {
     return this.agentCall(userId, connection, request, signal, request.stream === true && onDelta !== undefined ? onDelta : () => undefined);
   }
 
-  /** `model.call`: one call of an agent, answered on the stream it names. Asked again for a stream already open (after a reconnect), the call under way is the answer. */
+  /** `model.call`: one call of an agent, answered on the stream it names. Asked again for a stream already open (after a reconnect), the call under way is the answer. An agent with no connection of its own, in a run of a chat (`chat`), goes on the connection that chat lends it. */
   async call(caller: Caller, fields: Record<string, unknown>): Promise<{ accepted: true }> {
     const stream = streamOf(fields.stream, this.deps.name);
-    const request = requestOf(fields.request);
-    if (request === null) throw new LinkRefused("bad_request", `The model call is malformed: update the runtime and ${this.deps.name} to the same build.`);
+    const asked = requestOf(fields.request);
+    if (asked === null) throw new LinkRefused("bad_request", `The model call is malformed: update the runtime and ${this.deps.name} to the same build.`);
     const turn = typeof fields.turn === "string" && fields.turn !== "" ? fields.turn : null;
-    const { streams, settings } = this.deps;
+    const chat = typeof fields.chat === "string" && fields.chat !== "" ? fields.chat : null;
+    const lent = asked.connectionId === null && chat !== null ? await this.deps.lend(caller.userId, chat) : undefined;
+    // Lent the chat's own earlier connection, the call names it; lent the default, it goes as it came, which Lumiverse puts on the default.
+    const request = lent?.from === "chat" ? { ...asked, connectionId: lent.id } : asked;
+    const { streams, settings, name } = this.deps;
     const writer = streams.open(caller.userId, caller.relay.id, stream, turn, (await settings.transport(caller.userId)).streams);
     if (writer === null) return { accepted: true };
+    if (lent === null) {
+      writer.error(`This agent has no connection of its own, this chat had none before it was pinned to the runtime, and this account has no default connection that isn't a loopback. Pick a connection for the agent in ${name}'s settings, or set a default one in Lumiverse.`, "connection");
+      return { accepted: true };
+    }
     void this.run(caller.userId, writer, request.connectionId, "This agent", (connection, onDelta) => this.agentCall(caller.userId, connection, request, writer.signal, onDelta), request.stream === true);
     return { accepted: true };
   }

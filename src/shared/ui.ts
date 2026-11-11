@@ -339,6 +339,8 @@ export interface RuntimeView {
   issues: string[];
   /** A runtime is there to choose (§25): one is linked, the loopback key is minted and the loopback connection is made, so a chat set to run in the runtime is answered there now. */
   ready: boolean;
+  /** The extension that builds LumiAH in plays every chat it answers only in a runtime (LumiRPEngine): its name. The pages then say the runtime is needed, offer no built-in way, and leave switching a chat on to that extension's own pages. Absent for LumiAH, and for an extension whose chats may run built in. */
+  only?: string;
 }
 
 /**

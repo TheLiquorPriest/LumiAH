@@ -45,13 +45,13 @@ export interface StreamsEnv {
   tuning(): RuntimeTuning;
 }
 
-/** A failure's words and code: the extension's own (`error` frames), the link's, or the runtime's. */
-export function problemOf(error: unknown): { message: string; code: string } {
+/** A failure's words and code: the extension's own (`error` frames), the link's, or the runtime's. `name`: the extension the runtime links to, as the words name it. */
+export function problemOf(error: unknown, name = "LumiAH"): { message: string; code: string } {
   if (error instanceof LinkError) return { message: error.message, code: error.code };
   if (error instanceof LiveError) {
-    if (error.problem === "login") return { message: "The runtime's Lumiverse session has ended, so it can't reach LumiAH. Sign it in again on the machine it runs on: lumiah login (LumiAH's Runtime page shows the line).", code: "login" };
-    if (error.problem === "timeout") return { message: "LumiAH didn't answer the runtime in time: it may be restarting or busy. Press Retry in a moment.", code: "timeout" };
-    return { message: `The runtime couldn't reach LumiAH: ${error.message}`, code: error.problem === "forbidden" ? "unreachable" : error.problem };
+    if (error.problem === "login") return { message: `The runtime's Lumiverse session has ended, so it can't reach ${name}. Sign it in again on the machine it runs on: lumiah login (${name}'s Runtime page shows the line).`, code: "login" };
+    if (error.problem === "timeout") return { message: `${name} didn't answer the runtime in time: it may be restarting or busy. Press Retry in a moment.`, code: "timeout" };
+    return { message: `The runtime couldn't reach ${name}: ${error.message}`, code: error.problem === "forbidden" ? "unreachable" : error.problem };
   }
   return { message: error instanceof Error ? error.message : String(error), code: "internal" };
 }
@@ -94,7 +94,7 @@ export class Streams {
         } catch (error) {
           // A socket that closed under the request may or may not have delivered it: the start is taken once per stream, so it goes again.
           if (error instanceof LiveError && error.problem === "closed" && !stream.ended && this.env.now() - first < this.env.tuning().lostMs) continue;
-          this.end(stream, problemOf(error), false);
+          this.end(stream, problemOf(error, this.link.backendName), false);
           return false;
         }
       }
@@ -125,13 +125,13 @@ export class Streams {
   lost(ids: readonly string[]): void {
     for (const id of ids) {
       const stream = this.streams.get(id);
-      if (stream) this.end(stream, { message: "LumiAH restarted during this call, so it stopped here. Press Retry, or swipe.", code: "lost" }, false);
+      if (stream) this.end(stream, { message: `${this.link.backendName ?? "LumiAH"} restarted during this call, so it stopped here. Press Retry, or swipe.`, code: "lost" }, false);
     }
   }
 
   /** Lumiverse stopped the extension, or it crashed: every stream ends at once, with nothing to cancel. */
   stopped(why: "stopped" | "crashed", detail: string | null): void {
-    for (const stream of [...this.streams.values()]) this.end(stream, { message: stoppedWords(why, detail), code: "unavailable" }, false);
+    for (const stream of [...this.streams.values()]) this.end(stream, { message: stoppedWords(why, detail, this.link.backendName), code: "unavailable" }, false);
   }
 
   /** The runtime is stopping: every stream ends with words the chat shows. */
@@ -162,17 +162,17 @@ export class Streams {
     for (const stream of [...this.streams.values()]) {
       if (stream.ended) continue;
       if (refused !== null) {
-        this.end(stream, { message: `The runtime can't reach LumiAH: ${refused}`, code: "revoked" }, false);
+        this.end(stream, { message: `The runtime can't reach ${this.link.backendName ?? "LumiAH"}: ${refused}`, code: "revoked" }, false);
         continue;
       }
       if (out !== null && now - Math.max(out.since, stream.at) >= tuning.lostMs) {
         const seconds = Math.round((now - Math.max(out.since, stream.at)) / 1000);
         const problem =
           out.why === "silent"
-            ? { message: `LumiAH stopped answering the runtime during this call (nothing for ${seconds} s): it may have restarted or hung. Press Retry, or swipe.`, code: "stalled" }
+            ? { message: `${this.link.backendName ?? "LumiAH"} stopped answering the runtime during this call (nothing for ${seconds} s): it may have restarted or hung. Press Retry, or swipe.`, code: "stalled" }
             : out.why === "down"
               ? { message: `The runtime lost its connection to Lumiverse for ${seconds} s during this call. Press Retry once it is back (lumiah status says how it is).`, code: "lost" }
-              : { message: stoppedWords(out.why, out.detail), code: "unavailable" };
+              : { message: stoppedWords(out.why, out.detail, this.link.backendName), code: "unavailable" };
         // A stopped or crashed extension has nothing to cancel.
         this.end(stream, problem, out.why === "silent" || out.why === "down");
         continue;

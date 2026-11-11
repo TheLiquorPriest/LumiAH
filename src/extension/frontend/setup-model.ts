@@ -3,7 +3,7 @@
 // installed, so setup is three steps (LumiAH's permissions, a chat switched on, a reply). A runtime
 // is an option with steps of its own, which show only to someone who asks for one.
 
-import type { ChatView, PermissionNeed, RunPlace, SetupStepId, UiState } from "../../shared/ui";
+import type { ChatView, PermissionNeed, RunPlace, RuntimeView, SetupStepId, UiState } from "../../shared/ui";
 import { count, counted } from "./format";
 
 export const PLACE_LABEL: Readonly<Record<RunPlace, string>> = { builtin: "Built in", runtime: "Runtime" };
@@ -25,11 +25,13 @@ export interface SetupStep {
 }
 
 /** First-time setup's steps as the backend says they stand: switch LumiAH on for a chat, then send a message. */
-export function setupSteps(state: Pick<UiState, "setup">): SetupStep[] {
+export function setupSteps(state: Pick<UiState, "setup"> & { runtime?: Pick<RuntimeView, "only"> }): SetupStep[] {
   const done = (id: SetupStepId): boolean => state.setup.steps.find((s) => s.id === id)?.done ?? true;
   const chat = done("chat");
+  // An extension that plays its chats only in a runtime switches a chat on in its own pages.
+  const only = state.runtime?.only;
   return [
-    { id: "chat", at: chat ? "done" : "now", title: "Switch LumiAH on for this chat" },
+    { id: "chat", at: chat ? "done" : "now", title: only !== undefined ? `Switch this chat on in ${only}'s own pages` : "Switch LumiAH on for this chat" },
     { id: "reply", at: done("reply") ? "done" : chat ? "now" : "todo", title: "Send a message in the chat" },
   ];
 }
@@ -94,6 +96,9 @@ export function chatStanding(chat: ChatView, state: Pick<UiState, "permissions" 
   if (!chat.on) {
     // A chat on the runtime's connection reaches the runtime whether LumiAH pinned it or not.
     if (chat.connection?.loopback === true) return stands(true, "warn", `Switched off here, yet it generates on ${connection}, the runtime's connection, so the runtime still works on its replies. Choose another connection for the chat in Lumiverse to stop that.`);
+    const only = state.runtime.only;
+    if (only !== undefined) return stands(false, "neutral", `${only} plays this chat only in your runtime, and it is off. Switch it on in ${only}'s own pages.`);
+    if (chat.needsRuntime !== undefined) return stands(false, "neutral", `${chat.needsRuntime.by} plays this chat only in your runtime, and it is off. Switched on, it is pinned to the runtime by itself.`);
     return stands(false, "neutral", "LumiAH is off for this chat.");
   }
   if (neededPermissions(state).length > 0) return stands(false, "warn", "Switched on, but LumiAH can't work on a reply until it is allowed what it needs.");

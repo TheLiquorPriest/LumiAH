@@ -9,7 +9,7 @@
 // local-inference scheduler exclusions.
 
 import type { AskPush, ChunkPush, ConnectionPush, ExtensionOffer, LinkNotice, LinkRequests, LinkRequestType, OpenStream, RuntimeReport, SchedulerState, SessionReport, StopPush } from "../link/contract";
-import { LINK, LINK_VERSION, versionWords } from "../link/contract";
+import { EXTENSION_IDENTIFIER, LINK, LINK_VERSION, versionWords } from "../link/contract";
 import { extensionOfferOf, linkedBackendOf, pushOf } from "../link/frames";
 import type { RuntimeTuning } from "../link/settings";
 import type { OpenSocket } from "./connection";
@@ -50,6 +50,8 @@ export interface RuntimeLink {
    * false: whether LumiAH runs isn't known, and nothing is said of the chat.
    */
   readonly refusedByLumiAH?: boolean;
+  /** The extension it links to, as its words name it (`lumiah status` says it too); LumiAH where it isn't known. */
+  readonly backendName?: string;
   /** One request, sent once the link is up (waiting `waitMs` at most), with the relay's secret. */
   request<T extends AskType>(type: T, fields: Asked<T>, waitMs: number): Promise<LinkRequests[T]["result"]>;
   /** A notice, sent now when the link is up and dropped when it isn't: nothing waits for it. */
@@ -106,10 +108,10 @@ export interface LinkOptions {
 const LASTING: Partial<Record<LiveProblem, true>> = { login: true, locked: true, forbidden: true, insecure: true, not_installed: true, too_old: true };
 
 /** Words for a call that the extension's stop or crash ended or kept from starting. */
-export function stoppedWords(why: "stopped" | "crashed", detail: string | null | undefined): string {
-  if (why === "stopped") return "LumiAH was stopped on Lumiverse (restarted, updated or turned off), so this reply ended here. Press Retry, or swipe, once it runs again (Lumiverse's Extensions tab).";
+export function stoppedWords(why: "stopped" | "crashed", detail: string | null | undefined, name = "LumiAH"): string {
+  if (why === "stopped") return `${name} was stopped on Lumiverse (restarted, updated or turned off), so this reply ended here. Press Retry, or swipe, once it runs again (Lumiverse's Extensions tab).`;
   const said = detail?.replace(/\s+/g, " ").trim().slice(0, 200) ?? "";
-  return `LumiAH stopped with an error${said !== "" ? ` (${said})` : ""}, so this reply ended here. Lumiverse doesn't restart it by itself: restart it in Lumiverse's Extensions tab, then press Retry.`;
+  return `${name} stopped with an error${said !== "" ? ` (${said})` : ""}, so this reply ended here. Lumiverse doesn't restart it by itself: restart it in Lumiverse's Extensions tab, then press Retry.`;
 }
 
 /**
@@ -199,6 +201,12 @@ export class LinkClient implements RuntimeLink {
     return this.refusal !== null && this.refusedThere;
   }
 
+  /** The extension it links to, as its words name it: by the name its last hello gave; before one, LumiAH, or another extension by its identifier. */
+  get backendName(): string {
+    if (this.hello !== null) return linkedBackendOf(this.hello.backend).name;
+    return this.options.identifier === EXTENSION_IDENTIFIER ? "LumiAH" : `The extension "${this.options.identifier}"`;
+  }
+
   /**
    * The extension out of reach: stopped or crashed; the link down; or silent (something asked has
    * waited `silentMs` with nothing heard from the extension meanwhile, counted from the later of the
@@ -220,7 +228,7 @@ export class LinkClient implements RuntimeLink {
     const now = this.options.now();
     if (change === "loaded") {
       // A new worker, which knows neither this runtime's session nor its streams: the next tick says hello to it.
-      if (this.stoppedBy !== null) this.options.log("LumiAH is running again on Lumiverse");
+      if (this.stoppedBy !== null) this.options.log(`${this.backendName} is running again on Lumiverse`);
       this.stoppedBy = null;
       this.suspect = null;
       this.greetedGen = -1;
@@ -240,7 +248,7 @@ export class LinkClient implements RuntimeLink {
     this.stoppedBy = stopped;
     this.suspect = null;
     this.greetedGen = -1;
-    this.options.log(stoppedWords(stopped.why, stopped.detail));
+    this.options.log(stoppedWords(stopped.why, stopped.detail, this.backendName));
     this.handlers?.stopped(stopped.why, stopped.detail);
   }
 
@@ -261,7 +269,7 @@ export class LinkClient implements RuntimeLink {
       const stopped = this.stoppedBy;
       if (stopped !== null && this.conn.isOpen()) {
         // The live socket will say when Lumiverse starts the extension again; a crash it never restarts by itself.
-        if (stopped.why === "crashed" || this.options.now() >= deadline) throw new LiveError("not_running", stoppedWords(stopped.why, stopped.detail));
+        if (stopped.why === "crashed" || this.options.now() >= deadline) throw new LiveError("not_running", stoppedWords(stopped.why, stopped.detail, this.backendName));
         await pause();
         continue;
       }
@@ -322,8 +330,8 @@ export class LinkClient implements RuntimeLink {
       if (error instanceof LinkError && error.code === "forbidden") this.refuse(this.unknownWords(error.message), true);
       else if (error instanceof LinkError && error.code === "version") this.refuse(error.message, true);
       // An extension that doesn't know the hello is a build from before it, which may not stand in for a runtime either.
-      else if (error instanceof LinkError && error.code === "bad_request") this.refuse(`LumiAH on ${this.options.base} doesn't know this runtime's hello (${error.message}): update LumiAH (Extensions → LumiAH → Update).`, false);
-      else if (error instanceof LiveError && error.problem === "timeout") throw new LiveError("timeout", `LumiAH on ${this.options.base} didn't answer the runtime's hello. Check that it's running in Lumiverse's Extensions tab.`);
+      else if (error instanceof LinkError && error.code === "bad_request") this.refuse(`${this.backendName} on ${this.options.base} doesn't know this runtime's hello (${error.message}): update it in Lumiverse (Extensions → ${this.backendName} → Update).`, false);
+      else if (error instanceof LiveError && error.problem === "timeout") throw new LiveError("timeout", `${this.backendName} on ${this.options.base} didn't answer the runtime's hello. Check that it's running in Lumiverse's Extensions tab.`);
       throw error;
     }
     // An extension that didn't refuse another version itself is refused here, in the same words. It takes this runtime as linked, so nothing is said of what it does meanwhile.
@@ -383,7 +391,7 @@ export class LinkClient implements RuntimeLink {
       case "secret":
         if (push.relay !== this.options.relay) return;
         this.options.rotated(push.secret);
-        this.options.log("LumiAH rotated this runtime's secret: the new one is in its config");
+        this.options.log(`${this.backendName} rotated this runtime's secret: the new one is in its config`);
         return;
     }
   }
@@ -454,7 +462,7 @@ export class LinkClient implements RuntimeLink {
         const problem = ended ? `the runtime's Lumiverse session for ${this.options.base} has ended: sign it in again with lumiah login` : error instanceof Error ? error.message : String(error);
         this.retryAt = this.options.now() + Math.min(reconnectMaxMs, reconnectMs * 2 ** Math.min(this.failures, 16));
         this.failures++;
-        if (problem !== this.lastProblem) this.options.log(`can't reach LumiAH yet (trying again): ${problem}`);
+        if (problem !== this.lastProblem) this.options.log(`can't reach ${this.backendName} yet (trying again): ${problem}`);
         this.lastProblem = problem;
       });
       return;

@@ -507,6 +507,11 @@ function heldMarkdown(held: PromptHeld): string {
   return [`What the prompt held: ${heldLine(held)}.`, ...lore, indexWords(held.index), ...historyWords(held.history)].join("\n");
 }
 
+/** An agent as its steps and totals name it: its role as a heading, and which instance of its definition it is where whoever started it said (`as`): "Character (okoro)". */
+export function agentLabel(start: { role: string; as?: string }): string {
+  return start.as !== undefined && start.as !== "" ? `${roleLabel(start.role)} (${start.as})` : roleLabel(start.role);
+}
+
 /** A role as a heading: "main" → "Main agent", "writer" → "Writer", anything else with its first letter raised. */
 export function roleLabel(role: string): string {
   if (role === "main") return "Main agent";
@@ -1146,9 +1151,10 @@ function csvField(value: string | number): string {
 /** Tokens, time and cost per call as CSV, a call a row, for a spreadsheet: which agent made it, on which model, when, how long it took, what it spent (and which of those counts are estimates), how it finished, and the tools it called. */
 export function totalsCsv(totals: TurnTotals): string {
   const role = new Map(totals.agents.map((t) => [t.agent.start.id, t.agent.start.role]));
-  const head = ["agent", "role", "call", "model", "started", "ms", "in", "cached_in", "cache_write", "out", "reasoning_out", "estimated", "cost_usd", "finish", "tool_calls", "tool_ms", "prompt"];
+  const instance = new Map(totals.agents.map((t) => [t.agent.start.id, t.agent.start.as ?? ""]));
+  const head = ["agent", "role", "as", "call", "model", "started", "ms", "in", "cached_in", "cache_write", "out", "reasoning_out", "estimated", "cost_usd", "finish", "tool_calls", "tool_ms", "prompt"];
   // A cost worked out from prices carries the arithmetic's noise in its last places (0.0007761600000000001): ten significant digits keep every digit that means something.
-  const rows = totals.calls.map((c) => [c.agentId, role.get(c.agentId) ?? "", c.call, c.model, new Date(c.startedAt).toISOString(), c.ms, c.usage.in, c.usage.cachedIn, c.usage.cacheWrite ?? 0, c.usage.out, c.usage.reasoningOut, c.usage.estimated.join(" "), c.usage.cost === undefined ? "" : Number(c.usage.cost.toPrecision(10)), c.finishReason, c.tools, c.toolMs, c.prompt ?? ""]);
+  const rows = totals.calls.map((c) => [c.agentId, role.get(c.agentId) ?? "", instance.get(c.agentId) ?? "", c.call, c.model, new Date(c.startedAt).toISOString(), c.ms, c.usage.in, c.usage.cachedIn, c.usage.cacheWrite ?? 0, c.usage.out, c.usage.reasoningOut, c.usage.estimated.join(" "), c.usage.cost === undefined ? "" : Number(c.usage.cost.toPrecision(10)), c.finishReason, c.tools, c.toolMs, c.prompt ?? ""]);
   return `${[head, ...rows].map((row) => row.map(csvField).join(",")).join("\n")}\n`;
 }
 
@@ -1221,12 +1227,12 @@ export function transcriptMarkdown(turn: TurnView, feeds: readonly AgentFeed[] =
   if (turn.session) out.push(`Session: ${sessionWords(turn.session).join(" ")}`);
   if (turn.held) out.push(heldMarkdown(turn.held));
   if (totals.agents.length > 0) {
-    const rows = totals.agents.map((t) => `| ${roleLabel(t.agent.start.role)} | ${t.calls} | ${count(t.in)} | ${count(t.cachedIn)} | ${count(t.out)} | ${count(t.reasoningOut)} | ${duration(t.modelMs)} | ${duration(t.toolMs)} | ${totalCostWords(t)} |`);
+    const rows = totals.agents.map((t) => `| ${agentLabel(t.agent.start)} | ${t.calls} | ${count(t.in)} | ${count(t.cachedIn)} | ${count(t.out)} | ${count(t.reasoningOut)} | ${duration(t.modelMs)} | ${duration(t.toolMs)} | ${totalCostWords(t)} |`);
     out.push(["| Agent | Calls | In | Cached | Out | Reasoning | Model time | Tool time | Cost |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|", ...rows].join("\n"));
   }
   for (const feed of feeds) {
     const a = feed.agent;
-    out.push(`## ${roleLabel(a.start.role)}${a.start.task ? ` · ${a.start.task}` : ""} · ${AGENT_STATE_WORDS[a.state]}`);
+    out.push(`## ${agentLabel(a.start)}${a.start.task ? ` · ${a.start.task}` : ""} · ${AGENT_STATE_WORDS[a.state]}`);
     out.push(`${agentModel(a) ?? "the connection's model"}${a.start.connectionId ? ` on ${a.start.connectionId}` : ""} · effort ${a.start.effort}${a.start.parent ? ` · started by ${a.start.parent}` : ""}`);
     if (feed.hidden > 0) out.push(`(${counted(feed.hidden, "earlier step")} not shown)`);
     for (const item of feed.items) {

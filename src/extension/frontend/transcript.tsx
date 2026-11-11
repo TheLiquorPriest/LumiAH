@@ -69,6 +69,7 @@ import {
   turnTotals,
   turnView,
 } from "./live-model";
+import { agentLabel } from "./live-model";
 import { atFoot, revealInScroller, scrollParent } from "./scroll";
 import { SKIP_ABOUT, SKIP_REPLY } from "./nav-model";
 import { neededPermissions, PLACE_LABEL } from "./setup-model";
@@ -357,7 +358,7 @@ function Item(props: { item: FeedItem; folds: Folds; now: number; thinkingOpen: 
 function AgentBlock(props: { feed: AgentFeed; turn: TurnView; spent: AgentTotals | undefined; folds: Folds; now: number; open: boolean; connection(id: string): string; focused: boolean; thinkingOpen: boolean; toolsOpen: boolean; onToggle(): void; onFocus(): void }) {
   const app = useApp();
   const a = props.feed.agent;
-  const label = roleLabel(a.start.role);
+  const label = agentLabel(a.start);
   return (
     <li class="lah-agent" data-lah-agent={a.start.id} data-role={a.start.role} data-state={a.state} style={{ "--lah-depth": String(a.depth) }}>
       <div class="lah-agent-head">
@@ -405,7 +406,7 @@ function Outline(props: { turn: TurnView; totals: TurnTotals; agent: string | nu
           <button key={a.start.id} type="button" class="lah-outline-row" data-state={a.state} aria-pressed={props.agent === a.start.id} style={{ "--lah-depth": String(a.depth) }} onClick={() => props.onAgent(props.agent === a.start.id ? null : a.start.id)}>
             <span class="lah-outline-name">
               {a.state === "working" ? <span class="lah-pulse" aria-hidden="true" /> : <span class={`lah-dot lah-is-${STATE_TONE[a.state]}`} aria-hidden="true" />}
-              {roleLabel(a.start.role)}
+              {agentLabel(a.start)}
               <span class="lah-sr">{`, ${AGENT_STATE_WORDS[a.state]}`}</span>
             </span>
             <span class="lah-outline-sub">{[...(t.calls > 0 ? [brief(t)] : []), duration(agentMs(a, props.now)), ...(t.calls > 0 ? [totalCostWords(t)] : [])].join(" · ")}</span>

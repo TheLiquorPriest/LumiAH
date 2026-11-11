@@ -157,7 +157,7 @@ export function linkHost(deps: HostDeps): HarnessHost {
     const turn = deps.turn();
     return streamed<ModelResult>(
       signal,
-      (stream) => link.request("model.call", { stream, turn, request }, deps.tuning().lostMs),
+      (stream) => link.request("model.call", { stream, turn, request, chat: deps.chat() ?? "" }, deps.tuning().lostMs),
       (chunk, settle) => {
         switch (chunk.kind) {
           case "content":
@@ -216,7 +216,8 @@ export function linkHost(deps: HostDeps): HarnessHost {
     models: { call },
     connections: {
       list: async () => (await ask("connections.list", {})).connections,
-      get: async (connectionId) => (await ask("connections.get", { connection: connectionId })).profile,
+      // In a run of a chat, an agent with no connection of its own is lent the chat's (the extension says which).
+      get: async (connectionId) => (await ask("connections.get", { connection: connectionId, chat: deps.chat() ?? "" })).profile,
     },
     blobs: {
       put: async (hash, text) => {

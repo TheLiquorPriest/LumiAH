@@ -851,7 +851,7 @@ async function status(a: Args, io: RuntimeIO): Promise<number> {
     const body = await healthOf(config, io);
     if (isRecord(body) && typeof body.link === "string") {
       healthy = body.ok === true && body.link === "up";
-      io.out(`It answers: link to LumiAH ${body.link}, ${String(body.turns)} turn(s) under way${typeof body.problem === "string" ? `. ${body.problem}` : ""}.`);
+      io.out(`It answers: link to ${typeof body.backend === "string" && body.backend !== "" ? body.backend : "LumiAH"} ${body.link}, ${String(body.turns)} turn(s) under way${typeof body.problem === "string" ? `. ${body.problem}` : ""}.`);
     } else io.out(`Something answers on ${config.listen}:${config.port}, but not as the runtime this config is for: another runtime serves there, or this one was set up again and hasn't been restarted since.`);
   } catch (error) {
     io.out(`It doesn't answer on ${config.listen}:${config.port} (${error instanceof Error ? error.message : String(error)}).`);

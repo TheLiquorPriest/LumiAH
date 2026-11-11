@@ -26,16 +26,17 @@ export const READER = "story-reader";
 
 /**
  * Why LumiAH's own agents don't keep a chat's chronicle in a run: the chronicler or the story reader
- * is switched off, or the extension that answers the chat gives an agent of its own under that id
- * (one that does other work would be started in its place). Null where both are LumiAH's own, as
- * shipped or as the user replaced them. Where they aren't, no upkeep is offered and the story isn't
- * learned. `extension`: its name, as the reason says it.
+ * is switched off, or left out by the extension LumiAH is built into, or that extension gives an
+ * agent of its own under that id (one that does other work would be started in its place). Null
+ * where both are LumiAH's own, as shipped or as the user replaced them. Where they aren't, no
+ * upkeep is offered and the story isn't learned. `extension`: its name, as the reason says it.
  */
-export function chronicleRefusal(definitions: Pick<Definitions, "sourced">, extension: string | null): string | null {
+export function chronicleRefusal(definitions: Pick<Definitions, "sourced"> & { without?: ReadonlySet<string> }, extension: string | null): string | null {
   for (const [id, name] of [
     [CHRONICLER, "chronicler"],
     [READER, "story reader"],
   ] as const) {
+    if (definitions.without?.has(id) === true) return `${extension ?? "The extension LumiAH is built into"} doesn't offer LumiAH's ${name} here, so no chronicle is kept for this chat and its story isn't learned.`;
     const sourced = definitions.sourced(id);
     if (sourced === undefined) return `LumiAH's ${name} is switched off, so it keeps no chronicle for this chat and doesn't learn its story. Switch it on on the Agents page.`;
     if (sourced.source === "extension" || sourced.over === "extension") return `${extension ?? "The extension that answers this chat"} gives this chat an agent of its own in place of LumiAH's ${name}, so LumiAH keeps no chronicle for it and doesn't learn its story.`;

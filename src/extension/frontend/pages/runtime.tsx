@@ -124,7 +124,10 @@ export function RuntimePage() {
   const open = active === null ? null : (state.chats.find((c) => c.chatId === active) ?? (switched !== null && switched.chatId === active ? switched : read));
   const others = state.chats.filter((c) => c.chatId !== active);
   const begun = runtimeBegun(state);
-  const shown = begun || asked;
+  // An extension that plays its chats only in a runtime (LumiRPEngine) needs one: its steps show without being asked, its name says whose chats and whose runtime these are, and its own pages switch a chat on.
+  const only = runtime.only;
+  const who = only ?? "LumiAH";
+  const shown = begun || asked || only !== undefined;
   const steps = runtimeSteps(state);
   const stepsDone = steps.every((s) => s.at === "done");
   const trouble = runtimeTrouble(state);
@@ -261,7 +264,7 @@ export function RuntimePage() {
     <div class="lah-runtime" data-lah-view="runtime" data-lah-runtime={stepsDone ? "ready" : shown ? "begun" : "none"}>
       <div class="lah-runtime-col lah-runtime-wide">
         {runtime.issues.map((issue) => (
-          <Banner key={issue} tone="neg" title="LumiAH can't work as it should">
+          <Banner key={issue} tone="neg" title={`${who} can't work as it should`}>
             {issue}
           </Banner>
         ))}
@@ -279,15 +282,15 @@ export function RuntimePage() {
           </Banner>
         ) : trouble !== null ? (
           <Banner tone="warn" title="Your runtime isn't ready">
-            {`${trouble} Each runtime below says what it needs. Chats that run built in go on as they are.`}
+            {`${trouble} Each runtime below says what it needs.${only === undefined ? " Chats that run built in go on as they are." : ""}`}
           </Banner>
         ) : runtime.ready ? (
           <Banner tone="pos" title={linked.length === 1 ? `A runtime is ready: ${linked[0]?.name ?? "linked"}` : `${linked.length} runtimes are ready`}>
-            {`Choose Runtime for a chat below to run it there; every other chat stays built in. LumiAH build ${runtime.build}, link version ${runtime.link}.${linked.some((r) => r.update) ? " A runtime's build differs: its update line is below." : ""}`}
+            {`${only !== undefined ? `${only}'s chats play in it.` : "Choose Runtime for a chat below to run it there; every other chat stays built in."} ${who} build ${runtime.build}, link version ${runtime.link}.${linked.some((r) => r.update) ? " A runtime's build differs: its update line is below." : ""}`}
           </Banner>
         ) : (
           <Banner tone="info" title="Setting up a runtime">
-            {`Three steps, below. Until they are done every chat runs built in, which needs none of this. LumiAH build ${runtime.build}, link version ${runtime.link}.`}
+            {`Three steps, below. ${only !== undefined ? `${only} plays its chats only in a runtime, so none of them plays until these are done.` : "Until they are done every chat runs built in, which needs none of this."} ${who} build ${runtime.build}, link version ${runtime.link}.`}
           </Banner>
         )}
       </div>
@@ -297,24 +300,34 @@ export function RuntimePage() {
             {stepList}
           </Section>
         ) : null}
-        <Section title="Which chats LumiAH answers" flush id="chats">
-          <ul class="lah-facts lah-runtime-places" data-lah-places>
-            <li>
-              <span>
-                <strong>{PLACE_LABEL.builtin}.</strong> {PLACE_ABOUT.builtin}
-              </span>
-            </li>
-            <li>
-              <span>
-                <strong>{PLACE_LABEL.runtime}.</strong> {PLACE_ABOUT.runtime}
-              </span>
-            </li>
-          </ul>
+        <Section title={only !== undefined ? `Which chats ${only} plays` : "Which chats LumiAH answers"} flush id="chats">
+          {only !== undefined ? (
+            <ul class="lah-facts lah-runtime-places" data-lah-places="runtime">
+              <li>
+                <span>
+                  <strong>Runtime only.</strong> {`${only} plays its chats only in your runtime: there is no built-in way. Switch a chat on in ${only}'s own pages.`}
+                </span>
+              </li>
+            </ul>
+          ) : (
+            <ul class="lah-facts lah-runtime-places" data-lah-places>
+              <li>
+                <span>
+                  <strong>{PLACE_LABEL.builtin}.</strong> {PLACE_ABOUT.builtin}
+                </span>
+              </li>
+              <li>
+                <span>
+                  <strong>{PLACE_LABEL.runtime}.</strong> {PLACE_ABOUT.runtime}
+                </span>
+              </li>
+            </ul>
+          )}
           {open ? chatRow(open, true) : null}
           {others.map((c) => chatRow(c, false))}
           {open === null && others.length === 0 ? (
             <p class="lah-lead" style={{ padding: "var(--lah-s3)" }}>
-              {active === null ? "No chat is switched on. Open a chat in Lumiverse, and its switch shows here and on Home." : "Reading the open chat…"}
+              {active === null ? (only !== undefined ? `No chat is switched on. Switch one on in ${only}'s own pages.` : "No chat is switched on. Open a chat in Lumiverse, and its switch shows here and on Home.") : "Reading the open chat…"}
             </p>
           ) : null}
         </Section>
@@ -337,7 +350,7 @@ export function RuntimePage() {
           )}
           <Section title="Your loopback key" id="key">
             <p data-lah-key={key.set ? "set" : "none"}>{key.set ? `Fingerprint ${key.print ?? "unknown"}${key.at !== null ? `, made ${dateTime(key.at)}` : ""}.` : "No key yet."}</p>
-            <p class="lah-lead lah-small">The key proves a request for a reply comes from your Lumiverse. LumiAH keeps only its fingerprint, never the key.</p>
+            <p class="lah-lead lah-small">{`The key proves a request for a reply comes from your Lumiverse. ${who} keeps only its fingerprint, never the key.`}</p>
             <div class="lah-actions">
               <Button variant={key.set ? "secondary" : "primary"} icon="key" busy={busy} onClick={() => mint("card")}>
                 {key.set ? "Rotate the key" : "Mint the key"}
@@ -351,8 +364,8 @@ export function RuntimePage() {
             {minted?.from === "card" ? mintedNote : null}
           </Section>
           <Section title="The loopback connection" id="connection">
-            <p data-lah-loopbacks={loopbacks.length}>{loopbacks.length === 0 ? "None of your connections is the loopback yet." : `LumiAH takes ${loopbacks.map((c) => c.name).join(", ")} as the loopback.`}</p>
-            <p class="lah-lead lah-small">A chat that runs in the runtime generates on it. The agents themselves run on the connections named in Settings, never on the loopback: a call there would come back to the runtime.</p>
+            <p data-lah-loopbacks={loopbacks.length}>{loopbacks.length === 0 ? "None of your connections is the loopback yet." : `${who} takes ${loopbacks.map((c) => c.name).join(", ")} as the loopback.`}</p>
+            <p class="lah-lead lah-small">A chat that runs in the runtime generates on it. The agents themselves never run on the loopback, since a call there would come back to the runtime: each runs on the connection Settings name for it, else on the one its chat was on before it was pinned here, else on your default connection.</p>
             <Disclosure summary="Make it by hand" defaultOpen={loopbacks.length === 0 && linked.length === 0 && steps.find((s) => s.id === "connection")?.at !== "now"}>
               <ConnectionSteps state={state} />
             </Disclosure>
