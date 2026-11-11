@@ -115,6 +115,8 @@ export class Builtin {
       },
       ...(extension !== undefined ? { extension } : {}),
       userId,
+      // A claim that says its chat plays only in a runtime is refused here, by the core.
+      place: "builtin",
     });
     const core: UserCore = {
       harness,

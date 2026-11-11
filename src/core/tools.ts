@@ -7,7 +7,7 @@
 // use it). So the registry keeps definitions, each of which builds its tool from the run's
 // environment (`ToolEnv`).
 
-import type { ActivatedLore, AgentRef, ChatMessage, FileChange, HarnessHost, JobView, JobWhen, JsonObject, LoreBook, LoreEntry, PathMessage, RunKind, ToolTier, TurnRequest } from "./ports";
+import type { ActivatedLore, AgentRef, ChatMessage, FileChange, HarnessHost, JobDue, JobLane, JobView, JobWhen, JsonObject, LoreBook, LoreEntry, PathMessage, RunKind, ToolTier, TurnRequest } from "./ports";
 import type { LoreChange } from "./recall/shapes";
 import type { Book } from "./book";
 import type { LexicalIndex } from "./lexical";
@@ -18,12 +18,38 @@ import type { StorySource } from "./story";
 import type { Texts } from "./texts";
 import type { WorkspaceView } from "./workspace";
 
-/** What a tool's run gets besides its arguments: a signal that ends when the agent is cancelled or its time runs out, and who called. */
+/** What a tool's run gets besides its arguments: a signal that ends when the agent is cancelled or its time runs out, and who called (`as`: which instance of its definition the caller is, where whoever started it said). */
 export interface ToolCtx {
   signal: AbortSignal;
   agentId: string;
   role: string;
   callId: string;
+  as?: string;
+}
+
+/**
+ * The reply as a turn lets its agents write it themselves (`reply_write`, and `delegate`'s
+ * `to_reply`), in place of a writer: what they release streams to the user in the order released,
+ * and the reply is all of it.
+ *
+ * - `refused`: why nothing can be released now, in words for the model (the turn runs built in,
+ *   where Lumiverse writes the reply; the writer is at work on it; another agent's answer is
+ *   streaming into it); null where something can.
+ * - `write`: one passage from the agent `ctx` names, once the extension lets it go (§21
+ *   `releasing`), in the order the calls came: null once it went out, else why not. The extension
+ *   is told of what went out (`released`).
+ * - `hold`: the reply held for one sub-agent's answer as it streams (`agent`), never asked about,
+ *   so `refused` says so to every other agent meanwhile; `stream` appends what it brings (false
+ *   where it went nowhere: the turn was stopped). What `hold` gives back lets the reply go, with
+ *   all the stream released, which the extension is told of.
+ */
+export interface ReplyStream {
+  refused(): string | null;
+  write(text: string, ctx: ToolCtx): Promise<string | null>;
+  hold(agent: AgentRef): (released: string) => void;
+  stream(text: string): boolean;
+  /** The reply's length so far, in characters. */
+  length(): number;
 }
 
 /**
@@ -113,11 +139,13 @@ export interface DelegateChoice {
   description: string;
 }
 
-/** Starting and continuing sub-agents (§14), as the run offers it to one agent. Each answers with what the model is told. */
+/** Starting and continuing sub-agents (§14), as the run offers it to one agent. Each answers with what the model is told. `as` is offered where an extension builds LumiAH in; `toReply` where this agent may hand the reply on (it may write the reply itself). */
 export interface Delegation {
   /** The definitions this agent may delegate to. */
   agents(): readonly DelegateChoice[];
-  start(input: { agent: string; task: string; files: readonly string[] }, ctx: ToolCtx): Promise<ToolOutcome>;
+  offersAs: boolean;
+  toReply: boolean;
+  start(input: { agent: string; task: string; files: readonly string[]; as?: string; toReply?: boolean }, ctx: ToolCtx): Promise<ToolOutcome>;
   message(input: { handle: string; text: string }, ctx: ToolCtx): Promise<ToolOutcome>;
 }
 
@@ -128,14 +156,15 @@ export interface JobRead {
   report: string | null;
 }
 
-/** What an agent's `job_start` call asks for: an agent and a task, or a job to start again in their place. */
-export type JobStart = { agent: string; task: string; when: JobWhen } | { again: string; when: JobWhen };
+/** What an agent's `job_start` call asks for: an agent and a task, or a job to start again in their place; with which instance its agent is, its lane among waiting jobs, and whether the next turn waits for it. */
+export type JobStart = ({ agent: string; task: string } | { again: string }) & { when: JobWhen; as?: string; lane?: JobLane; due?: JobDue };
 
 /** What came of starting a job: the job, or why it wasn't started, in words for whoever asked. */
 export type JobStarted = JobView | { refused: string };
 
-/** Jobs (§15), as the run offers them to one agent. */
+/** Jobs (§15), as the run offers them to one agent. `offersAs`: `job_start` offers `as`, `lane` and `due`, where an extension builds LumiAH in. */
 export interface JobTools {
+  offersAs: boolean;
   /** The definitions a job may run as. */
   agents(): readonly DelegateChoice[];
   /**
@@ -178,6 +207,8 @@ export interface ToolEnv {
   past: readonly PastTurn[];
   /** Hands the writer a brief and has it write the reply; absent where no writer writes this run's reply. */
   writeReply?: (brief: string, ctx: ToolCtx) => Promise<ToolOutcome>;
+  /** The reply as this agent may write it itself (`reply_write`); absent where it may not: a job's or a side session's agent, or a turn's agent that is neither its main agent nor one an extension's definition gives it to. */
+  reply?: ReplyStream;
   /** The workspace as this agent may use it (§11). */
   workspace?: WorkspaceView;
   /** The skills it may load (§13). */

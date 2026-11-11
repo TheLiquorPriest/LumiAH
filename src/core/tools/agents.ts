@@ -1,8 +1,8 @@
 // delegate and agent_message (DESIGN §14): how an agent hands a task to another and asks it more.
 // The run does the work (`Delegation`: whom this agent may start, how many at once, what the
-// sub-agent is given and may hold); these read the call and say what the run answered. Each reads
-// its signal before anything else: an agent set to work spends the user's tokens, so none is once
-// the round that called it has ended.
+// sub-agent is given and may hold, and the reply where this agent may hand it on); these read the
+// call and say what the run answered. Each reads its signal before anything else: an agent set to
+// work spends the user's tokens, so none is once the round that called it has ended.
 
 import type { JsonObject } from "../ports";
 import { FAMILY, TEXT, TOOL } from "../texts";
@@ -35,6 +35,9 @@ const delegate: ToolDefinition = {
           agent: { type: "string", enum: choices.map((c) => c.id), description: texts.render(TEXT.toolArg(TOOL.delegate, "agent")) },
           task: { type: "string", description: texts.render(TEXT.toolArg(TOOL.delegate, "task")) },
           files: { type: "array", items: { type: "string" }, description: texts.render(TEXT.toolArg(TOOL.delegate, "files")) },
+          // Offered only where they mean something, so an agent that can use neither is sent delegate as it always was.
+          ...(delegation.offersAs ? { as: { type: "string", description: texts.render(TEXT.toolArg(TOOL.delegate, "as")) } } : {}),
+          ...(delegation.toReply ? { to_reply: { type: "boolean", description: texts.render(TEXT.toolArg(TOOL.delegate, "to_reply")) } } : {}),
         },
         required: ["agent", "task"],
       },
@@ -45,7 +48,11 @@ const delegate: ToolDefinition = {
         if (agent === null) return needs(p, "agent");
         const task = textArg(args.task);
         if (task === null) return needs(p, "task");
-        return delegation.start({ agent, task, files: pathsOf(args.files) }, ctx);
+        const as = delegation.offersAs && args.as !== undefined && args.as !== null ? textArg(args.as) : undefined;
+        if (as === null) return needs(p, "as");
+        // A model that writes a flag as the word is taken at its word.
+        const toReply = args.to_reply === true || args.to_reply === "true";
+        return delegation.start({ agent, task, files: pathsOf(args.files), ...(as !== undefined ? { as } : {}), ...(toReply ? { toReply: true } : {}) }, ctx);
       },
     };
   },

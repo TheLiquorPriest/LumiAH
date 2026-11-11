@@ -97,7 +97,7 @@ export function runtimeFrom(config: RuntimeConfig, lumiverse: FakeLumiverse, log
       held = next;
     },
     keepTuning: () => undefined,
-    harness: scripted !== undefined ? (harnessHost, settings, extension) => scripted(harnessHost, settings, extension, "runtime") : (harnessHost, settings, extension) => core().createHarness(harnessHost, { settings, extension }),
+    harness: scripted !== undefined ? (harnessHost, settings, extension) => scripted(harnessHost, settings, extension, "runtime") : (harnessHost, settings, extension) => core().createHarness(harnessHost, { settings, extension, place: "runtime" }),
     writerConnection: (values) => {
       const writer = isRecord(values) && isRecord(values.core) && isRecord(values.core.agents) ? values.core.agents.writer : undefined;
       return isRecord(writer) && typeof writer.connectionId === "string" ? writer.connectionId : null;

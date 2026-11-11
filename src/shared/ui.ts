@@ -342,6 +342,22 @@ export interface RuntimeView {
 }
 
 /**
+ * A user's runtime as an extension that builds LumiAH in reads it for its own pages
+ * (`Backend.runtimeState`), without the pages' whole state. `linked`: a runtime is linked now; asked
+ * about a chat, the one that chat's replies reach. `ready`: `RuntimeView.ready`. `connection`: a
+ * loopback connection exists, so a chat can be pinned to it. `words`: null while linked, else why it
+ * isn't, in plain words that say what to do (a refused link version names the side to update and
+ * how). `start`: the Runtime page's two lines (`RuntimeView.start`).
+ */
+export interface RuntimeState {
+  linked: boolean;
+  ready: boolean;
+  connection: boolean;
+  words: string | null;
+  start: RuntimeView["start"];
+}
+
+/**
  * First-time setup's steps, in order (§25: built in needs nothing installed): the permissions LumiAH
  * needs are granted, a chat is switched on, a reply was answered. A runtime is no step of it: it is
  * an option, and its own steps (start it, mint the key, have the connection) are worked out by the
@@ -413,8 +429,10 @@ export interface ChatView {
   connection: { id: string; name: string; loopback: boolean } | null;
   /** Another extension that has LumiAH built into itself (or LumiAH itself, seen from one) answers this chat: its identifier and its name. This backend then offers no switch for the chat: `on` is false, and switching it on is refused with `unavailable` in words that name the other. Absent where no other does. */
   other?: { identifier: string; name: string };
-  /** The chat is set to run in a runtime that isn't linked now, so its replies may fail until the runtime is back or the chat is set to run built in (`on` stays true, `place` stays "runtime"). */
+  /** The chat is set to run in a runtime that isn't linked now, so its replies may fail until the runtime is back or, unless it `needsRuntime`, the chat is set to run built in (`on` stays true, `place` stays "runtime"). */
   away?: true;
+  /** The extension that answers the chat plays it only in a runtime (its claim's `place`): its name. Its `place` is then always "runtime", switching it on pins it there, and no page offers built in for it. */
+  needsRuntime?: { by: string };
 }
 
 /** Whether a reply in the chat reaches LumiAH now: it is switched on to run built in, or it generates on a loopback connection (which a runtime serves). */

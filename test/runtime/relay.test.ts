@@ -438,7 +438,7 @@ describe("a turn that never ends", () => {
 });
 
 describe("a reply asked of a runtime whose link is refused", () => {
-  const NO_FALLBACK = "Nothing answers this chat in the runtime's place: once the runtime links again, send your message again, or set the chat to Built in on LumiAH's Home, which needs no runtime.";
+  const NO_FALLBACK = "Nothing answers this chat in the runtime's place: once the runtime links again, send your message again.";
   const KEY = `lah_${"0".repeat(64)}`;
   const reply: JsonObject = { model: "lumiah", stream: true, messages: [{ role: "user", content: "Who keeps the harbour light now?" }], lumiah_turn: "0".repeat(32) };
   const other: JsonObject = { model: "lumiah", stream: true, messages: [{ role: "user", content: "Who keeps the harbour light now?" }] };

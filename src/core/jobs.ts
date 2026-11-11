@@ -20,7 +20,7 @@ import { Gate } from "./gate";
 import { jobEnded, jobRestarts, jobState } from "./job-words";
 import { cutShort, type RunWords } from "./loop";
 import { DOC } from "./paths";
-import type { AgentStopCode, AgentUsage, HarnessHost, JobAllowance, JobState, JobView, JobWhen, JsonObject, JsonValue, ModelMessage, RecordJob, TurnRecord } from "./ports";
+import type { AgentStopCode, AgentUsage, HarnessHost, JobAllowance, JobDue, JobLane, JobState, JobView, JobWhen, JsonObject, JsonValue, ModelMessage, RecordJob, TurnRecord } from "./ports";
 import { isRecord } from "./ports";
 import { AgentStop } from "./provider";
 import { HarnessRefusal } from "./refusal";
@@ -70,6 +70,13 @@ export interface JobCreate {
   parent?: { id: string; left: TurnBudget };
   /** The agent that starts it, where an agent does: the tools it holds, which are the most the job's own agent is given (§14), and how deep it stands, which the job's agent stands one deeper than. */
   starter?: { held: readonly string[]; depth: number };
+  /** Which instance of its definition the job's agent is, its lane among waiting jobs, and whether the next turn waits for it (`job_start`'s `as`, `lane` and `due`). */
+  as?: string;
+  lane?: JobLane;
+  due?: JobDue;
+  /** A job the user starts that may write the chat's own area too, and the plan file it is asked to keep there (an extension's prepared start). */
+  area?: "chat";
+  plan?: string;
 }
 
 /** What a job may spend: its allowance's members over Settings' limits for each job. */
@@ -134,6 +141,8 @@ export class Jobs {
   private holding = false;
   /** The chats forgotten since the process started (§20): nothing is written for a job of one. */
   private readonly forgotten = new Set<string>();
+  /** Told whenever a job changes here: a turn waiting for the jobs due by it looks again. */
+  private readonly watchers = new Set<() => void>();
 
   constructor(private readonly shared: () => Shared) {}
 
@@ -219,6 +228,7 @@ export class Jobs {
     } catch (error) {
       this.host.log("warn", `[LumiAH] the host took no word of job ${doc.job.id} (${errorText(error)})`);
     }
+    for (const watch of [...this.watchers]) watch();
     return doc.job;
   }
 
@@ -237,6 +247,38 @@ export class Jobs {
         .map((entry) => entry.id)
         .reverse(),
     );
+  }
+
+  /**
+   * The jobs due by a turn (§15: `job_start`'s `due`), waited for: the chat's jobs marked due by the
+   * next turn that belong to `basis` (the turn just before the one that waits, on its path) and wait
+   * or run, not held by the user. Waits until none is left, `ms` has passed, or `signal` ends; gives
+   * those still not ended, the latest first.
+   */
+  async awaitDue(chatId: string, basis: string, ms: number, signal: AbortSignal): Promise<JobView[]> {
+    const until = this.host.clock.now() + ms;
+    for (;;) {
+      const due = (await this.open(chatId)).filter((job) => job.due === "next_turn" && job.basis === basis && (job.state === "queued" || job.state === "running") && job.paused !== true);
+      const left = until - this.host.clock.now();
+      if (due.length === 0 || left <= 0 || signal.aborted) return due;
+      await this.changedWithin(left, signal);
+    }
+  }
+
+  /** Resolves once a job changes here, `ms` passes, or `signal` ends, whichever comes first. */
+  private changedWithin(ms: number, signal: AbortSignal): Promise<void> {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    const over = new AbortController();
+    const done = (): void => {
+      this.watchers.delete(done);
+      signal.removeEventListener("abort", done);
+      over.abort();
+      resolve();
+    };
+    this.watchers.add(done);
+    signal.addEventListener("abort", done, { once: true });
+    this.host.clock.sleep(ms, over.signal).then(done, () => undefined);
+    return promise;
   }
 
   /** One page of jobs, the latest first: a chat's, or every chat's. `cursor`: the `next` of the page before. */
@@ -317,6 +359,8 @@ export class Jobs {
     let agent: string;
     let task: string;
     let again: string | undefined;
+    // Started again, a job is the same instance with the same reach and plan unless the call says otherwise.
+    let kept: Pick<JobView, "as" | "area" | "plan"> = {};
     if ("again" in input.what) {
       const old = await this.doc(input.what.again);
       if (!old || old.job.chatId !== input.chatId) return { refused: texts.render(TEXT.jobs.noJob, { id: clip(input.what.again, lineChars) }) };
@@ -324,7 +368,12 @@ export class Jobs {
       agent = old.job.agent;
       task = old.task;
       again = old.job.id;
+      kept = { ...(old.job.as !== undefined ? { as: old.job.as } : {}), ...(old.job.area !== undefined ? { area: old.job.area } : {}), ...(old.job.plan !== undefined ? { plan: old.job.plan } : {}) };
     } else ({ agent, task } = input.what);
+    const as = input.as ?? kept.as;
+    // Only the user starts a job that writes the chat's own area: a turn's job writes it as its turn does already.
+    const area = input.by.who === "user" ? (input.area ?? kept.area) : undefined;
+    const plan = input.by.who === "user" ? (input.plan ?? kept.plan) : undefined;
     // The user may give a job to any agent, the main agent among them (§22); an agent, to any but the main agent and the writer, whose work is a turn's reply.
     const may = input.by.who === "user" ? definitions.agents().filter((d) => d.id !== AGENT.writer) : definitions.workers();
     if (!may.some((d) => d.id === agent)) return { refused: texts.render(TEXT.jobs.noAgent, { agent: clip(agent, lineChars), agents: may.map((d) => d.id).join(", ") }) };
@@ -349,6 +398,11 @@ export class Jobs {
       by: input.by,
       basis: input.basis,
       ...(again !== undefined ? { again } : {}),
+      ...(as !== undefined ? { as } : {}),
+      ...(input.lane !== undefined ? { lane: input.lane } : {}),
+      ...(input.due !== undefined ? { due: input.due } : {}),
+      ...(area !== undefined ? { area } : {}),
+      ...(plan !== undefined ? { plan } : {}),
       ...(input.parent ? { parent: input.parent.id } : {}),
       ...(allowance ? { allowance } : {}),
       createdAt: this.host.clock.now(),
@@ -507,6 +561,27 @@ export class Jobs {
     if (!(await host.chat.anchor(job.chatId, turn.messageId, turn.swipeId, record as unknown as JsonValue))) host.log("warn", `[LumiAH] job ${job.id} couldn't be listed on its turn's record: the reply is gone`);
   }
 
+  /**
+   * After a change to the chat's own area that is kept through a swipe of the newest reply (a job
+   * the user started to write it, §22; the user on the page, §11): the records it went beside (the
+   * newest reply's, and the one a swipe of that reply starts from) are written again with their
+   * areas as they stand, so a branch cut there has it. A record's own count of what its turn
+   * changed stays as it was. Written by the same one writer as a job listed on a record, so neither
+   * undoes the other.
+   */
+  anchorNewest(chatId: string): Promise<void> {
+    return this.write(async () => {
+      const { host, areas } = this.shared();
+      const { latest, base } = await areas.newest(chatId);
+      for (const turn of [latest, base ?? null]) {
+        if (turn === null) continue;
+        const head = await areas.at(chatId, turn.record).headHash();
+        if (head === null || head === (turn.record.workspace ?? null)) continue;
+        if (!(await host.chat.anchor(chatId, turn.messageId, turn.swipeId, { ...turn.record, workspace: head } as unknown as JsonValue))) host.log("warn", "[LumiAH] a change to the chat's area couldn't be put on a reply's record: the reply is gone");
+      }
+    });
+  }
+
   /** What a job spent in one run counts against the job that started it too (§22): against that job's run where it is under way here, else in its document. */
   private async charge(parent: string, spent: AgentUsage): Promise<void> {
     const run = this.live.get(parent)?.run;
@@ -558,7 +633,8 @@ export class Jobs {
     if (waiting.job.state !== "queued") return waiting.job;
     let leave: () => void;
     try {
-      leave = await this.gate.enter(signal);
+      // A soon job goes before every later one that waits (§15: its lane).
+      leave = await this.gate.enter(signal, waiting.job.lane === "soon");
     } catch {
       // It never got its place: cancelled while it waited, or the host stopped waiting, in which case it waits on to be run again.
       return live.cancelled !== null ? this.stopped(waiting, { state: "cancelled", reason: live.cancelled }) : waiting.job;
@@ -572,6 +648,8 @@ export class Jobs {
       if (typeof setup === "string") return await this.stopped(doc, live.cancelled !== null ? { state: "cancelled", reason: live.cancelled } : { state: "failed", reason: setup });
       const { settings, texts } = setup;
       if (!settings.jobs.enabled) return await this.stopped(doc, { state: "cancelled", reason: texts.render(TEXT.jobs.whyOff) });
+      // A chat that plays only in a runtime has none of its work done inside Lumiverse (§25): there the job fails, in words that say where it runs, and can be started again there.
+      if (setup.claim?.place === "runtime" && shared.options.place === "builtin") return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyRuntimeOnly) });
       const resolved = setup.definitions.resolve(doc.job.agent, settings);
       if (!resolved) return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyGone, { agent: doc.job.agent }) });
       if (!(await this.stands(doc.job, settings.jobs.recordWaitMs, signal).catch(() => true))) return await this.stopped(doc, { state: "off_path", reason: texts.render(this.ended.get(doc.job.basis ?? "")?.record === false ? TEXT.jobs.whyNoRecord : TEXT.jobs.whyOffPath) });
@@ -621,8 +699,8 @@ export class Jobs {
         const equipment: Equipment = {
           chat: chatView(host, job.chatId, await host.chat.path(job.chatId), settings.tools),
           lore: loreView(host, { chatId: job.chatId, generationId: job.id }, settings.tools),
-          // A job the user started belongs to the chat and to no turn: the chat's own area, which follows the story's path, isn't its to change.
-          areas: job.basis === null ? { chat: areas.now(job.chatId, { gate: async () => texts.render(TEXT.jobs.noChatArea) }), learned, user: areas.user() } : { chat: areas.now(job.chatId, { basis: job.basis, gate: onPath }), learned: gated(learned, onPath), user: gated(areas.user(), onPath) },
+          // A job the user started belongs to the chat and to no turn: the chat's own area, which follows the story's path, isn't its to change, unless it was started to (an extension's prepared start), and then it writes it as the page does, at the latest reply on the path, and beneath that reply too, so a swipe or a regenerate of it keeps the job's work.
+          areas: job.basis === null ? { chat: job.area === "chat" ? areas.now(job.chatId, { throughSwipe: true }) : areas.now(job.chatId, { gate: async () => texts.render(TEXT.jobs.noChatArea) }), learned, user: areas.user() } : { chat: areas.now(job.chatId, { basis: job.basis, gate: onPath }), learned: gated(learned, onPath), user: gated(areas.user(), onPath) },
           past: [],
           basis: job.basis,
         };
@@ -633,7 +711,7 @@ export class Jobs {
         const history = session !== undefined ? sessionOf(await shared.blobs.getJson(session)) : null;
         // A job an agent started is given no more than that agent held (§14), as a sub-agent is, unless its definition keeps its tools whoever starts it; and it stands one deeper than its starter, so what it may delegate is counted on from there. One the user started holds its definition's tools, at 0.
         const grant = held !== undefined && (resolved.definition.grant ?? settings.delegation.grant) === "own" ? { grant: new Set(held) } : {};
-        const { agent, lead } = await run.agent(resolved, { depth: depth ?? 0, task: job.task, notes: true, main: true, ...grant, ...(history ? { history } : {}) });
+        const { agent, lead } = await run.agent(resolved, { depth: depth ?? 0, task: job.task, notes: true, main: true, ...grant, ...(history ? { history } : {}), ...(job.as !== undefined ? { as: job.as } : {}), standing: "job", by: job.by.who === "user" ? "user" : { agentId: job.by.id, role: job.by.role } });
         /** Keeps the job's session as it stands, for a run that carries the job on. */
         const keep = async (): Promise<void> => {
           session = await shared.blobs.putJson(agent.messages() as unknown as JsonValue, false);
@@ -649,10 +727,10 @@ export class Jobs {
             })
             .catch((error: unknown) => host.log("warn", `[LumiAH] job ${job.id}'s session couldn't be kept (${errorText(error)})`));
         };
-        // Only a job the user started is asked for a plan (§22), so only its texts name one.
-        const plan = job.by.who === "user" ? planPath(job.id) : null;
+        // Only a job the user started is asked for a plan (§22), so only its texts name one; a job started to write the chat's own area keeps it where it was told to.
+        const plan = job.by.who === "user" ? (job.plan ?? planPath(job.id)) : null;
         const allowance = allowanceText(run.left(), texts);
-        const message = history ? texts.render(TEXT.jobs.resumed, { allowance, plan: plan === null ? "" : texts.render(TEXT.jobs.resumedPlan, { plan }) }) : plan !== null ? texts.render(TEXT.jobs.objective, { task: doc.task, allowance, plan }) : texts.render(TEXT.jobs.task, { task: doc.task });
+        const message = history ? texts.render(TEXT.jobs.resumed, { allowance, plan: plan === null ? "" : texts.render(TEXT.jobs.resumedPlan, { plan }) }) : plan !== null ? texts.render(job.area === "chat" ? TEXT.jobs.objectiveChat : TEXT.jobs.objective, { task: doc.task, allowance, plan }) : texts.render(TEXT.jobs.task, { task: doc.task });
         const reply = await agent.send(lead === "" ? message : `${lead}\n\n${message}`, signal);
 
         const at = host.clock.now();
@@ -720,6 +798,7 @@ export class Jobs {
         host.log("warn", `[LumiAH] job ${job.id} ended (${state}) and couldn't be written (${errorText(error)})`);
       }
       this.listOn(job);
+      if (job.area === "chat") await this.anchorNewest(job.chatId).catch((error: unknown) => host.log("warn", `[LumiAH] what job ${job.id} wrote to the chat's area couldn't be put on the records it went beside (${errorText(error)}): a branch cut there won't have it`));
       const extension = shared.options.extension;
       run.hook("answer to a run ending", extension?.runEnded ? () => extension.runEnded?.({ userId: run.userId, chatId: job.chatId, turn: job.id, kind: "job", status: ended.status, ...(reason !== undefined ? { reason } : {}), reply: "", record: null, usage }) ?? Promise.resolve() : undefined);
       return job;

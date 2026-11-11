@@ -11,7 +11,7 @@
 // DESIGN §21), as the runtime hands it over. Its code runs in its backend, so each member is a
 // request too, and the runtime is the same for every extension.
 
-import type { ChatClaim, ExtensionDefinitions, HarnessExtension } from "../core/extension";
+import type { AgentModelChoice, ChatClaim, ExtensionDefinitions, HarnessExtension } from "../core/extension";
 import type { ApprovalAnswer, HarnessHost, JobView, JsonValue, LogLevel, ModelDelta, ModelMessage, ModelRequest, ModelResult, TraceDelta, TraceRecord } from "../core/ports";
 import type { ActivatedEntry, LoreBookRead, TimedMessage } from "../core/recall/ports";
 import type { ExtensionMember, ExtensionOffer, LinkRequests, StreamChunk } from "../link/contract";
@@ -355,9 +355,12 @@ function messagesOf(value: JsonValue | undefined): ModelMessage[] | null {
 /**
  * What the extension LumiAH is built into supplies to the core, over the link. A member the
  * extension said it doesn't have is answered here as the core takes "not supplied" (no definitions,
- * no claim, the request as the core built it, nothing for a hook), without a request. What reads
- * (its definitions, a claim, the writer's request) is asked again after a socket that closed under
- * it; a hook is sent once, so the extension never hears one twice.
+ * no claim, the request as the core built it, the definition's own model, a passage let go, nothing
+ * for a hook), without a request. What reads (its definitions, a claim, the writer's request, an
+ * agent's model) is asked again after a socket that closed under it. A hook, and the check before a
+ * passage goes out (`releasing`, which may do work in the extension), are sent once, so the
+ * extension never hears one twice: one whose answer is lost fails, as the core takes a check that
+ * failed.
  */
 export function linkExtension(deps: ExtensionDeps): HarnessExtension {
   const has = (member: ExtensionMember): boolean => deps.offer()?.members.includes(member) === true;
@@ -368,13 +371,19 @@ export function linkExtension(deps: ExtensionDeps): HarnessExtension {
     return answer.supplied ? answer.value : undefined;
   }
 
-  async function tell(member: ExtensionMember, arg: JsonValue): Promise<void> {
-    if (!has(member)) return;
+  /** Sent once: its answer (undefined where it has none), or a failure in the link's words. */
+  async function once(member: ExtensionMember, arg: JsonValue): Promise<JsonValue | undefined> {
+    if (!has(member)) return undefined;
     try {
-      await deps.link.request("extension.call", { member, arg }, deps.tuning().lostMs);
+      const answer = await deps.link.request("extension.call", { member, arg }, deps.tuning().lostMs);
+      return answer.supplied ? answer.value : undefined;
     } catch (error) {
       throw new Error(problemOf(error).message, { cause: error });
     }
+  }
+
+  async function tell(member: ExtensionMember, arg: JsonValue): Promise<void> {
+    await once(member, arg);
   }
 
   // What the core hands a member is JSON by its contract (extension.ts); the cast says so to the link.
@@ -394,7 +403,16 @@ export function linkExtension(deps: ExtensionDeps): HarnessExtension {
       return isRecord(value) ? (value as unknown as ChatClaim) : null;
     },
     writerRequest: async (request) => messagesOf(await read("writerRequest", json(request))),
+    agentModel: async (ask) => {
+      const value = await read("agentModel", json(ask));
+      return isRecord(value) ? (value as unknown as AgentModelChoice) : null;
+    },
     runBegan: (run) => tell("runBegan", json(run)),
+    releasing: async (release) => {
+      const value = await once("releasing", json(release));
+      return isRecord(value) && typeof value.refused === "string" ? { refused: value.refused } : null;
+    },
+    released: (release) => tell("released", json(release)),
     replyWritten: (reply) => tell("replyWritten", json(reply)),
     runEnded: (run) => tell("runEnded", json(run)),
   };

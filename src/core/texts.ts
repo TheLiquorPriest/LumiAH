@@ -96,6 +96,9 @@ export const TEXT = {
     directed: "main.turn.directed",
     direction: "main.turn.directed.direction",
     noDirection: "main.turn.directed.none",
+    turnNewest: "main.turn.newest",
+    noNewest: "main.turn.newest.none",
+    askReleases: "main.turn.ask.releases",
   },
   request: {
     message: "request.message",
@@ -165,6 +168,13 @@ export const TEXT = {
     replyFailed: "tool.answer.reply_failed",
     replyNoBrief: "tool.answer.reply_no_brief",
     replyEmpty: "tool.answer.reply_empty",
+    replyReleased: "tool.answer.reply_released",
+    released: "tool.answer.released",
+    releaseBuiltIn: "tool.answer.release_built_in",
+    releaseWriter: "tool.answer.release_writer",
+    releaseHeld: "tool.answer.release_held",
+    releaseUnchecked: "tool.answer.release_unchecked",
+    releaseEnded: "tool.answer.release_ended",
   },
   progress: {
     session: "progress.session",
@@ -184,6 +194,8 @@ export const TEXT = {
     retry: "progress.retry",
     stopped: "progress.stopped",
     turnStopped: "progress.turn_stopped",
+    dueWait: "progress.due_wait",
+    nothingReleased: "progress.nothing_released",
   },
   /** A noun as answers and notes count with it: its text holds the word for one and the word for several, with `|` between. */
   word: {
@@ -373,6 +385,16 @@ const MAIN_TEXTS: TextDef[] = [
   },
   { id: TEXT.main.direction, group: MAIN, label: "The direction for this reply", note: "Fills {{direction}} with the user's newest message, read from the chat, where it is given to the main agent (Your newest message: give it as the direction).", text: "\n\nThe direction for this reply:\n{{text}}", vars: [v("text", "the user's newest message", true)] },
   { id: TEXT.main.noDirection, group: MAIN, label: "No direction for this reply", note: "Fills {{direction}} where the chat ends with a reply, or with a message the user hid, so the user gave no direction for this one.", text: "\n\nThe user gave no direction for this reply: carry the story on from where it stands.", vars: [] },
+  {
+    id: TEXT.main.turnNewest,
+    group: MAIN,
+    label: "A turn's message, with only the newest message",
+    note: "What the main agent is sent each turn in a chat whose extension shows it only the user's newest message, not the whole request Lumiverse assembled.",
+    text: "{{kind}}\n\n{{notes}}The user's newest message:\n\n{{message}}\n\n{{ask}}",
+    vars: [v("kind", "why a reply is needed, in the words above", true), v("notes", "what changed about its notes since its last turn, each ending in a blank line; nothing when there is none of it. Required: a summary of its notes reaches the agent only here when no later turn follows it", true), v("message", "the user's newest message, framed as a message of the request is, or that there is none", true), v("ask", "what to do, in the words above", true)],
+  },
+  { id: TEXT.main.noNewest, group: MAIN, label: "No newest message", note: "Fills {{message}} where the request holds no message from the user.", text: "The request holds no message from the user: carry the story on from where it stands.", vars: [] },
+  { id: TEXT.main.askReleases, group: MAIN, label: "What to do: release the reply", note: "Fills {{ask}} in a chat whose reply is only what its agents release: no writer writes it.", text: "Work out what this reply needs, then release it with reply_write, a passage at a time, or hand it to an agent with delegate and to_reply. Nothing else reaches the user.", vars: [] },
 ];
 
 const REQUEST_TEXTS: TextDef[] = [
@@ -431,6 +453,7 @@ const TOOL_TEXTS: TextDef[] = [
   ...tool(TOOL.presetInstructions, "List the active preset's instruction blocks in order, those switched off marked: what the preset's author tells the model, as written in the preset, before Lumiverse fills in its macros. Give block to read one whole.", { block: "A block's id or name, to read that block whole.", cursor: CURSOR }),
   ...tool(TOOL.pastTurn, "Read or search an earlier turn of yours in full: every tool call you made with what came back, and your brief, where your notes keep only a receipt. Without arguments it lists your turns. Give reply to list that turn's steps; add step to read one whole; give grep to find the lines that hold some text, in that turn or, without reply, in your latest turns.", { reply: "The reply's number in the chat, as your receipts name it (reply #12).", step: "Which of the turn's steps to read whole, by its number in the turn's list.", grep: "Text to find, in any letter case: every line that holds it, with its reply, step and line.", cursor: CURSOR }),
   ...tool(TOOL.writeReply, "Hand the writer your brief and have it write the reply, which goes to the user. This ends your turn: call it once, when you have what the reply needs, and call nothing else beside it.", { brief: "What the writer needs that the prompt doesn't already give it: facts to keep straight, lore that bears on this moment, the thread to pick up. Short and specific; no prose for the reply itself." }),
+  ...tool(TOOL.replyWrite, "Release a passage of the reply: it streams to the user at once, after what was released before. Call it again for the next passage; the reply is everything released, in order. Released text can't be taken back. Your turn ends when you answer.", { text: "The passage, exactly as the user should read it." }),
 ];
 
 const ANSWER_TEXTS: TextDef[] = [
@@ -466,6 +489,13 @@ const ANSWER_TEXTS: TextDef[] = [
   { id: TEXT.answer.replyFailed, group: ANSWERS, label: "write_reply: the writer failed", note: "write_reply's answer when the writer's call failed before any of the reply was sent.", text: "The writer couldn't write the reply: {{reason}}. Nothing was sent to the user. Call write_reply again to try once more.", vars: [v("reason", "why", true)] },
   { id: TEXT.answer.replyNoBrief, group: ANSWERS, label: "write_reply: no brief", note: "write_reply's answer to a call without a brief.", text: "write_reply needs brief: what the writer needs that the prompt doesn't already give it. When the prompt holds everything, say that in a line. Call write_reply again with brief.", vars: [] },
   { id: TEXT.answer.replyEmpty, group: ANSWERS, label: "write_reply: an empty reply", note: "Fills {{reason}} in The writer failed, and the turn's error, when the writer's model answered with nothing.", text: "its model answered with nothing", vars: [] },
+  { id: TEXT.answer.replyReleased, group: ANSWERS, label: "write_reply: the reply was released already", note: "write_reply's answer once part of the reply was released with reply_write: no writer writes after it.", text: "Not handed to the writer: you released part of this reply with reply_write, so the reply is yours to finish. Go on with reply_write, or end your turn.", vars: [] },
+  { id: TEXT.answer.released, group: ANSWERS, label: "reply_write: released", note: "reply_write's answer once its passage reached the user.", text: "Released: {{chars}} characters reached the user. The reply holds {{total}} characters now. Release the next passage, or end your turn.", vars: [v("chars", "the passage's length", true), v("total", "the reply's length so far")] },
+  { id: TEXT.answer.releaseBuiltIn, group: ANSWERS, label: "reply_write: built in", note: "The answer of reply_write, and of delegate with to_reply, in a chat that runs inside Lumiverse: there Lumiverse's own generation writes the reply.", text: "Not released: this chat runs inside Lumiverse, which writes the reply itself, so no agent can release it here. Brief the writer with write_reply instead.", vars: [] },
+  { id: TEXT.answer.releaseWriter, group: ANSWERS, label: "reply_write: the writer has the reply", note: "The answer of reply_write, and of delegate with to_reply, once the writer is writing the reply or has written it.", text: "Not released: the writer is writing this reply, or has written it, so nothing more can go into it.", vars: [] },
+  { id: TEXT.answer.releaseHeld, group: ANSWERS, label: "reply_write: another agent's answer is streaming", note: "The answer of reply_write, and of delegate with to_reply, while a sub-agent's answer streams into the reply.", text: "Not released: another agent's answer is streaming into the reply now. Wait for that call to end, then release yours.", vars: [] },
+  { id: TEXT.answer.releaseUnchecked, group: ANSWERS, label: "reply_write: the extension didn't say", note: "reply_write's answer when the extension that checks each passage gave no word on it in time, or gave one that isn't a word: nothing goes out unchecked.", text: "Not released: the check on each passage didn't answer, so nothing was sent. Try again.", vars: [] },
+  { id: TEXT.answer.releaseEnded, group: ANSWERS, label: "reply_write: the reply has ended", note: "The answer of reply_write, and of delegate with to_reply, once the turn's reply has ended or the turn was stopped.", text: "Not released: this reply has ended.", vars: [] },
 ];
 
 const PROGRESS_TEXTS: TextDef[] = [
@@ -486,6 +516,8 @@ const PROGRESS_TEXTS: TextDef[] = [
   { id: TEXT.progress.retry, group: PROGRESS, label: "Trying a call again", note: "A line each time a model call that failed in passing is made again, whichever of the turn's agents made it.", text: "A model call failed ({{reason}}); trying again, {{attempt}} of {{retries}}…", vars: [v("reason", "the failure, in the provider's own words", true), v("attempt", "which try this is"), v("retries", "how many Settings allow")] },
   { id: TEXT.progress.stopped, group: PROGRESS, label: "Stopped", note: "A line when the turn ends without a reply.", text: "No reply: {{reason}}.", vars: [v("reason", "why", true)] },
   { id: TEXT.progress.turnStopped, group: PROGRESS, label: "Why: the turn was stopped", note: "The reason a turn gives when it was stopped before its agents could say why.", text: "the turn was stopped", vars: [] },
+  { id: TEXT.progress.dueWait, group: PROGRESS, label: "Waiting for jobs due", note: "A line when a turn waits at its start for the jobs started as due by it.", text: "Waiting for {{jobs}} due by this turn…", vars: [v("jobs", 'how many, with the word: "2 jobs"', true)] },
+  { id: TEXT.progress.nothingReleased, group: PROGRESS, label: "Why: nothing was released", note: "Why a turn failed in a chat whose reply is only what its agents release, when they released none of it. No writer writes in their place there.", text: "the agents ended without releasing any of the reply, and in this chat no writer writes it in their place", vars: [] },
 ];
 
 /** The nouns counts are written with. */

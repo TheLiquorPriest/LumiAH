@@ -18,7 +18,7 @@
 //   the turn's commit take LumiAH's record alone.
 
 import type { AgentDefinition } from "./agents";
-import type { AgentUsage, ChatInfo, ModelMessage, RunKind, TurnKind, TurnRecord, TurnStatus } from "./ports";
+import type { AgentRef, AgentUsage, ChatInfo, ModelEffort, ModelMessage, RunKind, TurnKind, TurnRecord, TurnStatus } from "./ports";
 import type { Skill } from "./skills";
 import type { StorySetting, StorySource } from "./story";
 
@@ -40,12 +40,23 @@ export type GuidanceLevel = { name: string; path: string } | { name: string; tex
  * claims, a tool of its that bears the name of one of LumiAH's replaces it (its `lore_search`, with
  * rules of its own, is the one offered). In every other chat LumiAH's stands and the extension's
  * tool of that name isn't offered. A claim that names nothing (`{}`) is still a claim.
+ *
+ * `place: "runtime"` says the chat plays only in a runtime (§25): a core that runs built in never
+ * runs its turns, jobs or side sessions, and hands a turn's prompt back as it came. `request` says
+ * what of the request Lumiverse assembled the main agent is shown (and a sub-agent given the
+ * request): all of it (`whole`, the default), or only the user's newest message (`newest`).
+ * `reply: "released"` says the reply is only what the chat's agents release (`reply_write`,
+ * `delegate`'s `to_reply`): in a runtime no writer writes it, and a turn that released nothing
+ * fails with a plain reason. Built in, the reply is Lumiverse's own whatever it says.
  */
 export interface ChatClaim {
   mainAgent?: string;
   guidance?: GuidanceLevel;
   withdraw?: string[];
   story?: Partial<StorySetting>;
+  place?: "runtime";
+  request?: "whole" | "newest";
+  reply?: "released";
 }
 
 /** An extension's own definitions: its defaults, which the user's still override (§13). */
@@ -105,6 +116,49 @@ export interface ReplyWritten {
   finish: string;
 }
 
+/**
+ * Which model an agent of a run is about to run on, asked of the extension (`agentModel`): the
+ * definition it runs as, which instance of it (`as`, from `delegate` or `job_start`; null where
+ * nobody said), how it stands (`turn`: an agent the run starts itself, such as a turn's main agent
+ * or the writer, or a side session's agent; `sub`: one another agent started; `job`: a job's
+ * agent), and who started it (the agent that delegated or started the job, the user who started
+ * the job, or null for an agent the run starts itself).
+ */
+export interface AgentModelAsk {
+  userId: string;
+  chatId: string;
+  turn: string;
+  kind: RunKind;
+  definition: string;
+  as: string | null;
+  standing: "turn" | "sub" | "job";
+  by: AgentRef | "user" | null;
+}
+
+/** The extension's word on an agent's model: each member given stands over the definition's own; one left out, or null, leaves the definition's. */
+export interface AgentModelChoice {
+  connectionId?: string | null;
+  model?: string | null;
+  effort?: ModelEffort | null;
+}
+
+/**
+ * A passage of a turn's reply an agent releases itself (`reply_write`), or a sub-agent's answer
+ * that streamed into it (`delegate`'s `to_reply`): the turn (its generation's id), the agent whose
+ * text it is, and the text. Asked about before a `reply_write` passage goes out (`releasing`), and
+ * told of once one went out or a stream ended (`released`).
+ */
+export interface ReplyRelease {
+  userId: string;
+  chatId: string;
+  turn: string;
+  agent: AgentRef;
+  text: string;
+}
+
+/** The extension's word on a passage: refused (`refused` is what the agent is told), or null to let it go. */
+export type ReleaseVerdict = { refused: string } | null;
+
 /** A run ended: how, what it spent, and, for a turn that answered a generation, the reply it sent and the record it leaves. */
 export interface RunEnded {
   userId: string;
@@ -132,6 +186,18 @@ export interface HarnessExtension {
   writerRequest?(request: WriterRequest): Promise<ModelMessage[] | null>;
   /** A run begins: nothing of it has been sent to a model yet, and nothing is until this answers (or its wait runs out). */
   runBegan?(run: RunBegan): Promise<void>;
+  /** Which connection, model and effort an agent runs on, asked as each agent of a run starts. Null: its definition's own, as without this. */
+  agentModel?(ask: AgentModelAsk): Promise<AgentModelChoice | null>;
+  /**
+   * Whether a passage an agent releases with `reply_write` may go out, asked before it does: a
+   * refusal is the call's answer and nothing streams. Without this member, every passage goes. An
+   * answer that is neither null nor a refusal, or none within Settings' wait, lets nothing go: what
+   * the user reads is held to what the extension let through. A sub-agent's answer streaming into
+   * the reply (`to_reply`) is never asked about, only told.
+   */
+  releasing?(release: ReplyRelease): Promise<ReleaseVerdict>;
+  /** A passage went out (`reply_write`), or a sub-agent's answer finished streaming into the reply (`to_reply`): what reached the user. */
+  released?(release: ReplyRelease): Promise<void>;
   /** A turn's reply has been written and its stream ended. */
   replyWritten?(reply: ReplyWritten): Promise<void>;
   /** A run ended, whichever way. */

@@ -168,7 +168,7 @@ const io: RuntimeIO = {
   extension: EXTENSION_IDENTIFIER,
   build: BUILD,
   version: pkg.version,
-  harness: (host, settings, extension) => createHarness(host, { settings, extension }),
+  harness: (host, settings, extension) => createHarness(host, { settings, extension, place: "runtime" }),
   // The writer's connection is the writer agent's own setting, in the core's section of the settings.
   writerConnection: (values) => settingsOf(isRecord(values) ? values.core : undefined).agents[AGENT.writer]?.connectionId ?? null,
 };

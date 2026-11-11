@@ -47,6 +47,8 @@ export interface AsksDeps {
   placeOf(userId: string, chatId: string): Promise<RunPlace>;
   /** The runtime a chat that runs in one generates on (the one whose loopback connection the chat is on), by its id; null while that runtime isn't linked. */
   runtimeOf(userId: string, chatId: string): Promise<string | null>;
+  /** Whether the extension that answers a chat plays it only in a runtime, and its name; null where it doesn't. */
+  needsRuntime(userId: string, chatId: string): Promise<{ by: string } | null>;
   /** The runtime a run under way runs in (`BUILTIN`: none, it runs here); null when it isn't under way. */
   runOf(userId: string, stream: string, turn: string): string | null;
   /** The runtime a job that isn't over runs in (`BUILTIN`: here); null when nothing was heard of it since the extension started. */
@@ -100,8 +102,8 @@ export class Asks {
     }
   }
 
-  /** Where a request is done: `BUILTIN`, or a runtime by its id; null: in its chat's runtime, which isn't linked. */
-  private async place(userId: string, where: Where): Promise<string | null> {
+  /** Where a request is done: `BUILTIN`, or a runtime by its id; `{ chat }`: in that chat's runtime, which isn't linked. */
+  private async place(userId: string, where: Where): Promise<string | { chat: string }> {
     if (where.run !== undefined) return this.deps.runOf(userId, where.run.stream, where.run.turn) ?? BUILTIN;
     let chat = where.chat ?? null;
     if (where.job !== undefined) {
@@ -109,7 +111,15 @@ export class Asks {
       if (runs !== null) return runs;
       chat = await this.chatOf(userId, "jobs.read", where.job);
     } else if (where.side !== undefined) chat = await this.chatOf(userId, "sides.turns", where.side);
-    return chat !== null && (await this.deps.placeOf(userId, chat)) === "runtime" ? this.deps.runtimeOf(userId, chat) : BUILTIN;
+    if (chat === null || (await this.deps.placeOf(userId, chat)) !== "runtime") return BUILTIN;
+    return (await this.deps.runtimeOf(userId, chat)) ?? { chat };
+  }
+
+  /** What a page is told of a chat whose runtime isn't linked: to start it, and, where the chat may run built in, that it may. */
+  private async awayWords(userId: string, chatId: string): Promise<string> {
+    const start = `Start it (its line is on ${this.deps.name}'s Runtime page) and try again`;
+    const needs = await this.deps.needsRuntime(userId, chatId).catch(() => null);
+    return needs !== null ? `${needs.by} plays this chat only in your runtime, which isn't linked now. ${start}.` : `This chat runs in a runtime, and its runtime isn't linked. ${start}, or set the chat to run built in, which needs no runtime.`;
   }
 
   /**
@@ -121,7 +131,7 @@ export class Asks {
   async ask(userId: string, op: string, args: JsonObject, where: Where = {}): Promise<JsonValue> {
     const relay = await this.place(userId, where);
     if (relay === BUILTIN) return this.deps.builtin(userId, op, args);
-    if (relay === null) throw new UiRefused("unavailable", `This chat runs in a runtime, and its runtime isn't linked. Start it (its line is on ${this.deps.name}'s Runtime page) and try again, or set the chat to run built in, which needs no runtime.`);
+    if (typeof relay !== "string") throw new UiRefused("unavailable", await this.awayWords(userId, relay.chat));
     const waitMs = (await this.deps.settings.transport(userId)).pages.askMs;
     const id = this.deps.id();
     const { promise, resolve, reject } = Promise.withResolvers<JsonValue>();

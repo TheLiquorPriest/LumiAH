@@ -354,8 +354,8 @@ export class FakeLumiverse {
       if (failed !== null) Object.assign(out, { status: 500, error: { message: failed, code: "interceptor" } });
       else if (!stop.signal.aborted) {
         options.onPrompt?.(body);
-        // A connection that is the runtime's loopback is the runtime's to answer; any other is a provider Lumiverse calls itself.
-        if (connection.url === `http://127.0.0.1:${options.port}/v1`) Object.assign(out, await this.post(fetch, body, { ...options, signal: stop.signal }));
+        // A connection that is the runtime's loopback is the runtime's to answer; any other is a provider Lumiverse calls itself. A loopback nothing listens on (the runtime's process is gone) fails the generation in Lumiverse's own words, as any provider it can't reach does.
+        if (connection.url === `http://127.0.0.1:${options.port}/v1`) Object.assign(out, await this.post(fetch, body, { ...options, signal: stop.signal }).catch((error: unknown) => ({ status: 0, error: { message: error instanceof Error ? error.message : String(error), code: "unreachable" } })));
         else Object.assign(out, await this.provide(body, connection.id, stop.signal, options.onPiece));
       }
     } finally {

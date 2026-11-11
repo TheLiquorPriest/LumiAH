@@ -114,7 +114,7 @@ Four are needed. The rest are optional: without one, the part that rests on it i
 
 ### For long turns: the runtime (optional)
 
-Built in, an agent has up to five minutes before a reply, and longer work goes to background jobs. For turns that need longer, or to have the agent's steps appear in the reply's thinking block, run LumiAH's runtime beside Lumiverse. It is one line, shown on the Runtime page, and you choose it chat by chat. A chat set to the runtime depends on it: while the runtime is down its replies fail, LumiAH tells you so, and Home offers one tap to run the chat built in. See [docs/RUNTIME.md](docs/RUNTIME.md).
+Built in, an agent has up to five minutes before a reply, and longer work goes to background jobs. For turns that need longer, for agents that write the reply themselves (passage by passage, or a character's answer streamed straight to you), or to have the agents' steps appear in the reply's thinking block, run LumiAH's runtime beside Lumiverse. It is one line, shown on the Runtime page, and runs on Linux (as a systemd service), macOS (under launchd) and Windows (under Task Scheduler). You choose it chat by chat. A chat set to the runtime depends on it: while the runtime is down its replies fail, LumiAH tells you so, and Home offers one tap to run the chat built in. An extension built on LumiAH may play its chats only in the runtime (LumiRPEngine does): those chats have no built-in way, and its pages say what to do while the runtime is down. The runtime links again by itself when Lumiverse restarts. See [docs/RUNTIME.md](docs/RUNTIME.md).
 
 ## Build on it
 

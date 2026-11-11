@@ -67,9 +67,9 @@ describe("the schema and the defaults", () => {
     expect(s.guidance).toEqual({ chars: 8000, agentsEdit: false });
     expect(s.skills).toEqual({ listChars: 4000 });
     // Two deep: the main agent delegates, and so does a job it starts (the job's agent stands at 1); whoever those hand a task to stands at 2 and hands nothing on.
-    expect(s.delegation).toEqual({ depth: 2, atOnce: 3, perRun: 12, grant: "own", fileChars: 12_000 });
-    // A job's sub-agents have no count of their own, since its allowance bounds them.
-    expect(s.jobs).toEqual({ enabled: true, atOnce: 1, perRun: 3, budget: { tokensIn: 600_000, tokensOut: 60_000, toolTurns: 60, wallMs: 900_000 }, tokensPerDay: 3_000_000, taskChars: 4000, openingChars: 600, recordWaitMs: 120_000, chain: true, delegations: null });
+    expect(s.delegation).toEqual({ depth: 2, atOnce: 3, perRun: 12, grant: "own", fileChars: 12_000, asChars: 200, replyHoldChars: 200 });
+    // A job's sub-agents have no count of their own, since its allowance bounds them. A turn waits a minute at most for the jobs due by it.
+    expect(s.jobs).toEqual({ enabled: true, atOnce: 1, perRun: 3, budget: { tokensIn: 600_000, tokensOut: 60_000, toolTurns: 60, wallMs: 900_000 }, tokensPerDay: 3_000_000, taskChars: 4000, openingChars: 600, recordWaitMs: 120_000, chain: true, delegations: null, dueWaitMs: 60_000 });
     expect(settingsOf({ jobs: { delegations: 4 } }).jobs.delegations).toBe(4);
     // No tier waits for the user's word as it ships: a tool that acts outside LumiAH is one they set up and switched on. Asking first is theirs to choose, by tier or by tool.
     expect(s.approval).toEqual({ tiers: { read: "allow", write: "allow", external: "allow" }, tools: {}, waitMs: 300_000 });

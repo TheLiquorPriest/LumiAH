@@ -98,13 +98,15 @@ export function chatStanding(chat: ChatView, state: Pick<UiState, "permissions" 
   }
   if (neededPermissions(state).length > 0) return stands(false, "warn", "Switched on, but LumiAH can't work on a reply until it is allowed what it needs.");
   if (chat.place === "builtin") return stands(true, "pos", "LumiAH prepares each reply in this chat, built in.");
+  // A chat its extension plays only in a runtime has no built-in way: what is wrong is said, with no press that would run it built in.
+  const only = chat.needsRuntime;
   // Its runtime isn't linked now: nothing stands in for it, so a reply may fail until it is back, or until the chat is set to run built in, which is one press.
-  if (chat.away === true) return stands(false, "warn", "Set to run in your runtime, which isn't answering, so replies here may fail until it is back.", { label: "Run it built in", place: "builtin" });
+  if (chat.away === true) return only !== undefined ? stands(false, "warn", `${only.by} plays this chat only in your runtime, which isn't answering, so it can't play until the runtime is back. Its line is on the Runtime page.`) : stands(false, "warn", "Set to run in your runtime, which isn't answering, so replies here may fail until it is back.", { label: "Run it built in", place: "builtin" });
   if (chat.connection?.loopback !== true) {
-    const fix = state.runtime.ready ? { label: "Pin it back", place: "runtime" as const } : { label: "Run it built in", place: "builtin" as const };
+    const fix = only !== undefined || state.runtime.ready ? { label: "Pin it back", place: "runtime" as const } : { label: "Run it built in", place: "builtin" as const };
     return stands(false, "warn", `Set to run in the runtime, but it generates on ${connection}, which isn't the runtime's connection, so its replies don't reach LumiAH.`, fix);
   }
-  if (!state.runtime.ready) return stands(false, "warn", "Set to run in the runtime, but none is linked now, so its replies fail until one is.", { label: "Run it built in", place: "builtin" });
+  if (!state.runtime.ready) return only !== undefined ? stands(false, "warn", `${only.by} plays this chat only in your runtime, and none is ready now, so it can't play until one is. See the Runtime page.`) : stands(false, "warn", "Set to run in the runtime, but none is linked now, so its replies fail until one is.", { label: "Run it built in", place: "builtin" });
   return stands(true, "pos", "LumiAH prepares each reply in this chat, in your runtime.");
 }
 
@@ -144,7 +146,8 @@ export function runtimeBegun(state: Pick<UiState, "runtime" | "key" | "connectio
 export function runtimeTrouble(state: Pick<UiState, "runtime" | "key" | "connections" | "chats">): string | null {
   if (state.runtime.ready || !runtimeBegun(state)) return null;
   const waiting = state.chats.filter((c) => c.on && c.place === "runtime");
-  if (waiting.length > 0) return `${counted(waiting.length, "chat is", "chats are")} set to run in the runtime, and none is ready: replies there may fail until one is, or until the chat is set to run built in.`;
+  // A chat its extension plays only in the runtime can't be set to run built in: the way out is said only where some chat can.
+  if (waiting.length > 0) return `${counted(waiting.length, "chat is", "chats are")} set to run in the runtime, and none is ready: replies there may fail until one is${waiting.some((c) => c.needsRuntime === undefined) ? ", or until the chat is set to run built in" : ""}.`;
   if (state.runtime.relays.length > 0 && !state.runtime.relays.some((r) => r.link === "linked")) return "Your runtime isn't linked. No chat is set to run in it, so nothing is lost.";
   return null;
 }

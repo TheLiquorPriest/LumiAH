@@ -64,9 +64,13 @@ export interface AgentSpec {
   params?: SamplingParams;
   /** Where a streamed answer's text and reasoning go as they arrive; with it, its calls stream whatever Settings say. */
   onDelta?: (delta: ModelDelta) => void;
+  /** Told as each of its model calls comes back: the answer's text, and how many tool calls it made (none: it is the agent's answer). */
+  onCall?: (answer: { text: string; calls: number }) => void;
   /** The agent that started it, and what for, as the trace tells it. */
   parent?: string;
   task?: string;
+  /** Which instance of its definition it is, where whoever started it said (`as`, §14): its tools are told it with the rest of who called. */
+  as?: string;
   /**
    * What the user said to it since it last looked (DESIGN §18): asked at the start of each round,
    * and whatever it gives joins the conversation there, marked as the user's. Absent: nobody talks
@@ -384,7 +388,7 @@ class Agent implements AgentHandle {
     if (this.tools.size > 0) this.tools.set(SCRATCH_READ, this.scratchRead());
     this.offered = [...this.tools.values()].map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
     this.offeredTokens = toolTokens(this.offered, settings.loop.charsPerToken);
-    deps.turn?.trace?.start({ id: this.id, role: spec.role, connectionId: spec.connectionId, model: spec.model, effort: spec.effort, system: spec.system, prefix: [...spec.prefix], history: this.conversation.length, ...(spec.parent !== undefined ? { parent: spec.parent } : {}), ...(spec.task !== undefined ? { task: spec.task } : {}), at: this.now() });
+    deps.turn?.trace?.start({ id: this.id, role: spec.role, connectionId: spec.connectionId, model: spec.model, effort: spec.effort, system: spec.system, prefix: [...spec.prefix], history: this.conversation.length, ...(spec.parent !== undefined ? { parent: spec.parent } : {}), ...(spec.task !== undefined ? { task: spec.task } : {}), ...(spec.as !== undefined ? { as: spec.as } : {}), at: this.now() });
   }
 
   private now(): number {
@@ -578,6 +582,7 @@ class Agent implements AgentHandle {
         at: this.now(),
         ...(prompt !== undefined ? { prompt } : {}),
       });
+      this.spec.onCall?.({ text: reply.text, calls: reply.calls.length });
       if (reply.calls.length === 0) {
         this.answered = true;
         this.conversation.push({ role: "assistant", content: reply.text });
@@ -932,7 +937,7 @@ class Agent implements AgentHandle {
         else {
           state = tool.state?.() ?? null;
           begun = true;
-          outcome = await this.raced(tool.run(call.args, { signal, agentId: this.id, role: this.spec.role, callId: call.id }), signal);
+          outcome = await this.raced(tool.run(call.args, { signal, agentId: this.id, role: this.spec.role, callId: call.id, ...(this.spec.as !== undefined ? { as: this.spec.as } : {}) }), signal);
         }
       } catch (error) {
         const stopped = signal.aborted ? this.why(error, signal) : null;

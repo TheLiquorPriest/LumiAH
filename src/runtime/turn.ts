@@ -12,6 +12,13 @@
 // view, or Lumiverse's own stop heard there), or when the runtime shuts down; the core hears each
 // as its signal, and its model calls under way are cancelled with it.
 //
+// A reply may come in several pieces: each passage the engine released, one after another, a
+// sub-agent's answer handed on as it is generated. Each goes out as it comes, in the order the core
+// handed it, as the one completion Lumiverse reads; the agents' progress lines go to the reply's
+// thinking block before, between and after them. Once the turn's signal has ended, nothing more
+// goes out but its end: the core counts as released only what it handed before then, so what a
+// stopped turn tells the extension it released is what the user saw.
+//
 // A reply the user stopped never ends as an error, which Lumiverse would show as a failed
 // generation. Lumiverse knows of its own Stop and has closed the request. It doesn't know of a stop
 // from the live view, so the runtime asks it to stop the generation as its own Stop does; where that
@@ -203,10 +210,14 @@ export class Turns implements TurnRunner {
         params: samplingOf(request.body),
         maxTokens: maxTokensOf(request.body),
       };
+      /** A piece of the reply, as the core hands it: out at once, unless the turn was stopped meanwhile. */
+      const out = (piece: ReplyPiece): void => {
+        if (!stop.signal.aborted) answer.piece(piece, this.env.now());
+      };
       const sink: ReplySink = {
-        progress: (text) => answer.piece({ kind: "progress", text }, this.env.now()),
-        reasoning: (text) => answer.piece({ kind: "reasoning", text }, this.env.now()),
-        content: (text) => answer.piece({ kind: "content", text }, this.env.now()),
+        progress: (text) => out({ kind: "progress", text }),
+        reasoning: (text) => out({ kind: "reasoning", text }),
+        content: (text) => out({ kind: "content", text }),
         // The end of a reply the user stopped is written once the turn is over (below).
         done: (finish, usage) => {
           const piece: ReplyPiece = { kind: "finish", finish: finish === "" ? "stop" : finish, usage: usageJson(usage, facts.turn) };

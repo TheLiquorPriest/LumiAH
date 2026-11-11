@@ -185,7 +185,7 @@ function remoteDefinition(tool: RemoteTool, host: Pick<HarnessHost, "tools">): T
         async run(args, ctx) {
           const { main = false, above = [] } = env.standing ?? {};
           // What the port answers comes from outside the core, whatever its type says: an answer that holds no text is a tool that gave nothing, told in words the agent can go on from.
-          const answer: unknown = await port.call({ name: tool.name, args, turn: env.run.id, chatId: env.run.chatId, agentId: ctx.agentId, role: ctx.role, callId: ctx.callId, kind: env.run.kind, main, above: above.map(({ agentId, role }) => ({ agentId, role })) }, ctx.signal);
+          const answer: unknown = await port.call({ name: tool.name, args, turn: env.run.id, chatId: env.run.chatId, agentId: ctx.agentId, role: ctx.role, callId: ctx.callId, kind: env.run.kind, main, above: above.map(({ agentId, role, as }) => ({ agentId, role, ...(as !== undefined ? { as } : {}) })), ...(ctx.as !== undefined ? { as: ctx.as } : {}) }, ctx.signal);
           // A file the tool's owner kept for this call (`harness.workspace.writeAs`) is the call's change: it rides on its result, as a built-in workspace tool's does.
           const files = takeChanges(env.run, ctx.callId);
           const changed = files.length > 0 ? { files } : {};

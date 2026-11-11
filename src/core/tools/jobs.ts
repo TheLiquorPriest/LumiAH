@@ -12,7 +12,7 @@
 // the state stands still, and asking the same again and again is a loop like any other.
 
 import { jobBy, jobEnded, jobLeft, jobState } from "../job-words";
-import type { JobView, JobWhen, JsonObject } from "../ports";
+import type { JobDue, JobLane, JobView, JobWhen, JsonObject } from "../ports";
 import { FAMILY, TEXT, TOOL } from "../texts";
 import type { JobRead, ToolCtx, ToolDefinition, ToolEnv, ToolOutcome } from "../tools";
 import { clip, textArg } from "../util";
@@ -24,6 +24,18 @@ function whenOf(raw: unknown): JobWhen | null {
   return raw === "now" || raw === "after_reply" ? raw : null;
 }
 
+/** A job's lane as a call names it: none where it names none; null for anything else. */
+function laneOf(raw: unknown): JobLane | undefined | null {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  return raw === "soon" || raw === "later" ? raw : null;
+}
+
+/** Whether a call asks the next turn to wait for its job: none where it says nothing; null for anything else. */
+function dueOf(raw: unknown): JobDue | undefined | null {
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  return raw === "next_turn" ? raw : null;
+}
+
 const jobStart: ToolDefinition = {
   name: TOOL.jobStart,
   family: FAMILY.jobs,
@@ -32,7 +44,7 @@ const jobStart: ToolDefinition = {
     const { texts, jobs } = env;
     const start = jobs?.start?.bind(jobs);
     const choices = jobs?.agents() ?? [];
-    if (!start || choices.length === 0) return null;
+    if (!jobs || !start || choices.length === 0) return null;
     const p = pagerOf(env, TOOL.jobStart);
     return {
       name: TOOL.jobStart,
@@ -44,6 +56,14 @@ const jobStart: ToolDefinition = {
           task: { type: "string", description: texts.render(TEXT.toolArg(TOOL.jobStart, "task")) },
           when: { type: "string", enum: ["after_reply", "now"], description: texts.render(TEXT.toolArg(TOOL.jobStart, "when")) },
           again: { type: "string", description: texts.render(TEXT.toolArg(TOOL.jobStart, "again")) },
+          // Offered where an extension builds LumiAH in: elsewhere job_start is sent as it always was.
+          ...(jobs.offersAs
+            ? {
+                as: { type: "string", description: texts.render(TEXT.toolArg(TOOL.jobStart, "as")) },
+                lane: { type: "string", enum: ["soon", "later"], description: texts.render(TEXT.toolArg(TOOL.jobStart, "lane")) },
+                due: { type: "string", enum: ["next_turn"], description: texts.render(TEXT.toolArg(TOOL.jobStart, "due")) },
+              }
+            : {}),
         },
       },
       async run(args: JsonObject, ctx: ToolCtx): Promise<ToolOutcome> {
@@ -55,7 +75,17 @@ const jobStart: ToolDefinition = {
         const agent = textArg(args.agent);
         const task = textArg(args.task);
         if (again === null && (agent === null || task === null)) return { text: texts.render(TEXT.jobs.noTask), error: true };
-        const started = await start(again !== null ? { again, when } : { agent: agent ?? "", task: task ?? "", when }, ctx);
+        // An argument that isn't offered is read as not given.
+        const offered = jobs.offersAs;
+        const as = offered && args.as !== undefined && args.as !== null ? textArg(args.as) : undefined;
+        if (as === null) return needs(p, "as");
+        if (as !== undefined && as.length > env.settings.delegation.asChars) return { text: texts.render(TEXT.agents.asLong, { chars: String(as.length), limit: String(env.settings.delegation.asChars) }), error: true };
+        const lane = offered ? laneOf(args.lane) : undefined;
+        if (lane === null) return needs(p, "lane");
+        const due = offered ? dueOf(args.due) : undefined;
+        if (due === null) return needs(p, "due");
+        const extra = { ...(as !== undefined ? { as } : {}), ...(lane !== undefined ? { lane } : {}), ...(due !== undefined ? { due } : {}) };
+        const started = await start(again !== null ? { again, when, ...extra } : { agent: agent ?? "", task: task ?? "", when, ...extra }, ctx);
         // A refusal says back the id or the agent the call gave, at most Line length of it (`createJob` writes it, for the page too), and names the agents there are: it is kept within Answer length here, as every answer is.
         if ("refused" in started) return { text: clip(started.refused, p.pageChars), error: true };
         return { text: texts.render(TEXT.jobs.started, { id: started.id, agent: started.agent, when: texts.render(when === "now" ? TEXT.jobs.whenNow : TEXT.jobs.whenAfter) }) };

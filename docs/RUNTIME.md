@@ -2,7 +2,7 @@
 
 The runtime is optional. LumiAH works without it: a chat you switch LumiAH on for runs **built in**, inside Lumiverse, with nothing to install. There the main agent works while Lumiverse waits to send the prompt, and Lumiverse's own generation writes the reply. Lumiverse gives an extension at most five minutes for that.
 
-The runtime is the second place a chat can run, for what built in can't do: a turn that needs longer than five minutes before the reply, the main agent writing the reply itself, and the agents' steps in the reply's thinking block. You choose it chat by chat, on LumiAH's first screen; every other chat stays built in. A chat you set to the runtime is answered only there: it has no fallback (see *When the runtime is down*), which is why built in is the default.
+The runtime is the second place a chat can run, for what built in can't do: a turn that needs longer than five minutes before the reply, the main agent writing the reply itself, and the agents' steps in the reply's thinking block. You choose it chat by chat, on LumiAH's first screen; every other chat stays built in. A chat you set to the runtime is answered only there: it has no fallback (see *When the runtime is down*), which is why built in is the default. An extension that has LumiAH built into it may play its chats only in the runtime (LumiRPEngine does): such a chat has no built-in way at all (see *A chat that plays only in the runtime*).
 
 It is a process that runs beside Lumiverse, serves the loopback connection (`POST /v1/chat/completions`, `GET /v1/models`, model `lumiah`) and keeps a link to the LumiAH extension, through which it reaches everything of Lumiverse's: your connections, your chats, lore and presets, and your storage. It is one file, `dist/lumiah.js`, which ships with the extension and runs on Bun.
 
@@ -12,19 +12,21 @@ It runs on the machine Lumiverse runs on, as the same account, and listens on `1
 
 ## Install and run
 
-Install LumiAH in Lumiverse (Extensions tab), then open **LumiAH → Runtime**. The page shows two lines with this server's own paths filled in; copy one into a terminal on the machine Lumiverse runs on.
+Install LumiAH in Lumiverse (Extensions tab), then open **LumiAH → Runtime**. The page shows two lines with this server's own paths filled in: `<bun>` is the Bun Lumiverse runs on, and `<LumiAH's folder>` is where Lumiverse installed the extension. Run them on the machine Lumiverse runs on, as the account Lumiverse runs as.
 
-As a service (recommended; it starts again after a reboot):
+On Linux, as a service (recommended; it starts again after a reboot or a crash):
 
 ```
 <bun> <LumiAH's folder>/dist/lumiah.js up --url <the address you open Lumiverse at> --systemd
 ```
 
-In the foreground (it stops when you close the terminal):
+In the foreground, on any system (it stops when you close the terminal):
 
 ```
 <bun> <LumiAH's folder>/dist/lumiah.js up --url <the address you open Lumiverse at>
 ```
+
+On macOS and Windows, run the foreground line once to set the runtime up, then have the system keep it running (*Keep it running on macOS*, *Keep it running on Windows*).
 
 `up` asks for your Lumiverse username and password once (or reads `LUMIVERSE_USERNAME` and `LUMIVERSE_PASSWORD`), signs in, registers the runtime with the extension, and starts serving. It never stores the password: it keeps the session Lumiverse gave it.
 
@@ -41,9 +43,15 @@ In the foreground (it stops when you close the terminal):
 | `--bun <path>` | The Bun the service runs under (an absolute path). | the Bun this line runs under |
 | `--extension <identifier>` | The extension the runtime links to, when LumiAH is built into another one (see *Beside an extension that includes LumiAH*). | LumiAH itself; set up again, the one the runtime linked to before |
 
-Other commands: `lumiah status` (how the runtime and its link are doing), `lumiah login` (signs it in again when its session has ended), `lumiah down` (stops and removes the service), `lumiah serve --config <file>` (what the service runs).
+Other commands: `lumiah status` (how the runtime and its link are doing), `lumiah login` (signs it in again when its session has ended), `lumiah down` (stops and removes the systemd service), `lumiah serve --name <name>` (what a service runs). Run each as the start line runs `up`: `<bun> <the runtime's file> status --name <name>`.
 
-Its config is one file per runtime under `~/.config/lumiah/` (or `$XDG_CONFIG_HOME/lumiah/`), readable by your account only.
+Its config is one file per runtime under `~/.config/lumiah/` (or `$XDG_CONFIG_HOME/lumiah/`; on Windows `C:\Users\<you>\.config\lumiah\`), readable by your account only. `up` prints its path.
+
+## Check that it is linked
+
+- **LumiAH → Runtime** shows the runtime as *linked*.
+- `lumiah status` says `It answers: link to LumiAH up` and ends with exit code 0. Otherwise it says what is wrong: not running, its session ended, its link refused.
+- In Lumiverse's Connections, **Test** on the loopback connection answers with its model.
 
 ## Listening on another address
 
@@ -93,6 +101,68 @@ systemctl --user status lumiah-<name>.service
 journalctl --user -u lumiah-<name>.service -f
 ```
 
+## Keep it running on macOS
+
+launchd starts it when you log in and starts it again whenever it stops. First run the foreground line once: it signs in, registers the runtime and saves its config. Stop it with Ctrl-C. Then:
+
+1. Copy the runtime where an update of the extension won't change it under the service:
+
+   ```
+   mkdir -p ~/.local/share/lumiah
+   cp "<LumiAH's folder>/dist/lumiah.js" ~/.local/share/lumiah/lumiah.js
+   ```
+
+2. Save this as `~/Library/LaunchAgents/lumiah.<name>.plist`. Put your own Bun, home folder and runtime name where the example has `<bun>`, `<home>` and `<name>` (`up` printed the name; launchd reads no `~`, so write the home folder in full):
+
+   ```xml
+   <?xml version="1.0" encoding="UTF-8"?>
+   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+   <plist version="1.0">
+   <dict>
+     <key>Label</key>
+     <string>lumiah.<name></string>
+     <key>ProgramArguments</key>
+     <array>
+       <string><bun></string>
+       <string><home>/.local/share/lumiah/lumiah.js</string>
+       <string>serve</string>
+       <string>--name</string>
+       <string><name></string>
+     </array>
+     <key>RunAtLoad</key>
+     <true/>
+     <key>KeepAlive</key>
+     <true/>
+     <key>StandardErrorPath</key>
+     <string><home>/Library/Logs/lumiah-<name>.log</string>
+   </dict>
+   </plist>
+   ```
+
+3. Load it, which starts it:
+
+   ```
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/lumiah.<name>.plist
+   ```
+
+Its words go to the log file the plist names. Restart it with `launchctl kickstart -k gui/$(id -u)/lumiah.<name>`; stop and unload it with `launchctl bootout gui/$(id -u)/lumiah.<name>`.
+
+## Keep it running on Windows
+
+Task Scheduler starts it when you sign in to Windows and starts it again if it fails. First run the foreground line once, in PowerShell: it signs in, registers the runtime and saves its config. Stop it with Ctrl+C. Then, in PowerShell, with your own `<bun>`, `<LumiAH's folder>` and runtime name (`up` printed it):
+
+```powershell
+New-Item -ItemType Directory -Force "$HOME\.local\share\lumiah" | Out-Null
+Copy-Item "<LumiAH's folder>\dist\lumiah.js" "$HOME\.local\share\lumiah\lumiah.js"
+$action = New-ScheduledTaskAction -Execute "<bun>" -Argument "`"$HOME\.local\share\lumiah\lumiah.js`" serve --name <name>"
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName "lumiah-<name>" -Action $action -Trigger $trigger -Settings $settings
+Start-ScheduledTask -TaskName "lumiah-<name>"
+```
+
+It runs while you are signed in, as Lumiverse on Windows usually does. Stop it with `Stop-ScheduledTask -TaskName "lumiah-<name>"`, and remove it with `Unregister-ScheduledTask -TaskName "lumiah-<name>" -Confirm:$false`. Task Scheduler keeps no log of its words: to read them, stop the task and run its line yourself, `& "<bun>" "$HOME\.local\share\lumiah\lumiah.js" serve --name <name>`.
+
 ## Beside an extension that includes LumiAH
 
 Another extension can have LumiAH built into it. It ships the same runtime, `dist/lumiah.js`, in its own folder, and its own Runtime page shows its own lines. They carry one more option, which names the extension the runtime links to:
@@ -119,7 +189,7 @@ With several runtimes set up on the machine, `lumiah status`, `login` and `down`
 
 ## Update
 
-Update LumiAH in Lumiverse (Extensions → LumiAH → Update). The Runtime page then shows the runtime's build as differing from the extension's, with its update line:
+On Linux, update LumiAH in Lumiverse (Extensions → LumiAH → Update). The Runtime page then shows the runtime's build as differing from the extension's, with its update line:
 
 ```
 <bun> <LumiAH's folder>/dist/lumiah.js up --name <name> --systemd
@@ -127,9 +197,22 @@ Update LumiAH in Lumiverse (Extensions → LumiAH → Update). The Runtime page 
 
 Run it. `up` reads the address from the runtime's config and keeps the runtime's registration, so the runtime that is running goes on answering with the secret it has. It replaces the stable copy, waits for the replies under way to finish (as long as *Wait before restart* in Settings allows: 5 minutes unless you changed it), and only then restarts the service.
 
+On macOS and Windows, update LumiAH in Lumiverse, then, while no reply is being written, copy the new runtime over the old one and restart it. Its config and registration stay as they are.
+
+```
+cp "<LumiAH's folder>/dist/lumiah.js" ~/.local/share/lumiah/lumiah.js
+launchctl kickstart -k gui/$(id -u)/lumiah.<name>
+```
+
+```powershell
+Stop-ScheduledTask -TaskName "lumiah-<name>"
+Copy-Item "<LumiAH's folder>\dist\lumiah.js" "$HOME\.local\share\lumiah\lumiah.js"
+Start-ScheduledTask -TaskName "lumiah-<name>"
+```
+
 Given another address for Lumiverse (`--url`) or another account, `up` doesn't show the secret the runtime holds, which was minted for the address and the account it was set up with. It then registers the runtime anew, which ends the running runtime's link at once: so there it waits for the replies under way before it registers, and again before it restarts the service.
 
-The link is versioned. When the two ends speak different link versions, the runtime's hello is refused in words that say which side to update, on the Runtime page and in the runtime's log.
+The link is versioned. When the two ends speak different link versions, the runtime's hello is refused in words that say which side to update and how, on the Runtime page, in the runtime's log, and in the reply that fails meanwhile.
 
 ## Three secrets, three jobs
 
@@ -201,9 +284,22 @@ What LumiAH does is tell you:
 
 - **Before a reply goes.** When a reply is about to go to a runtime that isn't linked, Lumiverse shows a notice: "LumiAH's runtime isn't answering, so this reply may fail. On LumiAH's Home, set this chat to Built in, or start the runtime."
 - **On LumiAH's Home.** The chat says its runtime isn't answering, and offers one tap to run it built in. The chat then gets back the connection it had, and its next reply is worked on inside Lumiverse.
-- **In the failed reply,** where the runtime is still up to say it (its link was refused, or the extension is out of its reach): why, and the same way out. Where the runtime's process is gone, the failure is Lumiverse's own, that of a connection that doesn't answer.
+- **In the failed reply,** where the runtime is still up to say it (its link was refused, or the extension is out of its reach): why, and that nothing answers in its place. Where the runtime's process is gone, the failure is Lumiverse's own, that of a connection that doesn't answer.
 
-Start the runtime again (`systemctl --user start lumiah-<name>.service`, or its start line) and the chat is answered there again, with nothing to set.
+Start the runtime again (`systemctl --user start lumiah-<name>.service`; on macOS, `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/lumiah.<name>.plist` if you unloaded it, since launchd restarts one that stopped by itself; on Windows, `Start-ScheduledTask -TaskName "lumiah-<name>"`; or its start line) and the chat is answered there again, with nothing to set.
+
+**A restart mid-reply** (an update, or its service stopping it) ends the reply under way with "The runtime is restarting. Press Retry in a moment."; what it had already written stays in the chat. A crash gives no time for that: the reply fails in Lumiverse's own words. Either way the chat's next reply goes to the runtime as soon as it is back.
+
+**A dropped link mends itself.** When Lumiverse restarts or the network drops the runtime's socket, the runtime links again by itself: after a second, then waiting longer after each failure, up to 30 seconds between tries (*First reconnect wait* and *Longest reconnect wait* in Settings).
+
+### A chat that plays only in the runtime
+
+An extension that has LumiAH built into it may play a chat only in the runtime. Such a chat has no built-in way:
+
+- Its pages offer no choice of place: switching it on pins it to the loopback connection by itself, even while the runtime is down, as long as a loopback connection exists. With none yet, it is refused in words that say to start a runtime and mint its key first.
+- It is never worked on built in, though it was switched on built in before the extension said so: such a chat reads as off until it is switched on again.
+- With the runtime down, the notice before a reply says: "<extension> plays this chat only in your runtime, which isn't answering, so this reply will fail. Start the runtime (its line is on <extension>'s Runtime page), then send your message again." Its page says the same, with the way to the Runtime page and no way to run it built in. The reply fails.
+- The extension's own pages read the same state from its backend (`runtimeState`): whether the runtime is linked, and what to do when it isn't.
 
 ## Before you disable or uninstall LumiAH
 
@@ -215,7 +311,7 @@ A chat that runs built in needs none of this: it is on its own connection, and w
 
 Work down this list; each step says what to look at.
 
-1. **Is it running?** `lumiah status`, or `systemctl --user status lumiah-<name>.service`. Not running: `journalctl --user -u lumiah-<name>.service -n 50` says why (the last lines are the runtime's own words).
+1. **Is it running?** `lumiah status`, or `systemctl --user status lumiah-<name>.service` (macOS: `launchctl print gui/$(id -u)/lumiah.<name>`; Windows: `Get-ScheduledTask -TaskName "lumiah-<name>"`). Not running: `journalctl --user -u lumiah-<name>.service -n 50` says why (the last lines are the runtime's own words; on macOS, its log file; on Windows, run its line yourself).
 2. **Is LumiAH running in Lumiverse?** Extensions tab: installed, enabled, running. The Runtime page's **Issues** list names any permission LumiAH wasn't granted; grant them there.
 3. **Has its session ended?** The Runtime page and `lumiah status` say so. Sign it in again: `lumiah login --name <name>` (the page shows the line), then it reconnects by itself.
 4. **Do the versions differ?** The Runtime page shows the runtime as *refused*, with which side to update. Update that side (see Update).
@@ -227,3 +323,5 @@ Work down this list; each step says what to look at.
 A reply the runtime fails says why in the chat, in the reply's place: what stopped it and what to do. With the runtime's process gone there is nobody to say it, and the failure is Lumiverse's own (see *When the runtime is down*).
 
 **Stop in the Live page.** Lumiverse gives an extension no way to stop a reply, so the runtime asks it with your session, as Lumiverse's own Stop button does (`POST /api/v1/generate/stop`): Lumiverse closes the request, keeps what was written and shows the reply as stopped, not as failed. When it can't be asked (the runtime's session has ended, Lumiverse doesn't answer within *Wait for Lumiverse's Stop* in Settings, or it no longer runs that generation), the runtime ends the reply as a finished one with whatever was written, and LumiAH deletes the empty message a new reply leaves; the runtime's log says why. The Live page says where a reply was stopped: there, or in Lumiverse. A chat that runs built in has no runtime to ask: there, Stop in the Live page ends LumiAH's own work on the reply, Lumiverse writes the reply on its own, and the page says so; to stop the reply itself, press Stop in Lumiverse.
+
+**Stop in a reply written passage by passage.** Where the agents write the reply themselves, releasing it a passage at a time or handing it to another agent whose answer streams in, Stop (in Lumiverse or in the Live page) ends the turn wherever it is. Each passage already released stays in the chat, nothing more is sent after Stop, and the extension that plays the chat is told exactly what had been released.

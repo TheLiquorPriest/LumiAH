@@ -3,14 +3,14 @@
 // anchors, the live buffer and the pages' requests, over one host (spindle.ts in Lumiverse, a fake
 // in the tests).
 
+import type { ClaimAsk } from "../../core/extension";
 import { checkSettings, defaultSettings, SETTINGS_SCHEMA, type SettingsScope, settingsOf } from "../../core/settings";
-import { storyWordOf } from "../../core/story";
 import { checkText, TEXT_DEFS } from "../../core/texts";
 import type { JsonObject } from "../../core/ports";
 import { LINK, loopbackModel, runtimeBase, sameBase } from "../../link/contract";
 import { isRecord } from "../../link/json";
 import { CEILINGS, checkTransport, TRANSPORT_KEY, TRANSPORT_SCHEMA, transportDefaults } from "../../link/settings";
-import type { PermissionNeed, RunPlace } from "../../shared/ui";
+import type { PermissionNeed, RunPlace, RuntimeState, RuntimeView } from "../../shared/ui";
 import { Approvals } from "./approvals";
 import { Asks } from "./asks";
 import { Builtin, type HarnessMaker } from "./builtin";
@@ -127,6 +127,16 @@ export interface Backend {
   readonly defs: Definitions;
   readonly builtin: Builtin;
   readonly hosted: HostedTurns;
+  /**
+   * A user's runtime, for the pages of an extension that builds LumiAH in: whether it is linked
+   * (asked about a chat, the one that chat's replies reach), whether it is there to choose, whether
+   * a loopback connection exists, plain words for what to do while it isn't linked, and the Runtime
+   * page's two lines. Reads what is held in memory and the user's cached documents: no page state
+   * is built for it.
+   */
+  runtimeState(userId: string, chatId?: string | null): Promise<RuntimeState>;
+  /** Hears when a user's runtime links, drops or is refused, and when a loopback connection is made: what `runtimeState` says may then differ. What it returns stops it. */
+  onRuntime(listener: (userId: string) => void): () => void;
 }
 
 /**
@@ -211,15 +221,27 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
   };
   /** What is being said of a reply's runtime now: `settle` waits for it. */
   const telling = new Set<Promise<void>>();
-  /** A reply is about to go to a runtime that isn't linked. Nothing answers it there and nothing here does in its place (§25), so the user is told before it fails, wherever they are in Lumiverse. The prompt isn't held for it. */
+  /** A reply is about to go to a runtime that isn't linked. Nothing answers it there and nothing here does in its place (§25), so the user is told before it fails, wherever they are in Lumiverse: how to run it built in, unless its extension plays it only in the runtime. The prompt isn't held for it. */
   const warnAway = (userId: string, chatId: string): void => {
     const told = (async (): Promise<void> => {
       if ((await runtimeOf(userId, chatId)) !== null) return;
-      host.toast(userId, "warning", `${name}'s runtime isn't answering, so this reply may fail. On ${name}'s Home, set this chat to Built in, or start the runtime.`);
+      const needs = (await made.chatSwitch?.needsRuntime(userId, chatId)) ?? null;
+      host.toast(userId, "warning", needs !== null ? `${needs.by} plays this chat only in your runtime, which isn't answering, so this reply will fail. Start the runtime (its line is on ${name}'s Runtime page), then send your message again.` : `${name}'s runtime isn't answering, so this reply may fail. On ${name}'s Home, set this chat to Built in, or start the runtime.`);
     })()
       .catch(warn("whether a reply's runtime is linked couldn't be told"))
       .finally(() => telling.delete(told));
     telling.add(told);
+  };
+  /** Who hears that a user's runtime changed (`Backend.onRuntime`). */
+  const runtimeHeard = new Set<(userId: string) => void>();
+  const tellRuntime = (userId: string): void => {
+    for (const listener of runtimeHeard) {
+      try {
+        listener(userId);
+      } catch (error) {
+        warn("a listener to the runtime's state failed")(error);
+      }
+    }
   };
   const turns = new Turns(host, {
     chats,
@@ -244,6 +266,8 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
   const live = new LiveBuffer(host, { now, transport: (userId) => settings.transport(userId), linkGoneFor: (userId, relay) => relays.goneFor(userId, relay), missing: () => permissions().some((need) => need.needed) });
   const models = new Models(host, { connections, streams, settings, registry, name });
   const keys = new Keys(host, { registry, relays, settings, connectionName: identity.connectionName, now, later });
+  /** The extension LumiAH is built into, whose claims say which chats it answers and how. */
+  const claimer = options.extension;
   const chatSwitch = new ChatSwitch(host, {
     chats,
     connections,
@@ -253,18 +277,20 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     identity,
     now,
     storySetting: async (userId) => settingsOf((await settings.values(userId))[CORE_KEY]).story,
-    // What the page shows as the extension's word is what its claim says: a claim that fails or says nothing of the story leaves the chat's and the user's to stand.
-    claimed: async (ask, userId) => {
-      const extension = options.extension;
-      if (extension?.claim === undefined) return null;
-      try {
-        const story = storyWordOf((await extension.claim(ask, userId))?.story);
-        return Object.keys(story).length > 0 ? { by: extension.name, story } : null;
-      } catch (error) {
-        warn(`${extension.name} gave no answer for chat ${ask.chatId}, so its word on the story isn't shown`)(error);
-        return null;
-      }
-    },
+    // A claim that fails is none: the log says so, and the chat is set as any other meanwhile.
+    ...(claimer?.claim !== undefined
+      ? {
+          claim: async (ask: ClaimAsk, userId: string) => {
+            try {
+              const claim = await claimer.claim?.(ask, userId);
+              return claim === null || claim === undefined ? null : { by: claimer.name, claim };
+            } catch (error) {
+              warn(`${claimer.name} gave no answer for chat ${ask.chatId}, so its claim on it isn't known`)(error);
+              return null;
+            }
+          },
+        }
+      : {}),
   });
   made.chatSwitch = chatSwitch;
   const sessions = new SessionsPage({ chats, storage, settings, now });
@@ -308,6 +334,7 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     runOf: (userId, stream, turn) => live.running(userId, stream, turn)?.relay ?? null,
     jobOf: (userId, job) => jobs.runsIn(userId, job),
     runtimeOf,
+    needsRuntime: (userId, chatId) => chatSwitch.needsRuntime(userId, chatId),
     name,
     later,
     id: () => randomHex(64),
@@ -369,6 +396,7 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
       // A loopback connection may be new, or have a new address: which connections are answered here is checked again.
       turns.unsure(userId);
       ui.touch(userId, "connections", "setup", "chats", "runtime");
+      tellRuntime(userId);
     },
     now,
     later,
@@ -385,6 +413,7 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     turns.unsure(userId);
     // What a runtime that is gone was asked will never be answered.
     asks.recheck(userId);
+    tellRuntime(userId);
   });
   relays.onPing((userId, relay, named) => live.named(userId, relay, named));
   live.onChange((userId) => ui.touch(userId, "running", "chats", "setup"));
@@ -498,6 +527,23 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     server.sessionClosed(session);
   });
 
+  /** Why the runtime isn't linked, in plain words that say what to do: a refused link's own words (which side to update, and how), else how to start it, or to set one up. */
+  const downWords = (view: RuntimeView, chatId: string | null): string => {
+    const refused = view.relays.find((r) => r.link === "refused" && r.problem !== null);
+    if (refused?.problem) return refused.problem;
+    if (view.relays.length === 0) return `No runtime is set up for ${name} yet. Start one with the line on ${name}'s Runtime page.`;
+    const linked = view.relays.some((r) => r.link === "linked");
+    if (chatId !== null && linked) return `The runtime this chat's replies reach isn't linked now. Start it again with its line on ${name}'s Runtime page.`;
+    const unit = view.relays.find((r) => r.unit !== null)?.unit ?? null;
+    const quiet = view.relays.some((r) => r.link === "quiet");
+    return `${name}'s runtime ${quiet ? "has gone quiet" : "isn't linked now"}. Start it again${unit !== null ? ` (systemctl --user restart ${unit})` : ""} with its line on ${name}'s Runtime page.`;
+  };
+  const runtimeState = async (userId: string, chatId: string | null = null): Promise<RuntimeState> => {
+    const [view, loops] = await Promise.all([relays.view(userId, issues()), connections.loopbacks(userId)]);
+    const linked = chatId !== null ? (await runtimeOf(userId, chatId)) !== null : view.relays.some((r) => r.link === "linked");
+    return { linked, ready: view.ready, connection: loops.length > 0, words: linked ? null : downWords(view, chatId), start: view.start };
+  };
+
   return {
     async tick() {
       await relays.tick();
@@ -531,5 +577,10 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     defs,
     builtin,
     hosted,
+    runtimeState,
+    onRuntime(listener) {
+      runtimeHeard.add(listener);
+      return () => void runtimeHeard.delete(listener);
+    },
   };
 }

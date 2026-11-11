@@ -112,8 +112,13 @@ export function stoppedWords(why: "stopped" | "crashed", detail: string | null |
   return `LumiAH stopped with an error${said !== "" ? ` (${said})` : ""}, so this reply ended here. Lumiverse doesn't restart it by itself: restart it in Lumiverse's Extensions tab, then press Retry.`;
 }
 
-/** What the user can do about a chat whose runtime LumiAH refuses, as the chat's failed reply is told it: the runtime way has no fallback, so nothing is promised. */
-const NO_FALLBACK = "Nothing answers this chat in the runtime's place: once the runtime links again, send your message again, or set the chat to Built in on LumiAH's Home, which needs no runtime.";
+/**
+ * What the user can do about a chat whose runtime its extension refuses, as the chat's failed reply
+ * is told it: the runtime way has no fallback, so nothing is promised. Whether the chat may run
+ * built in instead is the extension's to say (a chat it plays only in a runtime may not), and its
+ * pages and its notice before the reply say so where it may.
+ */
+const NO_FALLBACK = "Nothing answers this chat in the runtime's place: once the runtime links again, send your message again.";
 
 /** What a chat's reply is told when the link is refused: why, and what the user can do about the chat where LumiAH is known to run. Null while the link isn't refused. */
 export function refusedReply(link: RuntimeLink): string | null {
@@ -314,7 +319,7 @@ export class LinkClient implements RuntimeLink {
     try {
       answer = await this.ask("hello", { secret: this.options.secret(), version: LINK_VERSION, build: this.options.build, report: this.report(), open: this.handlers?.open() ?? [] });
     } catch (error) {
-      if (error instanceof LinkError && error.code === "forbidden") this.refuse(`LumiAH refused this runtime (${error.message}) Register it again with its start line on LumiAH's Runtime page.`, true);
+      if (error instanceof LinkError && error.code === "forbidden") this.refuse(this.unknownWords(error.message), true);
       else if (error instanceof LinkError && error.code === "version") this.refuse(error.message, true);
       // An extension that doesn't know the hello is a build from before it, which may not stand in for a runtime either.
       else if (error instanceof LinkError && error.code === "bad_request") this.refuse(`LumiAH on ${this.options.base} doesn't know this runtime's hello (${error.message}): update LumiAH (Extensions → LumiAH → Update).`, false);
@@ -346,6 +351,12 @@ export class LinkClient implements RuntimeLink {
     this.refusedThere = there;
     this.options.log(why);
     this.conn.close();
+  }
+
+  /** The extension doesn't know this runtime (its registration was forgotten or replaced): its words, and what to do, naming the extension as its last hello did (LumiAH before any). */
+  private unknownWords(said: string): string {
+    const { name } = linkedBackendOf(this.hello?.backend);
+    return `${name} refused this runtime (${said}) Register it again with its start line on ${name}'s Runtime page.`;
   }
 
   private push(data: Record<string, unknown>): void {
@@ -410,7 +421,7 @@ export class LinkClient implements RuntimeLink {
         if (Array.isArray(answer.lost) && answer.lost.length > 0) this.handlers?.lost(answer.lost);
       })
       .catch((error: unknown) => {
-        if (error instanceof LinkError && error.code === "forbidden") this.refuse(`LumiAH refused this runtime (${error.message}) Register it again with its start line on LumiAH's Runtime page.`, true);
+        if (error instanceof LinkError && error.code === "forbidden") this.refuse(this.unknownWords(error.message), true);
       })
       .finally(() => {
         this.pinging = false;

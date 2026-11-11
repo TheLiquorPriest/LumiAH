@@ -79,12 +79,16 @@ const whole = (v: unknown, what: string): number => {
 
 const short = (v: unknown): v is string => typeof v === "string" && v !== "";
 
+/** Which instance of its definition an agent is, where a call says (`as`): absent, or a string. */
+const asOf = (v: unknown): v is string | undefined => v === undefined || typeof v === "string";
+
 /** A call of a tool that runs here, as the core named it. */
 function toolCallOf(raw: unknown): RemoteToolCall {
-  if (!isRecord(raw) || !short(raw.name) || !isRecord(raw.args) || !short(raw.turn) || typeof raw.chatId !== "string" || !short(raw.agentId) || typeof raw.role !== "string" || !short(raw.callId) || !short(raw.kind) || typeof raw.main !== "boolean" || !Array.isArray(raw.above) || !raw.above.every((over) => isRecord(over) && short(over.agentId) && typeof over.role === "string")) {
+  if (!isRecord(raw) || !short(raw.name) || !isRecord(raw.args) || !short(raw.turn) || typeof raw.chatId !== "string" || !short(raw.agentId) || typeof raw.role !== "string" || !short(raw.callId) || !short(raw.kind) || typeof raw.main !== "boolean" || !asOf(raw.as) || !Array.isArray(raw.above) || !raw.above.every((over) => isRecord(over) && short(over.agentId) && typeof over.role === "string" && asOf(over.as))) {
     throw new LinkRefused("bad_request", "The tool call is malformed: update the runtime and LumiAH to the same build.");
   }
-  return { name: raw.name, args: raw.args as JsonObject, turn: raw.turn, chatId: raw.chatId, agentId: raw.agentId, role: raw.role, callId: raw.callId, kind: raw.kind as RemoteToolCall["kind"], main: raw.main, above: (raw.above as { agentId: string; role: string }[]).map(({ agentId, role }) => ({ agentId, role })) };
+  const above = (raw.above as { agentId: string; role: string; as?: string }[]).map(({ agentId, role, as }) => ({ agentId, role, ...(as !== undefined ? { as } : {}) }));
+  return { name: raw.name, args: raw.args as JsonObject, turn: raw.turn, chatId: raw.chatId, agentId: raw.agentId, role: raw.role, callId: raw.callId, kind: raw.kind as RemoteToolCall["kind"], main: raw.main, above, ...(raw.as !== undefined ? { as: raw.as } : {}) };
 }
 
 /** A tool call held for the user's word, as the core asks it. */

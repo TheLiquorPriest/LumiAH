@@ -147,6 +147,12 @@ export class Sides {
         return { status: "failed", reason, reply: "", usage: emptyUsage(), turn: null };
       }
       const { settings, texts } = setup;
+      // A chat that plays only in a runtime has none of its work done inside Lumiverse (§25).
+      if (setup.claim?.place === "runtime" && shared.options.place === "builtin") {
+        const reason = texts.render(TEXT.jobs.whyRuntimeOnly);
+        sink.error(reason, "failed");
+        return { status: "failed", reason, reply: "", usage: emptyUsage(), turn: null };
+      }
       const run = new Run(shared, setup, { info: { id: input.generationId, kind: "side", chatId: doc.chatId }, budget: settings.turn, startedAt, messageId: null, side: doc.id });
       let status: TurnStatus = "failed";
       let reason: string | undefined;

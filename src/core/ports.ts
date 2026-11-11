@@ -414,10 +414,11 @@ export interface RemoteTool {
   source: "extension" | "user";
 }
 
-/** An agent of a run, as another is told of it: its id in the run, and the definition it runs as. */
+/** An agent of a run, as another is told of it: its id in the run, the definition it runs as, and which instance of that definition it is, where whoever started it said (`as`, §14). */
 export interface AgentRef {
   agentId: string;
   role: string;
+  as?: string;
 }
 
 /**
@@ -439,6 +440,8 @@ export interface RemoteToolCall {
   main: boolean;
   /** The agents over the caller, from the run's main agent down to the one that started it; none for the main agent. */
   above: AgentRef[];
+  /** Which instance of its definition the caller is, where whoever started it said (`delegate`'s and `job_start`'s `as`): an extension that runs one definition for many people tells them apart by it. */
+  as?: string;
 }
 
 export interface ToolsPort {
@@ -489,6 +492,12 @@ export interface ApprovalsPort {
 /** When a job runs (DESIGN §15): beside the turn that started it, or once that turn's reply is written. */
 export type JobWhen = "now" | "after_reply";
 
+/** Which jobs go first among those waiting for a place (§15): every `soon` before any `later`, first come first through within each. A job that names none is `later`. */
+export type JobLane = "soon" | "later";
+
+/** A job the next turn waits for (§15): at that turn's start it is waited for up to Wait for jobs due, and the main agent is told if it still runs. */
+export type JobDue = "next_turn";
+
 /**
  * Where a job stands: waiting for the host to run it, running, ended with its report (`done`), ended
  * without one (`failed`, `cancelled`), cut off by a runtime restart (`interrupted`), stopped because
@@ -525,12 +534,23 @@ export interface JobView {
   paused?: true;
   /** Who started it: an agent's `job_start` call, or the user on the page. */
   by: { who: "agent"; id: string; role: string } | { who: "user" };
+  /** Which instance of its definition its agent is, where the call that started it said (`job_start`'s `as`). */
+  as?: string;
+  /** Its lane among waiting jobs; absent: `later`. */
+  lane?: JobLane;
+  /** The next turn waits for it; absent: no turn does. */
+  due?: JobDue;
   /**
    * The turn it belongs to, by its generation's id: the turn whose agent started it (for a job that
    * another job started, that job's). Null for a job the user started: it belongs to the chat, not
-   * to a turn, so it writes `learned/` and `~/` and never the chat's own area (§22).
+   * to a turn, so it writes `learned/` and `~/` and never the chat's own area (§22), unless it was
+   * started to (`area`).
    */
   basis: string | null;
+  /** A job the user started that may write the chat's own area too, as it stands at the latest reply on the chat's path, as the page writes it (an extension's prepared start). */
+  area?: "chat";
+  /** The plan file a job the user started is asked to keep, where it isn't `learned/plans/<id>.md`. */
+  plan?: string;
   /** The job it was started again from. */
   again?: string;
   /** The job whose agent started it: what it spends counts against that job's allowance too. */
@@ -1000,6 +1020,8 @@ export interface AgentStarted {
   parent?: string;
   /** What it was started for, in a few words. */
   task?: string;
+  /** Which instance of its definition it is, where whoever started it said (`as`, §14). */
+  as?: string;
   at: number;
 }
 

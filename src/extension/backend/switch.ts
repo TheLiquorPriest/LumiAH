@@ -24,11 +24,17 @@
 // its replies until the runtime is back or the user sets the chat to run built in. The chat's view
 // says so (`away`), so a page can offer that one tap.
 //
+// A chat the extension that answers it plays only in a runtime (its claim's `place`, §21) has no
+// built-in way at all: its view says so (`needsRuntime`), so the pages offer no built-in choice;
+// switching it on pins it to the loopback connection whether or not a runtime is linked just then;
+// it is never worked on built in, though it was switched on built in before the extension said so
+// (it then reads as off, until it is switched on again); and its words never offer built in.
+//
 // The chat's own choice of what counts as its story (§24.4) is kept beside its other choices, while
 // the chat is off too. The core reads it with the chat (`info`), and the pages see it with what
 // stands over it and under it (`story`).
 
-import type { ClaimAsk } from "../../core/extension";
+import type { ChatClaim, ClaimAsk } from "../../core/extension";
 import type { ChatInfo, JsonValue } from "../../core/ports";
 import { type StorySetting, storyHolds, storyWordOf } from "../../core/story";
 import { isRecord } from "../../link/json";
@@ -102,8 +108,8 @@ export interface SwitchDeps {
   now(): number;
   /** The user's own setting of what counts as the story (Settings), which a chat's choice stands over. */
   storySetting(userId: string): Promise<StorySetting>;
-  /** What the extension that answers a chat says of its story: its name, and the members it sets; null where it sets none, or there is no such extension. */
-  claimed(ask: ClaimAsk, userId: string): Promise<{ by: string; story: Partial<StorySetting> } | null>;
+  /** What the extension that answers this backend's chats says of a chat: its claim, with its name. Null where it claims nothing or gave no answer. Absent where it supplies no claims. */
+  claim?(ask: ClaimAsk, userId: string): Promise<{ by: string; claim: ChatClaim } | null>;
 }
 
 export class ChatSwitch {
@@ -166,13 +172,33 @@ export class ChatSwitch {
     const connection = await this.deps.connections.ofChat(userId, chat);
     const doc = await this.docs.get(userId);
     const switched = doc.on[chat.id];
-    const place: RunPlace = switched?.place ?? (doc.ran[chat.id] ? "runtime" : "builtin");
+    const needs = await this.needsRuntime(userId, chat.id);
+    // A chat its extension plays only in a runtime runs nowhere else, whatever was kept for it before the extension said so.
+    const place: RunPlace = needs !== null ? "runtime" : (switched?.place ?? (doc.ran[chat.id] ? "runtime" : "builtin"));
     const other = this.other(chat, connection);
-    // In a runtime, on only while the pin it made still stands: a chat pinned elsewhere since is answered by that connection, whatever was asked here. And never while the chat is another backend's.
-    const on = other === null && switched !== undefined && (switched.place === "builtin" || (connection?.loopback === true && chat.metadata[PIN] === connection.id));
+    // In a runtime, on only while the pin it made still stands: a chat pinned elsewhere since is answered by that connection, whatever was asked here. And never while the chat is another backend's. A chat switched on built in before its extension asked for the runtime is off until it is switched on again, which pins it.
+    const pinned = connection?.loopback === true && chat.metadata[PIN] === connection.id;
+    const on = other === null && switched !== undefined && ((switched.place === "builtin" && needs === null) || pinned);
     // Set to run in a runtime that isn't linked now: nothing answers its replies there, and nothing here does in its place.
-    const away = on && switched.place === "runtime" && !(await this.deps.runtimeLinked(userId, chat.id));
-    return { chatId: chat.id, name: chat.name === "" ? null : chat.name, on, since: on ? switched.since : null, place, connection: connection === null ? null : { id: connection.id, name: connection.name, loopback: connection.loopback }, ...(other !== null ? { other } : {}), ...(away ? { away: true as const } : {}) };
+    const away = on && place === "runtime" && !(await this.deps.runtimeLinked(userId, chat.id));
+    return { chatId: chat.id, name: chat.name === "" ? null : chat.name, on, since: on ? switched.since : null, place, connection: connection === null ? null : { id: connection.id, name: connection.name, loopback: connection.loopback }, ...(other !== null ? { other } : {}), ...(away ? { away: true as const } : {}), ...(needs !== null ? { needsRuntime: needs } : {}) };
+  }
+
+  /**
+   * Whether the extension that answers this backend's chats plays a chat only in a runtime (its
+   * claim's `place`), and its name; null where it doesn't, supplies no claims, gave no answer, or
+   * the user has no such chat.
+   */
+  async needsRuntime(userId: string, chatId: string): Promise<{ by: string } | null> {
+    const claimed = await this.claimed(userId, chatId);
+    return claimed?.claim.place === "runtime" ? { by: claimed.by } : null;
+  }
+
+  /** The extension's claim on a chat, asked with what a claim is asked with (read here); null without one. */
+  private async claimed(userId: string, chatId: string, setting?: StorySetting): Promise<{ by: string; claim: ChatClaim } | null> {
+    if (this.deps.claim === undefined) return null;
+    const ask = await this.claimAsk(userId, chatId, setting);
+    return ask === null ? null : this.deps.claim(ask, userId);
   }
 
   /** `lah.chat.get`: a chat as the pages show it. */
@@ -210,7 +236,10 @@ export class ChatSwitch {
     const ask = await this.claimAsk(userId, chatId, setting);
     if (ask === null) throw new LinkRefused("not_found", "There is no such chat in this account.");
     const chosen = ask.chat.story ?? {};
-    const claimed = await this.deps.claimed(ask, userId);
+    const said = this.deps.claim === undefined ? null : await this.deps.claim(ask, userId);
+    // What the page shows as the extension's word is what its claim says of the story: a claim that says nothing of it leaves the chat's and the user's to stand.
+    const word = storyWordOf(said?.claim.story);
+    const claimed = said !== null && Object.keys(word).length > 0 ? { by: said.by, story: word } : null;
     return { chatId, chosen, setting, claimed, sovereignHand: ask.sovereignHand, holds: storyHolds({ claim: claimed?.story ?? null, chat: chosen, user: setting, sovereignHand: ask.sovereignHand }) };
   }
 
@@ -234,7 +263,8 @@ export class ChatSwitch {
   async builtin(userId: string, chatId: string): Promise<boolean> {
     if ((await this.docs.get(userId)).on[chatId]?.place !== "builtin") return false;
     const chat = await this.deps.chats.own(userId, chatId);
-    return this.other(chat, await this.deps.connections.ofChat(userId, chat)) === null;
+    // Never a chat its extension plays only in a runtime, though it was switched on built in before the extension said so.
+    return this.other(chat, await this.deps.connections.ofChat(userId, chat)) === null && (await this.needsRuntime(userId, chatId)) === null;
   }
 
   /**
@@ -262,6 +292,12 @@ export class ChatSwitch {
    * pins the chat to the loopback connection; off, and a change from the runtime to built in, puts
    * back the pin the chat had. On, the chat bears this backend's mark; off, the mark is taken away.
    * `takeover` (`lah.chat.takeover`): a chat another backend answers is taken from it first.
+   *
+   * A chat its extension plays only in a runtime (`needsRuntime`) goes to the runtime whatever is
+   * asked: built in is refused, except by a takeover, which takes it to the runtime. It is pinned
+   * whenever a loopback connection is there to pin it to, linked or not (its view says `away` until
+   * a runtime links); only with no loopback connection at all is it refused, in words that say how
+   * to set one up.
    */
   async set(userId: string, chatId: string, on: boolean, place?: RunPlace, takeover = false): Promise<ChatView> {
     const { chats, connections, identity } = this.deps;
@@ -271,7 +307,9 @@ export class ChatSwitch {
     const loops = (await connections.loopbacks(userId)).map((c) => c.id);
     const pin = typeof chat.metadata[PIN] === "string" ? chat.metadata[PIN] : null;
     const pinnedLoop = pin !== null && loops.includes(pin);
-    const where: RunPlace = place ?? switched?.place ?? (doc.ran[chatId] ? "runtime" : "builtin");
+    const needs = await this.needsRuntime(userId, chatId);
+    if (needs !== null && on && place === "builtin" && !takeover) throw new UiRefused("unavailable", `${needs.by} plays this chat only in your runtime, so it can't run built in.`);
+    const where: RunPlace = needs !== null ? "runtime" : (place ?? switched?.place ?? (doc.ran[chatId] ? "runtime" : "builtin"));
     if (!on) {
       const patch = { ...this.unpin(chat, switched, loops), ...(chat.metadata[this.markKey] !== undefined ? { [this.markKey]: null } : {}) };
       if (Object.keys(patch).length > 0) await this.host.chats.patchMetadata(chatId, patch, userId);
@@ -301,8 +339,9 @@ export class ChatSwitch {
     const mark: JsonValue = { v: 1, chat: chatId, name: identity.name, place: where, since, ...(where === "runtime" && prior !== null ? { prior, priorModel } : {}) };
     if (where === "runtime") {
       const loop = loops[0];
-      if (loop === undefined || !(await this.deps.runtimeReady(userId))) {
-        throw new UiRefused("unavailable", `There is no runtime to run this chat in yet. Start one and mint its key on ${identity.name}'s Runtime page, or let the chat run built in, which needs neither.`);
+      // Any other chat waits for a runtime that is there to choose, since built in serves it meanwhile.
+      if (loop === undefined || (needs === null && !(await this.deps.runtimeReady(userId)))) {
+        throw new UiRefused("unavailable", needs !== null ? `${needs.by} plays this chat only in your runtime, and none is set up yet. Start one with its line on ${identity.name}'s Runtime page and mint its key there, then switch the chat on.` : `There is no runtime to run this chat in yet. Start one and mint its key on ${identity.name}'s Runtime page, or let the chat run built in, which needs neither.`);
       }
       // Pinned to the loopback already (by hand, or by an earlier switch): the pin stands, with no earlier pin to put back that isn't already remembered.
       await this.host.chats.patchMetadata(chatId, { ...taken, ...(pinnedLoop ? {} : { [PIN]: loop, [PIN_MODEL]: null }), [this.markKey]: mark }, userId);

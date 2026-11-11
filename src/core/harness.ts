@@ -218,8 +218,8 @@ export interface Harness {
   jobs: {
     list(input: { chatId: string | null; cursor: string | null; limit: number }): Promise<JobsPage>;
     read(input: { id: string }): Promise<JobRead>;
-    /** The user starts a job (§15, §22): it belongs to the chat and to no turn. */
-    start(input: { chatId: string; agent: string; task: string; when: JobWhen; allowance?: JobAllowance }): Promise<{ job: JobView }>;
+    /** The user starts a job (§15, §22): it belongs to the chat and to no turn. `area: "chat"`: it may write the chat's own area too, at the latest reply on the path; `plan`: the plan file it is asked to keep, where not `learned/plans/<id>.md`. */
+    start(input: { chatId: string; agent: string; task: string; when: JobWhen; allowance?: JobAllowance; area?: "chat"; plan?: string }): Promise<{ job: JobView }>;
     /** Starts a job that stopped short again, from the start, as a new job with the same agent and task. */
     again(input: { id: string }): Promise<{ job: JobView }>;
     cancel(input: { id: string }): Promise<{ job: JobView }>;
@@ -311,12 +311,17 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
   // The caps count what earlier runs of the process spent once the last day's calls are read; until then, what this one spent.
   shared.spend.ready().catch((error: unknown) => host.log("warn", `[LumiAH] the last day's spend couldn't be read (${errorText(error)}): the caps count from now`));
 
-  /** The workspace as the user holds it on the page: every file is theirs to read and write, and what they write is recorded as theirs. */
+  /** The workspace as the user holds it on the page: every file is theirs to read and write, and what they write is recorded as theirs. What they write to the chat's own area is kept through a regenerate or a swipe of the newest reply (§11). */
   const userView = async (chatId: string | null): Promise<WorkspaceView> => {
-    const areas: Record<WorkspaceArea, AreaAccess | null> = chatId === null ? { chat: null, learned: null, user: shared.areas.user() } : { chat: shared.areas.now(chatId), learned: await shared.areas.learned(chatId), user: shared.areas.user() };
+    const areas: Record<WorkspaceArea, AreaAccess | null> = chatId === null ? { chat: null, learned: null, user: shared.areas.user() } : { chat: shared.areas.now(chatId, { throughSwipe: true }), learned: await shared.areas.learned(chatId), user: shared.areas.user() };
     return { author: { who: "user" }, role: AGENT.main, areas, guard: () => null };
   };
   const page = async (chatId: string | null): Promise<PageWorkspace> => pageWorkspace(await userView(chatId), () => shared.latest.workspace);
+  /** A change the user made on the page: where it was to the chat's own area, the records it went beside carry it (§11), so a branch cut there has it. Gives back what the change gave. */
+  const kept = async <T>(input: { chatId: string | null; area: WorkspaceArea }, done: T): Promise<T> => {
+    if (input.chatId !== null && input.area === "chat") await shared.jobs.anchorNewest(input.chatId).catch((error: unknown) => host.log("warn", `[LumiAH] a change to the chat's area couldn't be put on the reply's record (${errorText(error)}): a branch cut there won't have it`));
+    return done;
+  };
 
   /** The levels of guidance of a chat (none: the user's alone), read as a run's are. */
   const levels = async (chatId: string | null): Promise<{ levels: GuidanceRead[]; view: WorkspaceView; limit: number; agentsEdit: boolean }> => {
@@ -433,10 +438,10 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
         return { ...listed, agents: setup.definitions.agents().map((d) => ({ id: d.id, name: d.name })), basis: latest ? { messageId: latest.messageId, swipe: latest.swipeId, index: latest.index } : null };
       },
       read: async (input) => (await page(input.chatId)).read(input),
-      write: async (input) => ({ file: (await (await page(input.chatId)).write(input)).file }),
-      move: async (input) => (await page(input.chatId)).move(input),
-      delete: async (input) => (await page(input.chatId)).delete(input),
-      pin: async (input) => (await page(input.chatId)).pin(input),
+      write: async (input) => kept(input, { file: (await (await page(input.chatId)).write(input)).file }),
+      move: async (input) => kept(input, await (await page(input.chatId)).move(input)),
+      delete: async (input) => kept(input, await (await page(input.chatId)).delete(input)),
+      pin: async (input) => kept(input, await (await page(input.chatId)).pin(input)),
       history: async (input) => (await page(input.chatId)).history(input),
       async changes(input) {
         const turns = await pathTurns(await host.chat.path(input.chatId));
@@ -522,7 +527,9 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
         if (!host.jobs) throw new HarnessRefusal("unavailable", "This runtime can't run jobs.");
         const setup = await readSetup(shared, input.chatId);
         // The user's own start: the job belongs to the chat and to no turn (§22).
-        const started = await shared.jobs.createJob({ chatId: input.chatId, when: input.when === "now" ? "now" : "after_reply", what: { agent: input.agent, task: input.task }, by: { who: "user" }, basis: null, ...(isRecord(input.allowance) ? { allowance: allowanceOf(input.allowance) } : {}) }, setup);
+        const plan = typeof input.plan === "string" && input.plan.trim() !== "" ? input.plan.trim() : null;
+        if (plan !== null && plan.length > setup.settings.workspace.pathChars) throw new HarnessRefusal("invalid", `The plan's path is ${plan.length} characters, and a path may be ${setup.settings.workspace.pathChars} at most (Path length).`);
+        const started = await shared.jobs.createJob({ chatId: input.chatId, when: input.when === "now" ? "now" : "after_reply", what: { agent: input.agent, task: input.task }, by: { who: "user" }, basis: null, ...(isRecord(input.allowance) ? { allowance: allowanceOf(input.allowance) } : {}), ...(input.area === "chat" ? { area: "chat" as const } : {}), ...(plan !== null ? { plan } : {}) }, setup);
         if ("refused" in started) throw new HarnessRefusal("invalid", started.refused);
         return { job: started };
       },

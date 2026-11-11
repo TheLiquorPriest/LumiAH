@@ -53,6 +53,7 @@ function rig(linked: string[] = ["relay-1"]) {
       const home = HOMES[chatId];
       return home !== undefined && up.has(home) ? home : null;
     },
+    needsRuntime: async () => null,
     runOf: (_userId, _stream, turn) => runs.get(turn) ?? null,
     jobOf: (_userId, job) => jobs.get(job) ?? null,
     name: "LumiAH",

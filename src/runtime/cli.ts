@@ -599,7 +599,7 @@ async function up(a: Args, io: RuntimeIO): Promise<number> {
   if (!bun.startsWith("/")) throw new UsageError(`--bun must be an absolute path (systemd searches no PATH that has Bun): ${bun}`);
   const memory = a.values["--memory"] ?? DEFAULT_MEMORY;
   if (!MEMORY.test(memory)) throw new UsageError(`--memory is "${memory}": give a size as systemd reads one, such as 768M or 2G.`);
-  if (systemd && io.platform !== "linux") throw new Error(`--systemd installs a systemd service, and this is ${io.platform}. Run the runtime in the foreground instead (leave out --systemd), under your own service manager.`);
+  if (systemd && io.platform !== "linux") throw new Error(`--systemd installs a systemd service, and this is ${io.platform}. Leave out --systemd: the runtime then runs in the foreground, and ${io.platform === "darwin" ? "launchd" : io.platform === "win32" ? "Task Scheduler" : "your system's service manager"} keeps it running (LumiAH's docs/RUNTIME.md, "Keep it running", has the steps).`);
   if (systemd && io.uid === 0) throw new Error("--systemd installs a service of your own account, and root's account has none on most systems. Run the runtime as the account Lumiverse runs as (sudo -u <account> …): it needs no more rights than that.");
   if (systemd && inContainer(io)) throw new Error(containerGuide(bun, io.self, placeOf(named ?? "runtime", io).config, base, extension));
   if (systemd && /\.ts$/.test(io.self)) throw new Error(`The service runs a built runtime, and this runs from source (${io.self}). Build first (bun run build), then run dist/lumiah.js.`);
@@ -845,7 +845,7 @@ async function status(a: Args, io: RuntimeIO): Promise<number> {
     const ctl = ctlOf(io);
     const active = await io.run("systemctl", [...ctl.args, "is-active", place.unitName], ctl.env);
     io.out(`Service ${place.unitName}: ${active.out.trim() || "unknown"}.`);
-  } else io.out("No service: it runs only while `lumiah up` or `lumiah serve` does.");
+  } else io.out("No systemd unit here: it runs while `lumiah up` or `lumiah serve` runs, or under the service you made for it (launchd on macOS, Task Scheduler on Windows).");
   let healthy = false;
   try {
     const body = await healthOf(config, io);

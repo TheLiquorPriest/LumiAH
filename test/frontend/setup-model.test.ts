@@ -96,6 +96,19 @@ describe("how a chat stands, said under its switch", () => {
     expect(chatStanding(chat({ place: "runtime", connection: OWN }), unready).fix).toEqual({ label: "Run it built in", place: "builtin" });
   });
 
+  test("a chat its extension plays only in the runtime is never offered built in: down, it says what to do instead", () => {
+    const unready: UiState = { ...ready, runtime: { ...ready.runtime, ready: false } };
+    const only = { place: "runtime" as const, needsRuntime: { by: "Harbour Play" } };
+    const away = chatStanding(chat({ ...only, connection: LOOPBACK, away: true }), unready);
+    expect(away).toEqual({ answered: false, tone: "warn", line: "Harbour Play plays this chat only in your runtime, which isn't answering, so it can't play until the runtime is back. Its line is on the Runtime page.", fix: null, takeover: null });
+    expect(chatStanding(chat({ ...only, connection: LOOPBACK }), unready).fix).toBeNull();
+    // Off its connection, the one press pins it back, whether or not a runtime is ready now.
+    expect(chatStanding(chat({ ...only, connection: OWN }), unready).fix).toEqual({ label: "Pin it back", place: "runtime" });
+    // Trouble with the runtime promises no built-in way where every chat that rests on it plays only there.
+    const resting: UiState = { ...unready, chats: [chat({ ...only, chatId: "chat-lamp", connection: LOOPBACK, away: true })] };
+    expect(runtimeTrouble(resting)).toBe("1 chat is set to run in the runtime, and none is ready: replies there may fail until one is.");
+  });
+
   test("each place is said in a line a newcomer can read", () => {
     expect(PLACE_ABOUT.builtin).toContain("Nothing to install");
     expect(PLACE_ABOUT.runtime).toContain("a program you start beside Lumiverse".replace(/^a/, "A"));

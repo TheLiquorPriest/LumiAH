@@ -35,6 +35,7 @@ export const TOOL = {
   presetInstructions: "preset_instructions",
   pastTurn: "past_turn",
   writeReply: "write_reply",
+  replyWrite: "reply_write",
   workspaceList: "workspace_list",
   workspaceRead: "workspace_read",
   workspaceGrep: "workspace_grep",

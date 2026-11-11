@@ -22,10 +22,10 @@
 import type { ResolvedAgent } from "./agents";
 import { foldKey, foldOf, summaryOf } from "./compaction";
 import { mergeDefinitions } from "./definitions";
-import { jobNews } from "./job-words";
+import { jobNews, jobState } from "./job-words";
 import { type AgentReply, cutShort } from "./loop";
 import { DOC } from "./paths";
-import { type AgentUsage, type HarnessHost, type JobView, type JsonObject, type ModelDelta, modelMessages, type PathMessage, type PreparedTurn, type PresetBlock, type RecordJob, type ReplySink, type RequestMessage, type TraceEvent, type TranscriptEntry, type TurnRecord, type TurnRequest, type TurnResult, type TurnStatus } from "./ports";
+import { type AgentRef, type AgentUsage, type HarnessHost, isRecord, type JobView, type JsonObject, type ModelDelta, modelMessages, type PathMessage, type PreparedTurn, type PresetBlock, type RecordJob, type ReplySink, type RequestMessage, type TraceEvent, type TranscriptEntry, type TurnRecord, type TurnRequest, type TurnResult, type TurnStatus } from "./ports";
 import { AgentStop } from "./provider";
 import { chronicleRefusal } from "./recall/definitions";
 import { recallTold } from "./recall/turn";
@@ -38,7 +38,7 @@ import { type Compaction, compactionAsked, compactionDue, type PendingTurn, pend
 import { AGENT, type Settings, settingsOf } from "./settings";
 import { leftOutWhy, type StorySource, storyHolds } from "./story";
 import { TEXT, TOOL, type Texts, textsOf } from "./texts";
-import type { PastTurn, ToolCtx, ToolOutcome } from "./tools";
+import type { PastTurn, ReplyStream, ToolCtx, ToolOutcome } from "./tools";
 import { emptyUsage } from "./usage";
 import { clip, errorText, type Limit, limitOf, stopWords, timerMs } from "./util";
 import { chatView, loreView } from "./views";
@@ -121,6 +121,12 @@ export class Turn {
   private readonly waited = new AbortController();
   /** The main agent was told the reply is nearly due. */
   private warned = false;
+  /** Text of the reply was released by the turn's agents themselves (`reply_write`, `to_reply`): the reply is what they released, and no writer writes it. */
+  private streamed = false;
+  /** A sub-agent's answer is streaming into the reply (`to_reply`): nothing else goes in meanwhile. */
+  private holder = false;
+  /** What `reply_write` releases, one passage after another in the order the calls came. */
+  private releasing: Promise<unknown> = Promise.resolve();
 
   constructor(
     private readonly shared: Shared,
@@ -152,6 +158,7 @@ export class Turn {
     this.settings = setup.settings;
     this.texts = setup.texts;
     const run = new Run(shared, setup, { info: { id: turn.generationId, kind: turn.kind, chatId: turn.chatId }, budget: this.settings.turn, startedAt: this.startedAt, messageId: turn.target.messageId, turn, heard: (event) => this.heard(event) });
+    run.reply = this.replyStream(run, false);
     const work = new Work();
     return this.conclude(work, run, await this.outcome(work, run, unread));
   }
@@ -162,6 +169,10 @@ export class Turn {
     if (failed === null) {
       try {
         const main = await this.runMain(work, run);
+        // The agents released the reply themselves: it is what they released, whatever the main agent answered last (§3.4).
+        if (this.streamed) return this.released();
+        // Where the extension says only what is released is the reply, nothing else stands in for it.
+        if (run.claim?.reply === "released") return main.reply.status === "cancelled" || this.signal.aborted ? { status: "stopped", reason: this.stoppedWhy() } : { status: "failed", reason: this.text(TEXT.progress.nothingReleased) };
         return main.writes ? this.ownReply(main.reply) : await this.briefed(main.reply, main.id, run, work);
       } catch (error) {
         if (error instanceof Stopped || this.signal.aborted) return { status: "stopped", reason: this.stoppedWhy() };
@@ -234,8 +245,11 @@ export class Turn {
     }
     this.settings = setup.settings;
     this.texts = setup.texts;
+    // A chat whose extension says it plays only in a runtime is never worked on here (§25): Lumiverse writes its reply alone, and the view says why.
+    if (setup.claim?.place === "runtime") return asCame(this.text(TEXT.jobs.whyRuntimeOnly));
     const replyBy = this.hosted?.replyBy ?? null;
     const run = new Run(shared, setup, { info: { id: turn.generationId, kind: turn.kind, chatId: turn.chatId }, budget: this.settings.turn, startedAt: this.startedAt, messageId: turn.target.messageId, turn, ...(replyBy !== null ? { replyBy } : {}) });
+    run.reply = this.replyStream(run, true);
     const work = new Work();
     // The moment the reply is due ends whatever is under way, as a stop would, with its own reason. A reply already due ends it before anything is begun.
     const timer = new AbortController();
@@ -501,6 +515,8 @@ export class Turn {
       this.live();
     }
     const { history, lead, tokens } = carriedOf(carried, sizes);
+    // The jobs the turn before this one started as due by it: waited for a while first, so the news below holds those that ended meanwhile.
+    const dueNote = await this.dueJobs(session);
     // The jobs that stopped since the turn before this one last looked: its main agent hasn't heard of them.
     const before = session.records.at(-1);
     work.heard = host.clock.now();
@@ -536,10 +552,16 @@ export class Turn {
     // What the prompt holds of the lore and of the chat (§24.1) and the top of the chat's chronicle (§24.7) follow the request's messages.
     // Upkeep is offered only where LumiAH's own agents keep the chronicle: in a chat whose extension puts an agent of its own in the chronicler's place, a job started for it would start that agent.
     const kept = settings.jobs.enabled && host.jobs !== undefined && chronicleRefusal(run.definitions, shared.options.extension?.name ?? null) === null;
-    const told = run.recall ? await recallTold(run.recall, { path: session.before, blocks, writes, learned: run.areas.learned, jobs: kept ? () => shared.jobs.open(turn.chatId) : null, emit: (event) => run.trace.emit(event), log: host.log, now: host.clock.now() }) : undefined;
+    // Where the extension shows the main agent only the user's newest message, nothing of the prompt is told: it isn't shown the prompt.
+    const newestOnly = run.claim?.request === "newest";
+    const releasedOnly = this.hosted === null && run.claim?.reply === "released";
+    const told = run.recall && !newestOnly ? await recallTold(run.recall, { path: session.before, blocks, writes, learned: run.areas.learned, jobs: kept ? () => shared.jobs.open(turn.chatId) : null, emit: (event) => run.trace.emit(event), log: host.log, now: host.clock.now() }) : undefined;
     const document = requestDocument(turn.messages, blocks, session.before, texts, told);
     work.request = { messages: document.messages, last: document.last };
-    run.request = { count: texts.counted(document.messages, TEXT.word.message), text: document.text };
+    // The user's newest message: the last of the user's that came from the chat, else the last of the user's.
+    const latest = newestOnly ? (turn.messages.findLast((m) => m.role === "user" && m.source?.kind === "history") ?? turn.messages.findLast((m) => m.role === "user") ?? null) : null;
+    const newest = latest ? requestDocument([latest], blocks, session.before, texts).text : texts.render(TEXT.main.noNewest);
+    run.request = newestOnly ? { count: texts.counted(latest ? 1 : 0, TEXT.word.message), text: newest, newest: true } : { count: texts.counted(document.messages, TEXT.word.message), text: document.text };
     const jobs = jobNews(news, texts);
     // Where only the model's replies are the story, the user's messages are directions: the main agent is told so, and given this reply's, read from the chat itself.
     const directed = await directedNote({
@@ -562,10 +584,13 @@ export class Turn {
       ...(lead !== null ? [texts.render(TEXT.main.noteSummary, { summary: lead })] : []),
       ...(session.continued ? [texts.render(TEXT.main.noteContinued, { receipt: receiptOf(session.continued.segment, settings.session, texts) })] : []),
       ...(jobs !== null ? [jobs] : []),
+      ...(dueNote !== null ? [dueNote] : []),
       ...(directed !== null ? [directed] : []),
     ];
     const kinds = { new: TEXT.main.kindNew, regenerate: TEXT.main.kindRegenerate, swipe: TEXT.main.kindSwipe, continue: TEXT.main.kindContinue } as const;
-    const asked = texts.render(TEXT.main.turn, { kind: texts.render(kinds[turn.kind]), notes: notes.map((note) => `${note}\n\n`).join(""), count: run.request.count, request: document.text, ask: texts.render(writes ? TEXT.main.askWrites : TEXT.main.ask) });
+    const ask = texts.render(releasedOnly ? TEXT.main.askReleases : writes ? TEXT.main.askWrites : TEXT.main.ask);
+    const noted = notes.map((note) => `${note}\n\n`).join("");
+    const asked = newestOnly ? texts.render(TEXT.main.turnNewest, { kind: texts.render(kinds[turn.kind]), notes: noted, message: newest, ask }) : texts.render(TEXT.main.turn, { kind: texts.render(kinds[turn.kind]), notes: noted, count: run.request.count, request: document.text, ask });
     // Where the reply is due at a moment the host named, the main agent is told how long it has.
     const replyBy = this.hosted?.replyBy ?? null;
     const message = replyBy === null ? asked : `${asked}\n\n${texts.render(TEXT.hosted.replyBy, { seconds: String(Math.max(0, Math.round((replyBy - host.clock.now()) / 1000))) })}`;
@@ -576,7 +601,8 @@ export class Turn {
       main: true,
       // LumiAH's own main agent has instructions for each way the reply is written; any other definition's are its own.
       ...(writes && main.definition.text === TEXT.main.system ? { system: texts.render(TEXT.main.systemWrites) } : {}),
-      ...(writes ? {} : { writeReply: this.hosted ? async (brief: string) => this.handBrief(brief, run) : (brief: string, ctx: ToolCtx) => this.writeReply(brief, ctx.agentId, run) }),
+      // Where only what the agents release is the reply, no writer is there to brief.
+      ...(writes || releasedOnly ? {} : { writeReply: this.hosted ? async (brief: string) => this.handBrief(brief, run) : (brief: string, ctx: ToolCtx) => this.writeReply(brief, ctx.agentId, run) }),
       ...(this.hosted ? { notices: () => this.soon() } : {}),
     });
     this.mainId = agent.id;
@@ -665,6 +691,13 @@ export class Turn {
    */
   private async unbriefed(reason: string, work: Work, run: Run): Promise<Outcome> {
     if (this.signal.aborted) return { status: "stopped", reason: this.stoppedWhy() };
+    // What the agents released stands as the reply: the log keeps what broke after it.
+    if (this.streamed) {
+      this.host.log("warn", `[LumiAH] the turn's work failed after part of its reply was released (${reason}): what was released stands`);
+      return this.released();
+    }
+    // Where only what is released is the reply, no writer writes in the agents' place.
+    if (this.hosted === null && run.claim?.reply === "released") return { status: "failed", reason };
     // The reply stands as far as it was written: whole, the turn is done, and the log keeps what broke after it; in part, nothing can be written after it.
     if (this.written) {
       this.host.log("warn", `[LumiAH] the turn's work failed after its reply was written (${reason}): the reply stands`);
@@ -728,6 +761,9 @@ export class Turn {
 
   /** `write_reply`: the writer writes from the main agent's brief, and its reply ends the main agent's send. */
   private async writeReply(brief: string, mainId: string, run: Run): Promise<ToolOutcome> {
+    // Once the agents released part of the reply, it is theirs to finish: a writer would write a second reply after it.
+    if (this.streamed) return { text: this.text(TEXT.answer.replyReleased), error: true };
+    if (this.holder) return { text: this.text(TEXT.answer.releaseHeld), error: true };
     if (this.writing || this.written || this.broken !== null) return { text: this.text(TEXT.answer.replyBusy), error: true };
     this.progress(TEXT.progress.writing);
     const wrote = await this.write(brief, "call", mainId, run);
@@ -833,8 +869,115 @@ export class Turn {
     this.closed = true;
   }
 
+  // ---------------------------------------------------------------- the reply, released by the agents (§3.4)
+
+  /**
+   * The reply as the turn's agents may write it themselves (`reply_write`, `delegate`'s
+   * `to_reply`). Built in, nothing can be released: Lumiverse's own generation writes the reply
+   * there (§25). In a runtime a passage goes out once nothing else holds the reply and the
+   * extension lets it (§21 `releasing`), in the order the calls came.
+   */
+  private replyStream(run: Run, builtIn: boolean): ReplyStream {
+    const shut = (): string | null => {
+      if (builtIn) return this.text(TEXT.answer.releaseBuiltIn);
+      if (this.closed || this.signal.aborted) return this.text(TEXT.answer.releaseEnded);
+      if (this.writing || this.written || this.broken !== null) return this.text(TEXT.answer.releaseWriter);
+      if (this.holder) return this.text(TEXT.answer.releaseHeld);
+      return null;
+    };
+    return {
+      refused: shut,
+      write: (text, ctx) => {
+        const next = this.releasing.then(() => this.release(text, ctx, run, shut));
+        this.releasing = next.catch(() => undefined);
+        return next;
+      },
+      hold: (agent) => {
+        this.holder = true;
+        let given = false;
+        return (released) => {
+          if (given) return;
+          given = true;
+          this.holder = false;
+          if (released !== "") this.tellReleased(run, agent, released);
+        };
+      },
+      stream: (text) => this.streamOut(text),
+      length: () => this.reply.length,
+    };
+  }
+
+  /** One `reply_write` passage: asked about (§21 `releasing`), then sent. Null once it went out; else why not, in words for the model. A check that fails or gives no word in time lets nothing go: the passage is held to what the extension let through. */
+  private async release(text: string, ctx: ToolCtx, run: Run, shut: () => string | null): Promise<string | null> {
+    const first = shut();
+    if (first !== null) return first;
+    const { turn, shared } = this;
+    const agent: AgentRef = run.ref(ctx.agentId) ?? { agentId: ctx.agentId, role: ctx.role, ...(ctx.as !== undefined ? { as: ctx.as } : {}) };
+    const extension = shared.options.extension;
+    if (extension?.releasing) {
+      const lost = {};
+      const verdict: unknown = await askExtension<unknown>(shared, "word on a passage of the reply", this.extensionWait(), () => extension.releasing?.({ userId: run.userId, chatId: turn.chatId, turn: turn.generationId, agent, text }) ?? Promise.resolve(null), lost);
+      if (verdict === lost) return this.text(TEXT.answer.releaseUnchecked);
+      if (verdict !== null && verdict !== undefined) return isRecord(verdict) && typeof verdict.refused === "string" && verdict.refused.trim() !== "" ? clip(verdict.refused, this.settings.tools.pageChars) : this.text(TEXT.answer.releaseUnchecked);
+      // Asked again: the reply may have ended, or another agent's answer begun streaming into it, while the extension looked.
+      const late = shut();
+      if (late !== null) return late;
+    }
+    if (!this.streamOut(text)) return this.text(TEXT.answer.releaseEnded);
+    this.tellReleased(run, agent, text);
+    return null;
+  }
+
+  /** Text the agents release goes to the reply, unless the turn was stopped or its reply ended: false where it went nowhere. */
+  private streamOut(text: string): boolean {
+    if (text === "" || this.closed || this.signal.aborted) return false;
+    this.streamed = true;
+    this.content(text);
+    return true;
+  }
+
+  /** The extension hears what reached the user (§21 `released`); nothing waits on it. */
+  private tellReleased(run: Run, agent: AgentRef, text: string): void {
+    const { turn } = this;
+    const extension = this.shared.options.extension;
+    run.hook("answer to a passage released", extension?.released ? () => extension.released?.({ userId: run.userId, chatId: turn.chatId, turn: turn.generationId, agent, text }) ?? Promise.resolve() : undefined);
+  }
+
+  /** The turn ends with the reply its agents released: whole, however the main agent's own work ended. */
+  private released(): Outcome {
+    if (this.signal.aborted) return { status: "stopped", reason: this.stoppedWhy() };
+    this.written = true;
+    this.finish = "stop";
+    return { status: "done" };
+  }
+
+  /**
+   * The jobs due by this turn (§15: `job_start`'s `due`): those the turn before it on the path
+   * started as due by the next, waited for until they end or Wait for jobs due has passed. The note
+   * that names those still not ended, for the main agent; null where there are none.
+   */
+  private async dueJobs(session: ResumedSession): Promise<string | null> {
+    const { host, turn, settings, texts, shared } = this;
+    const basis = (session.own ?? session.records.at(-1))?.generationId;
+    if (basis === undefined || !settings.jobs.enabled || !host.jobs) return null;
+    let still: JobView[];
+    try {
+      const due = await shared.jobs.awaitDue(turn.chatId, basis, 0, this.signal);
+      if (due.length === 0) return null;
+      this.progress(TEXT.progress.dueWait, { jobs: texts.counted(due.length, TEXT.jobs.word) });
+      still = await shared.jobs.awaitDue(turn.chatId, basis, settings.jobs.dueWaitMs, this.signal);
+    } catch (error) {
+      host.log("warn", `[LumiAH] the jobs due by this turn couldn't be read (${errorText(error)}): the main agent isn't told of them`);
+      return null;
+    }
+    this.live();
+    if (still.length === 0) return null;
+    return texts.render(TEXT.jobs.dueRunning, { jobs: still.map((job) => texts.render(TEXT.jobs.dueLine, { id: job.id, agent: job.agent, as: job.as !== undefined ? texts.render(TEXT.jobs.dueAs, { as: job.as }) : "", state: jobState(job, texts) })).join("\n") });
+  }
+
   private content(text: string): void {
-    if (text === "") return;
+    // Nothing more counts as the reply once the turn was stopped: the runtime sends nothing after a stop, so the reply is what the user saw.
+    if (text === "" || this.signal.aborted) return;
     this.reply += text;
     this.toSink(() => this.sink.content(text));
   }
@@ -858,7 +1001,8 @@ export class Turn {
     const { entry } = event;
     if (entry.kind === "retry") this.progress(TEXT.progress.retry, { reason: entry.reason, attempt: String(entry.attempt), retries: String(entry.of) });
     if (event.agentId !== this.mainId || entry.kind !== "answer") return;
-    for (const call of entry.calls) this.progress(TEXT.progress.call, { tool: call.name, args: JSON.stringify(call.args) });
+    // A passage the main agent releases is in the reply itself: the thinking block isn't given it again.
+    for (const call of entry.calls) if (call.name !== TOOL.replyWrite) this.progress(TEXT.progress.call, { tool: call.name, args: JSON.stringify(call.args) });
   }
 
   // ---------------------------------------------------------------- the record

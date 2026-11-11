@@ -11,7 +11,12 @@
 //   session) writes to the latest turn on the active path: "the index of the latest record on the
 //   active path, plus what jobs on that path wrote since". While a turn is under way in the chat they
 //   write to that turn's area, so its agents see the change, and to the area it started from as
-//   well, so the change stays on the path if that turn's reply is swiped away.
+//   well, so the change stays on the path if that turn's reply is swiped away. The user on the page,
+//   and a job the user started to write the chat's area (an extension's prepared start, §22), do the
+//   same for the newest reply once its turn has ended: what they write stays through a swipe or a
+//   regenerate of it.
+// - A branch reads each turn's area from that turn's record. Before its first record it reads the
+//   chat it was branched from, as that chat's stands, until it writes its own.
 
 import { DOC, ROOT_AREA } from "./paths";
 import type { FileAuthor, FileChange, HarnessHost, JsonObject, TurnRecord } from "./ports";
@@ -38,6 +43,8 @@ export interface Outsider {
   basis?: string | null;
   /** Asked before every change: why it may not be made (in words for whoever asked), or null. A job's is whether its turn still stands on the path. */
   gate?: () => Promise<string | null>;
+  /** Its changes stay through a swipe or a regenerate of the newest reply: they go to the area that reply's turn started from as well (the user on the page, §11; a job the user started to write the chat's area, §22). */
+  throughSwipe?: true;
 }
 
 /**
@@ -95,10 +102,17 @@ export class Areas {
     }
   }
 
-  /** The chat's area as a turn left it (`record`), with what was written to it since; before any turn, for none. */
+  /** The chat's area as a turn left it (`record`), with what was written to it since; before any turn, for none, which a branch reads from the chat it was branched from until it writes its own. */
   at(chatId: string, record: TurnRecord | null): Area {
-    if (record === null) return this.workspace.area("chat", DOC.chatArea(chatId, ROOT_AREA));
+    if (record === null) return this.workspace.area("chat", DOC.chatArea(chatId, ROOT_AREA), () => this.originRoot(chatId, new Set([chatId])));
     return this.workspace.area("chat", DOC.chatArea(chatId, record.generationId), async () => record.workspace ?? null);
+  }
+
+  /** The chat's area before any turn, for a branch that has written none of its own: the one of the chat it was branched from, as it stands. `seen`: the chats asked already, so no chain of branches is followed round. */
+  private async originRoot(chatId: string, seen: ReadonlySet<string>): Promise<string | null> {
+    const from = (await this.host.chat.info?.(chatId))?.branchedFrom ?? null;
+    if (from === null || seen.has(from)) return null;
+    return this.workspace.area("chat", DOC.chatArea(from, ROOT_AREA), () => this.originRoot(from, new Set([...seen, from]))).headHash();
   }
 
   /**
@@ -143,6 +157,19 @@ export class Areas {
   /** The latest record that stands on the chat's active path, with where its reply is; null when there is none. */
   async latest(chatId: string): Promise<PathTurn | null> {
     return (await this.standing(chatId)).at(-1) ?? null;
+  }
+
+  /**
+   * The latest record on the chat's active path and, where it is on the path's last message (a
+   * reply a swipe or a regenerate would replace), the record such a turn starts from: the one
+   * before it, or null for none. `base` is absent where a swipe of the last message starts from
+   * the latest record itself.
+   */
+  async newest(chatId: string): Promise<{ latest: PathTurn | null; base?: PathTurn | null }> {
+    const path = await this.host.chat.path(chatId);
+    const standing = (await pathTurns(path)).filter((turn) => turn.onPath);
+    const latest = standing.at(-1) ?? null;
+    return latest !== null && latest.at === path.length - 1 ? { latest, base: standing.at(-2) ?? null } : { latest };
   }
 
   /**
@@ -205,6 +232,10 @@ class LiveArea implements AreaAccess {
     const turns = (): Promise<PathTurn[]> => (standing ??= this.areas.standing(this.chatId));
     const turn = await this.areas.current(this.chatId, turns);
     if (turn) return { area: turn.area, also: this.who.basis === turn.generationId ? null : turn.under };
+    if (this.who.throughSwipe) {
+      const { latest, base } = await this.areas.newest(this.chatId);
+      return { area: this.areas.at(this.chatId, latest?.record ?? null), also: base === undefined ? null : this.areas.at(this.chatId, base?.record ?? null) };
+    }
     return { area: this.areas.at(this.chatId, (await turns()).at(-1)?.record ?? null), also: null };
   }
 

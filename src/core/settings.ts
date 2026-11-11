@@ -234,6 +234,10 @@ export interface Settings {
     grant: "own" | "definition";
     /** The files a task names are given with it, in characters at most in all. */
     fileChars: number;
+    /** The most characters `as` may hold in a `delegate` or `job_start` call: which instance of a definition an agent is. */
+    asChars: number;
+    /** A sub-agent whose answer goes to the reply (`delegate`'s `to_reply`): the text of each of its model calls is held until it is this long or the call ends without a tool call, then it streams. Text of a call that ends in tool calls before that is never sent. */
+    replyHoldChars: number;
   };
   jobs: {
     /** Off: no job is started and none runs. */
@@ -256,6 +260,8 @@ export interface Settings {
     chain: boolean;
     /** Sub-agents the agents of one job's run may start in all; null: no limit of its own, since its allowance bounds it. A turn's are bound by `delegation.perRun`. */
     delegations: Limit;
+    /** How long a turn waits at its start for the jobs due by it (`job_start`'s `due`), in milliseconds; those still running then are named to its main agent. */
+    dueWaitMs: number;
   };
   approval: {
     /** For each tier of tool: its calls run, or wait for the user's word. */
@@ -352,8 +358,8 @@ export const MAIN_TOOLS: readonly string[] = [
 /** The tools the summarizer is given unless the user says otherwise: enough to read what it is asked to summarize, and nothing that changes anything. */
 export const SUMMARIZER_TOOLS: readonly string[] = [TOOL.chatSearch, TOOL.chatGrep, TOOL.chatRead, TOOL.bookOutline, TOOL.bookRead, TOOL.loreSearch, TOOL.loreRead, TOOL.workspaceList, TOOL.workspaceRead, TOOL.workspaceGrep];
 
-/** Every tool and every family of tools the core has: what an agent may be given where no more is registered (`@family` gives every tool of a family, those added to it later too). */
-export const CORE_TOOLS: readonly string[] = [...MAIN_TOOLS, TOOL.webSearch, ...Object.values(FAMILY).map((family) => `@${family}`)];
+/** Every tool and every family of tools the core has: what an agent may be given where no more is registered (`@family` gives every tool of a family, those added to it later too). `reply_write` is nobody's by default: it is given by name, to the main agent or an extension's agent that releases the reply itself. */
+export const CORE_TOOLS: readonly string[] = [...MAIN_TOOLS, TOOL.webSearch, TOOL.replyWrite, ...Object.values(FAMILY).map((family) => `@${family}`)];
 
 /** A new user's settings. */
 export function defaultSettings(): Settings {
@@ -395,9 +401,11 @@ export function defaultSettings(): Settings {
     guidance: { chars: 8000, agentsEdit: false },
     skills: { listChars: 4000 },
     // Two deep: the agent a run starts with, and the agents it starts. So a job the main agent starts (the chronicler's) may hand parts of its work on, and whoever takes them hands nothing further. A few at a time, and nobody gives away what it doesn't hold.
-    delegation: { depth: 2, atOnce: 3, perRun: 12, grant: "own", fileChars: 12_000 },
+    // `as` names an instance (an entity's id), so 200 characters is room to spare. A sub-agent's text is held for its first 200 characters: what a model writes before a tool call is a line or two, and past that it is the answer.
+    delegation: { depth: 2, atOnce: 3, perRun: 12, grant: "own", fileChars: 12_000, asChars: 200, replyHoldChars: 200 },
     // A job runs unattended, so each has a ceiling of its own: enough for a long look through a chat, not for running away. Its sub-agents are bounded by that ceiling, not counted.
-    jobs: { enabled: true, atOnce: 1, perRun: 3, budget: { tokensIn: 600_000, tokensOut: 60_000, toolTurns: 60, wallMs: 900_000 }, tokensPerDay: 3_000_000, taskChars: 4000, openingChars: 600, recordWaitMs: 120_000, chain: true, delegations: null },
+    // A turn waits a minute at most for the jobs due by it: long enough for a digest, short enough that the user isn't left waiting on one that has stalled.
+    jobs: { enabled: true, atOnce: 1, perRun: 3, budget: { tokensIn: 600_000, tokensOut: 60_000, toolTurns: 60, wallMs: 900_000 }, tokensPerDay: 3_000_000, taskChars: 4000, openingChars: 600, recordWaitMs: 120_000, chain: true, delegations: null, dueWaitMs: 60_000 },
     // Every tier runs without a word. A tool that acts outside LumiAH is one the user set up in Lumiverse and switched on for agents, or installed with an extension: that was their word, and Lumiverse's own tool calling asks no more. Asking first is one switch, by tier or by tool.
     approval: { tiers: { read: "allow", write: "allow", external: "allow" }, tools: {}, waitMs: 300_000 },
     // A cached re-read at a tenth of a token: about what providers bill it at.
@@ -433,6 +441,11 @@ const EFFORTS: readonly [ModelEffort, string, string?][] = [
   ["xhigh", "Extra high"],
   ["max", "Maximum"],
 ];
+
+/** Whether a value is a model effort the settings take: what an extension answers for an agent's model is outside data. */
+export function isEffort(value: unknown): value is ModelEffort {
+  return EFFORTS.some(([effort]) => effort === value);
+}
 
 const TOOL_CALLS: readonly [ToolCalls, string, string][] = [
   ["auto", "Native, else as text", "Native tool calls where the connection takes them. Once it refuses them, the tools are described in the prompt and the model writes its calls; native calls are tried again after a time (Connections)."],
@@ -728,6 +741,8 @@ export const SETTINGS_SCHEMA: JsonObject = {
           ["definition", "Whatever its definition names", "Its definition alone decides."],
         ]),
         fileChars: whole("Files given with a task", "The most characters of the files a task names that are given with it. Past it the rest are named, with how to read them.", 0, "characters"),
+        asChars: whole("Instance name length", "The most characters of as in delegate and job_start: which one of the many an agent stands for, such as a character. A longer one is refused.", 1, "characters"),
+        replyHoldChars: whole("Hold before a handed-on reply streams", "When an agent hands the reply to another (to_reply in delegate), each of that agent's answers is held until it is this long or ends without a tool call, then it streams. So the line or two it writes before a tool call is never sent; what streamed is never taken back. 0 streams everything at once.", 0, "characters"),
       },
     },
     jobs: {
@@ -755,6 +770,7 @@ export const SETTINGS_SCHEMA: JsonObject = {
         recordWaitMs: whole("Wait for a turn to be saved", "A job that ends just as its turn does waits this long for Lumiverse to save that turn's reply before it takes the turn as gone from the chat.", 0, "ms", TIMER_MAX_MS),
         chain: flag("Jobs may start jobs", "A job's own agents are offered job_start. A job so started may spend no more than is left of the one that started it, and what it spends counts against that one's allowance too. Off: only the agents of a turn or a side session, and you, start jobs."),
         delegations: limit("Delegations per job", "The most sub-agents the agents of one job may start in all. None: no limit of its own, since what a job may spend bounds it. Sub-agents per turn bounds a turn's.", "agents"),
+        dueWaitMs: whole("Wait for jobs due", "How long a turn waits at its start for the jobs started as due by it (due in job_start). The main agent is told of any still running.", 0, "ms", TIMER_MAX_MS),
       },
     },
     approval: {

@@ -1,0 +1,387 @@
+// What LumiAH gives an extension that writes its own story engine on it (DESIGN §3.4, §14, §15, §21,
+// §25): the reply released a passage at a time, a sub-agent's answer handed the reply's stream, the
+// extension's word on each agent's model and on each passage, jobs in lanes and due by the next
+// turn, and a claim that keeps a chat to the runtime, shows the main agent only the user's newest
+// message, and lets nothing but released text be the reply.
+
+import { describe, expect, test } from "bun:test";
+import type { AgentDefinition } from "../../src/core/agents";
+import type { AgentModelAsk, ChatClaim, HarnessExtension, ReplyRelease } from "../../src/core/extension";
+import { Gate } from "../../src/core/gate";
+import { createHarness } from "../../src/core/harness";
+import type { ModelRequest, TurnRequest } from "../../src/core/ports";
+import { defaultSettings, newAgentSettings, type Settings } from "../../src/core/settings";
+import { renderDefault, TEXT } from "../../src/core/texts";
+import { type Answer, call, MemoryHost, runTurn, type Script, until, WRITER } from "./support/host";
+
+const CHAT = "chat-depth";
+const never = new AbortController().signal;
+
+const AUTHOR = "You are the author. You decide what happens and release the reply.";
+const VOICE = "You are Mara, a lamp keeper. Answer as she would.";
+const def = (id: string, instructions: string, tools: string[]): AgentDefinition => ({ ...newAgentSettings(), id, name: id, description: `${id}: part of the story engine.`, instructions, given: "task", tools, grant: "definition" });
+const author = def("author", AUTHOR, ["reply_write", "write_reply", "delegate", "agent_message", "job_start", "job_list", "job_read"]);
+const voice = def("voice", VOICE, ["reply_write", "job_list"]);
+
+const system = (request: ModelRequest): string => (request.messages[0]?.role === "system" ? request.messages[0].content : "");
+/** Every message of a call, as one text: what the agent was sent, its own calls and their results. */
+const seen = (request: ModelRequest | undefined): string => JSON.stringify(request?.messages ?? []);
+
+/** Answers each agent's calls in turn, by whose instructions the call carries. */
+function lines(parts: { author?: Answer[]; voice?: Answer[] }): Script {
+  const at = { author: 0, voice: 0 };
+  return (request) => {
+    const who = system(request).includes(VOICE) ? "voice" : "author";
+    const line = parts[who]?.[at[who]++];
+    if (line === undefined) throw new Error(`no line for the ${who}'s call ${at[who]}`);
+    return line;
+  };
+}
+
+/** A chat an extension claims for its author, the extension hearing every passage released. */
+function rig(script: Script, options: { claim?: ChatClaim | null; extension?: Partial<HarnessExtension>; place?: "builtin" | "runtime"; change?: (s: Settings) => void } = {}) {
+  const host = new MemoryHost();
+  host.script = script;
+  host.say(CHAT, "assistant", "The lamp room is cold.");
+  host.say(CHAT, "user", "I ask Mara what she saw.");
+  const stored = { values: defaultSettings(), texts: {} };
+  options.change?.(stored.values);
+  const released: ReplyRelease[] = [];
+  const extension: HarnessExtension = {
+    name: "Depth",
+    definitions: async () => ({ agents: [author, voice] }),
+    claim: async () => (options.claim === null ? null : { mainAgent: "author", ...options.claim }),
+    released: async (release) => void released.push(structuredClone(release)),
+    ...options.extension,
+  };
+  const harness = createHarness(host, { settings: async () => structuredClone(stored), extension, ...(options.place ? { place: options.place } : {}) });
+  /** The calls one agent made, in order. */
+  const callsOf = (instructions: string): ModelRequest[] => host.calls.filter((request) => system(request).includes(instructions));
+  return { host, harness, released, callsOf };
+}
+
+describe("the reply, released by the agents (§3.4)", () => {
+  test("several reply_write calls make one reply, in order; the turn needs no write_reply, and write_reply is refused after", async () => {
+    const r = rig(
+      lines({
+        author: [
+          // Two in one answer go out in the order they were called.
+          { toolCalls: [call("reply_write", { text: "The lamp gutters. " }), call("reply_write", { text: "Mara looks up." })] },
+          { toolCalls: [call("reply_write", { text: ' "I saw the boat."' })] },
+          { toolCalls: [call("write_reply", { brief: "Mara saw the boat." })] },
+          "That is the moment.",
+        ],
+      }),
+    );
+    const { result, sink } = await runTurn(r.host, r.harness, CHAT);
+    const reply = 'The lamp gutters. Mara looks up. "I saw the boat."';
+    expect(result).toMatchObject({ status: "done", reply });
+    expect(sink.text).toBe(reply);
+    expect(sink.order.filter((kind) => kind === "content")).toHaveLength(3);
+    // The record holds the turn, and the main agent's last answer is no part of the reply.
+    expect(result.record).not.toBeNull();
+    // No writer was called: the author's four calls are all there were, and write_reply was refused in words.
+    expect(r.host.calls).toHaveLength(4);
+    expect(seen(r.host.calls[3])).toContain(renderDefault(TEXT.answer.replyReleased));
+    // The extension heard each passage, from the author.
+    expect(r.released.map((release) => [release.agent.role, release.text])).toEqual([
+      ["author", "The lamp gutters. "],
+      ["author", "Mara looks up."],
+      ["author", ' "I saw the boat."'],
+    ]);
+  });
+
+  test("built in, reply_write is refused with a plain reason, and Lumiverse writes the reply", async () => {
+    const r = rig(lines({ author: [{ toolCalls: [call("reply_write", { text: "Mara nods." })] }, "Mara should nod and say nothing."] }));
+    const prepared = await r.harness.prepare(request(r.host), { replyBy: null }, never);
+    expect(prepared.part).toBe("answer");
+    expect(seen(r.host.calls[1])).toContain(renderDefault(TEXT.answer.releaseBuiltIn));
+    expect(r.released).toEqual([]);
+  });
+
+  test("the extension's check: a refusal is the call's answer and nothing streams; a check that fails lets nothing go", async () => {
+    const r = rig(
+      lines({
+        author: [
+          { toolCalls: [call("reply_write", { text: "The vault code is 4471." })] },
+          { toolCalls: [call("reply_write", { text: "boom" })] },
+          { toolCalls: [call("reply_write", { text: "Mara shrugs." })] },
+          "Done.",
+        ],
+      }),
+      {
+        extension: {
+          releasing: async (release) => {
+            if (release.text === "boom") throw new Error("the checker broke");
+            return release.text.includes("vault") ? { refused: "That names the vault's code: keep it hidden." } : null;
+          },
+        },
+      },
+    );
+    const { result } = await runTurn(r.host, r.harness, CHAT);
+    expect(result).toMatchObject({ status: "done", reply: "Mara shrugs." });
+    expect(seen(r.host.calls[1])).toContain("That names the vault's code: keep it hidden.");
+    expect(seen(r.host.calls[2])).toContain(renderDefault(TEXT.answer.releaseUnchecked));
+    expect(r.released.map((release) => release.text)).toEqual(["Mara shrugs."]);
+  });
+
+  test("a claim whose reply is only what is released: a turn that released nothing fails, and no writer writes", async () => {
+    const r = rig(lines({ author: ["Nothing to say."] }), { claim: { reply: "released" } });
+    const { result, sink } = await runTurn(r.host, r.harness, CHAT);
+    expect(result).toMatchObject({ status: "failed", reason: renderDefault(TEXT.progress.nothingReleased), reply: "" });
+    expect(sink.text).toBe("");
+    expect(sink.failed).not.toBeNull();
+    expect(r.host.calls).toHaveLength(1);
+    // write_reply isn't offered, and the author is asked to release the reply.
+    expect(r.host.calls[0]?.tools?.map((tool) => tool.name)).not.toContain("write_reply");
+    expect(seen(r.host.calls[0])).toContain(renderDefault(TEXT.main.askReleases));
+  });
+});
+
+describe("handing the reply on (§14: to_reply)", () => {
+  test("the sub-agent's answer streams into the reply as it is written, and is the call's result; words before a tool call never go out", async () => {
+    const r = rig(
+      lines({
+        author: [{ toolCalls: [call("delegate", { agent: "voice", task: "Answer the user as Mara.", as: "mara", to_reply: true })] }, "Done."],
+        voice: [{ content: "Hmm. ", toolCalls: [call("job_list", {})] }, "I saw the boat go out at dawn."],
+      }),
+      { change: (s) => (s.delegation.replyHoldChars = 10) },
+    );
+    const { result, sink } = await runTurn(r.host, r.harness, CHAT);
+    const answer = "I saw the boat go out at dawn.";
+    expect(result).toMatchObject({ status: "done", reply: answer });
+    expect(sink.text).toBe(answer);
+    // It went out in pieces as the model wrote it, not whole at the end.
+    expect(sink.order.filter((kind) => kind === "content").length).toBeGreaterThan(1);
+    // The author's call came back with that answer.
+    expect(seen(r.callsOf(AUTHOR)[1])).toContain(answer);
+    expect(r.released).toEqual([expect.objectContaining({ text: answer, agent: expect.objectContaining({ role: "voice", as: "mara" }) })]);
+    const started = r.host.traced.flatMap(({ event }) => (event.kind === "agent_started" && event.agent.role === "voice" ? [event.agent] : []));
+    expect(started[0]?.as).toBe("mara");
+  });
+
+  test("an agent that doesn't write the reply can't hand it on; delegate offers as only where an extension builds LumiAH in", async () => {
+    const r = rig(lines({ author: [{ toolCalls: [call("delegate", { agent: "voice", task: "Speak.", to_reply: true })] }, "Mara is quiet."] }), { claim: null, change: (s) => (s.reply.writer = "main") });
+    const { result } = await runTurn(r.host, r.harness, CHAT);
+    expect(result).toMatchObject({ status: "done", reply: "Mara is quiet." });
+    expect(seen(r.host.calls[1])).toContain(renderDefault(TEXT.agents.noReply));
+    const delegate = r.host.calls[0]?.tools?.find((tool) => tool.name === "delegate");
+    expect(Object.keys((delegate?.parameters.properties ?? {}) as object)).toEqual(["agent", "task", "files", "as"]);
+  });
+
+  test("a chat that uses none of it is sent the tools as before", async () => {
+    const host = new MemoryHost();
+    host.script = ["Mara is quiet."];
+    host.say(CHAT, "user", "Hello.");
+    const stored = { values: defaultSettings(), texts: {} };
+    stored.values.reply.writer = "main";
+    const harness = createHarness(host, { settings: async () => structuredClone(stored) });
+    await runTurn(host, harness, CHAT);
+    const tools = host.calls[0]?.tools ?? [];
+    expect(tools.map((tool) => tool.name)).not.toContain("reply_write");
+    expect(Object.keys((tools.find((tool) => tool.name === "delegate")?.parameters.properties ?? {}) as object)).toEqual(["agent", "task", "files"]);
+    expect(Object.keys((tools.find((tool) => tool.name === "job_start")?.parameters.properties ?? {}) as object)).toEqual(["agent", "task", "when", "again"]);
+  });
+});
+
+describe("the extension's word on an agent's model (§21: agentModel)", () => {
+  test("the model the hook answers is the one called, asked with the definition, as, and who started it; a long as is refused", async () => {
+    const asked: AgentModelAsk[] = [];
+    const r = rig(
+      lines({
+        author: [
+          { toolCalls: [call("delegate", { agent: "voice", task: "Say what you saw.", as: "x".repeat(201) })] },
+          { toolCalls: [call("delegate", { agent: "voice", task: "Say what you saw.", as: "mara" })] },
+          { toolCalls: [call("reply_write", { text: "Mara saw the boat." })] },
+          "Done.",
+        ],
+        voice: ["The boat, at dawn."],
+      }),
+      {
+        extension: {
+          agentModel: async (ask) => {
+            asked.push(structuredClone(ask));
+            return ask.definition === "voice" ? { connectionId: WRITER, model: "model-mara", effort: "high" } : null;
+          },
+        },
+      },
+    );
+    await runTurn(r.host, r.harness, CHAT);
+    expect(seen(r.callsOf(AUTHOR)[1])).toContain(renderDefault(TEXT.agents.asLong, { chars: "201", limit: "200" }));
+    const [spoke] = r.callsOf(VOICE);
+    expect([spoke?.connectionId, spoke?.model]).toEqual([WRITER, "model-mara"]);
+    // The author runs on its definition's own: the hook said nothing for it.
+    expect(r.callsOf(AUTHOR)[0]?.model).toBeNull();
+    expect(asked.find((ask) => ask.definition === "author")).toMatchObject({ as: null, standing: "turn", by: null });
+    expect(asked.find((ask) => ask.definition === "voice")).toMatchObject({ as: "mara", standing: "sub", by: { role: "author" } });
+  });
+});
+
+describe("jobs in lanes and due by the next turn (§15)", () => {
+  test("waiting jobs go soon before later, first come first through within each", async () => {
+    const gate = new Gate(() => 1);
+    const leave = await gate.enter(never);
+    const went: string[] = [];
+    const wait = (name: string, soon: boolean) => gate.enter(never, soon).then((free) => (went.push(name), free()));
+    const all = Promise.all([wait("later-1", false), wait("later-2", false), wait("soon-1", true), wait("soon-2", true)]);
+    leave();
+    await all;
+    expect(went).toEqual(["soon-1", "soon-2", "later-1", "later-2"]);
+  });
+
+  /** A turn whose author starts a job due by the next turn, its reply saved, and the user's next message. */
+  async function dueRig() {
+    const r = rig(
+      lines({
+        author: [
+          { toolCalls: [call("job_start", { agent: "voice", task: "Digest the beat.", due: "next_turn", lane: "soon", as: "mara" }), call("reply_write", { text: "Mara nods." })] },
+          "Done.",
+          { toolCalls: [call("reply_write", { text: "Mara waits." })] },
+          "Done.",
+        ],
+        voice: ["Digested: the boat went out at dawn."],
+      }),
+      { change: (s) => (s.jobs.dueWaitMs = 45_000) },
+    );
+    await runTurn(r.host, r.harness, CHAT);
+    const [job] = r.host.queued;
+    expect(job).toMatchObject({ due: "next_turn", lane: "soon", as: "mara" });
+    r.host.say(CHAT, "user", "And then?");
+    return { ...r, job: job?.id ?? "" };
+  }
+
+  test("a due job still running when the wait runs out is named to the main agent", async () => {
+    const r = await dueRig();
+    const next = runTurn(r.host, r.harness, CHAT);
+    await until(() => r.host.clock.slept.includes(45_000));
+    r.host.clock.advance(45_000);
+    const { sink } = await next;
+    expect(sink.progressLines).toContain(renderDefault(TEXT.progress.dueWait, { jobs: "1 job" }));
+    const opening = seen(r.callsOf(AUTHOR)[2]);
+    expect(opening).toContain("Jobs due by this turn that haven't ended yet");
+    expect(opening).toContain(`${r.job} (voice for mara)`);
+  });
+
+  test("a due job is waited for: one that ends meanwhile is heard of as ended, not as running", async () => {
+    const r = await dueRig();
+    const next = runTurn(r.host, r.harness, CHAT);
+    await until(() => r.host.clock.slept.includes(45_000));
+    // Time passes while it works: the news a turn hears is of jobs that ended after its last look.
+    r.host.clock.advance(1000);
+    expect((await r.harness.jobs.run({ id: r.job }, never)).state).toBe("done");
+    const { result } = await next;
+    expect(result).toMatchObject({ status: "done", reply: "Mara waits." });
+    const opening = seen(r.callsOf(AUTHOR)[2]);
+    expect(opening).not.toContain("haven't ended yet");
+    expect(opening).toContain(`${r.job} (voice): done.`);
+  });
+});
+
+describe("a claim that keeps a chat to the runtime, and what of the request the main agent is shown (§21, §25)", () => {
+  test("a claim that requires the runtime is never run built in: not the turn, not its jobs", async () => {
+    const r = rig(lines({}), { claim: { place: "runtime" }, place: "builtin" });
+    const turn = request(r.host);
+    const prepared = await r.harness.prepare(turn, { replyBy: null }, never);
+    expect(prepared).toMatchObject({ part: "none", pending: false, reason: renderDefault(TEXT.jobs.whyRuntimeOnly) });
+    expect(prepared.messages).toBe(turn.messages);
+    const { job } = await r.harness.jobs.start({ chatId: CHAT, agent: "voice", task: "Digest the beat.", when: "now" });
+    expect(await r.harness.jobs.run({ id: job.id }, never)).toMatchObject({ state: "failed", reason: renderDefault(TEXT.jobs.whyRuntimeOnly) });
+    expect(r.host.calls).toHaveLength(0);
+  });
+
+  test("the main agent is shown only the user's newest message where the claim says so", async () => {
+    const r = rig(lines({ author: [{ toolCalls: [call("reply_write", { text: "Mara frowns." })] }, "Done."] }), { claim: { request: "newest" } });
+    await runTurn(r.host, r.harness, CHAT);
+    const opening = r.callsOf(AUTHOR)[0]?.messages.find((m) => m.role === "user")?.content ?? "";
+    expect(opening).toContain("The user's newest message:");
+    expect(opening).toContain("I ask Mara what she saw.");
+    expect(opening).not.toContain("The lamp room is cold.");
+  });
+});
+
+describe("a job the user starts that writes the chat's own area (the prepared start)", () => {
+  test("with area chat it writes the chat's own area and keeps its plan where it was told; without it, that write is refused", async () => {
+    const KEEPER = "You keep the story's notes.";
+    const keeper = def("keeper", KEEPER, ["workspace_write"]);
+    const write = (path: string): Answer => ({ toolCalls: [call("workspace_write", { path, content: "Mara saw the boat.", base: "new" })] });
+    const steps: Answer[] = [write("author/notebook.md"), "Done.", write("author/other.md"), "Done."];
+    let at = 0;
+    const r = rig(() => steps[at++] ?? "Done.", { extension: { definitions: async () => ({ agents: [author, voice, keeper] }) } });
+    const { job: prepared } = await r.harness.jobs.start({ chatId: CHAT, agent: "keeper", task: "Prepare the story.", when: "now", area: "chat", plan: "author/prepare.md" });
+    expect(prepared).toMatchObject({ area: "chat", plan: "author/prepare.md", basis: null });
+    expect((await r.harness.jobs.run({ id: prepared.id }, never)).state).toBe("done");
+    const { job: plain } = await r.harness.jobs.start({ chatId: CHAT, agent: "keeper", task: "Tidy the notes.", when: "now" });
+    expect((await r.harness.jobs.run({ id: plain.id }, never)).state).toBe("done");
+    const [first, second, third, fourth] = r.callsOf(KEEPER);
+    expect(seen(first)).toContain("write your plan to author/prepare.md");
+    expect(seen(first)).toContain("You may write the chat's own area");
+    expect(seen(second)).not.toContain(renderDefault(TEXT.jobs.noChatArea));
+    expect(seen(third)).toContain("learned/plans/");
+    expect(seen(fourth)).toContain(renderDefault(TEXT.jobs.noChatArea));
+  });
+
+  /** A chat whose main agent writes its replies, `replies` of them already played, and a job of the user's that writes two files to the chat's own area. Every model call is answered in turn from `script`. */
+  async function prepared(replies: number, script: Answer[]) {
+    const host = new MemoryHost();
+    let at = 0;
+    host.script = () => script[at++] ?? "Done.";
+    host.say(CHAT, "assistant", "The lamp room is cold.");
+    host.say(CHAT, "user", "I ask Mara what she saw.");
+    const stored = { values: defaultSettings(), texts: {} };
+    stored.values.reply.writer = "main";
+    const harness = createHarness(host, { settings: async () => structuredClone(stored) });
+    for (let n = 0; n < replies; n++) {
+      if (n > 0) host.say(CHAT, "user", "And then?");
+      await runTurn(host, harness, CHAT);
+    }
+    const { job } = await harness.jobs.start({ chatId: CHAT, agent: "main", task: "Prepare the story.", when: "now", area: "chat" });
+    expect((await harness.jobs.run({ id: job.id }, never)).state).toBe("done");
+    /** A file of the chat's own area as the page reads it in a chat; null where it isn't there. */
+    const file = async (path: string, chatId = CHAT): Promise<string | null> => harness.workspace.read({ chatId, area: "chat", path }).then((read) => read.text, () => null);
+    /** What a tool call was answered with, as the agent's next call carried it. */
+    const result = (callId: string): string => {
+      for (const request of host.calls) for (const m of request.messages) for (const part of m.parts ?? []) if (part.type === "tool_result" && part.toolUseId === callId) return part.content;
+      return "";
+    };
+    return { host, harness, file, result };
+  }
+  const MIND = "Mara saw the boat leave at dawn.";
+  const NOTEBOOK = "The story turns on the missing boat.";
+  const writes: Answer = { toolCalls: [call("workspace_write", { path: "/minds/mara/core.md", content: MIND, base: "new" }), call("workspace_write", { path: "/author/notebook.md", content: NOTEBOOK, base: "new" })] };
+  const reads = (id: string): Answer => ({ toolCalls: [call("workspace_read", { path: "/minds/mara/core.md" }, `${id}-mind`), call("workspace_read", { path: "/author/notebook.md" }, `${id}-notes`)] });
+
+  test("what it wrote survives a swipe of the newest reply, every later turn on that path, and a branch cut before or after the swipe", async () => {
+    const r = await prepared(2, ["Okoro opens the door.", "He lets Mara in.", writes, "Prepared.", reads("swipe"), "The lamp is lit.", "Mara waits.", reads("branch"), "The quay is empty."]);
+    // A branch cut right after the job, before anything else is played.
+    r.host.branch(CHAT, r.host.chats.get(CHAT)?.length ?? 0, "chat-early");
+    // The newest reply is swiped: the turn that writes the new reply reads both files whole.
+    await runTurn(r.host, r.harness, CHAT, { kind: "swipe" });
+    expect([r.result("swipe-mind"), r.result("swipe-notes")].join("\n")).toContain(MIND);
+    expect(r.result("swipe-notes")).toContain(NOTEBOOK);
+    // A later turn on that path, and the page, still have them.
+    r.host.say(CHAT, "user", "And then?");
+    await runTurn(r.host, r.harness, CHAT);
+    expect([await r.file("minds/mara/core.md"), await r.file("author/notebook.md")]).toEqual([MIND, NOTEBOOK]);
+    // A branch cut after the swipe has them; so does the early one, where a swipe of the newest reply reads them too.
+    r.host.branch(CHAT, r.host.chats.get(CHAT)?.length ?? 0, "chat-late");
+    expect([await r.file("minds/mara/core.md", "chat-late"), await r.file("author/notebook.md", "chat-late")]).toEqual([MIND, NOTEBOOK]);
+    expect([await r.file("minds/mara/core.md", "chat-early"), await r.file("author/notebook.md", "chat-early")]).toEqual([MIND, NOTEBOOK]);
+    await runTurn(r.host, r.harness, "chat-early", { kind: "swipe" });
+    expect(r.result("branch-mind")).toContain(MIND);
+    expect(r.result("branch-notes")).toContain(NOTEBOOK);
+  });
+
+  test("in a chat with no reply of LumiAH's yet, what it wrote is there for the first turn, for a swipe of the newest message, and in a branch", async () => {
+    const r = await prepared(0, [writes, "Prepared.", reads("first"), "Mara looks up."]);
+    r.host.branch(CHAT, r.host.chats.get(CHAT)?.length ?? 0, "chat-fresh");
+    expect([await r.file("minds/mara/core.md", "chat-fresh"), await r.file("author/notebook.md", "chat-fresh")]).toEqual([MIND, NOTEBOOK]);
+    await runTurn(r.host, r.harness, "chat-fresh");
+    expect(r.result("first-mind")).toContain(MIND);
+    expect(r.result("first-notes")).toContain(NOTEBOOK);
+  });
+});
+
+/** The request Lumiverse would assemble for a new reply in the chat. */
+function request(host: MemoryHost): TurnRequest {
+  return { userId: "user-1", chatId: CHAT, generationId: `gen-built-${host.calls.length}`, kind: "new", target: { messageId: null, swipeId: 0 }, presetId: null, messages: host.requestOf(CHAT, host.chats.get(CHAT)?.length ?? 0, null), params: {}, maxTokens: 700 };
+}

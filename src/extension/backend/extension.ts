@@ -8,7 +8,7 @@
 // added last: a backend serves every user, where the core's host serves one. So what a test or a
 // one-user host wrote against the core's shapes fits as it is.
 
-import type { ChatClaim, ClaimAsk, ExtensionDefinitions, HarnessExtension, ReplyWritten, RunBegan, RunEnded, WriterRequest } from "../../core/extension";
+import type { AgentModelAsk, AgentModelChoice, ChatClaim, ClaimAsk, ExtensionDefinitions, HarnessExtension, ReleaseVerdict, ReplyRelease, ReplyWritten, RunBegan, RunEnded, WriterRequest } from "../../core/extension";
 import type { JsonValue, ModelMessage, RemoteTool, RemoteToolCall } from "../../core/ports";
 import type { ExtensionMember, ExtensionOffer } from "../../link/contract";
 import { EXTENSION_MEMBERS } from "../../link/contract";
@@ -30,6 +30,12 @@ export interface BackendExtension {
   /** The writer's request, rewritten; null: as the core built it. */
   writerRequest?(request: WriterRequest, userId: string): Promise<ModelMessage[] | null>;
   runBegan?(run: RunBegan, userId: string): Promise<void>;
+  /** Which connection, model and effort an agent of a run runs on (its definition, which instance it is, who started it); null: the definition's own. */
+  agentModel?(ask: AgentModelAsk, userId: string): Promise<AgentModelChoice | null>;
+  /** A passage an agent is about to release into the reply (`reply_write`): `{ refused }` keeps it back, and the agent is told why; null lets it go. */
+  releasing?(release: ReplyRelease, userId: string): Promise<ReleaseVerdict>;
+  /** A passage went out, or a sub-agent's answer finished streaming into the reply: what reached the user. */
+  released?(release: ReplyRelease, userId: string): Promise<void>;
   replyWritten?(reply: ReplyWritten, userId: string): Promise<void>;
   runEnded?(run: RunEnded, userId: string): Promise<void>;
 }
@@ -59,6 +65,9 @@ export function harnessExtension(extension: BackendExtension, userId: string): H
     ...(extension.claim ? { claim: (ask) => extension.claim?.({ ...ask, userId }, userId) ?? Promise.resolve(null) } : {}),
     ...(extension.writerRequest ? { writerRequest: (request) => extension.writerRequest?.({ ...request, userId }, userId) ?? Promise.resolve(null) } : {}),
     ...(extension.runBegan ? { runBegan: (run) => extension.runBegan?.({ ...run, userId }, userId) ?? Promise.resolve() } : {}),
+    ...(extension.agentModel ? { agentModel: (ask) => extension.agentModel?.({ ...ask, userId }, userId) ?? Promise.resolve(null) } : {}),
+    ...(extension.releasing ? { releasing: (release) => extension.releasing?.({ ...release, userId }, userId) ?? Promise.resolve(null) } : {}),
+    ...(extension.released ? { released: (release) => extension.released?.({ ...release, userId }, userId) ?? Promise.resolve() } : {}),
     ...(extension.replyWritten ? { replyWritten: (reply) => extension.replyWritten?.({ ...reply, userId }, userId) ?? Promise.resolve() } : {}),
     ...(extension.runEnded ? { runEnded: (run) => extension.runEnded?.({ ...run, userId }, userId) ?? Promise.resolve() } : {}),
   };
@@ -114,6 +123,22 @@ export async function callExtension(extension: BackendExtension | undefined, mem
       if (core.runBegan === undefined) return none;
       await ownChat();
       await core.runBegan(given);
+      return { supplied: true, value: null };
+    case "agentModel":
+      if (core.agentModel === undefined) return none;
+      await ownChat();
+      return { supplied: true, value: json(await core.agentModel(given)) };
+    case "releasing": {
+      if (core.releasing === undefined) return none;
+      await ownChat();
+      const verdict = await core.releasing(given);
+      // Only a refusal in words keeps a passage back; anything else lets it go.
+      return { supplied: true, value: isRecord(verdict) && typeof verdict.refused === "string" ? { refused: verdict.refused } : null };
+    }
+    case "released":
+      if (core.released === undefined) return none;
+      await ownChat();
+      await core.released(given);
       return { supplied: true, value: null };
     case "replyWritten":
       if (core.replyWritten === undefined) return none;

@@ -3,7 +3,7 @@
 // gaps); the turn's transcript is `transcript.tsx`, and what the user can do to it while it runs
 // (answer a held tool call, say something, pause) is `runs.tsx`. A reply LumiAH works on in another
 // chat is said across the top, with the way to it; so is a chat whose runtime isn't answering, with
-// the one press that runs it built in.
+// the one press that runs it built in (none for a chat its extension plays only in the runtime).
 
 import { chatAnswered, isReply } from "../../../shared/ui";
 import { useApp } from "../app";
@@ -53,12 +53,18 @@ export function LivePage() {
             tone="warn"
             title="Your runtime isn't answering"
             actions={
-              <Button size="sm" variant="primary" busy={fixing} onClick={runBuiltIn}>
-                Run it built in
-              </Button>
+              chat.needsRuntime === undefined ? (
+                <Button size="sm" variant="primary" busy={fixing} onClick={runBuiltIn}>
+                  Run it built in
+                </Button>
+              ) : (
+                <Button size="sm" variant="primary" icon="link" onClick={() => app.nav.update((n) => ({ ...n, page: "runtime" }))}>
+                  Start the runtime
+                </Button>
+              )
             }
           >
-            This chat is set to run in it, so replies here may fail until it is back.
+            {chat.needsRuntime === undefined ? "This chat is set to run in it, so replies here may fail until it is back." : `${chat.needsRuntime.by} plays this chat only in your runtime, so it can't play until the runtime is back. Its line is on the Runtime page.`}
           </Banner>
         </div>
       ) : null}

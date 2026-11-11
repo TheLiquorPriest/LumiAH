@@ -29,7 +29,7 @@ const STANDING_ICON: Readonly<Record<"pos" | "neutral" | "warn", IconName>> = { 
  * has one thing to press. A chat another extension holds has no switch here: it says whose it is,
  * and offers to take it over. `fold` keeps the choice of place under a line that says where it runs
  * (Home does: few change it); a list of chats shows the choice itself, and says what each place is
- * once above them.
+ * once above them. A chat its extension plays only in a runtime has no choice of place: it says so.
  */
 export function ChatSwitch(props: { chat: ChatView; open: boolean; title?: string; fold?: boolean; onChanged?(chat: ChatView): void; children?: ComponentChildren }) {
   const app = useApp();
@@ -94,43 +94,49 @@ export function ChatSwitch(props: { chat: ChatView; open: boolean; title?: strin
     if (place === "runtime" && !state.runtime.ready) return setAsked(true);
     set(true, place, place === "builtin" ? `${name} runs built in from its next reply.` : `${name} runs in your runtime from its next reply.`);
   };
-  const places = (
-    <>
-      <Seg value={chat.place} options={PLACES} label={`Where ${name} runs`} disabled={busy} onChange={choose} />
-      {props.fold === true ? (
-        <ul class="lah-facts" data-lah-places>
-          <li>
-            <span>
-              <strong>{PLACE_LABEL.builtin}.</strong> {PLACE_ABOUT.builtin}
-            </span>
-          </li>
-          <li>
-            <span>
-              <strong>{PLACE_LABEL.runtime}.</strong> {PLACE_ABOUT.runtime}
-            </span>
-          </li>
-        </ul>
-      ) : null}
-      {asked ? (
-        <Banner
-          tone="info"
-          title="No runtime is set up yet"
-          actions={
-            <>
-              <Button variant="primary" icon="link" onClick={() => app.nav.update((n) => ({ ...n, page: "runtime" }))}>
-                Set up a runtime
-              </Button>
-              <Button variant="ghost" onClick={() => setAsked(false)}>
-                Stay built in
-              </Button>
-            </>
-          }
-        >
-          {`${PLACE_ABOUT.runtime} This chat keeps running built in until one is linked.`}
-        </Banner>
-      ) : null}
-    </>
-  );
+  const only = chat.needsRuntime;
+  const places =
+    only !== undefined ? (
+      <p class="lah-field-help" data-lah-runtime-only>
+        {`${only.by} plays this chat only in your runtime: there is no built-in way for it. ${PLACE_ABOUT.runtime}`}
+      </p>
+    ) : (
+      <>
+        <Seg value={chat.place} options={PLACES} label={`Where ${name} runs`} disabled={busy} onChange={choose} />
+        {props.fold === true ? (
+          <ul class="lah-facts" data-lah-places>
+            <li>
+              <span>
+                <strong>{PLACE_LABEL.builtin}.</strong> {PLACE_ABOUT.builtin}
+              </span>
+            </li>
+            <li>
+              <span>
+                <strong>{PLACE_LABEL.runtime}.</strong> {PLACE_ABOUT.runtime}
+              </span>
+            </li>
+          </ul>
+        ) : null}
+        {asked ? (
+          <Banner
+            tone="info"
+            title="No runtime is set up yet"
+            actions={
+              <>
+                <Button variant="primary" icon="link" onClick={() => app.nav.update((n) => ({ ...n, page: "runtime" }))}>
+                  Set up a runtime
+                </Button>
+                <Button variant="ghost" onClick={() => setAsked(false)}>
+                  Stay built in
+                </Button>
+              </>
+            }
+          >
+            {`${PLACE_ABOUT.runtime} This chat keeps running built in until one is linked.`}
+          </Banner>
+        ) : null}
+      </>
+    );
   return (
     <div class="lah-chatswitch" data-lah-chat={chat.chatId} data-answered={standing.answered} data-place={chat.place} data-on={chat.on} data-lah-other={chat.other?.identifier}>
       <Switch checked={chat.on || wanted} disabled={busy || wanted || chat.other !== undefined} label={<strong>{props.title ?? (props.open ? "Use LumiAH in this chat" : name)}</strong>} help={props.title === undefined && props.open ? name : undefined} onChange={turn} />

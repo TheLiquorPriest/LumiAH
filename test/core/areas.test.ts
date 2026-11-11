@@ -94,6 +94,35 @@ describe("the chat's area through a swipe", () => {
     r.host.show(CHAT, reply.id, 1);
     expect(await r.files("chat")).toEqual(["log.md"]);
   });
+
+  test("what the user writes or edits on the page in the chat's area stays through a regenerate of the newest reply, the turns after it, and a branch", async () => {
+    const MIND = "Mara saw the boat leave at dawn.";
+    const EDITED = "Light the lamp at noon.";
+    const reads = (id: string): Answer => ({ toolCalls: [call("workspace_read", { path: "/minds/mara.md" }, `${id}-mind`), call("workspace_read", { path: "/notes/plan.md" }, `${id}-plan`)] });
+    const r = rig([{ toolCalls: [write("/notes/plan.md", PLAN, "a1")] }, "Okoro opens the door.", "He lets Mara in.", reads("again"), "The lamp is lit.", "Mara waits.", reads("branch"), "The quay is empty."]);
+    await r.turn();
+    r.host.say(CHAT, "user", "I step inside.");
+    await r.turn();
+    // A new file, and an edit of a file the first turn's agent wrote.
+    await r.harness.workspace.write({ chatId: CHAT, area: "chat", path: "minds/mara.md", text: MIND, base: null });
+    const { file } = await r.harness.workspace.read({ chatId: CHAT, area: "chat", path: "notes/plan.md" });
+    await r.harness.workspace.write({ chatId: CHAT, area: "chat", path: "notes/plan.md", text: EDITED, base: file.hash });
+    const early = "chat-early";
+    r.host.branch(CHAT, r.host.chats.get(CHAT)?.length ?? 0, early);
+    // The newest reply is regenerated: the turn that writes it reads both as the user left them.
+    await r.turn(CHAT, { kind: "regenerate" });
+    expect(r.result("again-mind")).toContain(MIND);
+    expect(r.result("again-plan")).toContain(EDITED);
+    r.host.say(CHAT, "user", "And then?");
+    await r.turn();
+    const text = async (chatId: string, path: string): Promise<string> => (await r.harness.workspace.read({ chatId, area: "chat", path })).text;
+    expect([await text(CHAT, "minds/mara.md"), await text(CHAT, "notes/plan.md")]).toEqual([MIND, EDITED]);
+    // A branch cut before the regenerate has them, and so does a swipe of its newest reply.
+    expect([await text(early, "minds/mara.md"), await text(early, "notes/plan.md")]).toEqual([MIND, EDITED]);
+    await r.turn(early, { kind: "swipe" });
+    expect(r.result("branch-mind")).toContain(MIND);
+    expect(r.result("branch-plan")).toContain(EDITED);
+  });
 });
 
 describe("the chat's area through a branch", () => {

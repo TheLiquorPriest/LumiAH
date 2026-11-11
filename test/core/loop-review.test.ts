@@ -217,6 +217,8 @@ describe("a round a stop or a time limit ended begins no further call (H4)", () 
     const started: string[] = [];
     const delegation: Delegation = {
       agents: () => [{ id: "summarizer", name: "Summarizer", description: "Reads and sums up." }],
+      offersAs: false,
+      toReply: false,
       start: async (input) => (started.push(`start:${input.agent}`), { text: "started" }),
       message: async (input) => (started.push(`message:${input.handle}`), { text: "sent" }),
     };
@@ -235,6 +237,7 @@ describe("a round a stop or a time limit ended begins no further call (H4)", () 
   test("job_start and job_cancel, given a signal already ended, queue no job and cancel none", async () => {
     const done: string[] = [];
     const jobs: JobTools = {
+      offersAs: false,
       agents: () => [{ id: "summarizer", name: "Summarizer", description: "Reads and sums up." }],
       start: async () => (done.push("start"), job("queued")),
       list: async () => [],
@@ -393,6 +396,7 @@ describe("the loop detector counts a repeat only where the result is the same to
     let state: JobState = "running";
     let reads = 0;
     const jobs: JobTools = {
+      offersAs: false,
       agents: () => [],
       list: async () => (reads++, [job(state)]),
       read: async (id) => (reads++, id === "job-1" ? { job: job(state), task: "Find who holds the key.", report: state === "done" ? "Okoro holds the key." : null } : null),

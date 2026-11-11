@@ -18,21 +18,21 @@ import { type Book, readBook } from "./book";
 import type { CompactionMemo } from "./compaction";
 import { type Definitions, mergeDefinitions } from "./definitions";
 import { Delegator } from "./delegation";
-import type { ChatClaim, HarnessExtension } from "./extension";
+import type { AgentModelAsk, ChatClaim, HarnessExtension } from "./extension";
 import { type GuidanceRead, guidanceGuard, guidancePrefix, readGuidance } from "./guidance";
 import type { Jobs } from "./jobs";
 import { type AgentDeps, type AgentHandle, AgentTurn, type RunWords, startAgent } from "./loop";
-import type { AgentRef, AgentUsage, ChatInfo, FileChange, HarnessHost, ModelDelta, ModelMessage, RecordJob, RemoteTool, SamplingParams, TraceEvent, TurnRequest, TurnStatus, WorkspaceArea } from "./ports";
+import type { AgentRef, AgentUsage, ChatInfo, FileChange, HarnessHost, ModelDelta, ModelEffort, ModelMessage, RecordJob, RemoteTool, SamplingParams, TraceEvent, TurnRequest, TurnStatus, WorkspaceArea } from "./ports";
 import { isRecord } from "./ports";
 import type { AgentAccounts } from "./provider";
 import { type RecallRun, recallOf } from "./recall/recall";
 import type { Sessions } from "./sessions";
-import { type AgentBudget, type Settings, settingsOf, type TurnBudget } from "./settings";
+import { type AgentBudget, isEffort, type Settings, settingsOf, type TurnBudget } from "./settings";
 import type { SkillRegistry } from "./skills";
 import type { Spend } from "./spend";
 import { type StoryHolds, storyHolds, storyWordOf } from "./story";
 import { TEXT, TOOL, type Texts, textDef, textsOf } from "./texts";
-import type { AgentTool, ChatView, DelegateChoice, JobStarted, JobTools, LoreView, PastTurn, RunInfo, ToolEnv, ToolOutcome, ToolRegistry } from "./tools";
+import type { AgentTool, ChatView, DelegateChoice, JobStarted, JobTools, LoreView, PastTurn, ReplyStream, RunInfo, ToolEnv, ToolOutcome, ToolRegistry } from "./tools";
 import { TurnTrace } from "./transcript";
 import { addUsage, countedIn, priced } from "./usage";
 import { clip, errorText, type Limit, limitOf, timerMs } from "./util";
@@ -62,6 +62,13 @@ export interface HarnessOptions {
    * no user (`""`): enough where its backend serves one user, as behind a runtime's link.
    */
   userId?: string;
+  /**
+   * Where this core runs (§25): built in, inside Lumiverse, or in a runtime. A chat whose claim says
+   * it plays only in a runtime (`ChatClaim.place`) never has a job or a side session run by a core
+   * that runs built in. Absent: a turn's own call says where it runs (`prepare` built in, `answer`
+   * in a runtime), and jobs and side sessions run wherever they are asked to.
+   */
+  place?: "builtin" | "runtime";
 }
 
 /** What a harness keeps across runs. */
@@ -145,6 +152,9 @@ function claimOf(raw: unknown): ChatClaim | null {
     ...(guidance && typeof guidance.path === "string" ? { guidance: { name: guidance.name as string, path: guidance.path } } : guidance && typeof guidance.text === "string" ? { guidance: { name: guidance.name as string, text: guidance.text } } : {}),
     ...(Array.isArray(raw.withdraw) ? { withdraw: raw.withdraw.filter((name): name is string => typeof name === "string") } : {}),
     ...(Object.keys(story).length > 0 ? { story } : {}),
+    ...(raw.place === "runtime" ? { place: "runtime" as const } : {}),
+    ...(raw.request === "whole" || raw.request === "newest" ? { request: raw.request } : {}),
+    ...(raw.reply === "released" ? { reply: "released" as const } : {}),
   };
 }
 
@@ -282,6 +292,16 @@ export interface AgentStart {
   notices?: () => string[];
   /** Its calls are made whatever the caps on a day's spend say (`AgentSpec.uncapped`): the writer's call of the reply the user waits for. */
   uncapped?: true;
+  /** Told as each of its model calls comes back (`AgentSpec.onCall`). */
+  onCall?: (answer: { text: string; calls: number }) => void;
+  /** Which instance of its definition it is (`delegate`'s or `job_start`'s `as`). */
+  as?: string;
+  /** How it stands, as the extension is asked its model (`AgentModelAsk.standing`); absent: a job's agent in a job's run, else an agent the run starts itself. */
+  standing?: AgentModelAsk["standing"];
+  /** Who started it, as the extension is asked its model: the agent that delegated to it or started its job, or the user who started its job. */
+  by?: AgentRef | "user";
+  /** Its answer streams into the reply (`to_reply`): it writes the reply as its answer, so it is given no reply of its own to write besides. */
+  replying?: true;
 }
 
 /** An agent of a run, started: its handle, what leads its first message (the files pinned for it; empty for none), and the workspace as it holds it. */
@@ -310,10 +330,12 @@ export class Run {
   readonly jobs: RecordJob[] = [];
   /** The workspace files its agents' tool calls changed, in the order they did. */
   readonly wrote: FileChange[] = [];
-  /** The request the run answers, as its first agent reads it: what a sub-agent whose definition is given the request gets with its task. */
-  request: { count: string; text: string } | null = null;
+  /** The request the run answers, as its first agent reads it: what a sub-agent whose definition is given the request gets with its task. `newest`: only the user's newest message of it (`ChatClaim.request`). */
+  request: { count: string; text: string; newest?: true } | null = null;
   /** The levels of guidance its agents are given. */
   guidance: readonly GuidanceRead[] = [];
+  /** The reply as the turn lets its agents write it themselves (`reply_write`, `to_reply`); null for a run that writes no reply (a job's, a side session's). The turn sets it before its first agent starts. */
+  reply: ReplyStream | null = null;
 
   private equipment: Equipment | null = null;
   /** The chat's book (§23), read once when the run is equipped; null where the chat has none. */
@@ -524,7 +546,11 @@ export class Run {
     // Its id is known only once it started, and its tools are built before: its writes are recorded under the author set just below.
     const view: WorkspaceView = { author: { who: "agent", id: "", role: definition.id }, role: definition.id, areas: equipment.areas, guard: this.guard };
     const held = new Set<string>();
-    const delegation = how.toolless ? undefined : this.delegator.for({ definition: definition.id, depth: how.depth, held, view });
+    const names = how.toolless ? [] : this.definitions.names(resolved.tools).filter((name) => !how.grant || how.grant.has(name));
+    // The reply is the run's main agent's to write, and any agent's an extension's definition names reply_write for (the user's in place of one it supplies counts): never a user's own agent's, nor another of the core's.
+    const sourced = this.definitions.sourced(definition.id);
+    const reply = !how.toolless && !how.replying && this.reply !== null && (how.main === true || sourced?.source === "extension" || sourced?.over === "extension") ? this.reply : null;
+    const delegation = how.toolless ? undefined : this.delegator.for({ definition: definition.id, depth: how.depth, held, view, ...(reply !== null && names.includes(TOOL.replyWrite) ? { reply } : {}) });
     const jobs = how.toolless ? undefined : this.jobTools({ held, depth: how.depth });
     const skills = this.definitions.skills();
     // The agents over it: those over the agent that started it, and that agent. One the run started itself has nobody above.
@@ -543,23 +569,26 @@ export class Run {
       lore: equipment.lore,
       past: how.past ?? equipment.past,
       ...(how.writeReply ? { writeReply: how.writeReply } : {}),
+      ...(reply !== null ? { reply } : {}),
       workspace: view,
       skills,
       ...(delegation ? { delegation } : {}),
       ...(jobs ? { jobs } : {}),
       ...(this.book ? { book: this.book } : {}),
     };
-    const names = how.toolless ? [] : this.definitions.names(resolved.tools).filter((name) => !how.grant || how.grant.has(name));
     const tools: AgentTool[] = this.definitions.build(names, env);
     for (const tool of tools) held.add(tool.name);
     const own = how.system ?? instructionsOf(definition, texts);
     const system = [own, how.about ?? "", !how.plain && held.has(TOOL.skillLoad) ? this.skillList() : ""].filter((part) => part !== "").join("\n\n");
+    // The extension may say which model this agent runs on (§21); asked only where it supplies the hook, so a run without it starts its agents as it always did.
+    const chosen = shared.options.extension?.agentModel ? await this.modelOf({ definition: definition.id, as: how.as ?? null, standing: how.standing ?? (info.kind === "job" ? "job" : "turn"), by: how.by ?? null }) : {};
     const agent = startAgent(
       {
         role: definition.id,
-        connectionId: resolved.connectionId ?? this.ownConnection,
-        model: resolved.model,
-        effort: resolved.effort,
+        connectionId: chosen.connectionId ?? resolved.connectionId ?? this.ownConnection,
+        // A connection the extension chose runs its own model unless it named one: the definition's was chosen for another connection.
+        model: chosen.model ?? (chosen.connectionId !== undefined ? null : resolved.model),
+        effort: chosen.effort ?? resolved.effort,
         system,
         prefix: how.plain ? [] : this.prefix,
         tools,
@@ -568,17 +597,37 @@ export class Run {
         ...(how.history ? { history: how.history } : {}),
         ...(how.params ? { params: how.params } : {}),
         ...(how.onDelta ? { onDelta: how.onDelta } : {}),
+        ...(how.onCall ? { onCall: how.onCall } : {}),
         ...(how.uncapped ? { uncapped: true as const } : {}),
         ...(how.parent !== undefined ? { parent: how.parent } : {}),
         ...(how.task !== undefined ? { task: how.task } : {}),
+        ...(how.as !== undefined ? { as: how.as } : {}),
         ...(how.notes ? { notes: () => this.said.splice(0) } : {}),
         ...(how.notices ? { notices: how.notices } : {}),
       },
       this.deps,
     );
     view.author = info.kind === "job" ? { who: "job", id: info.id, role: definition.id } : { who: "agent", id: agent.id, role: definition.id };
-    this.lines.set(agent.id, [...above, { agentId: agent.id, role: definition.id }]);
+    this.lines.set(agent.id, [...above, { agentId: agent.id, role: definition.id, ...(how.as !== undefined ? { as: how.as } : {}) }]);
     return { agent, lead: how.plain ? "" : await this.pinned(view), view };
+  }
+
+  /** The agent an agent of the run is, as another is told of it; undefined for none of this run's. */
+  ref(agentId: string): AgentRef | undefined {
+    return this.lines.get(agentId)?.at(-1);
+  }
+
+  /** What the extension says an agent runs on (§21), read: outside data, so only a connection or a model that is a name, and an effort the settings take, stand; anything else leaves the definition's own. */
+  private async modelOf(ask: Pick<AgentModelAsk, "definition" | "as" | "standing" | "by">): Promise<{ connectionId?: string; model?: string; effort?: ModelEffort }> {
+    const { shared, settings, info } = this;
+    const extension = shared.options.extension;
+    const answer: unknown = await askExtension<unknown>(shared, "agent's model", settings.extension.waitMs, extension?.agentModel ? () => extension.agentModel?.({ userId: this.userId, chatId: info.chatId, turn: info.id, kind: info.kind, ...ask }) ?? Promise.resolve(null) : undefined, null);
+    if (!isRecord(answer)) return {};
+    return {
+      ...(typeof answer.connectionId === "string" && answer.connectionId !== "" ? { connectionId: answer.connectionId } : {}),
+      ...(typeof answer.model === "string" && answer.model !== "" ? { model: answer.model } : {}),
+      ...(isEffort(answer.effort) ? { effort: answer.effort } : {}),
+    };
   }
 
   /** The skills an agent may load, as its instructions list them: as many as Settings give room for, and how many more there are. */
@@ -636,6 +685,8 @@ export class Run {
     if (!settings.jobs.enabled || !shared.host.jobs || info.chatId === "") return undefined;
     const { basis } = this.equipped();
     const tools: JobTools = {
+      // `as`, `lane` and `due` mean something only to an extension that builds LumiAH in: a harness without one offers job_start as it always did.
+      offersAs: shared.options.extension !== undefined,
       agents: () => this.definitions.workers().map(choiceOf),
       list: () => shared.jobs.list(info.chatId),
       read: (id) => shared.jobs.read(info.chatId, id),
@@ -647,11 +698,11 @@ export class Run {
       let starting = 0;
       tools.start = async (input, ctx): Promise<JobStarted> => {
         if (this.jobs.length + starting >= limitOf(settings.jobs.perRun)) return { refused: texts.render(TEXT.jobs.tooMany, { limit: texts.counted(settings.jobs.perRun ?? 0, TEXT.jobs.word) }) };
-        const { when, ...what } = input;
+        const { when, as, lane, due, ...what } = input;
         starting++;
         let started: JobStarted;
         try {
-          started = await shared.jobs.createJob({ chatId: info.chatId, when, what, by: { who: "agent", id: ctx.agentId, role: ctx.role }, basis, starter: { held: [...starter.held], depth: starter.depth }, ...(info.kind === "job" ? { parent: { id: info.id, left: this.left() } } : {}) }, this);
+          started = await shared.jobs.createJob({ chatId: info.chatId, when, what, by: { who: "agent", id: ctx.agentId, role: ctx.role }, basis, starter: { held: [...starter.held], depth: starter.depth }, ...(as !== undefined ? { as } : {}), ...(lane !== undefined ? { lane } : {}), ...(due !== undefined ? { due } : {}), ...(info.kind === "job" ? { parent: { id: info.id, left: this.left() } } : {}) }, this);
           if (!("refused" in started)) this.jobs.push({ id: started.id, agent: started.agent, state: started.state });
         } finally {
           starting--;

@@ -1,6 +1,8 @@
 // Delegation (DESIGN §14): an agent hands a task to another, which works in a session of its own
 // and answers; the handle its answer names lives until the run ends, and `agent_message` goes on
-// with that agent under its own revision cap.
+// with that agent under its own revision cap. An agent that may write the reply itself may hand it
+// on (`to_reply`): the sub-agent's answer then streams into the reply as it is written, and is the
+// call's result too.
 //
 // Every limit is a setting: how deep delegation goes, how many sub-agents work at once in a run,
 // how many a run may start, what a sub-agent may be given (never more than the agent that started
@@ -12,18 +14,58 @@
 import type { AgentDefinition } from "./agents";
 import { Gate } from "./gate";
 import { type AgentHandle, type AgentReply, cutShort } from "./loop";
+import type { ModelDelta } from "./ports";
 import type { Run } from "./run";
 import { TEXT } from "./texts";
-import type { DelegateChoice, Delegation, ToolCtx, ToolOutcome } from "./tools";
+import type { DelegateChoice, Delegation, ReplyStream, ToolCtx, ToolOutcome } from "./tools";
 import { clip, limitOf } from "./util";
 import { readFile, showPath, versionOf, type WorkspaceView } from "./workspace";
 
-/** The agent that delegates, as the run started it: its definition, how deep it stands, the tools it holds (filled once they are built), and the workspace as it holds it. */
+/** The agent that delegates, as the run started it: its definition, how deep it stands, the tools it holds (filled once they are built), the workspace as it holds it, and the reply where it may hand that on. */
 export interface Delegating {
   definition: string;
   depth: number;
   held: ReadonlySet<string>;
   view: WorkspaceView;
+  reply?: ReplyStream;
+}
+
+/**
+ * A sub-agent's answer on its way into the reply (`to_reply`): the text of each of its model calls
+ * is held until it is `hold` characters long or the call ends without a tool call, then released;
+ * what a call that ends in tool calls had held is never released. `released` is all it let out.
+ */
+class ReplyHold {
+  /** The text of the call under way, as it streamed, and how much of it is out. */
+  private seen = "";
+  private sent = 0;
+  released = "";
+
+  constructor(
+    private readonly reply: ReplyStream,
+    private readonly hold: number,
+  ) {}
+
+  /** A piece of a call's answer as it arrives. Its reasoning stays the agent's own: the reply's thinking block is the user's to read, and an agent's thoughts may hold what the user's character doesn't know. */
+  delta(delta: ModelDelta): void {
+    if (delta.content === undefined || delta.content === "") return;
+    this.seen += delta.content;
+    if (this.seen.length >= this.hold) this.out(this.seen.slice(this.sent));
+  }
+
+  /** A call came back: with no tool call it is the answer, all of it out (a host that streams nothing gives it whole here); with tool calls, what it held is let go. */
+  call(answer: { text: string; calls: number }): void {
+    if (answer.calls === 0) this.out((answer.text.startsWith(this.seen) ? answer.text : this.seen).slice(this.sent));
+    this.seen = "";
+    this.sent = 0;
+  }
+
+  private out(text: string): void {
+    if (text === "") return;
+    this.sent += text.length;
+    // What went nowhere (the turn was stopped) was never released.
+    if (this.reply.stream(text)) this.released += text;
+  }
 }
 
 /** A sub-agent of the run: its handle, the definition it runs as, and the agent that started it, which alone may message it. */
@@ -56,6 +98,9 @@ export class Delegator {
     if (from.depth >= run.settings.delegation.depth) return undefined;
     return {
       agents: () => run.definitions.workers(from.definition).map(choiceOf),
+      // `as` names an instance for an extension's tools and its model hook: a harness without an extension offers delegate as it always did.
+      offersAs: run.shared.options.extension !== undefined,
+      toReply: from.reply !== undefined,
       start: (input, ctx) => this.start(from, input, ctx),
       message: (input, ctx) => this.message(input, ctx),
     };
@@ -67,12 +112,18 @@ export class Delegator {
     this.started.clear();
   }
 
-  private async start(from: Delegating, input: { agent: string; task: string; files: readonly string[] }, ctx: ToolCtx): Promise<ToolOutcome> {
+  private async start(from: Delegating, input: { agent: string; task: string; files: readonly string[]; as?: string; toReply?: boolean }, ctx: ToolCtx): Promise<ToolOutcome> {
     const { run } = this;
     const { settings, texts } = run;
     const workers = run.definitions.workers(from.definition);
     const resolved = workers.some((d) => d.id === input.agent) ? run.resolve(input.agent) : undefined;
     if (!resolved) return run.refusal(TEXT.agents.noAgent, { agent: clip(input.agent, settings.tools.lineChars), agents: workers.map((d) => d.id).join(", ") });
+    if (input.as !== undefined && input.as.length > settings.delegation.asChars) return run.refusal(TEXT.agents.asLong, { chars: String(input.as.length), limit: String(settings.delegation.asChars) });
+    // Only an agent that may write the reply hands it on, and only while the reply can take text: never built in, nor while the writer or another agent's answer is at it.
+    const reply = input.toReply === true ? from.reply : undefined;
+    if (input.toReply === true && !reply) return run.refusal(TEXT.agents.noReply);
+    const shut = reply?.refused() ?? null;
+    if (shut !== null) return { text: shut, error: true };
     // The files a task names go with it whole while Settings give them room; one that doesn't fit is named, for the sub-agent to read itself.
     let room = settings.delegation.fileChars;
     const files: string[] = [];
@@ -96,12 +147,18 @@ export class Delegator {
     try {
       const leave = await this.gate.enter(ctx.signal);
       try {
+        const hold = reply ? new ReplyHold(reply, settings.delegation.replyHoldChars) : null;
         const { agent, lead } = await run.agent(resolved, {
           depth: from.depth + 1,
           parent: ctx.agentId,
           task: clip(input.task, settings.reply.progressChars),
           // What the agent that starts it holds itself, unless its own definition says it keeps its tools whoever starts it, or, where the definition says nothing, Settings give a sub-agent whatever its definition names.
           ...((resolved.definition.grant ?? settings.delegation.grant) === "own" ? { grant: from.held } : {}),
+          ...(input.as !== undefined ? { as: input.as } : {}),
+          standing: "sub",
+          by: run.ref(ctx.agentId) ?? { agentId: ctx.agentId, role: ctx.role },
+          // An agent whose answer is the reply writes it as its answer: it is given no reply of its own to write besides.
+          ...(hold ? { onDelta: (delta: ModelDelta) => hold.delta(delta), onCall: (answer: { text: string; calls: number }) => hold.call(answer), replying: true as const } : {}),
         });
         this.started.set(agent.id, { agent, definition: resolved.definition.id, owner: ctx.agentId });
         began = true;
@@ -109,9 +166,21 @@ export class Delegator {
         const task = texts.render(TEXT.agents.task, {
           task: input.task,
           files: files.length > 0 ? texts.render(TEXT.agents.taskFiles, { files: files.join("\n\n") }) : "",
-          request: resolved.definition.given === "request" && request ? texts.render(TEXT.agents.taskRequest, { count: request.count, request: request.text }) : "",
+          request: resolved.definition.given === "request" && request ? (request.newest ? texts.render(TEXT.agents.taskNewest, { request: request.text }) : texts.render(TEXT.agents.taskRequest, { count: request.count, request: request.text })) : "",
         });
-        return this.answered(resolved.definition.id, agent.id, await agent.send(lead === "" ? task : `${lead}\n\n${task}`, ctx.signal));
+        const sent = lead === "" ? task : `${lead}\n\n${task}`;
+        if (!reply || !hold) return this.answered(resolved.definition.id, agent.id, await agent.send(sent, ctx.signal));
+        // Asked again at the last moment, and the reply held in the same step: two agents' answers released at once would interleave.
+        const late = reply.refused();
+        if (late !== null) return { text: late, error: true };
+        const letGo = reply.hold(run.ref(agent.id) ?? { agentId: agent.id, role: resolved.definition.id, ...(input.as !== undefined ? { as: input.as } : {}) });
+        try {
+          const answer = await agent.send(sent, ctx.signal);
+          // Its result is what reached the reply: all of its answers' text that was released, in order.
+          return this.answered(resolved.definition.id, agent.id, hold.released === "" ? answer : { ...answer, text: hold.released });
+        } finally {
+          letGo(hold.released);
+        }
       } finally {
         leave();
       }
