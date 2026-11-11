@@ -1028,6 +1028,7 @@ var AGENTS_TEXT = {
   answer: "agents.delegate.answer",
   stopped: "agents.delegate.stopped",
   noAgent: "agents.delegate.no_agent",
+  notOffered: "agents.not_offered",
   tooMany: "agents.delegate.too_many",
   noFile: "agents.delegate.no_file",
   noHandle: "agents.message.no_handle",
@@ -1127,6 +1128,7 @@ For reference, the user's newest message:
   { id: AGENTS_TEXT.stopped, group: ANSWERS, label: "delegate: the agent stopped short", note: "What delegate and agent_message return when the agent stopped before an answer.", text: `{{agent}} (handle {{handle}}) stopped before it answered: {{reason}}.{{said}}
 agent_message with this handle has it go on, if it still may; or go on without it.`, vars: [v("agent", "the agent's id"), v("handle", "the handle agent_message takes", true), v("reason", "why it stopped", true), v("said", "what it had last written, if anything")] },
   { id: AGENTS_TEXT.noAgent, group: ANSWERS, label: "delegate: no such agent", note: "delegate's answer to an id that names no agent it may delegate to.", text: "There's no agent {{agent}} to delegate to. You can delegate to: {{agents}}.", vars: [v("agent", "the id asked for"), v("agents", "the ids there are", true)] },
+  { id: AGENTS_TEXT.notOffered, group: ANSWERS, label: "delegate and job_start: an agent left out here", note: "The answer of delegate and job_start, and of a job you start, to a built-in agent the extension LumiAH is built into leaves out.", text: "Not started: {{agent}} isn't offered here, since the extension LumiAH is built into leaves it out. Do the work with the agents there are, or yourself.", vars: [v("agent", "the id asked for")] },
   { id: AGENTS_TEXT.tooMany, group: ANSWERS, label: "delegate: too many sub-agents", note: "delegate's answer once the turn has started every sub-agent Sub-agents per turn allows.", text: "Not started: this turn has started the {{limit}} it may (Sub-agents per turn). Ask one you already have with agent_message, or do it yourself.", vars: [v("limit", 'Sub-agents per turn, with the word: "3 sub-agents"', true)] },
   { id: AGENTS_TEXT.noFile, group: ANSWERS, label: "delegate: no such file", note: "delegate's answer to a file that isn't in the workspace.", text: "Not started: there's no workspace file {{path}}. workspace_list shows what there is. Call delegate again with the right path, or without it.", vars: [v("path", "the path asked for", true)] },
   { id: AGENTS_TEXT.asLong, group: ANSWERS, label: "delegate and job_start: as too long", note: "The answer of delegate and job_start to an as past Instance name length.", text: "Not started: as is {{chars}} characters, and it may be {{limit}} at most (Instance name length). Give the short id.", vars: [v("chars", "its length"), v("limit", "Instance name length", true)] },
@@ -2758,7 +2760,7 @@ var STOP_TEXTS = [
   stopText(TEXT.stop.failed, "A call failed", "A call that failed: the connection's or Lumiverse's error, as it gave it; words of your own may go around it.", "{{error}}", [v("error", "the error, as the connection or Lumiverse gave it", true)]),
   stopText(TEXT.stop.throttle, "Past a connection's throttle", "A call that needs more tokens than its connection's throttle lets through in a minute.", "the call needs {{tokens}}, more than this connection's throttle lets through in a minute ({{limit}})", [v("tokens", 'the tokens the call needs, with the word: "9000 tokens"', true), v("limit", "the tokens the throttle lets through in a minute", true)]),
   stopText(TEXT.stop.connectionUnread, "A connection that couldn't be read", "The agent's connection couldn't be read from Lumiverse.", "the connection {{connection}} couldn't be read ({{error}}): check that the runtime is linked, then try again", [v("connection", "the connection's id; empty for the default connection"), v("error", "why", true)]),
-  stopText(TEXT.stop.noDefault, "No default connection", "The agent runs on your default connection, and Lumiverse has none.", "there is no default connection: choose one in Lumiverse, or give this agent a connection in LumiAH's Settings"),
+  stopText(TEXT.stop.noDefault, "No connection to run on", "An agent with no connection of its own runs on the one its chat was on before it was set to play in the runtime, else on your default connection, never on a loopback; there is neither.", "there is no connection to run this agent on: it has none of its own, its chat had none before it was set to play in the runtime, and Lumiverse has no default connection. Give this agent a connection in LumiAH's Settings, or choose a default connection in Lumiverse"),
   stopText(TEXT.stop.noConnection, "A connection that is gone", "The agent's connection isn't among your connections any more.", "the connection {{connection}} no longer exists: give this agent another in LumiAH's Settings", [v("connection", "the connection's id", true)]),
   stopText(TEXT.stop.loopback, "The loopback connection", "The agent is set to run on the loopback connection, whose calls come back to LumiAH itself.", "the connection {{connection}} is LumiAH's own loopback: a call on it would come straight back here. Give this agent a connection to a model in LumiAH's Settings", [v("connection", "the connection's name", true)]),
   stopText(TEXT.stop.answerRoom, "Too little room left for an answer", "A call that would have fewer answer tokens than Least answer room, because the agent's or its turn's answer tokens are nearly spent.", "only {{left}} are left of its answer tokens, fewer than Least answer room ({{floor}}): an answer written in them would be cut", [v("left", 'the answer tokens left, with the word: "40 tokens"', true), v("floor", "Least answer room", true)])
@@ -6704,6 +6706,9 @@ function mergeDefinitions(sources, host) {
   const offAgents = strings(off.agents);
   for (const [id, view] of agents)
     view.off = offAgents.includes(id) && !CORE_AGENTS.includes(id);
+  const without = strings(stored.without).filter((id) => !CORE_AGENTS.includes(id));
+  for (const id of without)
+    agents.delete(id);
   const skills = new Map;
   for (const s of sources.code.skills)
     skills.set(s.id, { ...s, source: sources.core.skills.has(s.id) ? "builtin" : "extension", off: false });
@@ -6719,17 +6724,19 @@ function mergeDefinitions(sources, host) {
   const offSkills = strings(off.skills);
   for (const [id, view] of skills)
     view.off = offSkills.includes(id);
-  return new Definitions(agents, skills, tools);
+  return new Definitions(agents, skills, tools, new Set(without));
 }
 
 class Definitions {
   agentRows;
   skillRows;
   toolRows;
-  constructor(agentRows, skillRows, toolRows) {
+  without;
+  constructor(agentRows, skillRows, toolRows, without = new Set) {
     this.agentRows = agentRows;
     this.skillRows = skillRows;
     this.toolRows = toolRows;
+    this.without = without;
   }
   agent(id) {
     const view = this.agentRows.get(id);
@@ -6867,7 +6874,7 @@ class Delegator {
     const workers = run.definitions.workers(from.definition);
     const resolved = workers.some((d) => d.id === input.agent) ? run.resolve(input.agent) : undefined;
     if (!resolved)
-      return run.refusal(TEXT.agents.noAgent, { agent: clip(input.agent, settings.tools.lineChars), agents: workers.map((d) => d.id).join(", ") });
+      return run.definitions.without.has(input.agent) ? run.refusal(TEXT.agents.notOffered, { agent: clip(input.agent, settings.tools.lineChars) }) : run.refusal(TEXT.agents.noAgent, { agent: clip(input.agent, settings.tools.lineChars), agents: workers.map((d) => d.id).join(", ") });
     if (input.as !== undefined && input.as.length > settings.delegation.asChars)
       return run.refusal(TEXT.agents.asLong, { chars: String(input.as.length), limit: String(settings.delegation.asChars) });
     const reply = input.toReply === true ? from.reply : undefined;
@@ -9600,7 +9607,7 @@ class Jobs {
     const plan = input.by.who === "user" ? input.plan ?? kept.plan : undefined;
     const may = input.by.who === "user" ? definitions.agents().filter((d) => d.id !== AGENT.writer) : definitions.workers();
     if (!may.some((d) => d.id === agent))
-      return { refused: texts.render(TEXT.jobs.noAgent, { agent: clip(agent, lineChars), agents: may.map((d) => d.id).join(", ") }) };
+      return { refused: definitions.without.has(agent) ? texts.render(TEXT.agents.notOffered, { agent: clip(agent, lineChars) }) : texts.render(TEXT.jobs.noAgent, { agent: clip(agent, lineChars), agents: may.map((d) => d.id).join(", ") }) };
     if (task.trim() === "")
       return { refused: texts.render(TEXT.jobs.noTask) };
     if (task.length > settings.jobs.taskChars)
@@ -10018,6 +10025,8 @@ function chronicleRefusal(definitions, extension) {
     [CHRONICLER, "chronicler"],
     [READER, "story reader"]
   ]) {
+    if (definitions.without?.has(id) === true)
+      return `${extension ?? "The extension LumiAH is built into"} doesn't offer LumiAH's ${name} here, so no chronicle is kept for this chat and its story isn't learned.`;
     const sourced = definitions.sourced(id);
     if (sourced === undefined)
       return `LumiAH's ${name} is switched off, so it keeps no chronicle for this chat and doesn't learn its story. Switch it on on the Agents page.`;
@@ -18124,11 +18133,11 @@ class HostConnection {
 
 // src/runtime/link.ts
 var LASTING2 = { login: true, locked: true, forbidden: true, insecure: true, not_installed: true, too_old: true };
-function stoppedWords(why, detail) {
+function stoppedWords(why, detail, name = "LumiAH") {
   if (why === "stopped")
-    return "LumiAH was stopped on Lumiverse (restarted, updated or turned off), so this reply ended here. Press Retry, or swipe, once it runs again (Lumiverse's Extensions tab).";
+    return `${name} was stopped on Lumiverse (restarted, updated or turned off), so this reply ended here. Press Retry, or swipe, once it runs again (Lumiverse's Extensions tab).`;
   const said2 = detail?.replace(/\s+/g, " ").trim().slice(0, 200) ?? "";
-  return `LumiAH stopped with an error${said2 !== "" ? ` (${said2})` : ""}, so this reply ended here. Lumiverse doesn't restart it by itself: restart it in Lumiverse's Extensions tab, then press Retry.`;
+  return `${name} stopped with an error${said2 !== "" ? ` (${said2})` : ""}, so this reply ended here. Lumiverse doesn't restart it by itself: restart it in Lumiverse's Extensions tab, then press Retry.`;
 }
 var NO_FALLBACK = "Nothing answers this chat in the runtime's place: once the runtime links again, send your message again.";
 function refusedReply(link) {
@@ -18193,6 +18202,11 @@ class LinkClient {
   get refusedByLumiAH() {
     return this.refusal !== null && this.refusedThere;
   }
+  get backendName() {
+    if (this.hello !== null)
+      return linkedBackendOf(this.hello.backend).name;
+    return this.options.identifier === EXTENSION_IDENTIFIER ? "LumiAH" : `The extension "${this.options.identifier}"`;
+  }
   get out() {
     const now = this.options.now();
     if (this.stoppedBy !== null)
@@ -18212,7 +18226,7 @@ class LinkClient {
     const now = this.options.now();
     if (change2 === "loaded") {
       if (this.stoppedBy !== null)
-        this.options.log("LumiAH is running again on Lumiverse");
+        this.options.log(`${this.backendName} is running again on Lumiverse`);
       this.stoppedBy = null;
       this.suspect = null;
       this.greetedGen = -1;
@@ -18230,7 +18244,7 @@ class LinkClient {
     this.stoppedBy = stopped;
     this.suspect = null;
     this.greetedGen = -1;
-    this.options.log(stoppedWords(stopped.why, stopped.detail));
+    this.options.log(stoppedWords(stopped.why, stopped.detail, this.backendName));
     this.handlers?.stopped(stopped.why, stopped.detail);
   }
   report() {
@@ -18250,7 +18264,7 @@ class LinkClient {
       const stopped = this.stoppedBy;
       if (stopped !== null && this.conn.isOpen()) {
         if (stopped.why === "crashed" || this.options.now() >= deadline)
-          throw new LiveError("not_running", stoppedWords(stopped.why, stopped.detail));
+          throw new LiveError("not_running", stoppedWords(stopped.why, stopped.detail, this.backendName));
         await pause();
         continue;
       }
@@ -18308,9 +18322,9 @@ class LinkClient {
       else if (error instanceof LinkError && error.code === "version")
         this.refuse(error.message, true);
       else if (error instanceof LinkError && error.code === "bad_request")
-        this.refuse(`LumiAH on ${this.options.base} doesn't know this runtime's hello (${error.message}): update LumiAH (Extensions \u2192 LumiAH \u2192 Update).`, false);
+        this.refuse(`${this.backendName} on ${this.options.base} doesn't know this runtime's hello (${error.message}): update it in Lumiverse (Extensions \u2192 ${this.backendName} \u2192 Update).`, false);
       else if (error instanceof LiveError && error.problem === "timeout")
-        throw new LiveError("timeout", `LumiAH on ${this.options.base} didn't answer the runtime's hello. Check that it's running in Lumiverse's Extensions tab.`);
+        throw new LiveError("timeout", `${this.backendName} on ${this.options.base} didn't answer the runtime's hello. Check that it's running in Lumiverse's Extensions tab.`);
       throw error;
     }
     if (answer.version !== LINK_VERSION) {
@@ -18368,7 +18382,7 @@ class LinkClient {
         if (push.relay !== this.options.relay)
           return;
         this.options.rotated(push.secret);
-        this.options.log("LumiAH rotated this runtime's secret: the new one is in its config");
+        this.options.log(`${this.backendName} rotated this runtime's secret: the new one is in its config`);
         return;
     }
   }
@@ -18440,7 +18454,7 @@ class LinkClient {
         this.retryAt = this.options.now() + Math.min(reconnectMaxMs, reconnectMs * 2 ** Math.min(this.failures, 16));
         this.failures++;
         if (problem !== this.lastProblem)
-          this.options.log(`can't reach LumiAH yet (trying again): ${problem}`);
+          this.options.log(`can't reach ${this.backendName} yet (trying again): ${problem}`);
         this.lastProblem = problem;
       });
       return;
@@ -19040,15 +19054,15 @@ class StreamReceiver {
 }
 
 // src/runtime/streams.ts
-function problemOf(error) {
+function problemOf(error, name = "LumiAH") {
   if (error instanceof LinkError)
     return { message: error.message, code: error.code };
   if (error instanceof LiveError) {
     if (error.problem === "login")
-      return { message: "The runtime's Lumiverse session has ended, so it can't reach LumiAH. Sign it in again on the machine it runs on: lumiah login (LumiAH's Runtime page shows the line).", code: "login" };
+      return { message: `The runtime's Lumiverse session has ended, so it can't reach ${name}. Sign it in again on the machine it runs on: lumiah login (${name}'s Runtime page shows the line).`, code: "login" };
     if (error.problem === "timeout")
-      return { message: "LumiAH didn't answer the runtime in time: it may be restarting or busy. Press Retry in a moment.", code: "timeout" };
-    return { message: `The runtime couldn't reach LumiAH: ${error.message}`, code: error.problem === "forbidden" ? "unreachable" : error.problem };
+      return { message: `${name} didn't answer the runtime in time: it may be restarting or busy. Press Retry in a moment.`, code: "timeout" };
+    return { message: `The runtime couldn't reach ${name}: ${error.message}`, code: error.problem === "forbidden" ? "unreachable" : error.problem };
   }
   return { message: error instanceof Error ? error.message : String(error), code: "internal" };
 }
@@ -19082,7 +19096,7 @@ class Streams {
         } catch (error) {
           if (error instanceof LiveError && error.problem === "closed" && !stream.ended && this.env.now() - first < this.env.tuning().lostMs)
             continue;
-          this.end(stream, problemOf(error), false);
+          this.end(stream, problemOf(error, this.link.backendName), false);
           return false;
         }
       }
@@ -19117,12 +19131,12 @@ class Streams {
     for (const id of ids) {
       const stream = this.streams.get(id);
       if (stream)
-        this.end(stream, { message: "LumiAH restarted during this call, so it stopped here. Press Retry, or swipe.", code: "lost" }, false);
+        this.end(stream, { message: `${this.link.backendName ?? "LumiAH"} restarted during this call, so it stopped here. Press Retry, or swipe.`, code: "lost" }, false);
     }
   }
   stopped(why, detail) {
     for (const stream of [...this.streams.values()])
-      this.end(stream, { message: stoppedWords(why, detail), code: "unavailable" }, false);
+      this.end(stream, { message: stoppedWords(why, detail, this.link.backendName), code: "unavailable" }, false);
   }
   shutdown() {
     for (const stream of [...this.streams.values()])
@@ -19146,12 +19160,12 @@ class Streams {
       if (stream.ended)
         continue;
       if (refused3 !== null) {
-        this.end(stream, { message: `The runtime can't reach LumiAH: ${refused3}`, code: "revoked" }, false);
+        this.end(stream, { message: `The runtime can't reach ${this.link.backendName ?? "LumiAH"}: ${refused3}`, code: "revoked" }, false);
         continue;
       }
       if (out !== null && now - Math.max(out.since, stream.at) >= tuning.lostMs) {
         const seconds = Math.round((now - Math.max(out.since, stream.at)) / 1000);
-        const problem = out.why === "silent" ? { message: `LumiAH stopped answering the runtime during this call (nothing for ${seconds} s): it may have restarted or hung. Press Retry, or swipe.`, code: "stalled" } : out.why === "down" ? { message: `The runtime lost its connection to Lumiverse for ${seconds} s during this call. Press Retry once it is back (lumiah status says how it is).`, code: "lost" } : { message: stoppedWords(out.why, out.detail), code: "unavailable" };
+        const problem = out.why === "silent" ? { message: `${this.link.backendName ?? "LumiAH"} stopped answering the runtime during this call (nothing for ${seconds} s): it may have restarted or hung. Press Retry, or swipe.`, code: "stalled" } : out.why === "down" ? { message: `The runtime lost its connection to Lumiverse for ${seconds} s during this call. Press Retry once it is back (lumiah status says how it is).`, code: "lost" } : { message: stoppedWords(out.why, out.detail, this.link.backendName), code: "unavailable" };
         this.end(stream, problem, out.why === "silent" || out.why === "down");
         continue;
       }
@@ -19275,7 +19289,7 @@ class Relay {
         return json(200, { up: true });
     }
     const out = this.link.out;
-    return json(200, { ok: this.link.refused === null, link: this.link.refused !== null ? "refused" : out?.why ?? (this.link.up ? "up" : "down"), turns: this.turns.count, requests: this.calls.size, ...this.link.refused !== null ? { problem: this.link.refused } : {} });
+    return json(200, { ok: this.link.refused === null, link: this.link.refused !== null ? "refused" : out?.why ?? (this.link.up ? "up" : "down"), backend: this.link.backendName ?? "LumiAH", turns: this.turns.count, requests: this.calls.size, ...this.link.refused !== null ? { problem: this.link.refused } : {} });
   }
   keyOf(req) {
     const auth = req.headers.get("authorization") ?? "";
@@ -19300,7 +19314,7 @@ class Relay {
       const { models } = await this.link.request("models", { key }, this.env.tuning().modelsWaitMs);
       return json(200, { object: "list", data: models.map((m) => ({ id: m.id, object: "model", created: 0, owned_by: "lumiah" })) });
     } catch (error) {
-      const p = problemOf(error);
+      const p = problemOf(error, this.link.backendName);
       const badKey = error instanceof LinkError && error.code === "forbidden";
       return json(badKey ? 401 : statusOf(p.code), errorJson(p.message, badKey ? "invalid_api_key" : p.code));
     }
@@ -19424,7 +19438,7 @@ class Relay {
     call.closed = () => stop.abort(new Error("The reply was stopped in Lumiverse (it closed the request)."));
     const answer = this.writer(call);
     this.turns.run({ request: call.id, tag, key, body, answer, signal: stop.signal }).catch((error) => {
-      const p = problemOf(error);
+      const p = problemOf(error, this.link.backendName);
       this.env.log(`a turn failed: ${p.message}`);
       answer.fail(p.message, p.code, this.env.now());
     }).finally(() => {
@@ -19575,7 +19589,7 @@ function linkHost(deps) {
   }
   function call(request, signal, onDelta) {
     const turn = deps.turn();
-    return streamed(signal, (stream) => link.request("model.call", { stream, turn, request }, deps.tuning().lostMs), (chunk, settle) => {
+    return streamed(signal, (stream) => link.request("model.call", { stream, turn, request, chat: deps.chat() ?? "" }, deps.tuning().lostMs), (chunk, settle) => {
       switch (chunk.kind) {
         case "content":
           onDelta?.({ content: chunk.text });
@@ -19622,7 +19636,7 @@ function linkHost(deps) {
     models: { call },
     connections: {
       list: async () => (await ask3("connections.list", {})).connections,
-      get: async (connectionId) => (await ask3("connections.get", { connection: connectionId })).profile
+      get: async (connectionId) => (await ask3("connections.get", { connection: connectionId, chat: deps.chat() ?? "" })).profile
     },
     blobs: {
       put: async (hash, text3) => {
@@ -20030,7 +20044,7 @@ class Turns {
       facts = await this.begin(request);
     } catch (error) {
       const refused3 = refusedReply(this.link);
-      const p = refused3 !== null ? { message: refused3, code: "revoked" } : problemOf(error);
+      const p = refused3 !== null ? { message: refused3, code: "revoked" } : problemOf(error, this.link.backendName);
       answer.fail(p.message, p.code === "forbidden" ? "invalid_api_key" : p.code, this.env.now());
       return;
     }
@@ -20093,9 +20107,9 @@ class Turns {
       else if (result.status !== "done")
         this.env.log(`turn ${facts.turn.slice(0, 8)} ${result.status}${result.reason !== undefined ? `: ${result.reason}` : ""}`);
     } catch (error) {
-      const p = problemOf(error);
+      const p = problemOf(error, this.link.backendName);
       this.env.log(`turn ${facts.turn.slice(0, 8)} failed: ${p.message}`);
-      answer.fail(`LumiAH's turn failed: ${p.message}`, p.code, this.env.now());
+      answer.fail(`${this.link.backendName ?? "LumiAH"}'s turn failed: ${p.message}`, p.code, this.env.now());
     } finally {
       request.signal.removeEventListener("abort", closed);
       await this.trace.drained().catch(() => {
@@ -21215,7 +21229,7 @@ async function status(a, io) {
     const body = await healthOf(config, io);
     if (isRecord2(body) && typeof body.link === "string") {
       healthy = body.ok === true && body.link === "up";
-      io.out(`It answers: link to LumiAH ${body.link}, ${String(body.turns)} turn(s) under way${typeof body.problem === "string" ? `. ${body.problem}` : ""}.`);
+      io.out(`It answers: link to ${typeof body.backend === "string" && body.backend !== "" ? body.backend : "LumiAH"} ${body.link}, ${String(body.turns)} turn(s) under way${typeof body.problem === "string" ? `. ${body.problem}` : ""}.`);
     } else
       io.out(`Something answers on ${config.listen}:${config.port}, but not as the runtime this config is for: another runtime serves there, or this one was set up again and hasn't been restarted since.`);
   } catch (error) {
@@ -21253,7 +21267,7 @@ if (process.versions.bun === undefined) {
 `);
   process.exit(1);
 }
-var BUILD = "2d685011";
+var BUILD = "7b7bf876";
 var http = async (request) => {
   const response = await fetch(request.url, { method: request.method, headers: request.headers, ...request.body !== undefined ? { body: request.body } : {}, redirect: "manual" });
   const text3 = await response.text();

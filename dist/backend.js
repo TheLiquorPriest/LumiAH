@@ -988,6 +988,7 @@ var AGENTS_TEXT = {
   answer: "agents.delegate.answer",
   stopped: "agents.delegate.stopped",
   noAgent: "agents.delegate.no_agent",
+  notOffered: "agents.not_offered",
   tooMany: "agents.delegate.too_many",
   noFile: "agents.delegate.no_file",
   noHandle: "agents.message.no_handle",
@@ -1087,6 +1088,7 @@ For reference, the user's newest message:
   { id: AGENTS_TEXT.stopped, group: ANSWERS, label: "delegate: the agent stopped short", note: "What delegate and agent_message return when the agent stopped before an answer.", text: `{{agent}} (handle {{handle}}) stopped before it answered: {{reason}}.{{said}}
 agent_message with this handle has it go on, if it still may; or go on without it.`, vars: [v("agent", "the agent's id"), v("handle", "the handle agent_message takes", true), v("reason", "why it stopped", true), v("said", "what it had last written, if anything")] },
   { id: AGENTS_TEXT.noAgent, group: ANSWERS, label: "delegate: no such agent", note: "delegate's answer to an id that names no agent it may delegate to.", text: "There's no agent {{agent}} to delegate to. You can delegate to: {{agents}}.", vars: [v("agent", "the id asked for"), v("agents", "the ids there are", true)] },
+  { id: AGENTS_TEXT.notOffered, group: ANSWERS, label: "delegate and job_start: an agent left out here", note: "The answer of delegate and job_start, and of a job you start, to a built-in agent the extension LumiAH is built into leaves out.", text: "Not started: {{agent}} isn't offered here, since the extension LumiAH is built into leaves it out. Do the work with the agents there are, or yourself.", vars: [v("agent", "the id asked for")] },
   { id: AGENTS_TEXT.tooMany, group: ANSWERS, label: "delegate: too many sub-agents", note: "delegate's answer once the turn has started every sub-agent Sub-agents per turn allows.", text: "Not started: this turn has started the {{limit}} it may (Sub-agents per turn). Ask one you already have with agent_message, or do it yourself.", vars: [v("limit", 'Sub-agents per turn, with the word: "3 sub-agents"', true)] },
   { id: AGENTS_TEXT.noFile, group: ANSWERS, label: "delegate: no such file", note: "delegate's answer to a file that isn't in the workspace.", text: "Not started: there's no workspace file {{path}}. workspace_list shows what there is. Call delegate again with the right path, or without it.", vars: [v("path", "the path asked for", true)] },
   { id: AGENTS_TEXT.asLong, group: ANSWERS, label: "delegate and job_start: as too long", note: "The answer of delegate and job_start to an as past Instance name length.", text: "Not started: as is {{chars}} characters, and it may be {{limit}} at most (Instance name length). Give the short id.", vars: [v("chars", "its length"), v("limit", "Instance name length", true)] },
@@ -2718,7 +2720,7 @@ var STOP_TEXTS = [
   stopText(TEXT.stop.failed, "A call failed", "A call that failed: the connection's or Lumiverse's error, as it gave it; words of your own may go around it.", "{{error}}", [v("error", "the error, as the connection or Lumiverse gave it", true)]),
   stopText(TEXT.stop.throttle, "Past a connection's throttle", "A call that needs more tokens than its connection's throttle lets through in a minute.", "the call needs {{tokens}}, more than this connection's throttle lets through in a minute ({{limit}})", [v("tokens", 'the tokens the call needs, with the word: "9000 tokens"', true), v("limit", "the tokens the throttle lets through in a minute", true)]),
   stopText(TEXT.stop.connectionUnread, "A connection that couldn't be read", "The agent's connection couldn't be read from Lumiverse.", "the connection {{connection}} couldn't be read ({{error}}): check that the runtime is linked, then try again", [v("connection", "the connection's id; empty for the default connection"), v("error", "why", true)]),
-  stopText(TEXT.stop.noDefault, "No default connection", "The agent runs on your default connection, and Lumiverse has none.", "there is no default connection: choose one in Lumiverse, or give this agent a connection in LumiAH's Settings"),
+  stopText(TEXT.stop.noDefault, "No connection to run on", "An agent with no connection of its own runs on the one its chat was on before it was set to play in the runtime, else on your default connection, never on a loopback; there is neither.", "there is no connection to run this agent on: it has none of its own, its chat had none before it was set to play in the runtime, and Lumiverse has no default connection. Give this agent a connection in LumiAH's Settings, or choose a default connection in Lumiverse"),
   stopText(TEXT.stop.noConnection, "A connection that is gone", "The agent's connection isn't among your connections any more.", "the connection {{connection}} no longer exists: give this agent another in LumiAH's Settings", [v("connection", "the connection's id", true)]),
   stopText(TEXT.stop.loopback, "The loopback connection", "The agent is set to run on the loopback connection, whose calls come back to LumiAH itself.", "the connection {{connection}} is LumiAH's own loopback: a call on it would come straight back here. Give this agent a connection to a model in LumiAH's Settings", [v("connection", "the connection's name", true)]),
   stopText(TEXT.stop.answerRoom, "Too little room left for an answer", "A call that would have fewer answer tokens than Least answer room, because the agent's or its turn's answer tokens are nearly spent.", "only {{left}} are left of its answer tokens, fewer than Least answer room ({{floor}}): an answer written in them would be cut", [v("left", 'the answer tokens left, with the word: "40 tokens"', true), v("floor", "Least answer room", true)])
@@ -7953,6 +7955,9 @@ function mergeDefinitions(sources, host) {
   const offAgents = strings(off.agents);
   for (const [id, view] of agents)
     view.off = offAgents.includes(id) && !CORE_AGENTS.includes(id);
+  const without = strings(stored.without).filter((id) => !CORE_AGENTS.includes(id));
+  for (const id of without)
+    agents.delete(id);
   const skills = new Map;
   for (const s of sources.code.skills)
     skills.set(s.id, { ...s, source: sources.core.skills.has(s.id) ? "builtin" : "extension", off: false });
@@ -7968,17 +7973,19 @@ function mergeDefinitions(sources, host) {
   const offSkills = strings(off.skills);
   for (const [id, view] of skills)
     view.off = offSkills.includes(id);
-  return new Definitions(agents, skills, tools);
+  return new Definitions(agents, skills, tools, new Set(without));
 }
 
 class Definitions {
   agentRows;
   skillRows;
   toolRows;
-  constructor(agentRows, skillRows, toolRows) {
+  without;
+  constructor(agentRows, skillRows, toolRows, without = new Set) {
     this.agentRows = agentRows;
     this.skillRows = skillRows;
     this.toolRows = toolRows;
+    this.without = without;
   }
   agent(id) {
     const view = this.agentRows.get(id);
@@ -8116,7 +8123,7 @@ class Delegator {
     const workers = run.definitions.workers(from.definition);
     const resolved = workers.some((d) => d.id === input.agent) ? run.resolve(input.agent) : undefined;
     if (!resolved)
-      return run.refusal(TEXT.agents.noAgent, { agent: clip(input.agent, settings.tools.lineChars), agents: workers.map((d) => d.id).join(", ") });
+      return run.definitions.without.has(input.agent) ? run.refusal(TEXT.agents.notOffered, { agent: clip(input.agent, settings.tools.lineChars) }) : run.refusal(TEXT.agents.noAgent, { agent: clip(input.agent, settings.tools.lineChars), agents: workers.map((d) => d.id).join(", ") });
     if (input.as !== undefined && input.as.length > settings.delegation.asChars)
       return run.refusal(TEXT.agents.asLong, { chars: String(input.as.length), limit: String(settings.delegation.asChars) });
     const reply = input.toReply === true ? from.reply : undefined;
@@ -10834,7 +10841,7 @@ class Jobs {
     const plan = input.by.who === "user" ? input.plan ?? kept.plan : undefined;
     const may = input.by.who === "user" ? definitions.agents().filter((d) => d.id !== AGENT.writer) : definitions.workers();
     if (!may.some((d) => d.id === agent))
-      return { refused: texts.render(TEXT.jobs.noAgent, { agent: clip(agent, lineChars), agents: may.map((d) => d.id).join(", ") }) };
+      return { refused: definitions.without.has(agent) ? texts.render(TEXT.agents.notOffered, { agent: clip(agent, lineChars) }) : texts.render(TEXT.jobs.noAgent, { agent: clip(agent, lineChars), agents: may.map((d) => d.id).join(", ") }) };
     if (task.trim() === "")
       return { refused: texts.render(TEXT.jobs.noTask) };
     if (task.length > settings.jobs.taskChars)
@@ -11252,6 +11259,8 @@ function chronicleRefusal(definitions, extension) {
     [CHRONICLER, "chronicler"],
     [READER, "story reader"]
   ]) {
+    if (definitions.without?.has(id) === true)
+      return `${extension ?? "The extension LumiAH is built into"} doesn't offer LumiAH's ${name} here, so no chronicle is kept for this chat and its story isn't learned.`;
     const sourced = definitions.sourced(id);
     if (sourced === undefined)
       return `LumiAH's ${name} is switched off, so it keeps no chronicle for this chat and doesn't learn its story. Switch it on on the Agents page.`;
@@ -18716,7 +18725,10 @@ class Builtin {
     const harness = (deps.harness ?? createHarness)(this.hostFor(userId, made), {
       settings: async () => {
         const snapshot = await deps.settings.snapshot(userId);
-        return { values: snapshot.values[deps.coreKey], texts: snapshot.texts, ...snapshot.definitions !== undefined ? { definitions: snapshot.definitions } : {} };
+        const without2 = deps.without ?? [];
+        const kept = snapshot.definitions;
+        const definitions = without2.length > 0 ? { ...typeof kept === "object" && kept !== null && !Array.isArray(kept) ? kept : {}, without: [...without2] } : kept;
+        return { values: snapshot.values[deps.coreKey], texts: snapshot.texts, ...definitions !== undefined ? { definitions } : {} };
       },
       ...extension !== undefined ? { extension } : {},
       userId,
@@ -20840,14 +20852,21 @@ class Models {
   }
   async call(caller, fields) {
     const stream = streamOf(fields.stream, this.deps.name);
-    const request = requestOf2(fields.request);
-    if (request === null)
+    const asked = requestOf2(fields.request);
+    if (asked === null)
       throw new LinkRefused("bad_request", `The model call is malformed: update the runtime and ${this.deps.name} to the same build.`);
     const turn = typeof fields.turn === "string" && fields.turn !== "" ? fields.turn : null;
-    const { streams, settings } = this.deps;
+    const chat = typeof fields.chat === "string" && fields.chat !== "" ? fields.chat : null;
+    const lent = asked.connectionId === null && chat !== null ? await this.deps.lend(caller.userId, chat) : undefined;
+    const request = lent?.from === "chat" ? { ...asked, connectionId: lent.id } : asked;
+    const { streams, settings, name } = this.deps;
     const writer = streams.open(caller.userId, caller.relay.id, stream, turn, (await settings.transport(caller.userId)).streams);
     if (writer === null)
       return { accepted: true };
+    if (lent === null) {
+      writer.error(`This agent has no connection of its own, this chat had none before it was pinned to the runtime, and this account has no default connection that isn't a loopback. Pick a connection for the agent in ${name}'s settings, or set a default one in Lumiverse.`, "connection");
+      return { accepted: true };
+    }
     this.run(caller.userId, writer, request.connectionId, "This agent", (connection, onDelta) => this.agentCall(caller.userId, connection, request, writer.signal, onDelta), request.stream === true);
     return { accepted: true };
   }
@@ -21735,7 +21754,7 @@ class Relays {
     });
     const missing = [...bun === null ? ["the path of Lumiverse's Bun (use the full path of your own bun)"] : [], ...script === null ? [`where this extension is installed (the runtime is dist/lumiah.js in ${identity.name}'s extension folder)`] : []];
     const line = (systemd) => bun === null || script === null ? null : `${[bun, script, "up", "--url"].map(shellWord).join(" ")} ${[URL_SLOT, ...named4.map(shellWord), ...systemd ? ["--systemd"] : []].join(" ")}`;
-    return { build: this.env.build, link: LINK_VERSION, model: loopbackModel(identity.identifier), relays, start: { service: line(true), foreground: line(false), missing }, issues, ready: await this.ready(userId) };
+    return { build: this.env.build, link: LINK_VERSION, model: loopbackModel(identity.identifier), relays, start: { service: line(true), foreground: line(false), missing }, issues, ready: await this.ready(userId), ...this.env.only ? { only: identity.name } : {} };
   }
 }
 
@@ -22054,8 +22073,11 @@ class LinkServer {
         return { last: d.streams.resend(userId, relay, streamId(r.stream), whole5(r.from, "chunk number")) };
       case "stream.cancel":
         return { cancelled: d.streams.cancel(userId, relay, streamId(r.stream), typeof r.reason === "string" ? r.reason : "") };
-      case "settings.get":
-        return d.settings.snapshot(userId);
+      case "settings.get": {
+        const snapshot = await d.settings.snapshot(userId);
+        const kept = snapshot.definitions;
+        return d.without.length > 0 ? { ...snapshot, definitions: { ...typeof kept === "object" && kept !== null && !Array.isArray(kept) ? kept : {}, without: [...d.without] } } : snapshot;
+      }
       case "trace.push":
         return { taken: await d.live.push(userId, relay, Array.isArray(r.records) ? r.records : []) };
       case "setup.connection": {
@@ -22097,8 +22119,15 @@ class LinkServer {
       }
       case "connections.list":
         return { connections: await d.connections.list(userId) };
-      case "connections.get":
-        return { profile: await d.connections.profile(userId, typeof r.connection === "string" && r.connection !== "" ? r.connection : null) };
+      case "connections.get": {
+        const named4 = typeof r.connection === "string" && r.connection !== "" ? r.connection : null;
+        if (named4 === null && typeof r.chat === "string" && r.chat !== "") {
+          await d.chats.own(userId, r.chat);
+          const lent = await d.chatSwitch.agentConnection(userId, r.chat);
+          return { profile: lent === null ? null : await d.connections.profile(userId, lent.id) };
+        }
+        return { profile: await d.connections.profile(userId, named4) };
+      }
       case "tools.list":
         return { tools: await d.tools.list(userId, typeof r.chat === "string" && r.chat !== "" ? (await d.chats.own(userId, r.chat)).id : "") };
       case "tool.call": {
@@ -22888,8 +22917,20 @@ class ChatSwitch {
     return { chatId: chat.id, name: chat.name === "" ? null : chat.name, on, since: on ? switched.since : null, place, connection: connection === null ? null : { id: connection.id, name: connection.name, loopback: connection.loopback }, ...other !== null ? { other } : {}, ...away ? { away: true } : {}, ...needs2 !== null ? { needsRuntime: needs2 } : {} };
   }
   async needsRuntime(userId, chatId) {
+    if (this.deps.only === true)
+      return { by: this.deps.identity.name };
     const claimed = await this.claimed(userId, chatId);
     return claimed?.claim.place === "runtime" ? { by: claimed.by } : null;
+  }
+  async agentConnection(userId, chatId) {
+    const prior = (await this.docs.get(userId)).on[chatId]?.prior ?? null;
+    const tries = prior !== null ? [[prior, "chat"], [null, "default"]] : [[null, "default"]];
+    for (const [id, from] of tries) {
+      const found = await this.deps.connections.resolve(userId, id);
+      if (found !== null && !found.loopback)
+        return { id: found.connection.id, from };
+    }
+    return null;
   }
   async claimed(userId, chatId, setting) {
     if (this.deps.claim === undefined)
@@ -24302,6 +24343,7 @@ function createBackend(host, env, options = {}) {
     now,
     build,
     identity,
+    only: options.place === "runtime",
     send: (frame, userId, session) => made.server?.send(frame, userId, session),
     hasLoopback: async (userId) => (await made.connections?.loopbacks(userId) ?? []).length > 0
   });
@@ -24358,7 +24400,17 @@ function createBackend(host, env, options = {}) {
   const presets = new Presets(host);
   const recall = new Recall2(host, { chats, lore, activated: (userId, chatId, generationId) => turns.activatedInfo(userId, chatId, generationId), now });
   const live2 = new LiveBuffer(host, { now, transport: (userId) => settings.transport(userId), linkGoneFor: (userId, relay) => relays.goneFor(userId, relay), missing: () => permissions().some((need) => need.needed) });
-  const models = new Models(host, { connections, streams, settings, registry, name });
+  const models = new Models(host, {
+    connections,
+    streams,
+    settings,
+    registry,
+    name,
+    lend: async (userId, chatId) => {
+      await chats.own(userId, chatId);
+      return await made.chatSwitch?.agentConnection(userId, chatId) ?? null;
+    }
+  });
   const keys = new Keys(host, { registry, relays, settings, connectionName: identity.connectionName, now, later });
   const claimer = options.extension;
   const chatSwitch = new ChatSwitch(host, {
@@ -24369,6 +24421,7 @@ function createBackend(host, env, options = {}) {
     blocked,
     identity,
     now,
+    ...options.place === "runtime" ? { only: true } : {},
     storySetting: async (userId) => settingsOf((await settings.values(userId))[CORE_KEY]).story,
     ...claimer?.claim !== undefined ? {
       claim: async (ask3, userId) => {
@@ -24390,6 +24443,7 @@ function createBackend(host, env, options = {}) {
   const mcp = new Mcp(host, { on: (userId) => defs.mcpOn(userId), callMs: async (userId) => (await settings.transport(userId)).mcp.callMs });
   const tools = new RemoteTools(options.tools, mcp, (level, message) => host.log(level, message));
   const builtin = new Builtin(host, {
+    without: options.withoutAgents ?? [],
     settings,
     storage,
     chats,
@@ -24457,6 +24511,7 @@ function createBackend(host, env, options = {}) {
     now
   });
   const server = new LinkServer(host, {
+    without: options.withoutAgents ?? [],
     relays,
     registry,
     settings,
@@ -25466,7 +25521,7 @@ function createSpindleHost(identifier = EXTENSION_IDENTIFIER) {
 }
 
 // src/extension/backend/main.ts
-var BUILD = "2d685011";
+var BUILD = "7b7bf876";
 var TICK_MS = 1000;
 var host = createSpindleHost();
 var backend = createBackend(host, {
