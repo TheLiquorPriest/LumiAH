@@ -1245,7 +1245,11 @@ var HOSTED_TEXTS = [
 var JOBS_TEXT = {
   task: "jobs.task",
   objective: "jobs.objective",
+  objectiveFiles: "jobs.objective.files",
   objectiveChat: "jobs.objective.chat",
+  againNote: "jobs.again.note",
+  againOffPath: "jobs.again.off_path",
+  whyCutThinking: "jobs.why.cut_thinking",
   resumed: "jobs.resumed",
   resumedPlan: "jobs.resumed.plan",
   allowance: "jobs.allowance",
@@ -1329,38 +1333,48 @@ var JOBS_TEXTS = [
     id: JOBS_TEXT.objective,
     group: JOBS,
     label: "A long objective",
-    note: "The first message of a job the user started on the page: the objective in their words, what the job may spend, and the plan it is asked for before it works.",
+    note: "The first message of a job the user started on the page: the objective in their words, what the job may spend, and, for an agent that can write files, the plan it is asked for before it works and where it keeps its files.",
     text: [
       `You are running as a job the user started: work that is too long for a reply and ends in none. Nobody reads along, there is no writer to brief and no reply to write: write_reply isn't yours here. The user's objective, in their words:
 
 {{task}}`,
-      "{{allowance}} Everything you and the agents and jobs you start spend counts against it, and when it runs out you are stopped where you stand. So keep what you learn in files as you go, never only in your head.",
-      "Before you work, write your plan to {{plan}}: what you will do with this allowance, where you will read closely, where a summary is enough, and what you will leave out. A smaller allowance means a narrower plan. Keep the plan true as you go: mark what is done, and change it when you change course. Whoever carries this job on, you among them, starts from that file.",
-      "Work in learned/ (kept with this chat whatever path its story takes) and ~/ (the user's own, shared by all their chats). You can read the chat's own area (/) and can't change it: it follows the story as swipes and edits do, and you belong to the chat, not to a turn. Keep a plain list of what you have not verified in learned/, beside what you have.",
-      "When you are done, answer with your report: what you did, what you found, where it is, and what is left."
+      "{{allowance}} Everything you and the agents and jobs you start spend counts against it, and when it runs out you are stopped where you stand.{{files}}",
+      "When you are done, answer with your report: what you did, what you found, and what is left."
     ].join(`
 
 `),
-    vars: [v("task", "the objective, as the user wrote it", true), v("allowance", "what the job may spend, as Its allowance writes it", true), v("plan", "the plan file's path", true)]
+    vars: [v("task", "the objective, as the user wrote it", true), v("allowance", "what the job may spend, as Its allowance writes it", true), v("files", "for an agent that can write files: its plan and where it keeps its files, as A long objective: files (or its form for the chat's own area) writes it; nothing for one that can't")]
+  },
+  {
+    id: JOBS_TEXT.objectiveFiles,
+    group: JOBS,
+    label: "A long objective: files",
+    note: "Fills {{files}} in A long objective for an agent that can write files: the plan it is asked for and where it keeps what it learns.",
+    text: [
+      " So keep what you learn in files as you go, never only in your head.",
+      "Before you work, write your plan to {{plan}}: what you will do with this allowance, where you will read closely, where a summary is enough, and what you will leave out. A smaller allowance means a narrower plan. Keep the plan true as you go: mark what is done, and change it when you change course. Whoever carries this job on, you among them, starts from that file.",
+      "Work in learned/ (kept with this chat whatever path its story takes) and ~/ (the user's own, shared by all their chats). You can read the chat's own area (/) and can't change it: it follows the story as swipes and edits do, and you belong to the chat, not to a turn. Keep a plain list of what you have not verified in learned/, beside what you have, and say in your report where your files are."
+    ].join(`
+
+`),
+    vars: [v("plan", "the plan file's path", true)]
   },
   {
     id: JOBS_TEXT.objectiveChat,
     group: JOBS,
-    label: "A long objective that may change the chat's own area",
-    note: "The first message of a job the user started that may write the chat's own area (an extension starts such a job to prepare a story): the objective in their words, what the job may spend, and the plan it is asked for before it works.",
+    label: "A long objective: files, with the chat's own area",
+    note: "Fills {{files}} in A long objective for a job that may write the chat's own area (an extension starts such a job to prepare a story), where its agent can write files.",
     text: [
-      `You are running as a job the user started: work that is too long for a reply and ends in none. Nobody reads along, there is no writer to brief and no reply to write: write_reply isn't yours here. The user's objective, in their words:
-
-{{task}}`,
-      "{{allowance}} Everything you and the agents and jobs you start spend counts against it, and when it runs out you are stopped where you stand. So keep what you learn in files as you go, never only in your head.",
+      " So keep what you learn in files as you go, never only in your head.",
       "Before you work, write your plan to {{plan}}: what you will do with this allowance, where you will read closely, where a summary is enough, and what you will leave out. A smaller allowance means a narrower plan. Keep the plan true as you go: mark what is done, and change it when you change course. Whoever carries this job on, you among them, starts from that file.",
-      "You may write the chat's own area (/), as it stands at the chat's latest reply, and learned/ (kept with this chat whatever path its story takes) and ~/ (the user's own, shared by all their chats). Keep a plain list of what you have not verified beside what you have.",
-      "When you are done, answer with your report: what you did, what you found, where it is, and what is left."
+      "You may write the chat's own area (/), as it stands at the chat's latest reply, and learned/ (kept with this chat whatever path its story takes) and ~/ (the user's own, shared by all their chats). Keep a plain list of what you have not verified beside what you have, and say in your report where your files are."
     ].join(`
 
 `),
-    vars: [v("task", "the objective, as the user wrote it", true), v("allowance", "what the job may spend, as Its allowance writes it", true), v("plan", "the plan file's path", true)]
+    vars: [v("plan", "the plan file's path", true)]
   },
+  { id: JOBS_TEXT.againNote, group: JOBS, label: "A job run again", note: "Ends the first message of a job the user ran again from the Jobs page: it is the same job, told what its first run was told, and why that run stopped.", text: "This is the same job run again. Its last run stopped: {{why}}.", vars: [v("why", "why the last run stopped, or how it stands", true)] },
+  { id: JOBS_TEXT.againOffPath, group: GROUP.answers, label: "Run again: its reply is gone", note: "Why a job can't be run again from the Jobs page: the reply it was started from is no longer on the chat's path.", text: "Not run again: job {{id}} belongs to a reply that is no longer on the chat's path (it was swiped, edited away or deleted), so it would have no turn to work for. Show that reply again to run it, or start a new job.", vars: [v("id", "the job's id", true)] },
   { id: JOBS_TEXT.resumed, group: JOBS, label: "A job carried on", note: "What a job's agent is sent when the job is carried on from its own session: the user granted it more after its allowance ran out, or resumed it after a restart had found it paused.", text: "This job was stopped and is carried on now, from where you left it. {{allowance}}{{plan}} Then go on.", vars: [v("allowance", "what is left of what the job may spend, as Its allowance writes it", true), v("plan", "where its plan is, as A job carried on: its plan writes it; nothing for a job that was asked for none")] },
   { id: JOBS_TEXT.resumedPlan, group: JOBS, label: "A job carried on: its plan", note: "Fills {{plan}} for a job that was asked to keep a plan: one the user started.", text: " Read your plan ({{plan}}) and your files first: they say what is done and what is left.", vars: [v("plan", "the plan file's path", true)] },
   { id: JOBS_TEXT.allowance, group: JOBS, label: "Its allowance", note: "How a job's agent is told what the job may still spend.", text: "What this job may still spend: {{parts}}.", vars: [v("parts", "each limit, as the four texts below write them, or that there is none", true)] },
@@ -1458,6 +1472,7 @@ It has no report.`, vars: [v("head", "the heading, as job_read: a job writes it"
   state(JOBS_TEXT.state.spent, "stopped at its allowance", "stopped at its allowance"),
   state(JOBS_TEXT.spentDay, "stopped at a day's limit", "stopped at a day's limit, with nothing lost"),
   { id: JOBS_TEXT.whyRuntimeOnly, group: JOBS, label: "Why: the chat plays only in a runtime", note: "Why a job, or a side session's turn, didn't run inside Lumiverse: the extension that answers the chat says it plays only in a runtime.", text: "this chat plays only in a runtime, so its work runs only there; start the runtime and run it again", vars: [] },
+  { id: JOBS_TEXT.whyCutThinking, group: JOBS, label: "Why: its answer ran out while it was thinking", note: "A job's reason when its agent's model used all its answer room on thinking and wrote no report.", text: "its agent ran out of answer room while it was still thinking, so it wrote no report (Answer per call, in the agent's settings, is that room). Raise it for this agent, or lower its effort, then run the job again", vars: [] },
   state(JOBS_TEXT.state.paused, "paused, with no run under way", "paused by the user"),
   state(JOBS_TEXT.paused, "paused", "running, paused by the user"),
   { id: JOBS_TEXT.whyCancelledByAgent, group: JOBS, label: "Why: cancelled by an agent", note: "A job's reason when an agent's job_cancel ended it.", text: "the {{role}} agent cancelled it", vars: [v("role", "the definition of the agent that cancelled it", true)] },
@@ -2720,7 +2735,7 @@ var STOP_TEXTS = [
   stopText(TEXT.stop.failed, "A call failed", "A call that failed: the connection's or Lumiverse's error, as it gave it; words of your own may go around it.", "{{error}}", [v("error", "the error, as the connection or Lumiverse gave it", true)]),
   stopText(TEXT.stop.throttle, "Past a connection's throttle", "A call that needs more tokens than its connection's throttle lets through in a minute.", "the call needs {{tokens}}, more than this connection's throttle lets through in a minute ({{limit}})", [v("tokens", 'the tokens the call needs, with the word: "9000 tokens"', true), v("limit", "the tokens the throttle lets through in a minute", true)]),
   stopText(TEXT.stop.connectionUnread, "A connection that couldn't be read", "The agent's connection couldn't be read from Lumiverse.", "the connection {{connection}} couldn't be read ({{error}}): check that the runtime is linked, then try again", [v("connection", "the connection's id; empty for the default connection"), v("error", "why", true)]),
-  stopText(TEXT.stop.noDefault, "No connection to run on", "An agent with no connection of its own runs on the one its chat was on before it was set to play in the runtime, else on your default connection, never on a loopback; there is neither.", "there is no connection to run this agent on: it has none of its own, its chat had none before it was set to play in the runtime, and Lumiverse has no default connection. Give this agent a connection in LumiAH's Settings, or choose a default connection in Lumiverse"),
+  stopText(TEXT.stop.noDefault, "No connection to run on", "An agent with no connection of its own runs on the one its chat was on before it was set to play in the runtime, else on the connection selected in Lumiverse, else on your default connection, never on a loopback; there is none of these.", "there is no connection to run this agent on: it has none of its own, its chat had none before it was set to play in the runtime, no connection is selected in Lumiverse, and Lumiverse has no default connection. Give this agent a connection in LumiAH's Settings, or select a connection in Lumiverse"),
   stopText(TEXT.stop.noConnection, "A connection that is gone", "The agent's connection isn't among your connections any more.", "the connection {{connection}} no longer exists: give this agent another in LumiAH's Settings", [v("connection", "the connection's id", true)]),
   stopText(TEXT.stop.loopback, "The loopback connection", "The agent is set to run on the loopback connection, whose calls come back to LumiAH itself.", "the connection {{connection}} is LumiAH's own loopback: a call on it would come straight back here. Give this agent a connection to a model in LumiAH's Settings", [v("connection", "the connection's name", true)]),
   stopText(TEXT.stop.answerRoom, "Too little room left for an answer", "A call that would have fewer answer tokens than Least answer room, because the agent's or its turn's answer tokens are nearly spent.", "only {{left}} are left of its answer tokens, fewer than Least answer room ({{floor}}): an answer written in them would be cut", [v("left", 'the answer tokens left, with the word: "40 tokens"', true), v("floor", "Least answer room", true)])
@@ -10513,7 +10528,7 @@ class Run {
     }, this.deps);
     view.author = info.kind === "job" ? { who: "job", id: info.id, role: definition.id } : { who: "agent", id: agent.id, role: definition.id };
     this.lines.set(agent.id, [...above, { agentId: agent.id, role: definition.id, ...how.as !== undefined ? { as: how.as } : {} }]);
-    return { agent, lead: how.plain ? "" : await this.pinned(view), view };
+    return { agent, lead: how.plain ? "" : await this.pinned(view), view, held };
   }
   ref(agentId) {
     return this.lines.get(agentId)?.at(-1);
@@ -10824,6 +10839,7 @@ class Jobs {
     let task;
     let again;
     let kept = {};
+    let same = null;
     if ("again" in input.what) {
       const old = await this.doc(input.what.again);
       if (!old || old.job.chatId !== input.chatId)
@@ -10834,12 +10850,21 @@ class Jobs {
       task = old.task;
       again = old.job.id;
       kept = { ...old.job.as !== undefined ? { as: old.job.as } : {}, ...old.job.area !== undefined ? { area: old.job.area } : {}, ...old.job.plan !== undefined ? { plan: old.job.plan } : {} };
+      if (input.by.who === "user") {
+        const basis = old.job.basis;
+        if (basis !== null && !this.shared().runs.has(basis) && !(await pathTurns(await this.host.chat.path(input.chatId))).some((turn) => turn.onPath && turn.record.generationId === basis))
+          return { refused: texts.render(TEXT.jobs.againOffPath, { id: old.job.id }) };
+        same = old;
+      }
     } else
       ({ agent, task } = input.what);
+    const by = same ? same.job.by : input.by;
     const as = input.as ?? kept.as;
-    const area2 = input.by.who === "user" ? input.area ?? kept.area : undefined;
-    const plan = input.by.who === "user" ? input.plan ?? kept.plan : undefined;
-    const may = input.by.who === "user" ? definitions.agents().filter((d) => d.id !== AGENT.writer) : definitions.workers();
+    const lane = input.lane ?? same?.job.lane;
+    const due = input.due ?? same?.job.due;
+    const area2 = by.who === "user" ? input.area ?? kept.area : undefined;
+    const plan = by.who === "user" ? input.plan ?? kept.plan : undefined;
+    const may = by.who === "user" ? definitions.agents().filter((d) => d.id !== AGENT.writer) : definitions.workers();
     if (!may.some((d) => d.id === agent))
       return { refused: definitions.without.has(agent) ? texts.render(TEXT.agents.notOffered, { agent: clip(agent, lineChars) }) : texts.render(TEXT.jobs.noAgent, { agent: clip(agent, lineChars), agents: may.map((d) => d.id).join(", ") }) };
     if (task.trim() === "")
@@ -10852,6 +10877,7 @@ class Jobs {
       const { left } = input.parent;
       allowance = { tokensIn: least(own.tokensIn, left.tokensIn), tokensOut: least(own.tokensOut, left.tokensOut), toolTurns: least(own.toolTurns, left.toolTurns), wallMs: least(own.wallMs, left.wallMs) };
     }
+    const parent = input.parent?.id ?? same?.job.parent;
     const job = {
       id: `job_${crypto.randomUUID().slice(0, 8)}`,
       chatId: input.chatId,
@@ -10860,22 +10886,23 @@ class Jobs {
       when: input.when,
       state: "queued",
       ...this.holding ? { paused: true } : {},
-      by: input.by,
-      basis: input.basis,
+      by,
+      basis: same ? same.job.basis : input.basis,
       ...again !== undefined ? { again } : {},
       ...as !== undefined ? { as } : {},
-      ...input.lane !== undefined ? { lane: input.lane } : {},
-      ...input.due !== undefined ? { due: input.due } : {},
+      ...lane !== undefined ? { lane } : {},
+      ...due !== undefined ? { due } : {},
       ...area2 !== undefined ? { area: area2 } : {},
       ...plan !== undefined ? { plan } : {},
-      ...input.parent ? { parent: input.parent.id } : {},
+      ...parent !== undefined ? { parent } : {},
       ...allowance ? { allowance } : {},
       createdAt: this.host.clock.now(),
       usage: emptyUsage()
     };
     this.forgotten.delete(input.chatId);
     const { starter } = input;
-    await this.put({ v: 1, kind: "job", job, task, ...starter ? { held: [...starter.held], depth: starter.depth + 1 } : {} });
+    const given = same ? { ...same.held !== undefined ? { held: same.held } : {}, ...same.depth !== undefined ? { depth: same.depth } : {} } : starter ? { held: [...starter.held], depth: starter.depth + 1 } : {};
+    await this.put({ v: 1, kind: "job", job, task, ...given });
     port.queued(job);
     return job;
   }
@@ -11129,7 +11156,8 @@ class Jobs {
         await save();
         const history = session !== undefined ? sessionOf(await shared.blobs.getJson(session)) : null;
         const grant = held !== undefined && (resolved.definition.grant ?? settings.delegation.grant) === "own" ? { grant: new Set(held) } : {};
-        const { agent, lead } = await run.agent(resolved, { depth: depth ?? 0, task: job.task, notes: true, main: true, ...grant, ...history ? { history } : {}, ...job.as !== undefined ? { as: job.as } : {}, standing: "job", by: job.by.who === "user" ? "user" : { agentId: job.by.id, role: job.by.role } });
+        const started = await run.agent(resolved, { depth: depth ?? 0, task: job.task, notes: true, main: true, ...grant, ...history ? { history } : {}, ...job.as !== undefined ? { as: job.as } : {}, standing: "job", by: job.by.who === "user" ? "user" : { agentId: job.by.id, role: job.by.role } });
+        const { agent, lead } = started;
         const keep = async () => {
           session = await shared.blobs.putJson(agent.messages(), false);
         };
@@ -11141,9 +11169,14 @@ class Jobs {
             return save();
           }).catch((error) => host.log("warn", `[LumiAH] job ${job.id}'s session couldn't be kept (${errorText(error)})`));
         };
-        const plan = job.by.who === "user" ? job.plan ?? planPath(job.id) : null;
+        const plan = job.by.who === "user" && (started.held.has(TOOL.workspaceWrite) || started.held.has(TOOL.workspaceEdit)) ? job.plan ?? planPath(job.id) : null;
         const allowance = allowanceText(run.left(), texts);
-        const message = history ? texts.render(TEXT.jobs.resumed, { allowance, plan: plan === null ? "" : texts.render(TEXT.jobs.resumedPlan, { plan }) }) : plan !== null ? texts.render(job.area === "chat" ? TEXT.jobs.objectiveChat : TEXT.jobs.objective, { task: doc.task, allowance, plan }) : texts.render(TEXT.jobs.task, { task: doc.task });
+        const first = job.again !== undefined && !history ? await this.doc(job.again) : null;
+        const ranAgain = first ? `
+
+${texts.render(TEXT.jobs.againNote, { why: first.job.reason ?? jobState(first.job, texts) })}` : "";
+        const opening = job.by.who === "user" ? texts.render(TEXT.jobs.objective, { task: doc.task, allowance, files: plan === null ? "" : texts.render(job.area === "chat" ? TEXT.jobs.objectiveChat : TEXT.jobs.objectiveFiles, { plan }) }) : texts.render(TEXT.jobs.task, { task: doc.task });
+        const message = history ? texts.render(TEXT.jobs.resumed, { allowance, plan: plan === null ? "" : texts.render(TEXT.jobs.resumedPlan, { plan }) }) : `${opening}${ranAgain}`;
         const reply = await agent.send(lead === "" ? message : `${lead}
 
 ${message}`, signal);
@@ -11176,7 +11209,7 @@ ${message}`, signal);
           return { state: "spent", ...reply.reason !== undefined ? { reason: reply.reason } : {}, stoppedAt: day ? "day" : "allowance", report: report2, at: at2 };
         }
         if (!whole4)
-          return { state: "failed", reason: reply.status === "answered" && said !== "" ? texts.render(TEXT.agents.cut) : reply.reason ?? texts.render(TEXT.jobs.whyNoAnswer), report: told, at: at2 };
+          return { state: "failed", reason: reply.status === "answered" && cutShort(reply.finish) ? texts.render(said === "" ? TEXT.jobs.whyCutThinking : TEXT.agents.cut) : reply.reason ?? texts.render(TEXT.jobs.whyNoAnswer), report: told, at: at2 };
         if (await this.stands(job, settings.jobs.recordWaitMs, hostSignal).catch(() => true))
           return { state: "done", report: told, at: at2 };
         return { state: "off_path", reason: texts.render(TEXT.jobs.whyOffPath), report: told, at: at2 };
@@ -20692,9 +20725,12 @@ class Connections {
     const theirs = c.provider === LOOPBACK_PROVIDER && c.model !== this.deps.model ? c.model === MODEL_ID ? EXTENSION_IDENTIFIER : c.model.startsWith(`${MODEL_ID}-`) ? c.model.slice(MODEL_ID.length + 1) : null : null;
     return { id: c.id, name: c.name, loopback: this.loops(c, await this.deps.bases(userId)), foreign: theirs };
   }
-  async unpinned(userId) {
+  async selectedId(userId) {
     const said2 = await this.host.connections.active(userId);
-    const selected = said2 !== undefined ? said2 : this.told.get(userId) ?? null;
+    return said2 !== undefined ? said2 : this.told.get(userId) ?? null;
+  }
+  async unpinned(userId) {
+    const selected = await this.selectedId(userId);
     const active = selected === null ? null : await this.host.connections.get(selected, userId);
     if (active !== null)
       return active;
@@ -20858,13 +20894,13 @@ class Models {
     const turn = typeof fields.turn === "string" && fields.turn !== "" ? fields.turn : null;
     const chat = typeof fields.chat === "string" && fields.chat !== "" ? fields.chat : null;
     const lent = asked.connectionId === null && chat !== null ? await this.deps.lend(caller.userId, chat) : undefined;
-    const request = lent?.from === "chat" ? { ...asked, connectionId: lent.id } : asked;
+    const request = lent !== undefined && lent !== null && lent.from !== "default" ? { ...asked, connectionId: lent.id } : asked;
     const { streams, settings, name } = this.deps;
     const writer = streams.open(caller.userId, caller.relay.id, stream, turn, (await settings.transport(caller.userId)).streams);
     if (writer === null)
       return { accepted: true };
     if (lent === null) {
-      writer.error(`This agent has no connection of its own, this chat had none before it was pinned to the runtime, and this account has no default connection that isn't a loopback. Pick a connection for the agent in ${name}'s settings, or set a default one in Lumiverse.`, "connection");
+      writer.error(`This agent has no connection of its own, this chat had none before it was pinned to the runtime, no connection that isn't a loopback is selected in Lumiverse, and this account has no default connection that isn't a loopback. Pick a connection for the agent in ${name}'s settings, or select one in Lumiverse.`, "connection");
       return { accepted: true };
     }
     this.run(caller.userId, writer, request.connectionId, "This agent", (connection, onDelta) => this.agentCall(caller.userId, connection, request, writer.signal, onDelta), request.stream === true);
@@ -22923,8 +22959,14 @@ class ChatSwitch {
     return claimed?.claim.place === "runtime" ? { by: claimed.by } : null;
   }
   async agentConnection(userId, chatId) {
+    const tries = [];
     const prior = (await this.docs.get(userId)).on[chatId]?.prior ?? null;
-    const tries = prior !== null ? [[prior, "chat"], [null, "default"]] : [[null, "default"]];
+    if (prior !== null)
+      tries.push([prior, "chat"]);
+    const selected = await this.deps.connections.selectedId(userId);
+    if (selected !== null)
+      tries.push([selected, "selected"]);
+    tries.push([null, "default"]);
     for (const [id, from] of tries) {
       const found = await this.deps.connections.resolve(userId, id);
       if (found !== null && !found.loopback)
@@ -25521,7 +25563,7 @@ function createSpindleHost(identifier = EXTENSION_IDENTIFIER) {
 }
 
 // src/extension/backend/main.ts
-var BUILD = "7b7bf876";
+var BUILD = "0efcfee9";
 var TICK_MS = 1000;
 var host = createSpindleHost();
 var backend = createBackend(host, {
