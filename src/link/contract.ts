@@ -327,7 +327,7 @@ export interface LinkRequests {
   /** A preset's blocks, in order, each switched on or off as it is for `chat` (a chat's preset binding may set its own over the preset's); null: as the preset has them. */
   "preset.blocks": { fields: { secret: string; preset: string; chat: string | null }; result: { blocks: PresetBlock[] } };
   "connections.list": { fields: { secret: string }; result: { connections: ConnectionInfo[] } };
-  /** One connection (null: the user's default). `chat`: the chat of the run that asks (absent or `""`: none). Asked for none in a run of a chat, which plays in a runtime, it is the connection that chat was on before it was pinned to the loopback, else the default; never a loopback, and null when there is neither (DESIGN §25). */
+  /** One connection (null: the user's default). `chat`: the chat of the run that asks (absent or `""`: none). Asked for none in a run of a chat, which plays in a runtime, it is the connection that chat was on before it was pinned to the loopback, else the one the user has selected in Lumiverse, else the default; never a loopback, and null when there is none of these (DESIGN §25). */
   "connections.get": { fields: { secret: string; connection: string | null; chat?: string }; result: { profile: ConnectionProfile | null } };
   /** The tools that run in the extension, as they stand for a chat (`""`: none): the extension's own, and those of the MCP servers the user left on (DESIGN §13, §16). */
   "tools.list": { fields: { secret: string; chat: string }; result: { tools: RemoteTool[] } };

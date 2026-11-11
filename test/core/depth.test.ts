@@ -10,6 +10,7 @@ import type { AgentModelAsk, ChatClaim, HarnessExtension, ReplyRelease } from ".
 import { Gate } from "../../src/core/gate";
 import { createHarness } from "../../src/core/harness";
 import type { ModelRequest, TurnRequest } from "../../src/core/ports";
+import { HarnessRefusal } from "../../src/core/refusal";
 import { defaultSettings, newAgentSettings, type Settings } from "../../src/core/settings";
 import { renderDefault, TEXT } from "../../src/core/texts";
 import { type Answer, call, MemoryHost, runTurn, type Script, until, WRITER } from "./support/host";
@@ -378,6 +379,43 @@ describe("a job the user starts that writes the chat's own area (the prepared st
     await runTurn(r.host, r.harness, "chat-fresh");
     expect(r.result("first-mind")).toContain(MIND);
     expect(r.result("first-notes")).toContain(NOTEBOOK);
+  });
+});
+
+describe("a job run again, what a job is told, and an answer cut while it thought (§15, §22)", () => {
+  test("run again from the page it is the same job for the same turn, told what it was told and why its last run stopped; refused once that reply is off the path", async () => {
+    const r = rig(
+      lines({
+        author: [{ toolCalls: [call("job_start", { agent: "voice", task: "Digest the beat.", as: "mara", lane: "soon", due: "next_turn" }), call("reply_write", { text: "Mara nods." })] }, "Done.", { toolCalls: [call("reply_write", { text: "Mara shrugs." })] }, "Done."],
+        voice: [{ content: "", reasoning: "Mara turns the morning over and over.", finishReason: "length" }, "Digested: the boat went out at dawn."],
+      }),
+    );
+    const { request } = await runTurn(r.host, r.harness, CHAT);
+    // Its answer ran out while it was still thinking: the failure says so.
+    const failed = await r.harness.jobs.run({ id: r.host.queued[0]?.id ?? "" }, never);
+    expect(failed).toMatchObject({ state: "failed", reason: renderDefault(TEXT.jobs.whyCutThinking) });
+    const { job } = await r.harness.jobs.again({ id: failed.id });
+    expect(job).toMatchObject({ again: failed.id, basis: request.generationId, by: { who: "agent", role: "author" }, as: "mara", lane: "soon", due: "next_turn", task: "Digest the beat." });
+    expect((await r.harness.jobs.run({ id: job.id }, never)).state).toBe("done");
+    const told = r.callsOf(VOICE)[1]?.messages.find((m) => m.role === "user")?.content ?? "";
+    expect(told).toContain(renderDefault(TEXT.jobs.task, { task: "Digest the beat." }));
+    expect(told).toContain(renderDefault(TEXT.jobs.againNote, { why: renderDefault(TEXT.jobs.whyCutThinking) }));
+    expect(told).not.toContain("write your plan");
+    // The reply it was started from is swiped away: it isn't run again, and not as anything else either.
+    await runTurn(r.host, r.harness, CHAT, { kind: "swipe" });
+    const refused = await r.harness.jobs.again({ id: failed.id }).catch((error: unknown) => error);
+    expect(refused).toBeInstanceOf(HarnessRefusal);
+    expect((refused as HarnessRefusal).message).toBe(renderDefault(TEXT.jobs.againOffPath, { id: failed.id }));
+  });
+
+  test("a job the user starts is told of a plan and of files only where its agent can write them", async () => {
+    const r = rig(lines({ voice: ["Thought it over."] }));
+    const { job } = await r.harness.jobs.start({ chatId: CHAT, agent: "voice", task: "Think over what Mara saw.", when: "now" });
+    expect((await r.harness.jobs.run({ id: job.id }, never)).state).toBe("done");
+    const told = r.callsOf(VOICE)[0]?.messages.find((m) => m.role === "user")?.content ?? "";
+    expect(told).toContain("You are running as a job the user started");
+    expect(told).toContain("Think over what Mara saw.");
+    for (const promise of ["write your plan", "learned/", "in files"]) expect(told).not.toContain(promise);
   });
 });
 

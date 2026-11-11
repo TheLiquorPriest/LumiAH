@@ -199,7 +199,7 @@ function StartJob(props: { chatId: string | null; chat: string | null; agents: J
         <Check
           checked={draft.allowance !== null}
           label="Give this job a budget of its own"
-          help={draft.allowance !== null ? "For a long objective: the agent is told its budget and says, before it works, what it will do with it." : `For a long objective, which plans to what it is given. Without one: ${settingsAllowanceWords(props.limits)}`}
+          help={draft.allowance !== null ? "For a long objective: the agent is told its budget. One that can write files is also asked, before it works, for a plan of what it will do with it." : `For a long objective. Without one: ${settingsAllowanceWords(props.limits)}`}
           onChange={(on) => change({ ...draft, allowance: on ? allowanceDraft(undefined, props.limits) : null })}
         />
         {draft.allowance !== null ? <AllowanceFields draft={draft.allowance} onChange={(allowance) => change({ ...draft, allowance })} /> : null}

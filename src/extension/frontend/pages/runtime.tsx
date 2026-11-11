@@ -365,7 +365,7 @@ export function RuntimePage() {
           </Section>
           <Section title="The loopback connection" id="connection">
             <p data-lah-loopbacks={loopbacks.length}>{loopbacks.length === 0 ? "None of your connections is the loopback yet." : `${who} takes ${loopbacks.map((c) => c.name).join(", ")} as the loopback.`}</p>
-            <p class="lah-lead lah-small">A chat that runs in the runtime generates on it. The agents themselves never run on the loopback, since a call there would come back to the runtime: each runs on the connection Settings name for it, else on the one its chat was on before it was pinned here, else on your default connection.</p>
+            <p class="lah-lead lah-small">A chat that runs in the runtime generates on it. The agents themselves never run on the loopback, since a call there would come back to the runtime: each runs on the connection Settings name for it, else on the one its chat was on before it was pinned here, else on the connection selected in Lumiverse, else on your default connection.</p>
             <Disclosure summary="Make it by hand" defaultOpen={loopbacks.length === 0 && linked.length === 0 && steps.find((s) => s.id === "connection")?.at !== "now"}>
               <ConnectionSteps state={state} />
             </Disclosure>

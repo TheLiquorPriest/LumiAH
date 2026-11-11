@@ -201,12 +201,17 @@ export class ChatSwitch {
   /**
    * The connection an agent with none of its own runs on in a run of this chat, which plays in a
    * runtime (§25): the one the chat was on before it was pinned to the loopback (`chat`), while it
-   * is there and is no loopback; else Lumiverse's default connection (`default`), unless that is a
-   * loopback. Null: neither, and the agent can't run.
+   * is there; else the connection the user has selected in Lumiverse now (`selected`), which a chat
+   * that pinned none ran on; else Lumiverse's default connection (`default`). Never a loopback.
+   * Null: none of these, and the agent can't run.
    */
-  async agentConnection(userId: string, chatId: string): Promise<{ id: string; from: "chat" | "default" } | null> {
+  async agentConnection(userId: string, chatId: string): Promise<{ id: string; from: "chat" | "selected" | "default" } | null> {
+    const tries: [string | null, "chat" | "selected" | "default"][] = [];
     const prior = (await this.docs.get(userId)).on[chatId]?.prior ?? null;
-    const tries: [string | null, "chat" | "default"][] = prior !== null ? [[prior, "chat"], [null, "default"]] : [[null, "default"]];
+    if (prior !== null) tries.push([prior, "chat"]);
+    const selected = await this.deps.connections.selectedId(userId);
+    if (selected !== null) tries.push([selected, "selected"]);
+    tries.push([null, "default"]);
     for (const [id, from] of tries) {
       const found = await this.deps.connections.resolve(userId, id);
       if (found !== null && !found.loopback) return { id: found.connection.id, from };

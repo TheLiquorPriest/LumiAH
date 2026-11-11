@@ -385,7 +385,8 @@ describe("limits", () => {
     expect(await r.harness.jobs.run({ id: two.id }, never)).toMatchObject({ state: "spent", stoppedAt: "day", reason: why, usage: { calls: 0 } });
     expect(r.host.calls).toHaveLength(1);
     expect((await r.harness.jobs.read({ id: two.id })).report).toBe(
-      `Stopped at a day's limit: ${why}.\nIts plan, learned/plans/${two.id}.md, says what it did and what is left.\nNothing is lost: it carries on from where it stopped. Raise the limit it names in Settings (Job tokens per day is under Jobs; Tokens per day and Cost per day are under Spend), or wait until the last 24 hours count less, then carry it on from the Jobs page.`,
+      // The summarizer can write no file, so its job is asked for no plan, and its report names none.
+      `Stopped at a day's limit: ${why}.\nNothing is lost: it carries on from where it stopped. Raise the limit it names in Settings (Job tokens per day is under Jobs; Tokens per day and Cost per day are under Spend), or wait until the last 24 hours count less, then carry it on from the Jobs page.`,
     );
     expect((await r.harness.jobs.list({ chatId: CHAT, cursor: null, limit: 10 })).today).toEqual({ tokens: 10_100, sent: 10_100 });
   });
@@ -761,10 +762,11 @@ describe("a long objective", () => {
     expect(told).toContain("The user's objective, in their words:\n\nLearn the story so far.\n\nWhat this job may still spend: 50000 tokens sent to models, 60000 tokens written by them, 5 rounds of tool calls, 15 minutes of work.");
     expect(told).toContain(`Before you work, write your plan to learned/plans/${job.id}.md: what you will do with this allowance`);
 
-    r.stored.texts["jobs.objective"] = "Objective: {{task}} | {{allowance}} | plan at {{plan}}";
+    // The user's own wording, with the part about a plan and files where the agent can write them: the summarizer can write none, so it is told of neither.
+    r.stored.texts["jobs.objective"] = "Objective: {{task}} | {{allowance}} | files:{{files}}";
     const two = (await r.harness.jobs.start({ chatId: CHAT, agent: "summarizer", task: "Tidy the workspace.", when: "now" })).job;
     await r.harness.jobs.run({ id: two.id }, never);
-    expect(firstUser(r.host.calls.at(-1)!)).toStartWith(`Objective: Tidy the workspace. | What this job may still spend: 600000 tokens sent to models, 60000 tokens written by them, 60 rounds of tool calls, 15 minutes of work. | plan at learned/plans/${two.id}.md`);
+    expect(firstUser(r.host.calls.at(-1)!)).toStartWith("Objective: Tidy the workspace. | What this job may still spend: 600000 tokens sent to models, 60000 tokens written by them, 60 rounds of tool calls, 15 minutes of work. | files:\n");
   });
 
   test("it writes learned/ and ~/, and a write to the chat's own area is refused in words that say why", async () => {

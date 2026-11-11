@@ -28,7 +28,7 @@ import { type Equipment, readSetup, Run, type Setup, type Shared } from "./run";
 import { pathTurns } from "./sessions";
 import { AGENT, type Settings, type TurnBudget } from "./settings";
 import type { AllJobsDoc, ChatJobsDoc, JobDoc, RunningJobsDoc } from "./stored";
-import { TEXT, type Texts, textsOf } from "./texts";
+import { TEXT, type Texts, textsOf, TOOL } from "./texts";
 import type { JobRead, JobStarted } from "./tools";
 import { addUsage, emptyUsage, usageSince } from "./usage";
 import { clip, errorText, jsonEqual, type Limit, stopWords } from "./util";
@@ -361,6 +361,8 @@ export class Jobs {
     let again: string | undefined;
     // Started again, a job is the same instance with the same reach and plan unless the call says otherwise.
     let kept: Pick<JobView, "as" | "area" | "plan"> = {};
+    // Run again by the user, it is the same job again: started as the first was, for the turn the first belongs to, so whatever answers that turn's jobs knows it for that turn's.
+    let same: JobDoc | null = null;
     if ("again" in input.what) {
       const old = await this.doc(input.what.again);
       if (!old || old.job.chatId !== input.chatId) return { refused: texts.render(TEXT.jobs.noJob, { id: clip(input.what.again, lineChars) }) };
@@ -369,13 +371,22 @@ export class Jobs {
       task = old.task;
       again = old.job.id;
       kept = { ...(old.job.as !== undefined ? { as: old.job.as } : {}), ...(old.job.area !== undefined ? { area: old.job.area } : {}), ...(old.job.plan !== undefined ? { plan: old.job.plan } : {}) };
+      if (input.by.who === "user") {
+        // A turn's job works for that turn: once the turn's reply is off the chat's path it would work for none, so it isn't started at all.
+        const basis = old.job.basis;
+        if (basis !== null && !this.shared().runs.has(basis) && !(await pathTurns(await this.host.chat.path(input.chatId))).some((turn) => turn.onPath && turn.record.generationId === basis)) return { refused: texts.render(TEXT.jobs.againOffPath, { id: old.job.id }) };
+        same = old;
+      }
     } else ({ agent, task } = input.what);
+    const by = same ? same.job.by : input.by;
     const as = input.as ?? kept.as;
+    const lane = input.lane ?? same?.job.lane;
+    const due = input.due ?? same?.job.due;
     // Only the user starts a job that writes the chat's own area: a turn's job writes it as its turn does already.
-    const area = input.by.who === "user" ? (input.area ?? kept.area) : undefined;
-    const plan = input.by.who === "user" ? (input.plan ?? kept.plan) : undefined;
+    const area = by.who === "user" ? (input.area ?? kept.area) : undefined;
+    const plan = by.who === "user" ? (input.plan ?? kept.plan) : undefined;
     // The user may give a job to any agent, the main agent among them (§22); an agent, to any but the main agent and the writer, whose work is a turn's reply.
-    const may = input.by.who === "user" ? definitions.agents().filter((d) => d.id !== AGENT.writer) : definitions.workers();
+    const may = by.who === "user" ? definitions.agents().filter((d) => d.id !== AGENT.writer) : definitions.workers();
     if (!may.some((d) => d.id === agent)) return { refused: definitions.without.has(agent) ? texts.render(TEXT.agents.notOffered, { agent: clip(agent, lineChars) }) : texts.render(TEXT.jobs.noAgent, { agent: clip(agent, lineChars), agents: may.map((d) => d.id).join(", ") }) };
     if (task.trim() === "") return { refused: texts.render(TEXT.jobs.noTask) };
     if (task.length > settings.jobs.taskChars) return { refused: texts.render(TEXT.jobs.taskLong, { chars: String(task.length), limit: String(settings.jobs.taskChars) }) };
@@ -386,6 +397,7 @@ export class Jobs {
       const { left } = input.parent;
       allowance = { tokensIn: least(own.tokensIn, left.tokensIn), tokensOut: least(own.tokensOut, left.tokensOut), toolTurns: least(own.toolTurns, left.toolTurns), wallMs: least(own.wallMs, left.wallMs) };
     }
+    const parent = input.parent?.id ?? same?.job.parent;
     const job: JobView = {
       // Eight hex digits of a random id, as an agent's: a name, not a limit.
       id: `job_${crypto.randomUUID().slice(0, 8)}`,
@@ -395,15 +407,15 @@ export class Jobs {
       when: input.when,
       state: "queued",
       ...(this.holding ? { paused: true as const } : {}),
-      by: input.by,
-      basis: input.basis,
+      by,
+      basis: same ? same.job.basis : input.basis,
       ...(again !== undefined ? { again } : {}),
       ...(as !== undefined ? { as } : {}),
-      ...(input.lane !== undefined ? { lane: input.lane } : {}),
-      ...(input.due !== undefined ? { due: input.due } : {}),
+      ...(lane !== undefined ? { lane } : {}),
+      ...(due !== undefined ? { due } : {}),
       ...(area !== undefined ? { area } : {}),
       ...(plan !== undefined ? { plan } : {}),
-      ...(input.parent ? { parent: input.parent.id } : {}),
+      ...(parent !== undefined ? { parent } : {}),
       ...(allowance ? { allowance } : {}),
       createdAt: this.host.clock.now(),
       usage: emptyUsage(),
@@ -411,7 +423,9 @@ export class Jobs {
     // A chat a job is started in is there: whatever was forgotten of it before is past.
     this.forgotten.delete(input.chatId);
     const { starter } = input;
-    await this.put({ v: 1, kind: "job", job, task, ...(starter ? { held: [...starter.held], depth: starter.depth + 1 } : {}) });
+    // Run again, its agent is given what the first run's was: the tools its starter held, and how deep it stands.
+    const given = same ? { ...(same.held !== undefined ? { held: same.held } : {}), ...(same.depth !== undefined ? { depth: same.depth } : {}) } : starter ? { held: [...starter.held], depth: starter.depth + 1 } : {};
+    await this.put({ v: 1, kind: "job", job, task, ...given });
     port.queued(job);
     return job;
   }
@@ -711,7 +725,8 @@ export class Jobs {
         const history = session !== undefined ? sessionOf(await shared.blobs.getJson(session)) : null;
         // A job an agent started is given no more than that agent held (§14), as a sub-agent is, unless its definition keeps its tools whoever starts it; and it stands one deeper than its starter, so what it may delegate is counted on from there. One the user started holds its definition's tools, at 0.
         const grant = held !== undefined && (resolved.definition.grant ?? settings.delegation.grant) === "own" ? { grant: new Set(held) } : {};
-        const { agent, lead } = await run.agent(resolved, { depth: depth ?? 0, task: job.task, notes: true, main: true, ...grant, ...(history ? { history } : {}), ...(job.as !== undefined ? { as: job.as } : {}), standing: "job", by: job.by.who === "user" ? "user" : { agentId: job.by.id, role: job.by.role } });
+        const started = await run.agent(resolved, { depth: depth ?? 0, task: job.task, notes: true, main: true, ...grant, ...(history ? { history } : {}), ...(job.as !== undefined ? { as: job.as } : {}), standing: "job", by: job.by.who === "user" ? "user" : { agentId: job.by.id, role: job.by.role } });
+        const { agent, lead } = started;
         /** Keeps the job's session as it stands, for a run that carries the job on. */
         const keep = async (): Promise<void> => {
           session = await shared.blobs.putJson(agent.messages() as unknown as JsonValue, false);
@@ -727,10 +742,14 @@ export class Jobs {
             })
             .catch((error: unknown) => host.log("warn", `[LumiAH] job ${job.id}'s session couldn't be kept (${errorText(error)})`));
         };
-        // Only a job the user started is asked for a plan (§22), so only its texts name one; a job started to write the chat's own area keeps it where it was told to.
-        const plan = job.by.who === "user" ? (job.plan ?? planPath(job.id)) : null;
+        // Only a job the user started is asked for a plan (§22), and only where its agent can write files: it is told what it can do, and nothing it has no tool for. A job started to write the chat's own area keeps its plan where it was told to.
+        const plan = job.by.who === "user" && (started.held.has(TOOL.workspaceWrite) || started.held.has(TOOL.workspaceEdit)) ? (job.plan ?? planPath(job.id)) : null;
         const allowance = allowanceText(run.left(), texts);
-        const message = history ? texts.render(TEXT.jobs.resumed, { allowance, plan: plan === null ? "" : texts.render(TEXT.jobs.resumedPlan, { plan }) }) : plan !== null ? texts.render(job.area === "chat" ? TEXT.jobs.objectiveChat : TEXT.jobs.objective, { task: doc.task, allowance, plan }) : texts.render(TEXT.jobs.task, { task: doc.task });
+        // Run again, the job is told what its first run was told, and why that run stopped.
+        const first = job.again !== undefined && !history ? await this.doc(job.again) : null;
+        const ranAgain = first ? `\n\n${texts.render(TEXT.jobs.againNote, { why: first.job.reason ?? jobState(first.job, texts) })}` : "";
+        const opening = job.by.who === "user" ? texts.render(TEXT.jobs.objective, { task: doc.task, allowance, files: plan === null ? "" : texts.render(job.area === "chat" ? TEXT.jobs.objectiveChat : TEXT.jobs.objectiveFiles, { plan }) }) : texts.render(TEXT.jobs.task, { task: doc.task });
+        const message = history ? texts.render(TEXT.jobs.resumed, { allowance, plan: plan === null ? "" : texts.render(TEXT.jobs.resumedPlan, { plan }) }) : `${opening}${ranAgain}`;
         const reply = await agent.send(lead === "" ? message : `${lead}\n\n${message}`, signal);
 
         const at = host.clock.now();
@@ -760,7 +779,8 @@ export class Jobs {
           if (run.agents.usage.calls > before.calls) await keep();
           return { state: "spent", ...(reply.reason !== undefined ? { reason: reply.reason } : {}), stoppedAt: day ? "day" : "allowance", report, at };
         }
-        if (!whole) return { state: "failed", reason: reply.status === "answered" && said !== "" ? texts.render(TEXT.agents.cut) : (reply.reason ?? texts.render(TEXT.jobs.whyNoAnswer)), report: told, at };
+        // A cut answer is no report. One cut before it said anything ran out while its model was still thinking: the user is told so in those words.
+        if (!whole) return { state: "failed", reason: reply.status === "answered" && cutShort(reply.finish) ? texts.render(said === "" ? TEXT.jobs.whyCutThinking : TEXT.agents.cut) : (reply.reason ?? texts.render(TEXT.jobs.whyNoAnswer)), report: told, at };
         // The moment it would report: its turn must still stand on the path, else the report is marked off the path.
         if (await this.stands(job, settings.jobs.recordWaitMs, hostSignal).catch(() => true)) return { state: "done", report: told, at };
         return { state: "off_path", reason: texts.render(TEXT.jobs.whyOffPath), report: told, at };

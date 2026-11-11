@@ -160,10 +160,15 @@ export class Connections {
     return { id: c.id, name: c.name, loopback: this.loops(c, await this.deps.bases(userId)), foreign: theirs };
   }
 
-  /** The connection a reply goes on in a chat that pins none. Which one is selected is Lumiverse's own word where it gives one, else the last word of a page of the user's. */
-  private async unpinned(userId: string): Promise<HostConnection | null> {
+  /** The connection the user has selected in Lumiverse now (their active profile), by its id: Lumiverse's own word where it gives one, else the last word of a page of the user's; null where none is known. */
+  async selectedId(userId: string): Promise<string | null> {
     const said = await this.host.connections.active(userId);
-    const selected = said !== undefined ? said : (this.told.get(userId) ?? null);
+    return said !== undefined ? said : (this.told.get(userId) ?? null);
+  }
+
+  /** The connection a reply goes on in a chat that pins none: the one selected, else the default, else the first listed. */
+  private async unpinned(userId: string): Promise<HostConnection | null> {
+    const selected = await this.selectedId(userId);
     const active = selected === null ? null : await this.host.connections.get(selected, userId);
     if (active !== null) return active;
     const all = await this.raw(userId);

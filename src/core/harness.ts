@@ -220,7 +220,7 @@ export interface Harness {
     read(input: { id: string }): Promise<JobRead>;
     /** The user starts a job (§15, §22): it belongs to the chat and to no turn. `area: "chat"`: it may write the chat's own area too, at the latest reply on the path; `plan`: the plan file it is asked to keep, where not `learned/plans/<id>.md`. */
     start(input: { chatId: string; agent: string; task: string; when: JobWhen; allowance?: JobAllowance; area?: "chat"; plan?: string }): Promise<{ job: JobView }>;
-    /** Starts a job that stopped short again, from the start, as a new job with the same agent and task. */
+    /** Runs a job that stopped short again, from the start, as a new job: the same job, with the same agent, task, `as`, lane and due, for the same turn (refused, in words for the user, once that turn's reply is off the chat's path). */
     again(input: { id: string }): Promise<{ job: JobView }>;
     cancel(input: { id: string }): Promise<{ job: JobView }>;
     /** Grants a job that stopped at its allowance more: it carries on from its own session (§22). */
@@ -537,7 +537,7 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
         if (!host.jobs) throw new HarnessRefusal("unavailable", "This runtime can't run jobs.");
         const { job } = await jobOf(input.id);
         const setup = await readSetup(shared, job.chatId);
-        // Started again by the user, it is the user's job now: it belongs to the chat, whatever the first one belonged to.
+        // Run again by the user, it is the same job again (`createJob` keeps who started it and the turn it belongs to); it runs now, since the reply it waited for is long written.
         const started = await shared.jobs.createJob({ chatId: job.chatId, when: "now", what: { again: job.id }, by: { who: "user" }, basis: null, ...(job.allowance ? { allowance: job.allowance } : {}) }, setup);
         if ("refused" in started) throw new HarnessRefusal("conflict", started.refused);
         return { job: started };

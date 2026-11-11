@@ -67,7 +67,7 @@ By default the loopback endpoint listens on `127.0.0.1`: only programs on the sa
 1. **LumiAH → Runtime** shows the runtime as linked.
 2. **Mint the loopback key.** The linked runtime puts it in a connection named *LumiAH* (provider Custom, model `lumiah`, address `http://127.0.0.1:<port>/v1`), making that connection when you have none. With no runtime linked, the page shows the key once and you paste it into the connection's API key yourself.
 3. **Switch LumiAH on for a chat, and choose the runtime for it.** That pins the chat to the loopback connection; switching it off, or setting it back to run built in, puts back the connection the chat had.
-4. In **LumiAH → Settings → Agents**, pick the connection each agent uses. It must not be the loopback connection: a call on it would come back to the runtime. An agent with none set runs on the connection the chat was on before it was set to the runtime, else on your default connection, never on the loopback; with neither, its reply fails and says so.
+4. In **LumiAH → Settings → Agents**, pick the connection each agent uses. It must not be the loopback connection: a call on it would come back to the runtime. An agent with none set runs on the connection the chat was on before it was set to the runtime, else on the connection selected in Lumiverse, else on your default connection, never on the loopback; with none of these, its reply fails and says so.
 
 A reply in that chat is now answered by the runtime. A chat that runs built in keeps its own connection and never reaches the runtime; a chat LumiAH isn't switched on for is untouched.
 

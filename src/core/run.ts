@@ -304,11 +304,12 @@ export interface AgentStart {
   replying?: true;
 }
 
-/** An agent of a run, started: its handle, what leads its first message (the files pinned for it; empty for none), and the workspace as it holds it. */
+/** An agent of a run, started: its handle, what leads its first message (the files pinned for it; empty for none), the workspace as it holds it, and the tools it was given. */
 export interface StartedAgent {
   agent: AgentHandle;
   lead: string;
   view: WorkspaceView;
+  held: ReadonlySet<string>;
 }
 
 export class Run {
@@ -609,7 +610,7 @@ export class Run {
     );
     view.author = info.kind === "job" ? { who: "job", id: info.id, role: definition.id } : { who: "agent", id: agent.id, role: definition.id };
     this.lines.set(agent.id, [...above, { agentId: agent.id, role: definition.id, ...(how.as !== undefined ? { as: how.as } : {}) }]);
-    return { agent, lead: how.plain ? "" : await this.pinned(view), view };
+    return { agent, lead: how.plain ? "" : await this.pinned(view), view, held };
   }
 
   /** The agent an agent of the run is, as another is told of it; undefined for none of this run's. */

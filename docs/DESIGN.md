@@ -297,6 +297,8 @@ A job is an agent run that outlives the reply.
 - **Off the path.** When its basis is no longer on the chat's active path at the moment it would write or report, the job stops, and its report is marked off the path. Writes it already made to the chat area stay with the path they were made on.
 - **Hearing about it.** At the start of its next turn the main agent is told which jobs finished or failed since, with each report's opening and how to read the whole. The page lists every job with its state, agent, spend and report, and tells the user when one finishes or needs them.
 - **A runtime restart** leaves a running job marked interrupted, with what it had done kept. The user or an agent may start it again.
+- **Run again** from the page starts the same job again: the same agent, `as`, task, lane and due, the same starter's tools, and the same turn it belongs to, so an extension knows it for that turn's job. It is told what its first run was told, and, in one line more, that it is run again and why its last run stopped. Once the reply it was started from is off the chat's path, it isn't run at all, and the user is told why. An agent's `job_start` with `again` starts the job again as its own, for its own turn.
+- **An answer cut while thinking.** A job whose agent's answer ran out of room before it wrote anything (its model spent the room thinking) fails in words that say so, and where to give it more room.
 
 ## 16. MCP tools
 
@@ -349,7 +351,7 @@ LumiAH's own tests include a sample extension that supplies one of each, so this
 Some work is too long for a turn and ends in no reply: learning the story of a chat that already has thousands of messages, or putting a workspace in order. It is a job the user starts on the page.
 
 - **What the user gives:** the objective in their own words, the agent to do it (the main agent unless they pick another), and an allowance of tokens and time for this job alone.
-- **A plan first.** The agent is told its allowance and asked to say, before it works, what it will do with it: where it will read closely, where a summary is enough, and what it will leave out. The plan is a file in `learned/`, which it keeps true as it goes. A smaller allowance should give a narrower plan.
+- **A plan first.** An agent that can write files is told its allowance and asked to say, before it works, what it will do with it: where it will read closely, where a summary is enough, and what it will leave out. The plan is a file in `learned/`, which it keeps true as it goes. A smaller allowance should give a narrower plan. An agent with no tool that writes files is told its allowance and its objective, and nothing about a plan or files: it is told only what it can do.
 - **Steering.** The user can say something to the job while it runs, and pause and resume it (§18 applies to a job as it does to a turn). A paused job stays paused across a runtime restart.
 - **When the allowance runs out** the job stops with a report of what it did and what is left. The user can grant more, and it carries on from its own session. A day's limit stops it the same way, and it is carried on with nothing more granted (§15).
 - **What it leaves:** files in `learned/`, among them a plain list of what it has not verified.
