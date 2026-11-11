@@ -3,10 +3,10 @@
 // the link's (`link` missing or another value) reads as null and is left for whoever it is for.
 
 import type { ModelResult, ModelThinkingBlock, ModelToolCall, TraceDelta } from "../core/ports";
-import type { JsonObject } from "./json";
+import type { JsonObject, JsonValue } from "./json";
 import { hasOwn, isRecord } from "./json";
-import type { ChunkPush, LinkErrorCode, LinkErrorFrame, LinkNotice, LinkPush, LinkRequest, LinkRequestType, LinkResultFrame, RuntimeReport, SchedulerState, StreamChunk } from "./contract";
-import { LINK } from "./contract";
+import type { ChunkPush, ExtensionMember, ExtensionOffer, LinkedBackend, LinkErrorCode, LinkErrorFrame, LinkNotice, LinkPush, LinkRequest, LinkRequestType, LinkResultFrame, RuntimeReport, SchedulerState, StreamChunk } from "./contract";
+import { EXTENSION_MEMBERS, LINK, OWN_BACKEND } from "./contract";
 
 const text = (v: unknown): v is string => typeof v === "string";
 const count = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
@@ -41,6 +41,33 @@ const REQUEST_TYPES: Readonly<Record<LinkRequestType, true>> = {
   "preset.blocks": true,
   "connections.list": true,
   "connections.get": true,
+  "tools.list": true,
+  "tool.call": true,
+  "approval.ask": true,
+  "extension.call": true,
+  "blob.list": true,
+  "blob.remove": true,
+  "doc.list": true,
+  "chat.info": true,
+  "chat.anchors": true,
+  "job.changed": true,
+  "ask.answer": true,
+  "recall.lore.read": true,
+  "recall.lore.activated": true,
+  "recall.chat.messages": true,
+  "recall.embedder": true,
+  "recall.embed": true,
+  "recall.memory.enabled": true,
+  "recall.memory.search": true,
+  "recall.memory.entity": true,
+  "recall.memory.entities": true,
+  "recall.memory.arcs": true,
+  "recall.databanks.list": true,
+  "recall.databanks.documents": true,
+  "recall.databanks.content": true,
+  "recall.web.enabled": true,
+  "recall.web.search": true,
+  "book.read": true,
 };
 
 /** Whether a frame is the link's at all. */
@@ -121,6 +148,8 @@ export function chunkOf(raw: unknown): StreamChunk | null {
       const result = modelResultOf(raw.result);
       return result === null ? null : { kind: "done", result };
     }
+    case "value":
+      return raw.value === undefined ? null : { kind: "value", value: raw.value as JsonValue };
     case "error":
       return text(raw.message) && text(raw.code) ? { kind: "error", message: raw.message, code: raw.code } : null;
     default:
@@ -151,16 +180,30 @@ export function pushOf(raw: unknown): LinkPush | null {
       return { link: LINK, type: "chunk", stream: raw.stream, seq: raw.seq, chunk } satisfies ChunkPush;
     }
     case "stop":
-      return text(raw.turn) && text(raw.why) ? { link: LINK, type: "stop", turn: raw.turn, why: raw.why } : null;
+      return text(raw.turn) && text(raw.why) ? { link: LINK, type: "stop", turn: raw.turn, why: raw.why, ...(raw.by === "live" || raw.by === "lumiverse" ? { by: raw.by } : {}) } : null;
     case "settings":
       return count(raw.revision) ? { link: LINK, type: "settings", revision: raw.revision } : null;
     case "secret":
       return text(raw.relay) && text(raw.secret) && raw.secret !== "" ? { link: LINK, type: "secret", relay: raw.relay, secret: raw.secret } : null;
     case "connection":
-      return text(raw.ref) && raw.ref !== "" && text(raw.key) && raw.key !== "" ? { link: LINK, type: "connection", ref: raw.ref, key: raw.key } : null;
+      return text(raw.ref) && raw.ref !== "" && text(raw.key) && raw.key !== "" ? { link: LINK, type: "connection", ref: raw.ref, key: raw.key, ...(text(raw.name) && raw.name !== "" ? { name: raw.name } : {}) } : null;
+    case "ask":
+      return text(raw.ask) && raw.ask !== "" && text(raw.op) && raw.op !== "" && isRecord(raw.args) ? { link: LINK, type: "ask", ask: raw.ask, op: raw.op, args: raw.args as JsonObject } : null;
     default:
       return null;
   }
+}
+
+/** What a hello's answer says the extension supplies, checked: its name and the members this contract knows; null when it says none (LumiAH on its own, or a backend from before it could say). */
+export function extensionOfferOf(raw: unknown): ExtensionOffer | null {
+  if (!isRecord(raw) || !text(raw.name) || !Array.isArray(raw.members)) return null;
+  const said = new Set<unknown>(raw.members);
+  return { name: raw.name, members: EXTENSION_MEMBERS.filter((m): m is ExtensionMember => said.has(m)) };
+}
+
+/** Who a register's or a hello's answer says the runtime is linked to, checked; LumiAH's own where it says none (a backend from before it could say). */
+export function linkedBackendOf(raw: unknown): LinkedBackend {
+  return isRecord(raw) && text(raw.name) && raw.name !== "" && text(raw.connection) && raw.connection !== "" ? { name: raw.name, connection: raw.connection } : OWN_BACKEND;
 }
 
 const ERROR_CODES: Readonly<Record<LinkErrorCode, true>> = { bad_request: true, forbidden: true, not_found: true, conflict: true, unavailable: true, version: true, too_large: true, internal: true };

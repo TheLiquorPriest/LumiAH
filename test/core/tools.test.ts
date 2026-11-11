@@ -1,6 +1,9 @@
-// The base tools (DESIGN §4.3) and the conventions their answers keep: results are paged with a
-// cursor, a search says how many it found and how many it shows, an error says what to do next, and
-// nothing returns more than its limit setting allows.
+// The base tools that read the chat's preset and the main agent's past turns, and write_reply
+// (DESIGN §4.3), and the conventions every tool's answers keep: results are paged with a cursor, a
+// listing says how many it found and how many it shows, an error says what to do next, and nothing
+// returns more than its limit setting allows, whatever the call's arguments are. The tools that
+// read the chat and its lore (§24) are built here too, so the conventions are held over them; what
+// each of those answers has its own tests (`recall-*.test.ts`).
 
 import { describe, expect, test } from "bun:test";
 import type { JsonObject, TurnRequest } from "../../src/core/ports";
@@ -8,7 +11,11 @@ import type { SessionSegment } from "../../src/core/sessions";
 import { defaultSettings, type Settings } from "../../src/core/settings";
 import { Texts } from "../../src/core/texts";
 import type { AgentTool, PastTurn, ToolEnv, ToolOutcome } from "../../src/core/tools";
-import { BASE_TOOLS } from "../../src/core/tools/base";
+import { CHAT_TOOLS } from "../../src/core/tools/chat";
+import { LORE_TOOLS } from "../../src/core/tools/lore";
+import { PAST_TOOLS } from "../../src/core/tools/past-turn";
+import { PRESET_TOOLS } from "../../src/core/tools/preset";
+import { REPLY_TOOLS } from "../../src/core/tools/write-reply";
 import { chatView, loreView, shortIds } from "../../src/core/views";
 import { MemoryHost } from "./support/host";
 
@@ -16,7 +23,7 @@ const CHAT = "chat-1";
 
 const segment = (reply: number, steps: SessionSegment["steps"]): SessionSegment => ({ v: 1, kind: "segment", reply, generationId: `gen-${reply}`, turn: "new", at: 1, request: { messages: reply, last: reply - 1 }, steps });
 
-/** A chat of forty messages, two world books and a preset, and the base tools built over them as one turn builds them. */
+/** A chat of forty messages, two world books and a preset, and the tools this file is about built over them as one turn builds them for its main agent. */
 async function rig(change: (s: Settings) => void = () => undefined, texts: Record<string, string> = {}) {
   const host = new MemoryHost();
   for (let i = 0; i < 40; i++) host.say(CHAT, i % 2 === 0 ? "user" : "assistant", i === 7 ? `Brann mends the nets by the quay.\n${"The tide runs out. ".repeat(60)}\nBrann counts the floats.` : `Message ${i}: the lantern at the mill burns ${i % 3 === 0 ? "low" : "bright"}.`);
@@ -39,8 +46,20 @@ async function rig(change: (s: Settings) => void = () => undefined, texts: Recor
     { reply: 21, hash: "a".repeat(64), segment: segment(21, [{ kind: "said", text: "First the lore." }, { kind: "call", name: "lore_search", args: { query: "mill" }, result: `1 entry found.\n${"The mill line. ".repeat(30)}\nThe wheel has not turned.` }, { kind: "call", name: "write_reply", args: { brief: "The wheel is still." }, result: "the writer wrote the reply" }]) },
     { reply: 23, hash: "b".repeat(64), segment: segment(23, [{ kind: "call", name: "chat_read", args: { from: 7 }, result: "nothing there", error: true }, { kind: "stop", reason: "the agent's time ran out" }]) },
   ];
-  const env: ToolEnv = { host, turn, settings, texts: new Texts(texts), agent: "main", chat: chatView(host, CHAT, await host.chat.path(CHAT), settings.tools), lore: loreView(host, turn, settings.tools), past, writeReply: async (brief) => ({ text: `written from: ${brief}`, end: true }) };
-  const tools = new Map(BASE_TOOLS.flatMap((d) => d.build(env) ?? []).map((t): [string, AgentTool] => [t.name, t]));
+  const env: ToolEnv = {
+    host,
+    run: { id: "gen-now", kind: "new", chatId: CHAT },
+    turn,
+    settings,
+    texts: new Texts(texts),
+    agent: "main",
+    depth: 0,
+    chat: chatView(host, CHAT, await host.chat.path(CHAT), settings.tools),
+    lore: loreView(host, turn, settings.tools),
+    past,
+    writeReply: async (brief) => ({ text: `written from: ${brief}`, end: true }),
+  };
+  const tools = new Map([...CHAT_TOOLS, ...LORE_TOOLS, ...PRESET_TOOLS, ...PAST_TOOLS, ...REPLY_TOOLS].flatMap((d) => d.build(env) ?? []).map((t): [string, AgentTool] => [t.name, t]));
   const run = (name: string, args: JsonObject = {}): Promise<ToolOutcome> => {
     const tool = tools.get(name);
     if (!tool) throw new Error(`no tool ${name}`);
@@ -68,16 +87,20 @@ async function pages(run: (name: string, args?: JsonObject) => Promise<ToolOutco
 describe("every tool", () => {
   test("is offered with a description and hand-written argument schemas, each argument described", async () => {
     const r = await rig();
-    expect([...r.tools.keys()]).toEqual(["chat_search", "chat_grep", "chat_read", "lore_index", "lore_search", "lore_grep", "lore_read", "active_lore", "preset_instructions", "past_turn", "write_reply"]);
+    expect([...r.tools.keys()]).toEqual(expect.arrayContaining(["chat_search", "chat_grep", "chat_read", "lore_index", "lore_search", "lore_grep", "lore_read", "active_lore"]));
+    expect([...r.tools.keys()].slice(-3)).toEqual(["preset_instructions", "past_turn", "write_reply"]);
     for (const tool of r.tools.values()) {
       expect(tool.description.length).toBeGreaterThan(20);
       expect(tool.parameters.type).toBe("object");
-      for (const arg of Object.values(tool.parameters.properties as Record<string, { description: string }>)) expect(arg.description.length).toBeGreaterThan(10);
+      for (const [name, arg] of Object.entries(tool.parameters.properties as Record<string, { description?: string }>)) expect([tool.name, name, (arg.description ?? "").length > 10]).toEqual([tool.name, name, true]);
     }
   });
 
   test("answers within Answer length, whatever it is asked", async () => {
     const r = await rig((s) => (s.tools = { ...s.tools, pageChars: 600, pageItems: 50 }));
+    // 5,000 characters that are no word and no line of anything here, and 5,000 that find every message.
+    const long = "zq".repeat(2500);
+    const found = "lantern ".repeat(625);
     const asks: [string, JsonObject][] = [
       ["chat_search", { query: "lantern mill" }],
       ["chat_grep", { text: "lantern" }],
@@ -97,6 +120,40 @@ describe("every tool", () => {
       ["chat_read", { from: 400 }],
       ["lore_read", { id: "nothing" }],
       ["past_turn", { reply: 99 }],
+      // Every argument that takes text, 5,000 characters long: what it looks for, what it names, and its cursor.
+      ["chat_search", { query: long }],
+      ["chat_search", { query: found }],
+      ["chat_search", { query: "lantern mill", cursor: long }],
+      ["chat_search", { query: "lantern mill", cursor: [long] }],
+      ["chat_grep", { text: long }],
+      ["chat_grep", { text: "lantern", cursor: long }],
+      ["chat_read", { from: 0, to: 39, cursor: long }],
+      ["chat_read", { from: 7, cursor: `7:${long}` }],
+      ["lore_index", { book: long }],
+      ["lore_index", { cursor: long }],
+      ["lore_search", { query: long }],
+      ["lore_search", { query: "mill", cursor: long }],
+      ["lore_grep", { text: long }],
+      ["lore_grep", { text: "the", cursor: long }],
+      ["lore_read", { id: long }],
+      // An id that names several entries, after a book's name as long.
+      ["lore_read", { id: `${long}/1111` }],
+      ["lore_read", { id: "11111111-b", cursor: long }],
+      ["active_lore", { cursor: long }],
+      ["preset_instructions", { block: long }],
+      ["preset_instructions", { cursor: long }],
+      ["preset_instructions", { block: "Main prompt", cursor: long }],
+      ["past_turn", { grep: long }],
+      ["past_turn", { reply: 21, grep: long }],
+      ["past_turn", { grep: "mill", cursor: long }],
+      ["past_turn", { cursor: long }],
+      ["past_turn", { reply: 21, cursor: long }],
+      ["past_turn", { reply: 21, step: 2, cursor: long }],
+      // And where a number is asked for.
+      ["chat_read", { from: long }],
+      ["chat_read", { from: 7, to: long }],
+      ["past_turn", { reply: long }],
+      ["past_turn", { reply: 21, step: long }],
     ];
     for (const [name, args] of asks) {
       let cursor: string | null = null;
@@ -110,121 +167,42 @@ describe("every tool", () => {
     }
   });
 
+  test("says a long argument back clipped at Line length, and shorter where the answer has no room for that", async () => {
+    const long = "dragon ".repeat(700).trim();
+    const r = await rig((s) => (s.tools.lineChars = 40));
+    const start = `${long.slice(0, 39)}…`;
+    expect(await r.run("past_turn", { cursor: long })).toEqual({ text: `“${start}” isn't a cursor past_turn gave. Pass the cursor exactly as the last answer wrote it, or leave it out to start at the beginning.`, error: true });
+    // The list of what there is keeps its place after an argument as long.
+    expect(await r.run("preset_instructions", { block: long })).toEqual({ text: `The preset has no instruction block “${start}”. Its instruction blocks are: “Main prompt” [b-main], “Style” [b-style]. Give one of those, or leave block out to list them.`, error: true });
+    // Answer length as short as it may be set, with Line length longer than it: the argument gives way, never what to do next.
+    const small = await rig((s) => (s.tools = { ...s.tools, pageChars: 200, lineChars: 300 }));
+    for (const [name, args] of [["chat_grep", { text: long }], ["lore_read", { id: long }], ["lore_index", { book: long }], ["preset_instructions", { block: long }], ["past_turn", { grep: long }], ["past_turn", { cursor: long }]] as [string, JsonObject][]) {
+      const { text } = await small.run(name, args);
+      expect({ name, length: text.length <= 200 ? "within" : text.length }).toEqual({ name, length: "within" });
+    }
+    for (const [name, args] of [["preset_instructions", { block: long }], ["past_turn", { grep: long }], ["past_turn", { cursor: long }]] as [string, JsonObject][]) expect([name, /\.$/.test((await small.run(name, args)).text)]).toEqual([name, true]);
+  });
+
   test("refuses a cursor it never gave, saying what to pass instead", async () => {
     const r = await rig();
-    for (const [name, args] of [["chat_search", { query: "lantern" }], ["lore_index", {}], ["past_turn", { reply: 21 }]] as [string, JsonObject][]) {
+    for (const [name, args] of [["preset_instructions", {}], ["past_turn", {}], ["past_turn", { reply: 21 }]] as [string, JsonObject][]) {
       const bad = await r.run(name, { ...args, cursor: "page two" });
       expect(bad).toEqual({ text: `“page two” isn't a cursor ${name} gave. Pass the cursor exactly as the last answer wrote it, or leave it out to start at the beginning.`, error: true });
       expect((await r.run(name, { ...args, cursor: "9999" })).error).toBe(true);
     }
+    // The tools that read the chat and its lore refuse one too.
+    for (const [name, args] of [["chat_grep", { text: "lantern" }], ["lore_index", {}]] as [string, JsonObject][]) expect([name, (await r.run(name, { ...args, cursor: "page two" })).error]).toEqual([name, true]);
   });
 
   test("says which argument is missing, in the argument's own words", async () => {
     const r = await rig();
-    expect(await r.run("chat_search")).toEqual({ text: "chat_search needs query: The words to look for. Names and rare words find the most. Call it again with query.", error: true });
-    expect((await r.run("lore_read")).text).toStartWith("lore_read needs id:");
-    expect((await r.run("chat_read", { from: "seven" })).text).toStartWith("chat_read needs from:");
+    expect(await r.run("write_reply")).toEqual({ text: "write_reply needs brief: what the writer needs that the prompt doesn't already give it. When the prompt holds everything, say that in a line. Call write_reply again with brief.", error: true });
+    for (const name of ["chat_grep", "lore_grep"]) expect((await r.run(name)).text).toStartWith(`${name} needs text:`);
   });
 });
 
-describe("the chat tools", () => {
-  test("chat_search says how many it found and which it shows, and pages to the end by cursor", async () => {
-    const r = await rig((s) => (s.tools.pageItems = 15));
-    const all = await pages(r.run, "chat_search", { query: "lantern" });
-    expect(all).toHaveLength(3);
-    expect(all[0]).toStartWith("39 messages found; showing 1 to 15.\n- #");
-    expect(all[0]).toEndWith('[There is more: call chat_search again with the same arguments and cursor "15".]');
-    expect(all[1]).toStartWith("39 messages found; showing 16 to 30.");
-    expect(all[2]).toStartWith("39 messages found; showing 31 to 39.");
-    expect(all[2]).toEndWith("[That is the end.]");
-    const hits = all.flatMap((page) => page.split("\n").filter((line) => line.startsWith("- #")));
-    expect(new Set(hits).size).toBe(39);
-    // The chat's text was read from the host once, however many searches.
-    expect(r.host.messageReads).toBe(1);
-  });
-
-  test("chat_search ranks the message that says most of what was asked first, and shows where", async () => {
-    const r = await rig();
-    const found = await r.run("chat_search", { query: "Brann nets quay" });
-    expect(found.text.split("\n")[1]).toStartWith("- #7 (Joss, 1199 characters): Brann ");
-  });
-
-  test("a search that finds nothing says what to try next", async () => {
-    const r = await rig();
-    expect(await r.run("chat_search", { query: "dragon" })).toEqual({ text: "No message of this chat matches “dragon”. Try fewer or other words (names and rare words find the most), or chat_grep for an exact phrase." });
-    expect(await r.run("chat_grep", { text: "dragon" })).toEqual({ text: "No line of this chat holds “dragon”. Try a shorter piece of it, or chat_search for the words in any order." });
-  });
-
-  test("chat_grep finds every line that holds a text, in any letter case, with its message and line", async () => {
-    const r = await rig();
-    const found = await r.run("chat_grep", { text: "brann" });
-    expect(found.text).toBe("2 lines found; showing 1 to 2.\n- #7 (Joss), line 1: Brann mends the nets by the quay.\n- #7 (Joss), line 3: Brann counts the floats.");
-  });
-
-  test("chat_read reads a run of messages, and a long message a page at a time", async () => {
-    const r = await rig();
-    const run = await r.run("chat_read", { from: 2, to: 4 });
-    expect(run.text).toBe("Chat messages #2 to #4 (3 asked for):\n#2 (Mara), characters 0 to 48 of 48:\nMessage 2: the lantern at the mill burns bright.\n\n#3 (Joss), characters 0 to 45 of 45:\nMessage 3: the lantern at the mill burns low.\n\n#4 (Mara), characters 0 to 48 of 48:\nMessage 4: the lantern at the mill burns bright.");
-    const small = await rig((s) => (s.tools.pageChars = 500));
-    const all = await pages(small.run, "chat_read", { from: 7 });
-    expect(all.length).toBeGreaterThan(2);
-    expect(cursorOf(all[0] ?? "")).toMatch(/^7:\d+$/);
-    const text = all.map((page) => page.split("\n").slice(2).join("\n").replace(/\n\[(There is more|That is the end)[^\]]*\]$/, "")).join("");
-    expect(text).toBe((await small.host.chat.messages(CHAT, 7, 8))[0]?.content ?? "");
-  });
-
-  test("chat_read says which messages there are when asked for one that isn't", async () => {
-    const r = await rig();
-    expect(await r.run("chat_read", { from: 41 })).toEqual({ text: "There is no chat message #41: this turn reads messages #0 to #39. Give a number in that range.", error: true });
-  });
-});
-
-describe("the lore tools", () => {
-  test("lore_index lists each book and its entries by short id, entries switched off or always sent marked", async () => {
-    const r = await rig();
-    expect((await r.run("lore_index")).text).toBe(
-      [
-        "3 entries found; showing 1 to 3.",
-        "Book “The Coast” [book-coast], 2 entries — Places along the shore.:",
-        "- [11111111-a] The Mill · keys: mill, millrace · 88 characters",
-        "- [11111111-b] The Quay (switched off) · keys: quay, harbour · 807 characters",
-        "Book “People” [book-people], 1 entry:",
-        "- [22222222] Okoro (always sent) · keys: okoro, keeper · 52 characters",
-      ].join("\n"),
-    );
-    expect((await r.run("lore_index", { book: "people" })).text).toStartWith("1 entry found; showing 1 to 1.\nBook “People” [book-people], 1 entry:");
-    expect(await r.run("lore_index", { book: "Maps" })).toEqual({ text: "No book “Maps” applies to this chat. The books are: “The Coast” [book-coast], “People” [book-people]. Give one of those, or leave book out to list them all.", error: true });
-  });
-
-  test("lore_search and lore_grep reach entries Lumiverse didn't activate, and lore_read reads one by the id they give", async () => {
-    const r = await rig();
-    const found = await r.run("lore_search", { query: "wheel flood" });
-    expect(found.text).toStartWith("1 entry found; showing 1 to 1.\n- [11111111-a] The Mill (book “The Coast”, 88 characters): The mill stands where the river meets the sea. Its wheel has not turned since the flood.");
-    expect((await r.run("lore_grep", { text: "GRANDFATHER" })).text).toBe("1 line found; showing 1 to 1.\n- [11111111-b] The Quay, line 1: The quay is stone, laid by Ilse's grandfather.");
-    expect((await r.run("lore_read", { id: "11111111-a" })).text).toBe("[11111111-a] The Mill (book “The Coast”) · keys: mill, millrace · characters 0 to 88 of 88:\nThe mill stands where the river meets the sea.\nIts wheel has not turned since the flood.");
-    // The whole id reads it too, and so does the id copied with its brackets.
-    expect((await r.run("lore_read", { id: "[22222222]" })).text).toContain("Okoro keeps the lighthouse");
-    expect((await r.run("lore_read", { id: "22222222-cccc-4000-8000-000000000003" })).text).toContain("Okoro keeps the lighthouse");
-  });
-
-  test("lore_read pages a long entry, and says what to do with an id that names none or several", async () => {
-    const r = await rig((s) => (s.tools.pageChars = 400));
-    const all = await pages(r.run, "lore_read", { id: "11111111-b" });
-    expect(all.length).toBeGreaterThan(2);
-    expect(await r.run("lore_read", { id: "33333333" })).toEqual({ text: "There is no lore entry 33333333 in the books that apply to this chat. Take an id from lore_index or a lore search, written as it gives it.", error: true });
-    expect(await r.run("lore_read", { id: "1111" })).toEqual({ text: "1111 names several entries: [11111111-a] The Mill, [11111111-b] The Quay. Give more of the id.", error: true });
-  });
-
-  test("active_lore lists what Lumiverse activated for this turn", async () => {
-    const r = await rig();
-    expect((await r.run("active_lore")).text).toBe("1 entry found; showing 1 to 1.\n- [22222222] Okoro (book “People”, 52 characters): Okoro keeps the lighthouse and owes the mill a debt.");
-    r.host.activatedLore = [];
-    const none = await rig();
-    none.host.activatedLore = [];
-    expect((await none.run("active_lore")).text).toBe("Lumiverse activated no lore entry for this reply. lore_search and lore_index reach the books that apply.");
-  });
-
-  test("short ids are as long as it takes to name one entry", () => {
+describe("short ids", () => {
+  test("are as long as it takes to name one thing", () => {
     expect(shortIds(["abcdefgh-1", "abcdefgh-2", "zzzzzzzz-9", "short"], 8)).toEqual(["abcdefgh-1", "abcdefgh-2", "zzzzzzzz", "short"]);
   });
 });
@@ -281,21 +259,21 @@ describe("write_reply", () => {
 });
 
 describe("limits and texts are the user's", () => {
-  test("Hits per page, Excerpt length and Line length change what a page holds", async () => {
-    const r = await rig((s) => (s.tools = { ...s.tools, pageItems: 2, excerptChars: 40, lineChars: 40 }));
-    const found = await r.run("chat_search", { query: "tide floats" });
-    expect(found.text.split("\n")[1]?.length).toBeLessThan(90);
-    const lines = (await r.run("chat_grep", { text: "lantern" })).text.split("\n");
-    expect(lines[0]).toBe("39 lines found; showing 1 to 2.");
-    expect(lines).toHaveLength(4);
-    const long = (await r.run("chat_grep", { text: "tide runs" })).text.split("\n")[1] ?? "";
-    expect(long).toMatch(/line 2: .{40}…$/);
+  test("Hits per page and Line length change what a page holds", async () => {
+    const r = await rig((s) => (s.tools = { ...s.tools, pageItems: 1, lineChars: 20 }));
+    const lines = (await r.run("past_turn", { grep: "wheel" })).text.split("\n");
+    expect(lines[0]).toBe("2 lines found; showing 1 to 1.");
+    // One hit a page, its line cut at Line length, and how to read on.
+    expect(lines).toHaveLength(3);
+    expect(lines[1]).toBe("- reply #21, step 2, line 4: The wheel has not tu…");
+    expect(lines[2]).toBe('[There is more: call past_turn again with the same arguments and cursor "1".]');
+    expect((await r.run("preset_instructions")).text.split("\n")).toHaveLength(3);
   });
 
   test("a replaced text is what the model reads", async () => {
-    const r = await rig(undefined, { "tool.chat_search": "Find messages.", "tool.answer.found": "{{total}} — {{from}}..{{to}}", "tool.answer.chat_search_nothing": "Nothing for {{query}}." });
-    expect(r.tools.get("chat_search")?.description).toBe("Find messages.");
-    expect((await r.run("chat_search", { query: "Brann" })).text).toStartWith("1 message — 1..1\n");
-    expect((await r.run("chat_search", { query: "dragon" })).text).toBe("Nothing for dragon.");
+    const r = await rig(undefined, { "tool.preset_instructions": "List the preset.", "tool.answer.found": "{{total}} — {{from}}..{{to}}", "tool.answer.preset_no_block": "No block {{block}}." });
+    expect(r.tools.get("preset_instructions")?.description).toBe("List the preset.");
+    expect((await r.run("preset_instructions")).text).toStartWith("2 instruction blocks — 1..2\n");
+    expect(await r.run("preset_instructions", { block: "Tone" })).toEqual({ text: "No block Tone.", error: true });
   });
 });

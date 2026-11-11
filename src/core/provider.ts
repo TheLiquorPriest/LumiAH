@@ -2,20 +2,28 @@
 // port, and what comes back.
 //
 // Tool turns are native: an assistant turn goes back as its text and `tool_use` parts, the results as
-// `tool_result` parts, which Lumiverse maps to each provider's own. For a connection that refuses
-// tools, the older convention stays: the tools are offered as text, the results go back in a plain
-// user message (`TEXT_TURNS`), and the calls the model writes are recovered from its text, as they
-// are from any model that writes a call instead of making it. Both are one interface
+// `tool_result` parts, which Lumiverse maps to each provider's own. For a connection's model that
+// refuses tools, and for an agent set to have its tools as text, the older convention stays: the
+// tools are offered as text, the results go back in a plain user message (`TEXT_TURNS`), and the
+// calls the model writes are recovered from its text, as they are from any model that writes a call
+// instead of making it, until its connection has made one natively in that agent's session: after
+// that a call block in its text is something it quotes, not a call. Both are one interface
 // (`ToolTurnEncoding`), so the loop never asks which it has.
+//
+// A tool's name in the registry may be one no provider takes natively (an MCP server's tool is
+// `mcp:<server>:<tool>`, DESIGN §16). A call's native tools, and the tool calls in the messages it
+// sends, go out under names a provider takes (`wireNames`), and a call that comes back is read back
+// to its tool's own name: the request sent is the only place the names on the wire stand.
 //
 // Here too: the effort a call goes with, a prompt's order and its cache breakpoints (within the
 // provider's limit, the connection's own counted), the usage request, whether a call streams, and the
-// accounts kept per connection: its throttles, its calls under way at once, and whether it was seen
-// refusing native tools. Every call reserves against its connection before it is sent.
+// accounts kept per connection: its throttles, its calls under way at once, and which of its models
+// were seen refusing native tools, and when. Every call reserves against its connection before it is
+// sent.
 
 import type { AgentStopCode, CallUsage, ConnectionProfile, HarnessHost, JsonObject, ModelDelta, ModelEffort, ModelMessage, ModelPart, ModelRequest, ModelResult, ModelThinkingBlock, ModelTool, SamplingParams } from "./ports";
 import { isRecord } from "./ports";
-import type { ConnectionThrottle, Settings } from "./settings";
+import type { ConnectionThrottle, Settings, ToolCalls } from "./settings";
 import { renderDefault, TEXT, type Texts } from "./texts";
 import { parseUsage, priced, promptTokens } from "./usage";
 import { errorText, hasOwn, limitOf, parseJson, tokensOf } from "./util";
@@ -156,6 +164,11 @@ export interface ToolTurnEncoding {
   results(results: readonly ToolResult[], texts: Texts): ModelMessage;
 }
 
+/** A native assistant turn as text, for logs and estimates: what it said, then each call as its tool and arguments, a line each. */
+function turnText(parts: readonly ModelPart[]): string {
+  return parts.flatMap((p) => (p.type === "text" ? [p.text] : p.type === "tool_use" ? [`${p.name} ${JSON.stringify(p.input)}`] : [])).join("\n");
+}
+
 /**
  * Native tool turns: the assistant's text and `tool_use` parts, with its reasoning carriers (a
  * thinking model must be sent them again after a tool call), then a `tool_result` part per call.
@@ -168,7 +181,7 @@ export const NATIVE_TURNS: ToolTurnEncoding = {
     for (const c of turn.calls) parts.push({ type: "tool_use", id: c.id, name: c.name, input: c.args, ...(c.thoughtSignature !== undefined ? { thoughtSignature: c.thoughtSignature } : {}) });
     return {
       role: "assistant",
-      content: [turn.text, ...turn.calls.map((c) => `${c.name} ${JSON.stringify(c.args)}`)].filter((s) => s !== "").join("\n"),
+      content: turnText(parts),
       parts,
       ...(turn.reasoning ? { reasoning: turn.reasoning } : {}),
       ...(turn.thinkingBlocks ? { thinkingBlocks: turn.thinkingBlocks } : {}),
@@ -196,6 +209,86 @@ function toolsAsText(tools: readonly ModelTool[], texts: Texts): string {
   return texts.render(TEXT.runtime.toolsInText, { tools: each.join("\n\n") });
 }
 
+// ---------------------------------------------------------------- tool names on the wire
+
+/**
+ * A native tool's name as a provider takes it: letters, digits, `_` and `-`, one to 64 of them. It
+ * is OpenAI's rule and Anthropic's, and a call that offers or carries one name outside it fails
+ * whole, while a name in the registry may be anything: an MCP server's tool is
+ * `mcp:<server>:<tool>` (DESIGN §16), and an extension names its tools as it likes. Not settings:
+ * the rule is the providers', not a limit of LumiAH's, and a provider that changes it is a fix here.
+ */
+const WIRE_NAME = /^[A-Za-z0-9_-]{1,64}$/;
+const WIRE_NAME_LENGTH = 64;
+/** One character a provider refuses in a tool's name, read whole: a character outside the basic plane is one, not the two halves it is written in. */
+const REFUSED_IN_NAME = /[^A-Za-z0-9_-]/gu;
+
+/** A name made one a provider takes, from the name alone: each character it refuses an underscore, cut at the length it takes, and one underscore for a name of nothing. A name it takes already is itself. */
+function wireName(name: string): string {
+  if (WIRE_NAME.test(name)) return name;
+  return name.replace(REFUSED_IN_NAME, "_").slice(0, WIRE_NAME_LENGTH) || "_";
+}
+
+/** An agent's tools by name, both ways. */
+interface WireNames {
+  /** The name each tool goes by on the wire, by its own. */
+  out: ReadonlyMap<string, string>;
+  /** The tool a call names, by each name it may come under: the one its tool goes by on the wire, and the tool's own. */
+  back: ReadonlyMap<string, string>;
+}
+
+/**
+ * The names an agent's tools go by on the wire, no two alike. A tool whose name a provider takes
+ * keeps it, whatever the other tools are and wherever it stands among them. Each other tool, in the
+ * list's order, goes by its name as `wireName` makes it; where that is taken, by a tool's own name
+ * or by an earlier tool's (two names that differ only in characters replaced, or past the cut), its
+ * last places hold a number instead: `_2`, `_3`, and on. One list of tools in one order always gives
+ * the same names, so every call of a session sends the same, and a prompt its provider cached still
+ * matches.
+ */
+function wireNames(tools: readonly ModelTool[]): WireNames {
+  const out = new Map<string, string>();
+  const back = new Map<string, string>();
+  for (const { name } of tools) {
+    if (!WIRE_NAME.test(name)) continue;
+    out.set(name, name);
+    back.set(name, name);
+  }
+  for (const { name } of tools) {
+    if (out.has(name)) continue;
+    const fitted = wireName(name);
+    let wire = fitted;
+    for (let n = 2; back.has(wire); n++) {
+      const ending = `_${n}`;
+      wire = `${fitted.slice(0, WIRE_NAME_LENGTH - ending.length)}${ending}`;
+    }
+    out.set(name, wire);
+    back.set(wire, name);
+    // A model has read the tool's own name wherever the core names its tools (a result, the tools as text), and may call it by that: it is the tool's too.
+    back.set(name, name);
+  }
+  return { out, back };
+}
+
+/**
+ * A message as it goes out: each tool call in it under the name its tool goes by on the wire (a
+ * call of a tool the agent no longer has, under that name as `wireName` makes it), and its text,
+ * where that renders its parts (`NATIVE_TURNS`), rendered from them again. A message whose calls
+ * keep their names is itself: the conversation the agent keeps is never written to.
+ */
+function onWire(m: ModelMessage, names: ReadonlyMap<string, string>): ModelMessage {
+  if (!m.parts) return m;
+  let parts: ModelPart[] | undefined;
+  for (const [i, part] of m.parts.entries()) {
+    if (part.type !== "tool_use") continue;
+    const name = names.get(part.name) ?? wireName(part.name);
+    if (name === part.name) continue;
+    parts ??= [...m.parts];
+    parts[i] = { ...part, name };
+  }
+  return parts ? { ...m, content: m.content === turnText(m.parts) ? turnText(parts) : m.content, parts } : m;
+}
+
 // ---------------------------------------------------------------- calls written as text
 
 /** A call a model wrote as text instead of making it. */
@@ -216,7 +309,7 @@ function writtenArgs(v: unknown): JsonObject | null {
  * arguments under any of the names models use; null when it isn't that (a tool's description is no
  * call, so an object that has one isn't read as one).
  */
-function callsFromJson(value: unknown, names: ReadonlySet<string>): WrittenCall[] | null {
+function callsFromJson(value: unknown, names: Pick<ReadonlySet<string>, "has">): WrittenCall[] | null {
   const list = Array.isArray(value) ? value : [value];
   if (list.length === 0) return null;
   const out: WrittenCall[] = [];
@@ -239,52 +332,216 @@ function writtenValue(text: string): JsonObject[string] {
   return parsed === undefined ? trimmed : (parsed as JsonObject[string]);
 }
 
+// A model's answer is read here as it came, and it may be anything: a tag opened and never closed,
+// with a page of blank lines after it, is an answer a model has written. A pattern that takes
+// "anything up to the closing tag" reads the rest of such an answer once for every way of splitting
+// what it has read, and again for every opening tag after it, and nothing else runs meanwhile. So a
+// form's blocks are found a tag at a time: an opening tag, then the first closing tag after it by
+// `indexOf`, and a form whose opening tag has no closing tag is done with, since no tag after it has
+// one either. Every search starts where the one before it ended, and each pattern left reads one tag
+// and none of the text between two, so an answer is read in time in line with its length, whatever
+// it holds.
+
+/** A block one of the forms encloses: where it stands in the text, the name its opening tag carries (`""` for a form whose tag has none), and what stands between its tags. */
+interface Block {
+  start: number;
+  end: number;
+  name: string;
+  body: string;
+}
+
+/** An opening tag: where its block starts, where the block's body starts, and the name it carries. */
+interface OpeningTag {
+  at: number;
+  body: number;
+  name: string;
+}
+
+/** A form's opening tags in one text: the first at or after `from`, or null when the text has no more. Asked from places that only move forward. */
+type OpeningTags = (from: number) => OpeningTag | null;
+
+/** A form calls are written in: how its blocks open, and the tags that close them. */
+interface Form {
+  open: (text: string) => OpeningTags;
+  close: readonly string[];
+}
+
+/**
+ * Where the first of `tags` next stands in `text`, for searches that only move forward. Each tag's
+ * last find answers every search before it, and a tag the text has no more of is never looked for
+ * again, so all the searches for one tag read the text once between them.
+ */
+function seeker(text: string, tags: readonly string[]): (from: number) => { at: number; end: number } | null {
+  const next = tags.map((tag) => text.indexOf(tag));
+  return (from) => {
+    let first: { at: number; end: number } | null = null;
+    for (const [i, tag] of tags.entries()) {
+      let at = next[i] ?? -1;
+      if (at >= 0 && at < from) next[i] = at = text.indexOf(tag, from);
+      if (at >= 0 && (first === null || at < first.at)) first = { at, end: at + tag.length };
+    }
+    return first;
+  };
+}
+
+/**
+ * Opening tags that start with one of `tags` and go on as `head` reads (a sticky pattern: the rest
+ * of the tag, its first group the name the tag carries); with no `head`, each of `tags` is a whole tag.
+ */
+function tagged(tags: readonly string[], head?: RegExp): (text: string) => OpeningTags {
+  return (text) => {
+    const seek = seeker(text, tags);
+    return (from) => {
+      for (let tag = seek(from); tag; tag = seek(tag.at + 1)) {
+        if (!head) return { at: tag.at, body: tag.end, name: "" };
+        head.lastIndex = tag.end;
+        const rest = head.exec(text);
+        if (rest) return { at: tag.at, body: head.lastIndex, name: rest[1] ?? "" };
+      }
+      return null;
+    };
+  };
+}
+
+/** What ends the name a Llama tag carries: the `>` that closes the tag, or a space, which no name holds. */
+const NAME_END = /[>\s]/g;
+
+/** Llama's opening tags: `<function=name>`, the name anything but a space, up to the `>`. */
+function llamaTags(text: string): OpeningTags {
+  const seek = seeker(text, ["<function="]);
+  return (from) => {
+    for (let tag = seek(from); tag; ) {
+      NAME_END.lastIndex = tag.end;
+      const stop = NAME_END.exec(text);
+      // No name ends from here on, so no tag does.
+      if (!stop) return null;
+      if (stop[0] === ">" && stop.index > tag.end) return { at: tag.at, body: stop.index + 1, name: text.slice(tag.end, stop.index) };
+      // A tag that starts inside this name would end where it does, on what closes no tag: the search goes on from there.
+      tag = seek(stop.index);
+    }
+    return null;
+  };
+}
+
+/** The name an XML tag of Claude's carries, and the tag's end. */
+const NAME_ATTRIBUTE = /\s+name="([^"]+)"\s*>/y;
+/** A DeepSeek call's head: the tool's name, after `function` and a separator (V3) or alone (V3.1), up to a separator or the line's end. */
+const DEEPSEEK_NAME = /(?:function<｜tool▁sep｜>)?([^\n<]+?)(?:<｜tool▁sep｜>|\n)/y;
+/** The rest of the line a code fence opens on: its language, where it names one. */
+const FENCE_LINE = /[A-Za-z_]*[ \t]*\n/y;
+
+/** The namespace a tag of Claude's XML form may carry before its name. */
+const NAMESPACE = "antml:";
+
+/** A tag pair of Claude's XML form, each tag written with or without its namespace; `head` reads the rest of an opening tag that carries a name. */
+function xml(name: string, head?: RegExp): Form {
+  const opens = head ? name : `${name}>`;
+  return { open: tagged([`<${opens}`, `<${NAMESPACE}${opens}`], head), close: [`</${name}>`, `</${NAMESPACE}${name}>`] };
+}
+
 /** DeepSeek's own call tokens, leaked into text: `function<｜tool▁sep｜>name` and a fenced JSON (V3), or `name<｜tool▁sep｜>JSON` (V3.1). */
-const DEEPSEEK_CALL = /<｜tool▁call▁begin｜>(?:function<｜tool▁sep｜>)?([^\n<]+?)(?:<｜tool▁sep｜>|\n)\s*(?:```(?:json)?\s*)?([\s\S]*?)\s*(?:```\s*)?<｜tool▁call▁end｜>/g;
+const DEEPSEEK_CALL: Form = { open: tagged(["<｜tool▁call▁begin｜>"], DEEPSEEK_NAME), close: ["<｜tool▁call▁end｜>"] };
 /** Hermes and Qwen's form, and the one `toolsAsText` asks for. */
-const TAGGED_CALL = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/g;
-/** Claude's XML form, with or without its namespace. */
-const FUNCTION_CALLS = /<(?:antml:)?function_calls>([\s\S]*?)<\/(?:antml:)?function_calls>/g;
-const INVOKE = /<(?:antml:)?invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/(?:antml:)?invoke>/g;
-const PARAMETER = /<(?:antml:)?parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/(?:antml:)?parameter>/g;
+const TAGGED_CALL: Form = { open: tagged(["<tool_call>"]), close: ["</tool_call>"] };
+/** Claude's XML form: the calls of one answer, each an `invoke` that names its tool and holds a `parameter` per argument. */
+const FUNCTION_CALLS = xml("function_calls");
+const INVOKE = xml("invoke", NAME_ATTRIBUTE);
+const PARAMETER = xml("parameter", NAME_ATTRIBUTE);
 /** Llama's `<function=name>{…}</function>`. */
-const LLAMA_CALL = /<function=([^>\s]+)>\s*([\s\S]*?)\s*<\/function>/g;
-/** Mistral's `[TOOL_CALLS]` and a JSON list. */
-const MISTRAL_CALLS = /\[TOOL_CALLS\]\s*(\[[\s\S]*\]|\{[\s\S]*\})/g;
-const FENCED = /```[A-Za-z_]*[ \t]*\n([\s\S]*?)\n?```/g;
+const LLAMA_CALL: Form = { open: llamaTags, close: ["</function>"] };
+/** A code fence that holds a call as JSON. */
+const FENCED: Form = { open: tagged(["```"], FENCE_LINE), close: ["```"] };
 /** What's left of a wrapper once the calls in it are taken out. */
 const LEFTOVERS = /<｜tool▁calls▁begin｜>|<｜tool▁calls▁end｜>|<(?:antml:)?function_calls>\s*<\/(?:antml:)?function_calls>/g;
 
+/** Every block of `form` in `text`, in order, none inside another: each is looked for from where the one before it ended. */
+function blocksOf(text: string, form: Form): Block[] {
+  const open = form.open(text);
+  const close = seeker(text, form.close);
+  const out: Block[] = [];
+  for (let opened = open(0); opened; ) {
+    const closed = close(opened.body);
+    // No closing tag from here on, so none for any opening tag after this one: the form is done with.
+    if (!closed) break;
+    out.push({ start: opened.at, end: closed.end, name: opened.name, body: text.slice(opened.body, closed.at) });
+    opened = open(closed.end);
+  }
+  return out;
+}
+
+/** Space, read from where a search stands. */
+const SPACE = /\s*/y;
+
+/**
+ * Mistral's `[TOOL_CALLS]` and the JSON after it: a list or an object, taken to the last bracket of
+ * its kind in the text, since a JSON value that holds others ends on its outermost one.
+ */
+function mistralBlocks(text: string): Block[] {
+  const seek = seeker(text, ["[TOOL_CALLS]"]);
+  const closes = { "[": text.lastIndexOf("]"), "{": text.lastIndexOf("}") };
+  const out: Block[] = [];
+  for (let tag = seek(0); tag; ) {
+    SPACE.lastIndex = tag.end;
+    SPACE.exec(text);
+    const at = SPACE.lastIndex;
+    const opens = text[at];
+    const close = opens === "[" || opens === "{" ? closes[opens] : -1;
+    // No value here (no bracket, or one that nothing closes): a later `[TOOL_CALLS]` may still hold one.
+    if (close <= at) {
+      tag = seek(tag.end);
+      continue;
+    }
+    out.push({ start: tag.at, end: close + 1, name: "", body: text.slice(at, close + 1) });
+    tag = seek(close + 1);
+  }
+  return out;
+}
+
+/** What may stand before a DeepSeek call's arguments: space, and the opening of a code fence. */
+const FENCE_OPENS = /^\s*(?:```(?:json)?\s*)?/;
+
+/** A DeepSeek call's arguments, without the space and the code fence V3 wraps them in. */
+function unfenced(body: string): string {
+  const args = body.replace(FENCE_OPENS, "").trimEnd();
+  return args.endsWith("```") ? args.slice(0, -3).trimEnd() : args;
+}
+
 /**
  * The calls a model wrote as text instead of making them, in the forms models write them, each
- * naming a tool the agent has; and its text without them. A block that names another tool or doesn't
- * parse stays in the text, and a whole answer that is one JSON call counts only when nothing else did.
+ * naming a tool the agent has (`names`: a set of names, or a map by them); and its text without
+ * them. A block that names another tool or doesn't parse stays in the text, and a whole answer that
+ * is one JSON call counts only when nothing else did.
  */
-export function recoverToolCalls(text: string, names: ReadonlySet<string>): { calls: WrittenCall[]; rest: string } {
+export function recoverToolCalls(text: string, names: Pick<ReadonlySet<string>, "has">): { calls: WrittenCall[]; rest: string } {
   const calls: WrittenCall[] = [];
   let rest = text;
-  // Each pattern's blocks that read as calls are taken out of the text, in turn; the rest stay.
-  const take = (pattern: RegExp, read: (groups: string[]) => WrittenCall[] | null): void => {
-    rest = rest.replace(pattern, (match: string, ...captures: unknown[]) => {
-      const found = read(captures.slice(0, -2).map((g) => (typeof g === "string" ? g : "")));
-      if (!found) return match;
+  // Each form's blocks that read as calls are taken out of the text, in turn; the rest stay.
+  const take = (blocks: readonly Block[], read: (block: Block) => WrittenCall[] | null): void => {
+    let kept = "";
+    let from = 0;
+    for (const block of blocks) {
+      const found = read(block);
+      if (!found) continue;
       calls.push(...found);
-      return "";
-    });
+      kept += rest.slice(from, block.start);
+      from = block.end;
+    }
+    if (from > 0) rest = kept + rest.slice(from);
   };
-  const named = (name: string, args: string | undefined): WrittenCall[] | null => {
+  const named = (name: string, args: string): WrittenCall[] | null => {
     const parsed = writtenArgs(args);
     return names.has(name) && parsed ? [{ name, args: parsed }] : null;
   };
-  take(DEEPSEEK_CALL, ([name = "", args]) => named(name.trim(), args));
-  take(TAGGED_CALL, ([body = ""]) => callsFromJson(parseJson(body.trim()), names));
-  take(FUNCTION_CALLS, ([body = ""]) => {
-    const invoked = [...body.matchAll(INVOKE)].map(([, name = "", inner = ""]) => ({ name, args: Object.fromEntries([...inner.matchAll(PARAMETER)].map(([, key = "", value = ""]) => [key, writtenValue(value)])) as JsonObject }));
+  const json = ({ body }: Block): WrittenCall[] | null => callsFromJson(parseJson(body.trim()), names);
+  take(blocksOf(rest, DEEPSEEK_CALL), ({ name, body }) => named(name.trim(), unfenced(body)));
+  take(blocksOf(rest, TAGGED_CALL), json);
+  take(blocksOf(rest, FUNCTION_CALLS), ({ body }) => {
+    const invoked = blocksOf(body, INVOKE).map(({ name, body: inner }) => ({ name, args: Object.fromEntries(blocksOf(inner, PARAMETER).map(({ name: key, body: value }) => [key, writtenValue(value)])) as JsonObject }));
     return invoked.length > 0 && invoked.every((c) => names.has(c.name)) ? invoked : null;
   });
-  take(LLAMA_CALL, ([name = "", args]) => named(name, args));
-  take(MISTRAL_CALLS, ([body = ""]) => callsFromJson(parseJson(body.trim()), names));
-  take(FENCED, ([body = ""]) => callsFromJson(parseJson(body.trim()), names));
+  take(blocksOf(rest, LLAMA_CALL), ({ name, body }) => named(name, body.trim()));
+  take(mistralBlocks(rest), json);
+  take(blocksOf(rest, FENCED), json);
   if (calls.length === 0) {
     const whole = callsFromJson(parseJson(rest.trim()), names);
     if (whole) return { calls: whole, rest: "" };
@@ -344,7 +601,7 @@ export function ownBreakpoints(cache: NonNullable<ConnectionProfile["cache"]>, n
 
 // ---------------------------------------------------------------- accounts
 
-/** A throttle's period. Not a setting: the throttles' settings are per minute, as providers state their own limits. */
+/** A minute, in milliseconds: the throttles' period, and what a refusal of native tools is kept by. Not a setting: it is the unit those settings are in, as providers state their own limits per minute. */
 const MINUTE_MS = 60_000;
 
 /** What a call holds of its connection's calls at once when the connection has no such limit: nothing to free. */
@@ -413,34 +670,47 @@ export interface Reservation {
   release: () => void;
 }
 
-/** What the accounts read of the settings: each connection's throttle, and the calls at once of one that sets none. */
+/** What the accounts read of the settings: each connection's throttle, the calls at once of one that sets none, and how long a refusal of native tools is remembered. */
 export type AccountSettings = Settings["connections"];
 
 /**
  * The accounts kept with each connection: the throttles' last minute, the calls under way at once,
- * and connections seen refusing native tools. Every call `reserve`s before it is sent and `settle`s
- * after. A throttle waits for its minute to have room, and refuses only a call bigger than its whole
- * minute. Kept in memory: a restart starts every minute afresh.
+ * and which of its models were seen refusing native tools, and when. Every call `reserve`s before
+ * it is sent and `settle`s after. A throttle waits for its minute to have room, and refuses only a
+ * call bigger than its whole minute. Kept in memory: a restart starts every minute afresh, and
+ * forgets every refusal.
  */
 export class AgentAccounts {
   /** Each connection's requests in the last minute: when, and their tokens. */
   private readonly window = new Map<string, { at: number; tokens: number }[]>();
-  /** Connections seen refusing native tools since the runtime started. */
-  private readonly refusing = new Set<string>();
+  /** When each model of a connection was last seen refusing native tools: by the two as one key, which JSON keeps apart whatever they hold. */
+  private readonly refusals = new Map<string, number>();
   /** Each connection's calls under way at once. */
   private readonly gates = new Map<string, ConnectionGate>();
 
   constructor(private readonly host: Pick<HarnessHost, "log" | "clock">) {}
 
-  /** Whether a connection was seen refusing native tools. */
-  refusesTools(connection: string): boolean {
-    return this.refusing.has(connection);
+  /**
+   * Whether a connection's model was seen refusing native tools, and that still stands. A refusal
+   * stands for `toolRefusalMinutes` (null: until the runtime restarts); one that old is dropped, so
+   * native tools are tried again: the model behind a name, or the server behind a connection, may
+   * have changed since. Another model of the connection is never taken for it.
+   */
+  refusesTools(connection: string, model: string, settings: Readonly<AccountSettings>): boolean {
+    const key = JSON.stringify([connection, model]);
+    const at = this.refusals.get(key);
+    if (at === undefined) return false;
+    if (this.host.clock.now() - at < limitOf(settings.toolRefusalMinutes) * MINUTE_MS) return true;
+    this.refusals.delete(key);
+    return false;
   }
 
-  refuseTools(connection: string, reason: string): void {
-    if (this.refusing.has(connection)) return;
-    this.refusing.add(connection);
-    this.host.log("info", `connection ${connection} refused native tools (${reason}); its agents are offered them as text from now on`);
+  /** Remembers, as of now, that a connection's model refused native tools. */
+  refuseTools(connection: string, model: string, reason: string): void {
+    const key = JSON.stringify([connection, model]);
+    // Logged when it is first remembered: a model seen refusing again while that stands only renews it.
+    if (!this.refusals.has(key)) this.host.log("info", `model ${model} on connection ${connection} refused native tools (${reason}); agents on it are offered them as text until native tools are tried again`);
+    this.refusals.set(key, this.host.clock.now());
   }
 
   /** Waits until the connection's throttle has room this minute; refuses a call bigger than the whole minute. */
@@ -520,8 +790,8 @@ export interface ProviderDeps {
 
 /**
  * What of an agent's spec its calls are made from: its connection, model and effort, its opening,
- * whether it marks cache breakpoints and the cache key it sends, the sampling parameters it sends,
- * and where a streamed answer's deltas go.
+ * whether it marks cache breakpoints and the cache key it sends, how its tools are offered
+ * (absent: `auto`), the sampling parameters it sends, and where a streamed answer's deltas go.
  */
 export interface CallSpec {
   connectionId: string | null;
@@ -530,6 +800,7 @@ export interface CallSpec {
   system: string;
   prefix: readonly string[];
   cache: { breakpoints: boolean; key: string };
+  toolCalls?: ToolCalls;
   params?: SamplingParams;
   onDelta?: (delta: ModelDelta) => void;
 }
@@ -537,11 +808,13 @@ export interface CallSpec {
 /** One call, assembled and estimated, ready for the budgets to check and then to send. */
 export interface PreparedCall {
   messages: ModelMessage[];
-  /** The tools offered natively (none when they go as text). */
+  /** The tools offered natively (none when they go as text), each under its name on the wire (`wireNames`). */
   tools: ModelTool[];
-  /** The agent's tools by name, natively or as text: what a written call may name. */
+  /** The agent's tools by name, natively or as text. */
   names: ReadonlySet<string>;
-  /** The tools go as text: the connection refuses them natively. */
+  /** The tool a call names, by each name it may come under, made or written: the one its tool goes by on the wire, and the tool's own. */
+  called: ReadonlyMap<string, string>;
+  /** The tools go as text: the agent is set to have them so, or its connection's model refused them natively. */
   textTools: boolean;
   /** The prompt's tokens, as estimated. */
   estimate: number;
@@ -585,21 +858,37 @@ export interface ModelReply extends ModelTurn {
 /**
  * An agent's calls: its connection read once (a loopback connection, or one that isn't there, stops
  * the agent before any call), each call assembled with its cache key and breakpoints, sent with its
- * effort and a usage request, and decoded. A connection that refuses native tools turns the session
- * to tools as text (`ToolsRefused`), kept for the connection once a call so made works.
+ * effort and a usage request, and decoded. How its tools are offered is the spec's (`toolCalls`):
+ * natively, and as text once its connection's model refuses them (`ToolsRefused`), which the accounts
+ * remember for that model of the connection once a call so made works; always natively, a refusal
+ * then being the call's own failure; or as text from the first call. Natively its tools go out under
+ * names a provider takes, and its calls come back under their tools' own (`wireNames`).
+ *
+ * A call a model writes as text where its tools went natively is recovered only until the session
+ * has seen the connection make a call natively. From then on its native tools are known to work, so
+ * a call block in its text is something it quotes (from the chat, a lore entry, a tool's result),
+ * and recovering it would run whatever text reached the model.
  */
 export class ProviderSession {
   private profile: ConnectionProfile | undefined;
-  /** The agent's tools go as text: its connection refused them natively. */
-  textTools = false;
+  private readonly toolCalls: ToolCalls;
+  /** The agent's tools go as text: it is set to have them so, or its connection's model refused them natively. */
+  textTools: boolean;
   /** Why the connection refused native tools, until a call with them as text has worked. */
   private refusal: string | null = null;
   private written = 0;
+  /** The connection has made a tool call natively in this session. */
+  private madeNative = false;
+  /** How many calls of the host's models this session has made, answered or not: what tells a call that failed on its way to its connection (a throttle refused it, its wait there was ended) from one a provider was sent and may bill. */
+  made = 0;
 
   constructor(
     private readonly deps: ProviderDeps,
     private readonly spec: CallSpec,
-  ) {}
+  ) {
+    this.toolCalls = spec.toolCalls ?? "auto";
+    this.textTools = this.toolCalls === "text";
+  }
 
   /** The connection as the host reads it, once; an `AgentStop` when it can't be used. */
   private async connection(): Promise<ConnectionProfile> {
@@ -618,8 +907,9 @@ export class ProviderSession {
     return profile;
   }
 
-  /** Turns to tools as text after the connection refused them natively. */
+  /** Turns to tools as text after the connection refused them natively: what answers `ToolsRefused`, which only a session free to turn throws. */
   refuseNativeTools(reason: string): void {
+    if (this.toolCalls !== "auto") return;
     this.textTools = true;
     this.refusal = reason;
   }
@@ -627,8 +917,16 @@ export class ProviderSession {
   async prepare(conversation: readonly ModelMessage[], tools: readonly ModelTool[]): Promise<PreparedCall> {
     const { settings, texts, accounts } = this.deps;
     const profile = await this.connection();
-    if (!this.textTools && tools.length > 0 && accounts.refusesTools(profile.id)) this.textTools = true;
-    const offered = this.textTools ? [] : [...tools];
+    const model = this.spec.model ?? profile.model ?? "";
+    // A session free to turn starts as text where this model of its connection was seen refusing native tools, for as long as that is remembered.
+    if (this.toolCalls === "auto" && !this.textTools && tools.length > 0 && accounts.refusesTools(profile.id, model, settings.connections)) this.textTools = true;
+    const wires = wireNames(tools);
+    const offered = this.textTools
+      ? []
+      : tools.map((t): ModelTool => {
+          const name = wires.out.get(t.name) ?? t.name;
+          return name === t.name ? t : { ...t, name };
+        });
     const { cache: own } = this.spec;
     // An agent with no instructions of its own (the writer) sends no cache key: its conversation goes as it came.
     const hasOpening = this.spec.system !== "" || this.spec.prefix.some((text) => text !== "");
@@ -641,13 +939,16 @@ export class ProviderSession {
     const toolMark = offered.length > 0 && cache !== null && !cache.tools && breakpoints >= 3;
     const native = toolMark ? offered.map((t, i): ModelTool => (i === offered.length - 1 ? { ...t, cache: true } : t)) : offered;
     const messages = assemble(opening, conversation, toolMark ? breakpoints - 1 : breakpoints);
-    return { messages, tools: native, names: new Set(tools.map((t) => t.name)), textTools: this.textTools && tools.length > 0, estimate: promptTokens(messages, native, settings.loop.charsPerToken), connection: profile.id, model: this.spec.model ?? profile.model ?? "", parallel: profile.parallelTools };
+    // A provider reads a call's name by the same rule wherever the call stands, so the calls in the conversation go out under their tools' names on the wire with the tools as text too. `assemble` made this list for this call: a message is replaced in it, and the conversation's own is left as it is.
+    for (const [i, m] of messages.entries()) messages[i] = onWire(m, wires.out);
+    return { messages, tools: native, names: new Set(tools.map((t) => t.name)), called: wires.back, textTools: this.textTools && tools.length > 0, estimate: promptTokens(messages, native, settings.loop.charsPerToken), connection: profile.id, model, parallel: profile.parallelTools };
   }
 
   /**
    * Sends a prepared call: held on its connection first (`AgentAccounts.reserve`, which may refuse
    * it), then made, decoded and settled. A call with native tools whose provider says it takes no
-   * tools (`isToolRefusal`) throws `ToolsRefused`; any other failure is the call's own.
+   * tools (`isToolRefusal`) throws `ToolsRefused` where the session may turn to tools as text; for a
+   * session set to native tools that failure is the call's own, as any other is.
    */
   async send(p: PreparedCall, request: ModelRequest, signal: AbortSignal): Promise<ModelReply> {
     const { host, settings, texts, accounts } = this.deps;
@@ -655,22 +956,27 @@ export class ProviderSession {
     const t0 = host.clock.now();
     let result: ModelResult;
     try {
+      this.made += 1;
       result = await host.models.call(request, signal, this.spec.onDelta);
     } catch (error) {
       accounts.settle(held, null);
-      if (!signal.aborted && p.tools.length > 0 && isToolRefusal(error)) throw new ToolsRefused(error);
+      if (!signal.aborted && p.tools.length > 0 && this.toolCalls === "auto" && isToolRefusal(error)) throw new ToolsRefused(error);
       throw error;
     }
-    const native = (result.toolCalls ?? []).map((c): AgentCall => ({ id: c.callId, name: c.name, args: c.args, ...(c.thoughtSignature !== undefined ? { thoughtSignature: c.thoughtSignature } : {}) }));
-    const recovered: { calls: WrittenCall[]; rest: string } = native.length === 0 && p.names.size > 0 ? recoverToolCalls(result.content, p.names) : { calls: [], rest: result.content };
-    const calls = native.length > 0 ? native : recovered.calls.map((c): AgentCall => ({ id: `written_${++this.written}`, ...c }));
+    // A call comes back under the name its tool went out by, and the loop is given the tool's own; a name that is no tool's passes as it came, for the loop to answer.
+    const native = (result.toolCalls ?? []).map((c): AgentCall => ({ id: c.callId, name: p.called.get(c.name) ?? c.name, args: c.args, ...(c.thoughtSignature !== undefined ? { thoughtSignature: c.thoughtSignature } : {}) }));
+    if (native.length > 0) this.madeNative = true;
+    // With the tools as text, written calls are how the model calls, and are always read. With them native, only until the connection has made a native call in this session.
+    const reads = native.length === 0 && p.names.size > 0 && (p.textTools || !this.madeNative);
+    const recovered: { calls: WrittenCall[]; rest: string } = reads ? recoverToolCalls(result.content, p.called) : { calls: [], rest: result.content };
+    const calls = native.length > 0 ? native : recovered.calls.map((c): AgentCall => ({ id: `written_${++this.written}`, name: p.called.get(c.name) ?? c.name, args: c.args }));
     const model = result.model ?? p.model;
     const { charsPerToken } = settings.loop;
     const estimate = { in: p.estimate, out: tokensOf(`${result.content}${native.map((c) => `${c.name} ${JSON.stringify(c.args)}`).join("")}`, charsPerToken), reasoningOut: tokensOf(result.reasoning ?? "", charsPerToken) };
-    const usage = priced(parseUsage(result.usage, this.profile?.provider ?? null, estimate), model, settings.prices);
+    const usage = priced(parseUsage(result.usage, this.profile?.provider ?? null, estimate), result.model === undefined ? [p.model] : [result.model, p.model], settings.prices);
     accounts.settle(held, usage);
     if (this.refusal !== null && p.textTools) {
-      accounts.refuseTools(p.connection, this.refusal);
+      accounts.refuseTools(p.connection, p.model, this.refusal);
       this.refusal = null;
     }
     return {

@@ -28,9 +28,9 @@ function intercept(it: Rig, input: Partial<InterceptorInput> & { chatId: string;
 }
 
 describe("the prompt interceptor", () => {
-  test("is registered to run last, and to stop the generation rather than let a prompt go untagged", async () => {
+  test("is registered to run last, and never to fail a generation: Lumiverse passes over one that isn't required, and the prompt goes on as it came", async () => {
     const it = (r = await rig());
-    expect(it.host.interceptor?.options).toEqual({ priority: Number.MAX_SAFE_INTEGER, types: ["normal", "regenerate", "swipe", "continue"], required: true });
+    expect(it.host.interceptor?.options).toEqual({ priority: Number.MAX_SAFE_INTEGER, types: ["normal", "regenerate", "swipe", "continue"], required: false });
   });
 
   test("leaves a prompt on any other connection as it is", async () => {
@@ -114,7 +114,7 @@ describe("the settings", () => {
 });
 
 describe("the per-chat switch and the secrets", () => {
-  test("on pins the chat to the loopback connection, off puts back the connection it had", async () => {
+  test("on for a runtime pins the chat to the loopback connection, off puts back the connection it had; on built in leaves the chat's connection alone", async () => {
     const it = (r = await rig());
     await it.setUp();
     it.host.addConnection({ id: "conn-other", name: "Other" });
@@ -122,13 +122,25 @@ describe("the per-chat switch and the secrets", () => {
     chat.metadata.connection_profile_id = "conn-other";
     const loopback = it.host.connectionList.find((c) => c.model === "lumiah");
 
-    const on = await it.page.request("lah.chat.set", { chatId: chat.id, on: true });
-    expect(on.chat).toMatchObject({ on: true, connection: { id: loopback?.id, loopback: true } });
+    const on = await it.page.request("lah.chat.set", { chatId: chat.id, on: true, place: "runtime" });
+    expect(on.chat).toMatchObject({ on: true, place: "runtime", connection: { id: loopback?.id, loopback: true } });
     expect(chat.metadata.connection_profile_id).toBe(loopback?.id ?? "");
 
     const off = await it.page.request("lah.chat.set", { chatId: chat.id, on: false });
     expect(off.chat).toMatchObject({ on: false, since: null, connection: { id: "conn-other", loopback: false } });
     expect(chat.metadata.connection_profile_id).toBe("conn-other");
+
+    // With the place left out, the chat runs where it ran before: in the runtime again.
+    const again = await it.page.request("lah.chat.set", { chatId: chat.id, on: true });
+    expect(again.chat).toMatchObject({ on: true, place: "runtime", connection: { id: loopback?.id, loopback: true } });
+    // Set to run built in, it gets back the connection it had and keeps generating on it.
+    const here = await it.page.request("lah.chat.set", { chatId: chat.id, on: true, place: "builtin" });
+    expect(here.chat).toMatchObject({ on: true, place: "builtin", connection: { id: "conn-other", loopback: false } });
+    expect(chat.metadata.connection_profile_id).toBe("conn-other");
+    expect((await it.page.request("lah.chat.set", { chatId: chat.id, on: false })).chat).toMatchObject({ on: false, since: null, place: "builtin", connection: { id: "conn-other", loopback: false } });
+    // A chat never set runs built in.
+    const fresh = it.host.addChat(USER, "Okoro's log");
+    expect((await it.page.request("lah.chat.set", { chatId: fresh.id, on: true })).chat).toMatchObject({ on: true, place: "builtin" });
     // Another account's chat is no chat at all.
     const theirs = it.host.addChat("user-brann", "Brann's stall");
     const refused = await it.page.request("lah.chat.get", { chatId: theirs.id }).catch((error: unknown) => error);

@@ -1,9 +1,11 @@
 // What LumiAH keeps of a user's runtimes and their loopback key (DESIGN §6: "three secrets, three
-// jobs"), in that user's own storage. The relay secret, minted when a runtime registers, proves a
-// request comes from that runtime; the loopback key, which goes in the loopback connection, proves a
-// completion request comes from that user's Lumiverse. Only their SHA-256 hashes are stored: neither
-// can be read back, here or from the file. (The third secret, the runtime's Lumiverse session, never
-// reaches the extension at all: Lumiverse checks it before a frame gets here.)
+// jobs"), in that user's own storage. The relay secret, minted when a runtime registers, tells that
+// runtime's requests from a page's and from another runtime's: registering needs only the user's
+// session, so it proves a runtime the account registered and no more. The loopback key, which goes
+// in the loopback connection, proves a completion request comes from that user's Lumiverse. Only
+// their SHA-256 hashes are stored: neither can be read back, here or from the file. (The third
+// secret, the runtime's Lumiverse session, never reaches the extension at all: Lumiverse checks it
+// before a frame gets here.)
 //
 // A request reaches the extension already attributed to its user (the runtime signed in as them), so
 // each user's registry is their own file and no key or secret is ever looked up across users.

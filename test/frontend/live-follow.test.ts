@@ -10,7 +10,7 @@ const T0 = Date.UTC(2026, 10, 10, 9, 0, 0);
 const ALL = finishedTurn("chat-mara", "turn-1", T0).events;
 
 function view(events: LiveEvent[], turn = "turn-1", partials: LivePartial[] = []): LiveView {
-  return { chatId: "chat-mara", turn, kind: "new", messageId: null, startedAt: T0, ended: null, events, partials };
+  return { stream: "chat-mara", chatId: "chat-mara", turn, kind: "new", messageId: null, startedAt: T0, ended: null, events, partials };
 }
 
 /** The backend's side of a follower, driven by hand: what each read answers, and what was asked. */

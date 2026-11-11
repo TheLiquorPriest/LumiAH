@@ -4,12 +4,13 @@
 // secret, and the `hello` handshake checks the link version both ends speak.
 
 import type { LinkFrame, LinkPush, LinkRequests, RuntimeReport } from "../../link/contract";
-import { LINK, LINK_VERSION, MODEL_ID, RUNTIME_NAME, runtimeBase, shellWord, versionWords } from "../../link/contract";
+import { EXTENSION_IDENTIFIER, LINK, LINK_VERSION, RUNTIME_NAME, loopbackModel, runtimeBase, shellWord, versionWords } from "../../link/contract";
 import { REPORT_TEXT_MAX, runtimeReportOf } from "../../link/frames";
 import type { LinkState, RelayView, RuntimeView } from "../../shared/ui";
 import { URL_SLOT } from "../../shared/ui";
 import { randomHex, sha256 } from "./docs";
 import { LinkRefused } from "./errors";
+import type { BackendIdentity } from "./identity";
 import type { RegistryStore, RelayRecord } from "./registry";
 import type { SettingsStore } from "./settings";
 import type { BackendHost } from "./spindle";
@@ -35,8 +36,12 @@ export interface Caller {
 export interface RelaysEnv {
   now(): number;
   build: string;
+  /** Who this backend is: the name its words show, the extension its lines name, and what it tells a runtime of itself. */
+  identity: BackendIdentity;
   /** Sends a frame to a session, in parts when it is too large to cross whole. */
   send(frame: LinkFrame, userId: string, session: string): void;
+  /** Whether the user has a loopback connection made. */
+  hasLoopback(userId: string): Promise<boolean>;
 }
 
 const SEP = "\u0000";
@@ -58,6 +63,8 @@ export class Relays {
    * registration gone.
    */
   private readonly outgoing = new Map<string, { hash: string; until: number }>();
+  /** Since when each runtime has had no session, by its key: one whose session closed, whose registration was replaced, or that was forgotten. A runtime with a session isn't here, nor one that never had one since the extension started. */
+  private readonly goneAt = new Map<string, number>();
   private readonly changed: ((userId: string) => void)[] = [];
   private readonly pinged: ((userId: string, relay: string, turns: readonly string[]) => void)[] = [];
 
@@ -113,7 +120,8 @@ export class Relays {
    * its own account's work.
    */
   async authenticate(secret: unknown, userId: string, session: string): Promise<Caller> {
-    const refused = new LinkRefused("forbidden", "LumiAH doesn't know this runtime (its registration was forgotten or replaced): run its start line on LumiAH's Runtime page again.");
+    const { name: shown } = this.env.identity;
+    const refused = new LinkRefused("forbidden", `${shown} doesn't know this runtime (its registration was forgotten or replaced): run its start line on ${shown}'s Runtime page again.`);
     if (typeof secret !== "string" || secret === "") throw refused;
     const hash = await sha256(secret);
     const relays = (await this.registry.read(userId)).relays;
@@ -131,45 +139,62 @@ export class Relays {
       if (live.session !== null) this.sessions.delete(live.session);
       live.session = session;
       this.sessions.set(session, key(userId, relay.id));
+      this.goneAt.delete(key(userId, relay.id));
     }
     return { userId, relay, session };
   }
 
-  /** `register`: a runtime's first word, with its user's own session and no secret yet. Mints its secret, kept only as a hash; the same name again replaces the registration. */
+  /**
+   * `register`: a runtime's first word, with its user's own session. Mints its secret, kept only as
+   * a hash; the same name again replaces the registration. Unless the request shows the secret the
+   * registration has (`up`, setting up again a runtime it set up before): then the registration
+   * stands, with where the runtime now says it runs, and the runtime that is answering with that
+   * secret goes on answering until `up` restarts it.
+   */
   async register(fields: Record<string, unknown>, userId: string): Promise<LinkRequests["register"]["result"]> {
     const { name, build, host, listen, port } = fields;
     if (typeof name !== "string" || !RUNTIME_NAME.test(name)) throw new LinkRefused("bad_request", "A runtime's name is lowercase letters, digits, _ and -, up to 40.");
-    if (!short(build) || !short(host) || !short(listen) || listen === "" || typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) throw new LinkRefused("bad_request", "The runtime's registration is malformed: update the runtime and LumiAH to the same build.");
+    const { identity } = this.env;
+    if (!short(build) || !short(host) || !short(listen) || listen === "" || typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) throw new LinkRefused("bad_request", `The runtime's registration is malformed: update the runtime and ${identity.name} to the same build.`);
     const most = (await this.settings.transport(userId)).link.relays;
+    const shown = typeof fields.secret === "string" && fields.secret !== "" ? await sha256(fields.secret) : null;
     const secret = randomHex(256);
     const hash = await sha256(secret);
     const now = this.env.now();
-    const id = await this.registry.change(userId, (registry) => {
+    const made = await this.registry.change(userId, (registry) => {
       const held = Object.values(registry.relays).find((r) => r.name === name);
       if (held === undefined && Object.keys(registry.relays).length >= most) return null;
       const relay = held?.id ?? randomHex(64);
-      registry.relays[relay] = { id: relay, name, secret: hash, build, host, listen, port, registeredAt: now, report: held?.report ?? null };
-      return relay;
+      // Replacing a secret that is still the registration's would end the link of the runtime that holds it, and the replies it is writing.
+      const stands = held !== undefined && held.secret === shown;
+      registry.relays[relay] = { id: relay, name, secret: stands ? held.secret : hash, build, host, listen, port, registeredAt: stands ? held.registeredAt : now, report: held?.report ?? null };
+      return { relay, stands };
     });
-    if (id === null) throw new LinkRefused("conflict", `This account has ${most} runtimes registered already: forget one on LumiAH's Runtime page first.`);
-    // Its old secret no longer speaks for it, so neither does the session that used it.
-    const live = this.liveOf(userId, id);
-    if (live.session !== null) this.sessions.delete(live.session);
-    live.session = null;
-    live.refused = null;
-    this.outgoing.delete(key(userId, id));
-    this.host.log("info", `[LumiAH] runtime "${name}" registered`);
+    if (made === null) throw new LinkRefused("conflict", `This account has ${most} runtimes registered already: forget one on ${identity.name}'s Runtime page first.`);
+    const { relay: id, stands } = made;
+    if (!stands) {
+      // Its old secret no longer speaks for it, so neither does the session that used it.
+      const live = this.liveOf(userId, id);
+      if (live.session !== null) {
+        this.sessions.delete(live.session);
+        this.goneAt.set(key(userId, id), this.env.now());
+      }
+      live.session = null;
+      live.refused = null;
+      this.outgoing.delete(key(userId, id));
+    }
+    this.host.log("info", `[LumiAH] runtime "${name}" ${stands ? "set up again: its registration stands" : "registered"}`);
     this.tell(userId);
-    return { relay: id, secret, model: MODEL_ID, user: userId };
+    return { relay: id, secret: stands && typeof fields.secret === "string" ? fields.secret : secret, model: loopbackModel(identity.identifier), user: userId, backend: { name: identity.name, connection: identity.connectionName } };
   }
 
   /** `hello`: the version checked, the runtime's report kept. Refused in words that name which side to update when the versions differ. */
   async hello(caller: Caller, fields: Record<string, unknown>): Promise<void> {
     const live = this.liveOf(caller.userId, caller.relay.id);
     const version = fields.version;
-    if (typeof version !== "number" || !Number.isSafeInteger(version)) throw new LinkRefused("bad_request", "The runtime's hello names no link version: update the runtime with its start line on LumiAH's Runtime page.");
+    if (typeof version !== "number" || !Number.isSafeInteger(version)) throw new LinkRefused("bad_request", `The runtime's hello names no link version: update the runtime with its start line on ${this.env.identity.name}'s Runtime page.`);
     if (version !== LINK_VERSION) {
-      live.refused = versionWords(version, LINK_VERSION);
+      live.refused = versionWords(version, LINK_VERSION, this.env.identity.name);
       live.seenAt = this.env.now();
       const report = runtimeReportOf(fields.report);
       if (report !== null) live.report = report;
@@ -218,6 +243,7 @@ export class Relays {
     const live = this.live.get(k);
     if (live === undefined || live.session !== session) return;
     live.session = null;
+    this.goneAt.set(k, this.env.now());
     live.turns = [];
     live.shown = this.stateOf(live, 0);
     this.tell(k.slice(0, k.indexOf(SEP)));
@@ -230,12 +256,28 @@ export class Relays {
     for (const [k, live] of this.live) if (live.session !== null) await this.follow(k.slice(0, k.indexOf(SEP)), live).catch(() => undefined);
   }
 
+  /** Whether a runtime has a session to push to now. */
+  isLinked(userId: string, relay: string): boolean {
+    return (this.live.get(key(userId, relay))?.session ?? null) !== null;
+  }
+
+  /** How long a runtime has had no session, in ms: since its session closed, or since it was forgotten. Null while it has one, and for a runtime that has had none since the extension started (nothing of its is followed here). */
+  goneFor(userId: string, relay: string): number | null {
+    const at = this.goneAt.get(key(userId, relay));
+    return at === undefined ? null : Math.max(0, this.env.now() - at);
+  }
+
   /** Pushes to a runtime's session; false while it has none (its hello resumes what it missed). */
   push(userId: string, relay: string, push: LinkPush): boolean {
     const session = this.live.get(key(userId, relay))?.session ?? null;
     if (session === null) return false;
     this.env.send(push, userId, session);
     return true;
+  }
+
+  /** Whether a runtime is there to choose for a chat (DESIGN §25): one is linked, the loopback key is minted and the loopback connection is made, so a chat set to run in the runtime is answered there now. */
+  async ready(userId: string): Promise<boolean> {
+    return (await this.linked(userId)).length > 0 && (await this.registry.read(userId)).key !== null && (await this.env.hasLoopback(userId));
   }
 
   /** The user's runtimes that are linked now, the one heard from last first. */
@@ -280,6 +322,8 @@ export class Relays {
     const k = key(userId, relay);
     const session = this.live.get(k)?.session ?? null;
     if (session !== null) this.sessions.delete(session);
+    // What still runs under it in the live view ends as lost in its own time: its link is gone from now.
+    if (!this.goneAt.has(k)) this.goneAt.set(k, this.env.now());
     this.live.delete(k);
     this.outgoing.delete(k);
     this.tell(userId);
@@ -305,7 +349,10 @@ export class Relays {
   async view(userId: string, issues: string[]): Promise<RuntimeView> {
     const quietMs = (await this.settings.transport(userId)).link.quietMs;
     const { bun, dir } = this.host.install;
+    const { identity } = this.env;
     const script = dir === null ? null : `${dir}/lumiah.js`;
+    // A runtime finds LumiAH's own extension by itself; built into another, it is told which, on every line that sets one up.
+    const named = identity.identifier === EXTENSION_IDENTIFIER ? [] : ["--extension", identity.identifier];
     const relays = Object.values((await this.registry.read(userId)).relays)
       .sort((a, b) => a.registeredAt - b.registeredAt)
       .map((r): RelayView => {
@@ -322,7 +369,7 @@ export class Relays {
             : link === "refused"
               ? (live?.refused ?? null)
               : link === "quiet"
-                ? `LumiAH hasn't heard from this runtime for over ${Math.round(quietMs / 1000)} seconds. Check that it is still running${unit !== null ? ` (systemctl --user status ${unit})` : ""}.`
+                ? `${identity.name} hasn't heard from this runtime for over ${Math.round(quietMs / 1000)} seconds. Check that it is still running${unit !== null ? ` (systemctl --user status ${unit})` : ""}.`
                 : `This runtime isn't connected to Lumiverse now. ${unit !== null ? `Check its service (systemctl --user status ${unit}), or run its update line.` : "Start it with its line."}`;
         return {
           id: r.id,
@@ -341,13 +388,13 @@ export class Relays {
           scheduler: live?.report?.scheduler ?? "unknown",
           lines: {
             // The extension's own copy of the runtime is the build to update to; `up` reads the address from the runtime's config.
-            update: updateBun !== null && script !== null ? [updateBun, script, "up", "--name", r.name, ...(unit !== null ? ["--systemd"] : [])].map(shellWord).join(" ") : null,
+            update: updateBun !== null && script !== null ? [updateBun, script, "up", "--name", r.name, ...named, ...(unit !== null ? ["--systemd"] : [])].map(shellWord).join(" ") : null,
             login: report !== null && loginBun !== null ? [loginBun, report.runtime.script, "login", "--name", r.name].map(shellWord).join(" ") : null,
           },
         };
       });
-    const missing = [...(bun === null ? ["the path of Lumiverse's Bun (use the full path of your own bun)"] : []), ...(script === null ? ["where this extension is installed (the runtime is dist/lumiah.js in LumiAH's extension folder)"] : [])];
-    const line = (systemd: boolean): string | null => (bun === null || script === null ? null : `${[bun, script, "up", "--url"].map(shellWord).join(" ")} ${URL_SLOT}${systemd ? " --systemd" : ""}`);
-    return { build: this.env.build, link: LINK_VERSION, model: MODEL_ID, relays, start: { service: line(true), foreground: line(false), missing }, issues };
+    const missing = [...(bun === null ? ["the path of Lumiverse's Bun (use the full path of your own bun)"] : []), ...(script === null ? [`where this extension is installed (the runtime is dist/lumiah.js in ${identity.name}'s extension folder)`] : [])];
+    const line = (systemd: boolean): string | null => (bun === null || script === null ? null : `${[bun, script, "up", "--url"].map(shellWord).join(" ")} ${[URL_SLOT, ...named.map(shellWord), ...(systemd ? ["--systemd"] : [])].join(" ")}`);
+    return { build: this.env.build, link: LINK_VERSION, model: loopbackModel(identity.identifier), relays, start: { service: line(true), foreground: line(false), missing }, issues, ready: await this.ready(userId) };
   }
 }

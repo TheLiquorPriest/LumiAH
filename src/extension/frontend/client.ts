@@ -30,6 +30,8 @@ export type Connection = "connecting" | "ready" | "failed";
 export interface ClientOptions {
   /** How long a request waits for its answer, in ms (this device's setting, read at each request). */
   timeoutMs(): number;
+  /** What the page tells the backend each time it says hello: what only a page can know of Lumiverse (the connection profile active now). Read at each hello, since it changes while the page is open. */
+  hello?(): UiRequests["lah.hello"]["body"];
 }
 
 interface Pending {
@@ -51,7 +53,7 @@ export class UiClient {
   readonly state: Store<UiState | null> = createStore<UiState | null>(null);
   readonly connection: Store<Connection> = createStore<Connection>("connecting");
   private readonly pending = new Map<string, Pending>();
-  private readonly live = new Set<(chatId: string, heard: LiveHeard) => void>();
+  private readonly live = new Set<(stream: string, heard: LiveHeard) => void>();
   private readonly back = new Set<() => void>();
   private readonly off: () => void;
   private hello: Promise<void> | null = null;
@@ -88,7 +90,7 @@ export class UiClient {
   /** Asks for the whole state again (`lah.hello`); one at a time, the later callers sharing the one under way. */
   sync(): Promise<void> {
     if (this.hello) return this.hello;
-    const run = this.request("lah.hello", {}).then(
+    const run = this.request("lah.hello", this.options.hello?.() ?? {}).then(
       (state) => {
         this.state.set(state);
         this.connection.set("ready");
@@ -121,8 +123,8 @@ export class UiClient {
     return () => this.back.delete(listener);
   }
 
-  /** Hears every live push (a turn's changes, and what its calls in flight send), for the views that opened a chat's live view; returns the stop. */
-  onLive(listener: (chatId: string, heard: LiveHeard) => void): () => void {
+  /** Hears every live push (a turn's changes, and what its calls in flight send), for the views that opened a stream; returns the stop. */
+  onLive(listener: (stream: string, heard: LiveHeard) => void): () => void {
     this.live.add(listener);
     return () => this.live.delete(listener);
   }
@@ -168,10 +170,10 @@ export class UiClient {
         return;
       }
       case "lah.live":
-        for (const listener of [...this.live]) listener(message.chatId, message.change);
+        for (const listener of [...this.live]) listener(message.stream, message.change);
         return;
       case "lah.live.delta":
-        for (const listener of [...this.live]) listener(message.chatId, { delta: message.delta });
+        for (const listener of [...this.live]) listener(message.stream, { delta: message.delta });
         return;
     }
   }

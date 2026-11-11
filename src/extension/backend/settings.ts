@@ -19,7 +19,8 @@ export interface SettingsSection {
   key: string;
   defaults(): JsonObject;
   schema: JsonObject;
-  check(values: unknown): UiProblem[];
+  /** What the section refuses of its values, for a user: a section whose names depend on what that user has (the core's: their extension's tools, their own agents) may ask for it first. */
+  check(values: unknown, userId: string): UiProblem[] | Promise<UiProblem[]>;
 }
 
 /** The texts a model is sent: their definitions, and what a text of the user's own is refused for (null: it is taken). */
@@ -39,6 +40,8 @@ interface Stored {
   rev: number;
   own: Own[];
   texts: Record<string, string>;
+  /** The user's own definitions (their agents and skills, and what they switched off: DESIGN §13), kept with the settings so both change under one revision. The core reads and checks them. */
+  definitions?: JsonObject;
 }
 
 /** The settings refused a change: each value it refuses, where it is and why. */
@@ -59,13 +62,35 @@ const FORBIDDEN_KEYS: Readonly<Record<string, true>> = Object.assign(Object.crea
 
 const isPath = (v: unknown): v is string[] => Array.isArray(v) && v.every((k) => typeof k === "string");
 
-function storedOf(raw: unknown): Stored | null {
+/**
+ * A stored value as it is read: a number past the most its setting takes reads as that most, down
+ * through a group put whole. A build that lowers a maximum (a ceiling that protects the worker all
+ * accounts share) would otherwise leave whoever had stored more with settings that refuse every
+ * later change, of any setting: a change is checked with all the values it leaves standing.
+ */
+function capped(schema: unknown, value: JsonValue): JsonValue {
+  if (!isRecord(schema)) return value;
+  if (typeof value === "number") return typeof schema.maximum === "number" && value > schema.maximum ? schema.maximum : value;
+  if (!isRecord(value) || !isRecord(schema.properties)) return value;
+  // By the schema's own names, so no key of the stored value's is ever written that the schema doesn't have.
+  for (const [key, child] of Object.entries(schema.properties)) if (hasOwn(value, key)) value[key] = capped(child, value[key] as JsonValue);
+  return value;
+}
+
+/** A stored document, read: `schema` is the settings' whole, which what it holds is capped by. */
+function storedOf(raw: unknown, schema: JsonObject): Stored | null {
   if (!isRecord(raw) || raw.v !== 1) return null;
   const own: Own[] = [];
-  if (Array.isArray(raw.own)) for (const o of raw.own) if (isRecord(o) && isPath(o.path) && o.path.length > 0 && o.value !== undefined) own.push({ path: o.path, value: o.value as JsonValue });
+  if (Array.isArray(raw.own))
+    for (const o of raw.own) {
+      if (!isRecord(o) || !isPath(o.path) || o.path.length === 0 || o.value === undefined) continue;
+      let rule: unknown = schema;
+      for (const key of o.path) rule = isRecord(rule) && isRecord(rule.properties) && hasOwn(rule.properties, key) ? rule.properties[key] : undefined;
+      own.push({ path: o.path, value: capped(rule, o.value as JsonValue) });
+    }
   const texts: Record<string, string> = {};
   if (isRecord(raw.texts)) for (const [id, text] of Object.entries(raw.texts)) if (typeof text === "string") texts[id] = text;
-  return { v: 1, rev: typeof raw.rev === "number" && Number.isSafeInteger(raw.rev) && raw.rev >= 0 ? raw.rev : 0, own, texts };
+  return { v: 1, rev: typeof raw.rev === "number" && Number.isSafeInteger(raw.rev) && raw.rev >= 0 ? raw.rev : 0, own, texts, ...(isRecord(raw.definitions) ? { definitions: raw.definitions as JsonObject } : {}) };
 }
 
 const clone = <T extends JsonValue>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
@@ -108,7 +133,12 @@ export class SettingsStore {
     private readonly sections: readonly SettingsSection[],
     private readonly textsDef: TextsDef,
   ) {
-    this.docs = new UserDocs<Stored>(host, FILE, storedOf, () => ({ v: 1, rev: 0, own: [], texts: {} }));
+    this.docs = new UserDocs<Stored>(
+      host,
+      FILE,
+      (raw) => storedOf(raw, this.schema()),
+      () => ({ v: 1, rev: 0, own: [], texts: {} }),
+    );
   }
 
   /** The user's settings or texts changed: told with the new revision. */
@@ -161,10 +191,18 @@ export class SettingsStore {
     return (await this.docs.get(userId)).rev;
   }
 
-  /** What the runtime reads (`settings.get`). */
+  /**
+   * What the core reads where it runs (a runtime's `settings.get`; built in, the same): the user's
+   * own values alone, with no default filled in. Each section's reader fills in its own defaults,
+   * and the core's does so with the run's definitions in view: a default handed over as if the user
+   * had set it would stand over what their own definition of an agent says.
+   */
   async snapshot(userId: string): Promise<SettingsSnapshot> {
-    const { rev, values } = await this.current(userId);
-    return { revision: rev, values, texts: { ...(await this.docs.get(userId)).texts } };
+    const stored = await this.docs.get(userId);
+    const values: JsonObject = {};
+    // A value nearer the root first, so one put deeper since stands over it.
+    for (const o of [...stored.own].sort((a, b) => a.path.length - b.path.length)) put(values, o.path, clone(o.value));
+    return { revision: stored.rev, values, texts: { ...stored.texts }, definitions: clone(stored.definitions ?? {}) };
   }
 
   async view(userId: string): Promise<SettingsView> {
@@ -215,7 +253,7 @@ export class SettingsStore {
       else place([...path], clone(value));
     }
     const values = this.valuesOf(own);
-    for (const section of this.sections) for (const p of section.check(values[section.key])) problems.push({ path: [section.key, ...p.path], message: p.message });
+    for (const section of this.sections) for (const p of await section.check(values[section.key], userId)) problems.push({ path: [section.key, ...p.path], message: p.message });
     if (problems.length > 0) throw new SettingsRefused(`The settings refused ${problems.length === 1 ? "a value" : `${problems.length} values`}: nothing was changed.`, problems);
     const revision = await this.docs.change(userId, (doc) => {
       doc.own = own;
@@ -239,6 +277,21 @@ export class SettingsStore {
     });
     for (const listener of this.listeners) listener(userId, revision);
     return this.texts(userId);
+  }
+
+  /** The user's own definitions as stored; `{}` while they have none. */
+  async definitions(userId: string): Promise<JsonObject> {
+    return clone((await this.docs.get(userId)).definitions ?? {});
+  }
+
+  /** Keeps the user's own definitions, whole: a new revision, told like any other change, so the runtime reads them before its next run. */
+  async setDefinitions(userId: string, definitions: JsonObject): Promise<void> {
+    const kept = clone(definitions);
+    const revision = await this.docs.change(userId, (doc) => {
+      doc.definitions = kept;
+      return ++doc.rev;
+    });
+    for (const listener of this.listeners) listener(userId, revision);
   }
 
   /** Resolves once every write is done (tests). */

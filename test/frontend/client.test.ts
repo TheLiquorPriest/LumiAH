@@ -5,10 +5,10 @@ import { describe, expect, test } from "bun:test";
 import { MockBackend } from "../../dev/preview/mock-backend";
 import { sampleSettings } from "../../dev/preview/sections";
 import { type Channel, UiClient, UiRequestError } from "../../src/extension/frontend/client";
-import { type BackendToFrontend, type FrontendToBackend, type UiState, UI_VERSION } from "../../src/shared/ui";
+import { type BackendToFrontend, type ChatView, type FrontendToBackend, type UiState, UI_VERSION } from "../../src/shared/ui";
 
 /** A channel whose other end is the test: what the page sent, and a way to answer it. */
-function wire(timeoutMs = 1000) {
+function wire(timeoutMs = 1000, hello?: () => { active?: string | null }) {
   const sent: FrontendToBackend[] = [];
   let handler: (payload: unknown) => void = () => {};
   const channel: Channel = {
@@ -20,7 +20,7 @@ function wire(timeoutMs = 1000) {
       };
     },
   };
-  const client = new UiClient(channel, { timeoutMs: () => timeoutMs });
+  const client = new UiClient(channel, { timeoutMs: () => timeoutMs, ...(hello ? { hello } : {}) });
   return { client, sent, deliver: (message: unknown) => handler(message), last: () => sent.at(-1) as FrontendToBackend };
 }
 
@@ -40,7 +40,7 @@ describe("requests", () => {
     const w = wire();
     const asked = w.client.request("lah.chat.get", { chatId: "chat-mara" });
     expect(w.last()).toMatchObject({ lah: UI_VERSION, type: "lah.chat.get", chatId: "chat-mara" });
-    const chat = { chatId: "chat-mara", name: "Mara at the harbour", on: true, since: 1, connection: null };
+    const chat: ChatView = { chatId: "chat-mara", name: "Mara at the harbour", on: true, since: 1, place: "builtin", connection: null };
     w.deliver(result(w.last().reqId, "lah.chat.get", { chat }));
     expect(await asked).toEqual({ chat });
   });
@@ -117,7 +117,7 @@ describe("the state every page holds", () => {
     w.deliver(result(w.last().reqId, "lah.hello", stateOf(4)));
     await syncing;
     const before = w.client.state.get();
-    const push: BackendToFrontend = { lah: UI_VERSION, type: "lah.state", rev: 5, patch: { running: [{ chatId: "chat-mara", turn: "t", kind: "new", startedAt: 9 }] } };
+    const push: BackendToFrontend = { lah: UI_VERSION, type: "lah.state", rev: 5, patch: { running: [{ stream: "chat-mara", chatId: "chat-mara", turn: "t", kind: "new", startedAt: 9, paused: false }] } };
     w.deliver(push);
     expect(w.client.state.get()?.rev).toBe(5);
     expect(w.client.state.get()?.running).toHaveLength(1);
@@ -157,12 +157,25 @@ describe("live pushes and coming back", () => {
   test("a live push reaches every view that listens, with its chat: a turn's changes, and what a call in flight sent", () => {
     const w = wire();
     const heard: string[] = [];
-    const off = w.client.onLive((chatId, change) => heard.push(`${chatId}:${"delta" in change ? `delta ${change.delta.text ?? ""}` : "view" in change ? "view" : `${change.events.length} events`}`));
-    w.deliver({ lah: UI_VERSION, type: "lah.live", chatId: "chat-mara", change: { turn: "t", events: [], ended: null } });
-    w.deliver({ lah: UI_VERSION, type: "lah.live.delta", chatId: "chat-mara", delta: { turn: "t", agentId: "main-1", call: 1, text: "The door", before: { text: 0, reasoning: 0 }, at: 5 } });
+    const off = w.client.onLive((stream, change) => heard.push(`${stream}:${"delta" in change ? `delta ${change.delta.text ?? ""}` : "view" in change ? "view" : `${change.events.length} events`}`));
+    w.deliver({ lah: UI_VERSION, type: "lah.live", stream: "chat-mara", change: { turn: "t", events: [], ended: null } });
+    w.deliver({ lah: UI_VERSION, type: "lah.live.delta", stream: "chat-mara", delta: { turn: "t", agentId: "main-1", call: 1, text: "The door", before: { text: 0, reasoning: 0 }, at: 5 } });
     off();
-    w.deliver({ lah: UI_VERSION, type: "lah.live", chatId: "chat-mara", change: { turn: "t", events: [], ended: null } });
+    w.deliver({ lah: UI_VERSION, type: "lah.live", stream: "chat-mara", change: { turn: "t", events: [], ended: null } });
     expect(heard).toEqual(["chat-mara:0 events", "chat-mara:delta The door"]);
+  });
+
+  test("each hello tells the backend what only a page knows of Lumiverse, read anew each time", async () => {
+    let active: string | null = "conn-deepseek";
+    const w = wire(1000, () => ({ active }));
+    const first = w.client.sync();
+    expect(w.last()).toMatchObject({ type: "lah.hello", active: "conn-deepseek" });
+    w.deliver(result(w.last().reqId, "lah.hello", stateOf(1)));
+    await first;
+    // The user made another profile active in Lumiverse (here: none), then came back to the page.
+    active = null;
+    w.client.resync();
+    expect(w.last()).toMatchObject({ type: "lah.hello", active: null });
   });
 
   test("a page that was away says hello again and tells its open views to read themselves again", () => {

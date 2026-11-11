@@ -4,13 +4,14 @@
 // stand-in answering the whole contract is what makes the preview worth looking at.
 
 import { describe, expect, test } from "bun:test";
-import { fakeHash } from "../../dev/preview/fixtures";
+import { fakeHash, workingTurn } from "../../dev/preview/fixtures";
 import { MockBackend, type MockOptions } from "../../dev/preview/mock-backend";
 import { sampleSettings } from "../../dev/preview/sections";
 import { type Channel, UiClient } from "../../src/extension/frontend/client";
 import { LiveFollower, type LiveState } from "../../src/extension/frontend/live-follow";
-import { feedOf, NO_FILTER, turnTotals, turnView } from "../../src/extension/frontend/live-model";
+import { feedOf, NO_FILTER, turnPhase, turnTotals, turnView } from "../../src/extension/frontend/live-model";
 import type { LiveView, UiRequests, UiRequestType } from "../../src/shared/ui";
+import { BODIES } from "./bodies";
 
 const T0 = Date.UTC(2026, 10, 10, 9, 0, 0);
 
@@ -75,8 +76,8 @@ function world(over: Partial<MockOptions> = {}) {
     const states: LiveState[] = [];
     const follower = new LiveFollower(
       {
-        open: () => client.request("lah.live.open", { chatId }),
-        events: (turn, from) => client.request("lah.live.events", { chatId, turn, from }),
+        open: () => client.request("lah.live.open", { stream: chatId }),
+        events: (turn, from) => client.request("lah.live.events", { stream: chatId, turn, from }),
       },
       (state) => states.push(state),
     );
@@ -105,43 +106,58 @@ describe("the stand-in backend answers the whole contract", () => {
     const w = world();
     const state = await w.ask("lah.hello", {});
     expect(state.rev).toBe(1);
-    const { live } = await w.ask("lah.live.open", { chatId: "chat-mara" });
+    const { live } = await w.ask("lah.live.open", { stream: "chat-mara" });
     const turns = await w.ask("lah.turns.list", { chatId: "chat-mara", cursor: null, limit: 4 });
     const compacted = turns.turns.find((t) => t.compaction?.rollback === "available");
     const prompt = live?.events.flatMap((e) => (e.event.kind === "agent_entry" && e.event.entry.kind === "answer" && e.event.entry.prompt ? [e.event.entry.prompt] : []))[0];
     if (!live || !compacted?.compaction || !turns.turns[0]?.transcript || !prompt) throw new Error("the fixtures lack a live turn, a compaction, a transcript or a prompt");
+    // What the workspace, the guidance and the jobs hold now: a write names the version it is based on, and only a job that ended badly can be started again. The notes are left alone: the made-up data has a job rewrite one of them, and Live's turns point at another.
+    const files = (await w.ask("lah.ws.list", { chatId: "chat-mara", area: "chat" })).files.filter((f) => !f.path.startsWith("notes/"));
+    const [moved, deleted] = files;
+    const guidance = (await w.ask("lah.guidance.get", { chatId: "chat-mara" })).levels.find((l) => l.id === "chat");
+    const jobs = (await w.ask("lah.jobs.list", { chatId: null, cursor: null, limit: 50 })).jobs;
+    const queued = jobs.find((j) => j.state === "queued");
+    const again = jobs.find((j) => j.state === "interrupted" || j.state === "failed" || j.state === "cancelled");
+    const spent = jobs.find((j) => j.state === "spent");
+    const held = jobs.find((j) => j.state === "paused");
+    if (!moved || !deleted || !guidance || !queued || !again || !spent || !held) throw new Error("the fixtures lack two files to move and delete, the chat's guidance, a queued job, one that ended badly, one out of allowance or one left paused");
 
-    // One well-formed body per request: a request added to the contract must be added here to compile.
+    // The shared bodies name what the made-up data holds; these need what only a live answer gives.
     const bodies: { [K in UiRequestType]: UiRequests[K]["body"] } = {
-      "lah.hello": {},
+      ...BODIES,
       "lah.chat.get": { chatId: "chat-ilse" },
       "lah.chat.set": { chatId: "chat-ilse", on: true },
-      "lah.live.open": { chatId: "chat-mara" },
-      "lah.live.events": { chatId: "chat-mara", turn: live.turn, from: 7 },
-      "lah.live.close": { chatId: "chat-mara" },
-      "lah.turn.stop": { chatId: "chat-mara", turn: live.turn },
+      "lah.live.events": { stream: "chat-mara", turn: live.turn, from: 7 },
+      "lah.turn.stop": { stream: "chat-mara", turn: live.turn },
+      "lah.turn.say": { stream: "chat-mara", turn: live.turn, text: "Keep it short." },
+      "lah.turn.pause": { stream: "chat-mara", turn: live.turn, on: true },
       "lah.turns.list": { chatId: "chat-mara", cursor: turns.next, limit: 4 },
-      "lah.transcript.get": { chatId: "chat-mara", transcript: turns.turns[0].transcript, from: 1 },
+      "lah.transcript.get": { transcript: turns.turns[0].transcript, from: 1 },
       "lah.prompt.get": { prompt },
       "lah.blob.get": { hash: compacted.compaction.summary },
       "lah.session.rollback": { chatId: "chat-mara", messageId: compacted.messageId, swipe: compacted.swipe },
       "lah.settings.set": { set: [{ path: ["sample", "reply", "writer"], value: "main" }], reset: [] },
-      "lah.models.list": { connectionId: null },
       "lah.text.set": { id: "main.system", text: "Be brief." },
-      "lah.text.reset": { id: "main.system" },
-      "lah.key": { op: "mint" },
-      "lah.relay": { op: "rotate", relay: "relay-1" },
+      "lah.ws.move": { chatId: "chat-mara", area: "chat", from: moved.path, to: `${moved.path}.moved`, base: moved.hash },
+      "lah.ws.delete": { chatId: "chat-mara", area: "chat", path: deleted.path, base: deleted.hash },
+      "lah.guidance.set": { chatId: "chat-mara", level: "chat", text: "Joss never lies to Mara, though he leaves things out.", base: guidance.hash },
+      "lah.job.cancel": { id: queued.id },
+      "lah.job.again": { id: again.id },
+      "lah.job.grant": { id: spent.id, allowance: { tokensIn: 400_000, tokensOut: 40_000 } },
+      "lah.job.resume": { id: held.id },
     };
     for (const type of Object.keys(bodies) as UiRequestType[]) {
-      const answered = await outcome(w.ask(type, bodies[type]));
-      expect(answered, type).not.toBeInstanceOf(Error);
+      // An answer may come later than at once (a sweep takes a while): the clock is turned until it has.
+      const asked = outcome(w.client.request(type, bodies[type]));
+      await w.pass(10_000);
+      expect(await asked, type).not.toBeInstanceOf(Error);
     }
   });
 
   test("what it has no answer for is refused in words, never left hanging", async () => {
     const w = world();
     expect(await outcome(w.ask("lah.prompt.get", { prompt: fakeHash("no such prompt") }))).toMatchObject({ code: "not_found", message: "The store no longer has that prompt." });
-    expect(await outcome(w.ask("lah.live.events", { chatId: "chat-mara", turn: "another-turn", from: 1 }))).toMatchObject({ code: "not_found" });
+    expect(await outcome(w.ask("lah.live.events", { stream: "chat-mara", turn: "another-turn", from: 1 }))).toMatchObject({ code: "not_found" });
     expect(await outcome(w.ask("lah.relay", { op: "forget", relay: "relay-9" }))).toMatchObject({ code: "not_found" });
     expect(await outcome(w.ask("lah.models.list", { connectionId: "conn-local" }))).toMatchObject({ code: "unavailable" });
     // A request the page's own types wouldn't let it send still gets an answer.
@@ -169,10 +185,14 @@ describe("a turn as the Live page sees it", () => {
     const sizes = states.flatMap((s) => (s.status === "ready" && s.view ? [s.view.events.length] : []));
     expect(sizes.length).toBeGreaterThan(2);
     expect(sizes).toEqual([...sizes].sort((a, b) => a - b));
-    expect(turnView(state.view).agents.map((a) => [a.start.role, a.state])).toEqual([["main", "done"], ["writer", "done"]]);
+    // The open chat runs built in: the main agent hands its brief over and Lumiverse writes, so no writer of LumiAH's is in the turn, and the view says where it ran and what the prompt held.
+    expect(turnView(state.view).agents.map((a) => [a.start.role, a.state])).toEqual([["main", "done"]]);
+    expect(state.view.place).toBe("builtin");
+    expect(state.view.ended?.noPart).toBeUndefined();
+    expect(turnView(state.view).held?.lore.map((e) => e.title)).toEqual(["How the town speaks", "The harbour office", "Joss"]);
   });
 
-  test("a turn that plays reaches the page a step at a time, and the state says it runs", async () => {
+  test("built in, a turn that plays reaches the page a step at a time, counts down to the reply, and hands its brief to Lumiverse", async () => {
     const w = world({ turn: "none" });
     await w.hello();
     const { follower } = await w.follow("chat-mara");
@@ -180,7 +200,8 @@ describe("a turn as the Live page sees it", () => {
 
     expect(w.backend.startTurn("chat-mara")).toBe(true);
     await w.pass(400);
-    expect(w.client.state.get()?.running.map((r) => r.chatId)).toEqual(["chat-mara"]);
+    // The state says it runs, where, and when its time before the reply ends.
+    expect(w.client.state.get()?.running.map((r) => [r.chatId, r.place, r.replyBy])).toEqual([["chat-mara", "builtin", T0 + 270_000]]);
     // A second reply can't be asked for while one is being written.
     expect(w.backend.startTurn("chat-mara")).toBe(false);
 
@@ -188,28 +209,89 @@ describe("a turn as the Live page sees it", () => {
     let state = follower.current;
     if (state.status !== "ready" || !state.view) throw new Error("no live view");
     expect(turnView(state.view).agents.map((a) => [a.start.role, a.state, a.activity?.waits])).toEqual([["main", "working", "model"]]);
+    expect(turnPhase(turnView(state.view))).toEqual({ at: "working", replyBy: T0 + 270_000 });
 
     await w.pass(3000);
     state = follower.current;
     if (state.status !== "ready" || !state.view) throw new Error("no live view");
-    // Its first answer called two tools, neither answered yet.
-    expect(turnView(state.view).agents[0]?.activity).toMatchObject({ waits: "tools", names: ["chat_search", "lore_search"] });
+    expect(turnView(state.view).agents[0]?.activity).toMatchObject({ waits: "tools", names: ["lore_search"] });
+
+    // Its brief handed over, nothing of LumiAH's is under way: Lumiverse writes, and the turn is recorded once the reply is saved.
+    await w.pass(4000);
+    state = follower.current;
+    if (state.status !== "ready" || !state.view) throw new Error("no live view");
+    expect(state.view.ended).toBeNull();
+    expect(turnPhase(turnView(state.view))).toEqual({ at: "writing" });
 
     await w.pass(20_000);
     state = follower.current;
     if (state.status !== "ready" || !state.view) throw new Error("no live view");
     const turn = turnView(state.view);
     expect(state.view.ended?.state).toBe("done");
-    expect(turn.agents.map((a) => [a.start.role, a.state])).toEqual([["main", "done"], ["writer", "done"]]);
+    expect(state.view.ended?.noPart).toBeUndefined();
+    expect(turn.agents.map((a) => [a.start.role, a.state])).toEqual([["main", "done"]]);
     expect(state.view.events.map((e) => e.seq)).toEqual(state.view.events.map((_, i) => i + 1));
-    expect(turnTotals(turn, 0).turn).toMatchObject({ calls: 3, in: 6020 + 6410 + 2380, toolCalls: 3, toolErrors: 0 });
-    expect(feedOf(turn, NO_FILTER)[1]?.items.some((i) => i.kind === "said" && i.text.includes("night key"))).toBe(true);
+    expect(turnTotals(turn, 0).turn).toMatchObject({ calls: 2, in: 6020 + 6410, toolCalls: 2, toolErrors: 0 });
+    // The lore the writer saw rides on write_reply's result: one entry added, one dropped, one it named refused.
+    const write = feedOf(turn, NO_FILTER)[0]?.items.find((i) => i.kind === "tool" && i.call.name === "write_reply");
+    expect(write?.kind === "tool" ? [write.lore?.added.map((e) => e.title), write.lore?.dropped.map((e) => e.title), write.lore?.refused.length] : null).toEqual([["The night key"], ["Joss"], 1]);
     // The state follows: nothing runs, and first-time setup's last step is done.
     expect(w.client.state.get()?.running).toEqual([]);
-    // Its record is kept: the chat's turns gain it, newest first.
+    // Its record is kept: the chat's turns gain it, newest first, and it says where it ran.
     const turns = await w.ask("lah.turns.list", { chatId: "chat-mara", cursor: null, limit: 1 });
-    expect(turns.turns[0]?.turn).toBe(state.view.turn);
-    expect(turns.total).toBe(7);
+    expect(turns.turns[0]).toMatchObject({ turn: state.view.turn, place: "builtin" });
+    expect(turns.total).toBe(8);
+    // And the first screen's read counts what it did.
+    expect((await w.ask("lah.home.get", { chatId: "chat-mara" })).last).toMatchObject({ turn: state.view.turn, place: "builtin", agents: 1, tools: 2, lore: { added: 1, dropped: 1 } });
+  });
+
+  test("built in, a turn still at work when the reply is due stops there, and the view says LumiAH had no part in the reply and why", async () => {
+    const w = world({ turn: "urgent" });
+    await w.hello();
+    const { follower } = await w.follow("chat-mara");
+    await w.pass(10_000);
+    let state = follower.current;
+    if (state.status !== "ready" || !state.view) throw new Error("no live view");
+    // Forty seconds for this turn, and its main agent reads on.
+    expect(state.view.replyBy).toBe(T0 + 400 + 40_000);
+    expect(state.view.ended).toBeNull();
+    await w.pass(35_000);
+    state = follower.current;
+    if (state.status !== "ready" || !state.view) throw new Error("no live view");
+    // The reply was due: its agent is stopped where it was, and Lumiverse writes from its prompt as it was.
+    const due = turnView(state.view);
+    expect(due.agents.map((a) => a.state)).toEqual(["stopped"]);
+    expect(turnPhase(due)).toEqual({ at: "writing" });
+    expect(feedOf(due, { ...NO_FILTER, problems: true })[0]?.items.map((i) => (i.kind === "stop" ? i.entry.code : i.kind))).toEqual(["reply_time", "notice"]);
+    await w.pass(10_000);
+    state = follower.current;
+    if (state.status !== "ready" || !state.view) throw new Error("no live view");
+    // The reply is saved and the turn recorded as any other, with why LumiAH had no part in it.
+    expect(state.view.ended).toMatchObject({ state: "done", noPart: { why: "time" } });
+    const turns = await w.ask("lah.turns.list", { chatId: "chat-mara", cursor: null, limit: 1 });
+    expect(turns.turns[0]?.noPart?.why).toBe("time");
+    expect((await w.ask("lah.home.get", { chatId: "chat-mara" })).last?.ended?.noPart?.text).toContain("ran out of the time");
+  });
+
+  test("in a runtime, LumiAH's own writer writes the reply, and the turn has no time to keep", async () => {
+    const w = world({ turn: "none" });
+    await w.hello();
+    const { follower } = await w.follow("chat-brann");
+    expect(w.backend.startTurn("chat-brann")).toBe(true);
+    await w.pass(3400);
+    let state = follower.current;
+    if (state.status !== "ready" || !state.view) throw new Error("no live view");
+    // Its first answer called two tools, neither answered yet.
+    expect(turnView(state.view).agents[0]?.activity).toMatchObject({ waits: "tools", names: ["chat_search", "lore_search"] });
+    expect(turnPhase(turnView(state.view))).toEqual({ at: "working", replyBy: null });
+    await w.pass(20_000);
+    state = follower.current;
+    if (state.status !== "ready" || !state.view) throw new Error("no live view");
+    const turn = turnView(state.view);
+    expect(state.view).toMatchObject({ place: "runtime", replyBy: null, ended: { state: "done" } });
+    expect(turn.agents.map((a) => [a.start.role, a.state])).toEqual([["main", "done"], ["writer", "done"]]);
+    expect(turnTotals(turn, 0).turn).toMatchObject({ calls: 3, in: 6020 + 6410 + 2380, toolCalls: 3, toolErrors: 0 });
+    expect(feedOf(turn, NO_FILTER)[1]?.items.some((i) => i.kind === "said" && i.text.includes("night key"))).toBe(true);
   });
 
   test("a push that never arrives leaves no hole: the page reads what it missed", async () => {
@@ -227,15 +309,16 @@ describe("a turn as the Live page sees it", () => {
   });
 
   test("a call's answer shows as it arrives, and its entry takes its place when it lands", async () => {
+    // A chat that runs in the runtime: there LumiAH's own writer writes the reply, so its text arrives as a call's answer does.
     const w = world({ turn: "none" });
-    const { follower } = await w.follow("chat-mara");
+    const { follower } = await w.follow("chat-brann");
     const viewNow = (): LiveView => {
       const state = follower.current;
       if (state.status !== "ready" || !state.view) throw new Error("no live view");
       return state.view;
     };
     const answers = (agentId: string) => viewNow().events.flatMap((e) => (e.event.kind === "agent_entry" && e.event.agentId === agentId && e.event.entry.kind === "answer" ? [e.event.entry] : []));
-    w.backend.startTurn("chat-mara");
+    w.backend.startTurn("chat-brann");
     // The main agent is told at 300 ms and its first call answers at 2,900: by 1,900 some of its thinking has come.
     await w.pass(1900);
     const early = turnView(viewNow());
@@ -293,7 +376,7 @@ describe("a turn as the Live page sees it", () => {
     const state = follower.current;
     if (state.status !== "ready" || !state.view) throw new Error("no live view");
     // What the page shows is what the backend holds: read afresh, the view says the same.
-    const fresh = await w.ask("lah.live.open", { chatId: "chat-mara" });
+    const fresh = await w.ask("lah.live.open", { stream: "chat-mara" });
     expect(state.view.partials).toEqual(fresh.live?.partials ?? []);
     expect(state.view.partials[0]?.reasoning.length).toBeGreaterThan(10);
   });
@@ -306,21 +389,195 @@ describe("a turn as the Live page sees it", () => {
     let state = follower.current;
     if (state.status !== "ready" || !state.view) throw new Error("no live view");
     const turn = state.view.turn;
-    expect(await w.ask("lah.turn.stop", { chatId: "chat-mara", turn })).toEqual({ stopped: true });
+    expect(await w.ask("lah.turn.stop", { stream: "chat-mara", turn })).toEqual({ stopped: true });
     await w.pass(30_000);
     state = follower.current;
     if (state.status !== "ready" || !state.view) throw new Error("no live view");
     expect(state.view.ended).toMatchObject({ state: "stopped", reason: "You stopped it from the live view." });
+    // Built in, a turn stopped before its brief had no part in the reply, and its view says so.
+    expect(state.view.ended?.noPart?.why).toBe("stopped");
     const stopped = turnView(state.view);
     expect(stopped.agents.map((a) => a.state)).toEqual(["cancelled"]);
-    expect(feedOf(stopped, { ...NO_FILTER, problems: true })[0]?.items.map((i) => i.kind)).toEqual(["stop"]);
-    expect(await w.ask("lah.turn.stop", { chatId: "chat-mara", turn })).toEqual({ stopped: false });
+    expect(feedOf(stopped, { ...NO_FILTER, problems: true })[0]?.items.map((i) => i.kind)).toEqual(["stop", "notice"]);
+    expect(await w.ask("lah.turn.stop", { stream: "chat-mara", turn })).toEqual({ stopped: false });
+    // Nothing of it is kept on the chat: the stored turns are as they were.
+    expect((await w.ask("lah.turns.list", { chatId: "chat-mara", cursor: null, limit: 1 })).total).toBe(7);
   });
 
   test("a chat LumiAH doesn't answer has no turn to play", async () => {
     const w = world({ turn: "none" });
     expect(w.backend.startTurn("chat-ilse")).toBe(false);
-    expect((await w.ask("lah.live.open", { chatId: "chat-ilse" })).live).toBeNull();
+    expect((await w.ask("lah.live.open", { stream: "chat-ilse" })).live).toBeNull();
+  });
+});
+
+describe("what the user does to a run that works", () => {
+  /** A page watching the made-up turn whose archivist's workspace write is held, the clock turned to where it is. `chatId`: the open chat, which runs built in, or one that runs in the runtime. */
+  const heldTurn = async (chatId = "chat-mara") => {
+    const w = world({ turn: "none" });
+    await w.hello();
+    const { follower } = await w.follow(chatId);
+    expect(w.backend.startTurn(chatId, workingTurn(w.backend.placeOf(chatId)))).toBe(true);
+    await w.pass(8000);
+    const state = follower.current;
+    if (state.status !== "ready" || !state.view) throw new Error("no live view");
+    return { w, follower, turn: state.view.turn };
+  };
+  const entries = (view: LiveView | null): string[] => (view?.events ?? []).flatMap((e) => (e.event.kind === "agent_entry" ? [e.event.entry.kind] : []));
+  const viewOf = (follower: LiveFollower): LiveView => {
+    const state = follower.current;
+    if (state.status !== "ready" || !state.view) throw new Error("no live view");
+    return state.view;
+  };
+
+  test("a held tool call reaches every page in the state, and the run waits for the user's word", async () => {
+    const { w, follower } = await heldTurn();
+    const [held] = w.client.state.get()?.approvals ?? [];
+    expect(held).toMatchObject({ stream: "chat-mara", chatId: "chat-mara", role: "archivist", tool: "workspace_write", tier: "write" });
+    expect(entries(viewOf(follower)).at(-1)).toBe("approval_asked");
+    // Nothing moves while it waits, however long (short of its bound).
+    const before = viewOf(follower).events.length;
+    await w.pass(60_000);
+    expect(viewOf(follower).events.length).toBe(before);
+    expect(turnView(viewOf(follower)).agents.find((a) => a.start.role === "archivist")?.activity).toMatchObject({ waits: "word", tool: "workspace_write" });
+  });
+
+  test("approved, the call runs, changes its file, and the turn goes on to its end", async () => {
+    const { w, follower } = await heldTurn();
+    const id = w.client.state.get()?.approvals[0]?.id ?? "";
+    expect(await w.ask("lah.approval.answer", { id, answer: { decision: "once" } })).toEqual({ answered: true });
+    expect(w.client.state.get()?.approvals).toEqual([]);
+    await w.pass(30_000);
+    const view = viewOf(follower);
+    expect(view.ended?.state).toBe("done");
+    const tools = feedOf(turnView(view), NO_FILTER).flatMap((f) => f.items.flatMap((i) => (i.kind === "tool" ? [i] : [])));
+    const write = tools.find((t) => t.call.name === "workspace_write");
+    expect(write?.word?.ended?.decision).toBe("once");
+    expect(write?.files.map((f) => f.path)).toEqual(["notes/ledger.md"]);
+    // Answered twice, the second finds nothing waiting.
+    expect(await w.ask("lah.approval.answer", { id, answer: { decision: "once" } })).toEqual({ answered: false });
+  });
+
+  test("refused, the agent is told why and the turn goes on without the write", async () => {
+    const { w, follower } = await heldTurn();
+    const id = w.client.state.get()?.approvals[0]?.id ?? "";
+    await w.ask("lah.approval.answer", { id, answer: { decision: "refused", reason: "Not while Brann is in the room." } });
+    await w.pass(30_000);
+    const view = viewOf(follower);
+    const result = view.events.flatMap((e) => (e.event.kind === "agent_entry" && e.event.entry.kind === "result" && e.event.entry.name === "workspace_write" ? [e.event.entry] : []))[0];
+    expect(result).toMatchObject({ error: true, text: expect.stringContaining("Not while Brann is in the room.") });
+    expect(result?.files).toBeUndefined();
+    expect(view.ended?.state).toBe("done");
+  });
+
+  test("unanswered, the wait runs out: the call is refused and the state stops asking", async () => {
+    // In a runtime a held call may wait its full five minutes; built in, the reply is due before that.
+    const { w, follower } = await heldTurn("chat-brann");
+    await w.pass(5 * 60_000);
+    expect(w.client.state.get()?.approvals).toEqual([]);
+    const worded = viewOf(follower).events.flatMap((e) => (e.event.kind === "agent_entry" && e.event.entry.kind === "approval" ? [e.event.entry.decision] : []));
+    expect(worded).toEqual(["timed_out"]);
+  });
+
+  test("built in, a call still held when the reply is due is let go with its turn's work", async () => {
+    const { w, follower } = await heldTurn();
+    await w.pass(270_000);
+    expect(w.client.state.get()?.approvals).toEqual([]);
+    expect(turnView(viewOf(follower)).agents.map((a) => a.state)).toEqual(["stopped", "stopped"]);
+    await w.pass(10_000);
+    expect(viewOf(follower).ended).toMatchObject({ state: "done", noPart: { why: "time" } });
+  });
+
+  test("stopping the turn takes its held call down", async () => {
+    const { w, follower, turn } = await heldTurn();
+    expect(await w.ask("lah.turn.stop", { stream: "chat-mara", turn })).toEqual({ stopped: true });
+    expect(w.client.state.get()?.approvals).toEqual([]);
+    expect(viewOf(follower).ended?.state).toBe("stopped");
+    // A held call whose turn is stopped ends with its agent's stop: no word was given on it.
+    expect(entries(viewOf(follower))).not.toContain("approval");
+  });
+
+  test("what the user says reaches the main agent at its next round, as theirs", async () => {
+    const w = world({ turn: "none" });
+    await w.hello();
+    const { follower } = await w.follow("chat-mara");
+    w.backend.startTurn("chat-mara");
+    await w.pass(1000);
+    const turn = viewOf(follower).turn;
+    expect(await w.ask("lah.turn.say", { stream: "chat-mara", turn, text: "Ilse should not open the back room." })).toEqual({ said: true });
+    await w.pass(3000);
+    const notes = viewOf(follower).events.flatMap((e) => (e.event.kind === "agent_entry" && e.event.entry.kind === "note" ? [[e.event.agentId, e.event.entry.text]] : []));
+    expect(notes).toEqual([["main-1", "Ilse should not open the back room."]]);
+    await w.pass(60_000);
+    expect(await w.ask("lah.turn.say", { stream: "chat-mara", turn, text: "Too late." })).toEqual({ said: false });
+  });
+
+  test("paused, a turn stands still and the state says so; let go, it goes on to its end", async () => {
+    const w = world({ turn: "none" });
+    await w.hello();
+    const { follower } = await w.follow("chat-mara");
+    w.backend.startTurn("chat-mara");
+    await w.pass(1000);
+    const turn = viewOf(follower).turn;
+    expect(await w.ask("lah.turn.pause", { stream: "chat-mara", turn, on: true })).toEqual({ paused: true });
+    expect(w.client.state.get()?.running[0]?.paused).toBe(true);
+    expect(turnView(viewOf(follower)).paused).toBe(true);
+    // What it had started finishes; nothing new starts.
+    await w.pass(120_000);
+    const stood = viewOf(follower).events.length;
+    await w.pass(120_000);
+    expect(viewOf(follower).events.length).toBe(stood);
+    expect(viewOf(follower).ended).toBeNull();
+    expect(await w.ask("lah.turn.pause", { stream: "chat-mara", turn, on: false })).toEqual({ paused: false });
+    expect(w.client.state.get()?.running[0]?.paused).toBe(false);
+    await w.pass(120_000);
+    expect(viewOf(follower).ended?.state).toBe("done");
+    expect(viewOf(follower).events.flatMap((e) => (e.event.kind === "turn_paused" || e.event.kind === "turn_resumed" ? [e.event.kind] : []))).toEqual(["turn_paused", "turn_resumed"]);
+  });
+});
+
+describe("a conversation with an agent", () => {
+  test("saying something starts a turn under the conversation's own id, which ends with an answer and a transcript", async () => {
+    const w = world({ turn: "none" });
+    await w.hello();
+    const { session } = await w.ask("lah.side.start", { agent: "archivist", chatId: "chat-mara" });
+    expect(session).toMatchObject({ agent: "archivist", agentName: "Archivist", chatId: "chat-mara", turns: 0 });
+    const { follower } = await w.follow(session.id);
+    const sent = await w.ask("lah.side.send", { session: session.id, text: "What do we know of Okoro?" });
+    expect(sent.session).toMatchObject({ title: "What do we know of Okoro?", turns: 1 });
+    await w.pass(500);
+    expect(w.client.state.get()?.running).toMatchObject([{ stream: session.id, kind: "side", chatId: "chat-mara", turn: sent.turn }]);
+    // While it works a second message is refused in words, not queued.
+    expect(await outcome(w.ask("lah.side.send", { session: session.id, text: "And Ilse?" }))).toMatchObject({ code: "unavailable" });
+    expect((await w.ask("lah.side.turns", { session: session.id, cursor: null, limit: 10 })).turns).toMatchObject([{ turn: sent.turn, state: "running", answer: null, transcript: null }]);
+    await w.pass(30_000);
+    const state = follower.current;
+    if (state.status !== "ready" || !state.view) throw new Error("no live view");
+    expect(state.view).toMatchObject({ stream: session.id, kind: "side", chatId: "chat-mara", messageId: null });
+    expect(state.view.ended?.state).toBe("done");
+    expect(w.client.state.get()?.running).toEqual([]);
+    const [turn] = (await w.ask("lah.side.turns", { session: session.id, cursor: null, limit: 10 })).turns;
+    expect(turn).toMatchObject({ state: "done", answer: expect.stringContaining("Okoro audits the ledgers") });
+    // Its work is kept as a transcript of its own, read like a reply's.
+    const read = await w.ask("lah.transcript.get", { transcript: turn?.transcript ?? "", from: 1 });
+    expect(read.view).toMatchObject({ stream: session.id, kind: "side" });
+    // Nothing of it is a reply in the chat.
+    expect((await w.ask("lah.turns.list", { chatId: "chat-mara", cursor: null, limit: 50 })).turns.some((t) => t.turn === sent.turn)).toBe(false);
+  });
+
+  test("a conversation is listed with the latest first, and is gone once deleted", async () => {
+    const w = world();
+    const before = (await w.ask("lah.side.list", {})).sessions;
+    expect(before.map((s) => s.id)).toEqual(["side-notes", "side-plain"]);
+    const { session } = await w.ask("lah.side.start", { agent: "main", chatId: null });
+    expect((await w.ask("lah.side.list", {})).sessions[0]?.id).toBe(session.id);
+    expect(await outcome(w.ask("lah.side.start", { agent: "nobody", chatId: null }))).toMatchObject({ code: "not_found" });
+    expect(await w.ask("lah.side.remove", { session: session.id })).toEqual({ removed: true });
+    expect(await outcome(w.ask("lah.side.turns", { session: session.id, cursor: null, limit: 10 }))).toMatchObject({ code: "not_found" });
+    // The conversation that was there when the preview opened has its turns to read, each with its work.
+    const kept = (await w.ask("lah.side.turns", { session: "side-notes", cursor: null, limit: 10 })).turns;
+    expect(kept.map((t) => t.said)).toEqual(["And what do we know of Okoro?", "What do the notes say about the ledger?"]);
+    expect((await w.ask("lah.transcript.get", { transcript: kept[0]?.transcript ?? "", from: 1 })).view.kind).toBe("side");
   });
 });
 
@@ -362,44 +619,96 @@ describe("settings and texts as the Settings page keeps them", () => {
 });
 
 describe("first-time setup, from nothing to a reply", () => {
-  test("each step is done by what the user does, in the state every page holds", async () => {
+  test("built in needs only the permissions and the switch: each step is done by what the user does, in the state every page holds", async () => {
     const w = world({ scenario: "fresh", turn: "none" });
     await w.hello();
-    const done = (): string[] => (w.client.state.get()?.setup.steps ?? []).filter((s) => s.done).map((s) => s.id);
+    const state = () => {
+      const held = w.client.state.get();
+      if (held === null) throw new Error("the page holds no state");
+      return held;
+    };
+    const done = (): string[] => state().setup.steps.filter((s) => s.done).map((s) => s.id);
+    expect(state().setup.steps.map((s) => s.id)).toEqual(["permissions", "chat", "reply"]);
     expect(done()).toEqual([]);
-    // No loopback connection yet: a chat can't be pinned to it.
-    expect(await outcome(w.ask("lah.chat.set", { chatId: "chat-ilse", on: true }))).toMatchObject({ code: "unavailable" });
+    expect(state().permissions.filter((p) => p.needed).length).toBeGreaterThan(0);
+    // Nothing granted yet: the switch is refused in words that say what to do first.
+    expect(await outcome(w.ask("lah.chat.set", { chatId: "chat-ilse", on: true }))).toMatchObject({ code: "unavailable", message: expect.stringContaining("Allow it on Home") });
+
+    // Granting some of what it needs isn't enough; granting all of it is the first step.
+    w.backend.grant(["generation"]);
+    await w.pass(0);
+    expect(done()).toEqual([]);
+    w.backend.grant(state().permissions.map((p) => p.id));
+    await w.pass(0);
+    expect(state().permissions).toEqual([]);
+    expect(done()).toEqual(["permissions"]);
+
+    // Switched on, the chat runs built in on its own connection: no runtime, key or connection was asked for.
+    const { chat } = await w.ask("lah.chat.set", { chatId: "chat-ilse", on: true });
+    expect(chat).toMatchObject({ on: true, place: "builtin", connection: { loopback: false } });
+    expect(state().chats.map((c) => c.chatId)).toEqual(["chat-ilse"]);
+    expect(state().runtime).toMatchObject({ relays: [], ready: false });
+    expect(state().key.set).toBe(false);
+    expect(done()).toEqual(["permissions", "chat"]);
+
+    // Its turn has a time before the reply, which the state says while it runs.
+    expect(w.backend.startTurn("chat-ilse")).toBe(true);
+    await w.pass(500);
+    const running = state().running.find((r) => r.chatId === "chat-ilse");
+    expect(running).toMatchObject({ place: "builtin" });
+    expect(running?.replyBy).toBeGreaterThan(running?.startedAt ?? Number.POSITIVE_INFINITY);
+    await w.pass(60_000);
+    expect(done()).toEqual(["permissions", "chat", "reply"]);
+
+    // Switched off, the chat leaves the list, and remembers where it ran.
+    const off = await w.ask("lah.chat.set", { chatId: "chat-ilse", on: false });
+    expect(off.chat).toMatchObject({ on: false, since: null, place: "builtin", connection: { loopback: false } });
+    expect(state().chats).toEqual([]);
+  });
+
+  test("a runtime is an option: a chat can be set to run in one only once it is linked, keyed and connected", async () => {
+    const w = world({ scenario: "fresh", turn: "none" });
+    await w.hello();
+    const state = () => {
+      const held = w.client.state.get();
+      if (held === null) throw new Error("the page holds no state");
+      return held;
+    };
+    w.backend.grant(state().permissions.map((p) => p.id));
+    await w.pass(0);
+    await w.ask("lah.chat.set", { chatId: "chat-ilse", on: true });
+    // No runtime yet: the choice is refused in words that say both ways out, and the chat stays as it was.
+    expect(await outcome(w.ask("lah.chat.set", { chatId: "chat-ilse", on: true, place: "runtime" }))).toMatchObject({ code: "unavailable", message: expect.stringContaining("run the chat built in") });
+    expect(state().chats[0]).toMatchObject({ place: "builtin" });
 
     // A key minted before a runtime links is shown, but nothing could put it in a connection.
     const early = await w.ask("lah.key", { op: "mint" });
     expect(early.key).toStartWith("lah_");
     expect(early.connection).toBeNull();
-    expect(done()).toEqual(["key"]);
-
     w.backend.linkRuntime();
     await w.pass(0);
-    expect(done()).toEqual(["runtime", "key"]);
+    expect(state().runtime.ready).toBe(false);
 
-    // Minted with a runtime linked, the key goes into the loopback connection, which is made.
+    // Minted with a runtime linked, the key goes into the loopback connection, which is made: a runtime is there to choose.
     const minted = await w.ask("lah.key", { op: "mint" });
     expect(minted.key).not.toBe(early.key);
     expect(minted.connection).toEqual({ id: "conn-loopback", name: "LumiAH loopback" });
-    expect(w.client.state.get()?.key).toMatchObject({ set: true });
-    expect(done()).toEqual(["runtime", "key", "connection"]);
+    expect(state().runtime.ready).toBe(true);
 
-    const { chat } = await w.ask("lah.chat.set", { chatId: "chat-ilse", on: true });
-    expect(chat).toMatchObject({ on: true, connection: { loopback: true } });
-    expect(w.client.state.get()?.chats.map((c) => c.chatId)).toEqual(["chat-ilse"]);
-    expect(done()).toEqual(["runtime", "key", "connection", "chat"]);
-
+    // Chosen, the chat is pinned to the loopback and keeps the moment it was switched on; back built in, it has its own connection again.
+    const since = state().chats[0]?.since;
+    const moved = await w.ask("lah.chat.set", { chatId: "chat-ilse", on: true, place: "runtime" });
+    expect(moved.chat).toMatchObject({ on: true, place: "runtime", since, connection: { loopback: true } });
     expect(w.backend.startTurn("chat-ilse")).toBe(true);
+    await w.pass(500);
+    expect(state().running.find((r) => r.chatId === "chat-ilse")).toMatchObject({ place: "runtime", replyBy: null });
     await w.pass(60_000);
-    expect(done()).toEqual(["runtime", "key", "connection", "chat", "reply"]);
+    const back = await w.ask("lah.chat.set", { chatId: "chat-ilse", on: true, place: "builtin" });
+    expect(back.chat).toMatchObject({ place: "builtin", connection: { loopback: false } });
 
-    // Switched off, the chat goes back to the connection it had and leaves the list.
-    const off = await w.ask("lah.chat.set", { chatId: "chat-ilse", on: false });
-    expect(off.chat).toMatchObject({ on: false, connection: { loopback: false } });
-    expect(w.client.state.get()?.chats).toEqual([]);
+    // The key forgotten, no runtime is there to choose any more.
+    await w.ask("lah.key", { op: "forget" });
+    expect(state().runtime.ready).toBe(false);
   });
 
   test("forgetting the key leaves none, and says so to every page", async () => {
@@ -438,11 +747,27 @@ describe("a compaction on the Sessions page", () => {
     const w = world();
     const one = await w.ask("lah.turns.list", { chatId: "chat-mara", cursor: null, limit: 4 });
     expect(one.turns.map((t) => t.index)).toEqual([43, 41, 39, 37]);
-    expect(one.total).toBe(6);
+    expect(one.total).toBe(7);
     const two = await w.ask("lah.turns.list", { chatId: "chat-mara", cursor: one.next, limit: 4 });
-    expect(two.turns.map((t) => t.index)).toEqual([35, 31]);
+    expect(two.turns.map((t) => t.index)).toEqual([35, 33, 31]);
+    // Each says where it ran, and the one LumiAH had no part in says so and why.
+    expect(one.turns.map((t) => t.place)).toEqual(["builtin", "builtin", "runtime", "runtime"]);
+    expect(two.turns.map((t) => t.noPart?.why)).toEqual([undefined, "time", undefined]);
     expect(two.next).toBeNull();
     // A turn whose transcript wasn't kept says so by having none to open.
     expect(two.turns[0]?.transcript).toBeNull();
+  });
+});
+
+describe("asking for a summary", () => {
+  test("the session says the user asked, from then on; a chat with no session is refused", async () => {
+    const w = world();
+    const before = await w.ask("lah.turns.list", { chatId: "chat-mara", cursor: null, limit: 5 });
+    expect(before.session.asked ?? null).toBeNull();
+    const { session } = await w.ask("lah.session.summarize", { chatId: "chat-mara" });
+    expect(typeof session.asked).toBe("number");
+    const after = await w.ask("lah.turns.list", { chatId: "chat-mara", cursor: null, limit: 5 });
+    expect(after.session.asked).toBe(session.asked);
+    expect(await outcome(w.ask("lah.session.summarize", { chatId: "chat-nobody" }))).toMatchObject({ code: "not_found" });
   });
 });

@@ -8,7 +8,7 @@ import { errorWords, useApp } from "./app";
 import { Badge, Button, CopyButton, Disclosure, Empty, Section } from "./components";
 import { clock, compact, count, counted, duration, money } from "./format";
 import { Icon } from "./icons";
-import { AGENT_STATE_WORDS, type AgentTotals, type CallRow, costWords, roleLabel, type Totals, totalCostWords, type TurnTotals, type TurnView } from "./live-model";
+import { AGENT_STATE_WORDS, type AgentTotals, type CallRow, costWords, heldLine, roleLabel, type Totals, totalCostWords, type TurnTotals, type TurnView } from "./live-model";
 import { type Folds, TextBlock } from "./feed-parts";
 
 // ---------------------------------------------------------------- the exact prompt
@@ -331,17 +331,38 @@ function eventWords(e: TraceEvent): string {
       return `${e.generation}${e.messageId ? ` → message ${e.messageId}` : ""}`;
     case "session":
       return `${counted(e.session.turns, "turn")}, ≈${count(e.session.tokens)} tokens${e.session.summary ? ", after a summary" : ""}`;
+    case "prompt_held":
+      return heldLine(e);
     case "agent_started":
       return `${e.agent.role} (${e.agent.id})${e.agent.parent ? `, started by ${e.agent.parent}` : ""}`;
     case "agent_entry": {
       const x = e.entry;
-      const what = x.kind === "answer" ? `answer, ${counted(x.calls.length, "tool call")}, ${x.finishReason || "stop"}` : x.kind === "result" ? `result of ${x.name}${x.error ? " (failed)" : ""}` : x.kind === "stop" ? `stop: ${x.code}` : x.kind === "tools_refused" ? "native tools refused" : x.kind === "retry" ? `call failed, try ${x.attempt} of ${x.of}` : "message";
-      return `${e.agentId} · ${what}`;
+      const WHAT: Readonly<Record<typeof x.kind, () => string>> = {
+        message: () => "message",
+        notice: () => "a word from the runtime",
+        note: () => "a note from the user",
+        answer: () => (x.kind === "answer" ? `answer, ${counted(x.calls.length, "tool call")}, ${x.finishReason || "stop"}` : ""),
+        result: () => (x.kind === "result" ? `result of ${x.name}${x.error ? " (failed)" : ""}${x.files && x.files.length > 0 ? `, ${counted(x.files.length, "file")} changed` : ""}` : ""),
+        stop: () => (x.kind === "stop" ? `stop: ${x.code}` : ""),
+        tools_refused: () => "native tools refused",
+        retry: () => (x.kind === "retry" ? `call failed, try ${x.attempt} of ${x.of}` : ""),
+        approval_asked: () => (x.kind === "approval_asked" ? `${x.tool} held for the user's word` : ""),
+        approval: () => (x.kind === "approval" ? `held call ${x.decision.replace("_", " ")}` : ""),
+      };
+      return `${e.agentId} · ${WHAT[x.kind]()}`;
     }
     case "usage":
       return `${e.agentId} · ${count(e.call.in)} in · ${count(e.call.out)} out`;
     case "agent_idle":
       return `${e.agentId} finished its message`;
+    case "turn_paused":
+      return "the user paused the run";
+    case "turn_resumed":
+      return "the user let the run go on";
+    case "job":
+      return `job ${e.job.id} as ${e.job.agent}, ${e.job.when === "now" ? "now" : "after the reply"}`;
+    case "notice":
+      return e.text;
     case "turn_ended":
       return `${e.status}${e.reason ? `: ${e.reason}` : ""}`;
   }

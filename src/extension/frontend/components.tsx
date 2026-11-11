@@ -39,6 +39,17 @@ export function useBusy(): [boolean, (run: () => Promise<unknown>) => void] {
   ];
 }
 
+/** The time, read again every `ms` while the component shows: for what counts up or down on its own. */
+export function useTick(ms: number): number {
+  const app = useApp();
+  const [now, setNow] = useState(() => app.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(app.now()), ms);
+    return () => clearInterval(timer);
+  }, [ms]);
+  return now;
+}
+
 // A modifier on any of these is a class of LumiAH's own, `lah-is-…`: a bare "primary" or "warn" is
 // what another extension's stylesheet, or a user's custom CSS, may well be written to catch.
 export function Button(props: { variant?: "primary" | "secondary" | "ghost" | "danger"; size?: "md" | "sm"; icon?: IconName; block?: boolean; disabled?: boolean; busy?: boolean; label?: string; pressed?: boolean; expanded?: boolean; onClick?(): void; children?: ComponentChildren }) {
@@ -374,6 +385,26 @@ export function TextArea(props: { id?: string; value: string; label?: string; ro
       onBlur={() => {
         if (text !== props.value) props.onCommit(text);
       }}
+    />
+  );
+}
+
+/** Text of several lines that says each change as it is typed (a file being edited, a message being written), where `TextArea` commits on blur. Set in the code face like every text box here; `prose` sets it in the page's own, for a message. */
+export function Editor(props: { id?: string; value: string; label: string; rows?: number; placeholder?: string; prose?: boolean; disabled?: boolean; invalid?: boolean; onInput(value: string): void; onKeyDown?(event: KeyboardEvent): void }) {
+  const classes = ["lah-input", props.prose ? "lah-is-prose" : null, props.invalid ? "lah-is-invalid" : null].filter((c) => c !== null).join(" ");
+  return (
+    <textarea
+      id={props.id}
+      class={classes}
+      value={props.value}
+      rows={props.rows ?? 4}
+      spellcheck={false}
+      aria-label={props.label}
+      aria-invalid={props.invalid || undefined}
+      placeholder={props.placeholder}
+      disabled={props.disabled}
+      onInput={(event) => props.onInput(event.currentTarget.value)}
+      onKeyDown={props.onKeyDown}
     />
   );
 }

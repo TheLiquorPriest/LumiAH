@@ -35,6 +35,8 @@ interface Stream {
   /** When it started. */
   at: number;
   ended: boolean;
+  /** It waits on a person (a tool call held for the user's word), so silence isn't a stall: only the extension out of reach, or no longer holding it, ends it. */
+  patient: boolean;
 }
 
 export interface StreamsEnv {
@@ -77,9 +79,9 @@ export class Streams {
    * under it (the extension takes a stream's start once, so a second is answered as the first), until
    * it is answered or the extension has been out of reach for `lostMs`.
    */
-  start(id: string, reader: StreamReader, send: () => Promise<unknown>): void {
+  start(id: string, reader: StreamReader, send: () => Promise<unknown>, patient = false): void {
     const now = this.env.now();
-    const stream: Stream = { id, reader, receiver: new StreamReceiver(), started: Promise.resolve(false), begun: false, heard: now, gap: null, at: now, ended: false };
+    const stream: Stream = { id, reader, receiver: new StreamReceiver(), started: Promise.resolve(false), begun: false, heard: now, gap: null, at: now, ended: false, patient };
     this.streams.set(id, stream);
     const run = async (): Promise<boolean> => {
       const first = this.env.now();
@@ -182,7 +184,7 @@ export class Streams {
         }
         this.askAgain(stream);
       }
-      if (out === null && now - stream.heard >= tuning.stallMs) this.end(stream, { message: `LumiAH sent nothing for this call in ${Math.round(tuning.stallMs / 60_000)} minutes, so the runtime gave it up. Press Retry.`, code: "stalled" }, true);
+      if (out === null && !stream.patient && now - stream.heard >= tuning.stallMs) this.end(stream, { message: `LumiAH sent nothing for this call in ${Math.round(tuning.stallMs / 60_000)} minutes, so the runtime gave it up. Press Retry.`, code: "stalled" }, true);
     }
   }
 

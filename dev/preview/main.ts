@@ -1,16 +1,21 @@
 // The preview's boot: a mock host and a mock backend, then the real frontend `setup`.
-// http://127.0.0.1:7895/?page=live|sessions|settings|runtime
-//   &scenario=ready|fresh|trouble   set up and linked (default); first-time setup; a runtime gone quiet and one refused
-//   &turn=done|failed|long|running|none   the open chat's live turn (default done); `running` starts one as the page opens
-//   &chat=chat-mara|chat-brann|chat-okoro|chat-ilse|none   the chat open in the host (chat-ilse: one LumiAH doesn't answer)
+// http://127.0.0.1:7895/?page=<a page's id: home (default), live, sessions, jobs, talk, lore, chronicle, workspace, guidance, agents, skills, tools, settings, spend, upkeep, runtime>
+//   &scenario=ready|fresh|trouble   set up, with one chat built in and one in a linked runtime (default); a new install with nothing
+//        granted or switched on; a permission missing, a runtime gone quiet and one refused
+//   &grant=none   this Lumiverse has no way for a page to ask for permissions: Home says where to grant them by hand
+//   &turn=done|failed|long|worked|running|working|nopart|urgent|none   the open chat's live turn (default done): `worked` has sub-agents,
+//        workspace writes, an approval and a job in it; `running` starts one as the page opens; `working` starts one that holds a tool call
+//        for your word; `nopart` is a reply LumiAH had no part in (its time ran out); `urgent` starts one with forty seconds before the reply
+//   &chat=chat-mara|chat-brann|chat-okoro|chat-ilse|chat-joss|none   the chat open in the host (chat-ilse: one LumiAH doesn't answer; chat-joss: one another extension answers)
 //   &settings=real|sample   LumiAH's own settings and texts (default), or a small made-up section using every kind of control
 //   &drawer=wide|default|<px>   the drawer's width on a desktop: as wide as the host lets it go (default), the host's 420 px, or a width
 //   &theme=dark|light   &pointer=coarse|fine   &delay=<ms an answer takes, default 120>   &fail=<request types that fail, comma-separated>
 //   &open=<a turn's index>   Sessions opens that turn   &section=<a settings path or a nav key>   Settings opens that section
 // `window.__lah` holds the backend, the host and the app's teardown, to drive from the console.
 
+import { groupOf, PAGES } from "../../src/extension/frontend/app";
 import { setup } from "../../src/extension/frontend/setup";
-import { CHATS, OTHER_CHAT } from "./fixtures";
+import { CHATS, OTHER_CHAT, THEIR_CHAT, workingTurn } from "./fixtures";
 import { MockBackend, type Scenario } from "./mock-backend";
 import { createMockHost } from "./mock-host";
 import { realSettings, sampleSettings } from "./sections";
@@ -53,10 +58,11 @@ const chatParam = params.get("chat");
 const chatId = chatParam === "none" ? null : (chatParam ?? "chat-mara");
 const settled = params.get("settings") === "sample" ? sampleSettings() : realSettings();
 const delay = Number(params.get("delay") ?? "120");
-const host = createMockHost({ drawerOpen: params.get("drawerOpen") !== "false", chatId });
+const host = createMockHost({ drawerOpen: params.get("drawerOpen") !== "false", chatId, canGrant: params.get("grant") !== "none" });
 const backend = new MockBackend((payload) => host.deliver(payload), {
   scenario,
-  turn: pick("turn", ["done", "failed", "long", "running", "none"] as const, "done"),
+  turn: pick("turn", ["done", "failed", "long", "worked", "running", "working", "nopart", "urgent", "none"] as const, "done"),
+  showcase: params.get("showcase") === "1",
   sections: settled.sections,
   texts: settled.texts,
   delay: Number.isFinite(delay) && delay >= 0 ? delay : 120,
@@ -67,13 +73,15 @@ const backend = new MockBackend((payload) => host.deliver(payload), {
     const timer = setTimeout(fn, ms);
     return () => clearTimeout(timer);
   },
+  closeDrawer: () => host.setDrawer(false),
 });
 host.onSend = (payload) => backend.receive(payload);
+host.onGrant = (permissions) => backend.grant(permissions);
 const teardown = setup(host.ctx);
 
 // ---------------------------------------------------------------- the host page's own parts
 
-const chats = [...CHATS, OTHER_CHAT];
+const chats = [...CHATS, OTHER_CHAT, THEIR_CHAT];
 const names = new Map(chats.map((c) => [c.chatId, c.name ?? c.chatId]));
 const messages = document.getElementById("messages") as HTMLElement;
 const say = (who: string, text: string, user = false): void => {
@@ -101,12 +109,14 @@ picker.addEventListener("change", () => {
 });
 (document.getElementById("chat-name") as HTMLElement).textContent = chatId === null ? "No chat" : (names.get(chatId) ?? chatId);
 
-// Send: a reply is asked for in the open chat, and its turn plays in Live.
-(document.getElementById("send") as HTMLElement).addEventListener("click", () => {
+// Send: a reply is asked for in the open chat, and its turn plays in Live. The second button's turn has a sub-agent whose workspace write is held for the user's word.
+const sendTurn = (said: string, held: boolean): void => {
   if (open === null) return;
-  say("Mara", "I knock at Ilse's door.", true);
-  if (!backend.startTurn(open)) say("Host", "LumiAH doesn't answer this chat, or a reply of it is being written already.");
-});
+  say("Mara", said, true);
+  if (!(held ? backend.startTurn(open, workingTurn(backend.placeOf(open))) : backend.startTurn(open))) say("Host", "LumiAH doesn't answer this chat, or a reply of it is being written already.");
+};
+(document.getElementById("send") as HTMLElement).addEventListener("click", () => sendTurn("I knock at Ilse's door.", false));
+(document.getElementById("send-held") as HTMLElement).addEventListener("click", () => sendTurn("I tell Ilse what Joss said.", true));
 
 const reload = (change: (next: URLSearchParams) => void): void => {
   const next = new URLSearchParams(location.search);
@@ -133,12 +143,31 @@ const press = (selector: string): boolean => {
 const pressWhenThere = (selector: string, tries = 60): void => {
   if (!press(selector) && tries > 0) setTimeout(() => pressWhenThere(selector, tries - 1), 50);
 };
-const page = pick("page", ["live", "sessions", "settings", "runtime"] as const, "live");
-if (page !== "live") pressWhenThere(`[data-lah-tab="${page}"]`);
+const page = pick(
+  "page",
+  PAGES.map((p) => p.id),
+  "home",
+);
+if (page !== "home") {
+  // The page bar shows the pages of one group at a time: the group first, then the page.
+  pressWhenThere(`[data-lah-group="${groupOf(page)}"]`);
+  pressWhenThere(`[data-lah-tab="${page}"]`);
+}
 const turnToOpen = params.get("open");
 if (page === "sessions" && turnToOpen) pressWhenThere(`[data-lah-turnrow$="${turnToOpen}"] > .lah-navrow`);
 const section = params.get("section");
-if (page === "settings" && section) pressWhenThere(`[data-lah-nav="${section}"]`);
+if (page === "settings" && section) {
+  // The full list is folded under its headings until asked for: they open first, so the section's row is there to press.
+  const openThenPress = (tries = 60): void => {
+    if (document.querySelector("details.lah-navfold") === null) {
+      if (tries > 0) setTimeout(() => openThenPress(tries - 1), 50);
+      return;
+    }
+    for (const fold of document.querySelectorAll<HTMLElement>("details.lah-navfold:not([open]) > summary")) fold.click();
+    pressWhenThere(`[data-lah-nav="${section}"]`);
+  };
+  openThenPress();
+}
 
 declare global {
   interface Window {

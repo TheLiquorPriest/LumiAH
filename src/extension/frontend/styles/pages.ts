@@ -68,14 +68,14 @@ export const PAGES_CSS = `
 .lah-facts>li::before{content:"·";flex:none;color:var(--lah-dim)}
 .lah-facts>li>span{min-width:0}
 .lah-chatrow{display:flex;flex-direction:column;gap:var(--lah-s1);padding:var(--lah-s3);border-top:1px solid var(--lah-hairline);min-width:0}
-.lah-chatrow:first-child{border-top:0}
-.lah-chatrow-sub{font-size:var(--lah-fs-sm);color:var(--lah-muted);overflow-wrap:anywhere}
+/* Under .lah so it outweighs the reset that takes a list's padding away: without it the list's dots sat on the card's edge. */
+.lah .lah-runtime-places{padding:var(--lah-s3)}
 .lah-ol{display:flex;flex-direction:column;gap:var(--lah-s2);padding-left:1.4em;list-style:decimal;min-width:0}
 .lah .lah-ol{list-style:decimal;padding-left:1.4em}
 .lah-ol>li{min-width:0;overflow-wrap:anywhere}
 @container lah (min-width:${WIDE_MIN_PX}px){
 .lah-runtime{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start;gap:var(--lah-s4)}
-.lah-runtime>.lah-runtime-wide{grid-column:1 / -1}
+.lah-runtime>.lah-runtime-wide,.lah-runtime[data-lah-runtime=none]>.lah-runtime-col{grid-column:1 / -1}
 .lah-set-row{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.1fr);gap:var(--lah-s1) var(--lah-s4);align-items:start}
 .lah-set-row>.lah-set-about{grid-column:1;display:flex;flex-direction:column;gap:var(--lah-s1);min-width:0}
 .lah-set-row>.lah-set-edit{grid-column:2;display:flex;flex-direction:column;gap:var(--lah-s1);min-width:0}

@@ -1,7 +1,9 @@
 // What the main agent carries from earlier turns (DESIGN §3.1): the last compaction summary, and a
 // receipt for each turn since. A receipt says what the turn was for and each thing the agent did in
-// it, with the start of each result and how to read it whole (`past_turn`), so a session of many
-// turns stays short while nothing in it is lost: the segment keeps every step in full.
+// it, with the start of each call's arguments and of each result and how to read either whole
+// (`past_turn`), so a session of many turns stays short while nothing in it is lost: the segment
+// keeps every step in full. A call's arguments are cut like its result, since a file written or a
+// long brief is as long as anything a tool gives back.
 //
 // Receipts are rendered when a turn reads its session, from the segments as stored and the user's
 // texts and settings as they stand, so a changed Receipt length or a replaced text takes effect on
@@ -29,13 +31,25 @@ export function stepText(step: SegmentStep): string {
   return step.kind === "stop" ? step.reason : "";
 }
 
-/** A turn's receipt: each step in a line or two, a text longer than `chars` kept as its start with how to read the rest. */
-export function receiptOf(segment: SessionSegment, chars: number, texts: Texts): string {
+/** How much a receipt keeps, as Settings' session part has it: of each result and each thing the agent wrote (Receipt length), and of each call's arguments. */
+export interface ReceiptSizes {
+  receiptChars: number;
+  receiptArgChars: number;
+}
+
+/** A turn's receipt: each step in a line or two, a text longer than its length kept as its start with how to read the rest. */
+export function receiptOf(segment: SessionSegment, sizes: ReceiptSizes, texts: Texts): string {
   const reply = String(segment.reply);
+  const chars = sizes.receiptChars;
   const short = (text: string): string => (text.length <= chars ? text : texts.render(TEXT.session.receiptClipped, { text: text.slice(0, cutAt(text, chars)), chars: String(text.length), reply }));
-  const lines = segment.steps.map((step): string => {
+  /** A call's arguments as JSON, cut where their length runs out: what is kept is their start, never one argument whole and another left out. `step`: the call's number in the turn, as `past_turn` takes it. */
+  const named = (args: unknown, step: number): string => {
+    const json = JSON.stringify(args);
+    return json.length <= sizes.receiptArgChars ? json : texts.render(TEXT.session.receiptArgsClipped, { text: json.slice(0, cutAt(json, sizes.receiptArgChars)), chars: String(json.length), reply, step: String(step) });
+  };
+  const lines = segment.steps.map((step, i): string => {
     if (step.kind === "said") return texts.render(TEXT.session.receiptSaid, { text: short(step.text) });
-    if (step.kind === "call") return texts.render(step.error ? TEXT.session.receiptFailed : TEXT.session.receiptCall, { tool: step.name, args: JSON.stringify(step.args), result: short(step.result) });
+    if (step.kind === "call") return texts.render(step.error ? TEXT.session.receiptFailed : TEXT.session.receiptCall, { tool: step.name, args: named(step.args, i + 1), result: short(step.result) });
     if (step.kind === "reply") return texts.render(TEXT.session.receiptReply, { chars: String(step.chars), reply });
     return texts.render(TEXT.session.receiptStop, { reason: step.reason });
   });
@@ -53,12 +67,12 @@ export interface Carried {
 }
 
 /** What `session` comes to as the main agent carries it. */
-export function carriedOf(session: { summary: string | null; turns: readonly PastTurn[] }, input: { receiptChars: number; charsPerToken: number; texts: Texts }): Carried {
+export function carriedOf(session: { summary: string | null; turns: readonly PastTurn[] }, input: ReceiptSizes & { charsPerToken: number; texts: Texts }): Carried {
   const { texts } = input;
   const summary = session.summary === null ? null : texts.render(TEXT.session.summary, { summary: session.summary });
   const history = session.turns.flatMap((turn, i): ModelMessage[] => [
     { role: "user", content: i === 0 && summary !== null ? `${summary}\n\n${toldOf(turn.segment, texts)}` : toldOf(turn.segment, texts) },
-    { role: "assistant", content: receiptOf(turn.segment, input.receiptChars, texts) },
+    { role: "assistant", content: receiptOf(turn.segment, input, texts) },
   ]);
   const lead = history.length === 0 ? summary : null;
   let tokens = lead === null ? 0 : tokensOf(lead, input.charsPerToken);

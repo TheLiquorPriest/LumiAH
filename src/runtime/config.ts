@@ -6,6 +6,7 @@
 // before it has linked.
 
 import { isRecord } from "../link/json";
+import { EXTENSION_IDENTIFIER } from "../link/contract";
 import type { RuntimeTuning } from "../link/settings";
 import { RUNTIME_DEFAULTS, TRANSPORT_KEY, runtimeTuningOf } from "../link/settings";
 import type { StoredLogin } from "./lumiverse";
@@ -14,6 +15,8 @@ export interface RuntimeConfig {
   name: string;
   /** Lumiverse's address, as the runtime reaches it. */
   base: string;
+  /** The identifier of the extension it links to: LumiAH's own, or that of an extension LumiAH is built into. */
+  extension: string;
   /** Where it serves the loopback endpoint. */
   listen: string;
   port: number;
@@ -58,5 +61,7 @@ export function configOf(text: string | null, path: string): RuntimeConfig {
   }
   // Read as the settings' own section is, so a value this build refuses falls back to its default.
   const tuning = isRecord(c.tuning) ? runtimeTuningOf({ [TRANSPORT_KEY]: { runtime: c.tuning } }) : { ...RUNTIME_DEFAULTS };
-  return { name: c.name, base: c.base, listen: c.listen, port: c.port, relay: c.relay, secret: c.secret, session: { username: s.username, token: s.token, savedAt: typeof s.savedAt === "number" ? s.savedAt : 0, ...(s.allowHttp === true ? { allowHttp: true } : {}) }, tuning };
+  // A config written before the extension could be named links to LumiAH's own.
+  const extension = typeof c.extension === "string" && c.extension !== "" ? c.extension : EXTENSION_IDENTIFIER;
+  return { name: c.name, base: c.base, extension, listen: c.listen, port: c.port, relay: c.relay, secret: c.secret, session: { username: s.username, token: s.token, savedAt: typeof s.savedAt === "number" ? s.savedAt : 0, ...(s.allowHttp === true ? { allowHttp: true } : {}) }, tuning };
 }

@@ -9,19 +9,31 @@
 import { type ComponentChildren, Fragment } from "preact";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import type { ConnectionView, JsonValue, SettingPath, TextDef } from "../../../shared/ui";
-import { errorWords, PREF_NUMBERS, PREF_SWITCHES, type Prefs, defaultPrefs, useApp } from "../app";
+import { type App, errorWords, PREF_NUMBERS, PREF_SWITCHES, type Prefs, defaultPrefs, useApp } from "../app";
 import { UiRequestError } from "../client";
-import { Badge, Banner, Button, Check, Empty, IconButton, NumberField, SearchField, Section, Switch, useBusy } from "../components";
-import { clock, counted } from "../format";
+import { Badge, Banner, Button, Check, Disclosure, Empty, IconButton, NumberField, SearchField, Section, Switch, useBusy } from "../components";
+import { clock, count, counted } from "../format";
 import { Icon } from "../icons";
 import { revealInScroller } from "../scroll";
-import { allSections, backupJson, backupOf, changedCount, changesOf, formOf, navOf, type NavSection, pathKey, problemsByPath, searchSettings, sectionFor, valueAt, valueWords } from "../settings-model";
-import { useSelect } from "../store";
-import { FieldNode, type FormCtx } from "./settings-form";
+import { allSections, backupJson, backupOf, besideNumber, changedCount, changesOf, foldHolds, foldOf, formOf, navOf, type NavSection, pathKey, problemsByPath, searchSettings, sectionAt, sectionFor, settingPlace, startHere, valueAt, valueWords } from "../settings-model";
+import { createStore, type Store, useSelect } from "../store";
+import { FieldNode, Fields, type FormCtx } from "./settings-form";
 import { TextEditor, TextList } from "./texts";
 
 /** One empty list, so a page with no state yet doesn't see a new one at every look. */
 const NO_CONNECTIONS: readonly ConnectionView[] = [];
+
+const DETAILS = new WeakMap<App, Store<boolean>>();
+
+/** Whether an app's Settings show each setting's key: asked for once, for every section, and kept while the pages live (the page's own state goes when the page bar shows another page). */
+function detailsOf(app: App): Store<boolean> {
+  let store = DETAILS.get(app);
+  if (!store) {
+    store = createStore(false);
+    DETAILS.set(app, store);
+  }
+  return store;
+}
 
 /** What Settings shows beside its list. */
 type Chosen = { kind: "section"; key: string } | { kind: "texts"; group: string } | { kind: "text"; id: string } | { kind: "device" } | { kind: "backup" };
@@ -75,11 +87,11 @@ function DevicePane() {
               <div class="lah-set-edit">
                 <div class="lah-set-control">
                   <NumberField label={def.label} value={prefs[key]} min={def.min} max={def.max} step={def.step} integer onChange={(value) => set(key, value)} />
-                  <span class="lah-set-unit">{def.unit}</span>
+                  <span class="lah-set-unit">{besideNumber(prefs[key], def.unit)}</span>
                 </div>
                 {prefs[key] !== defaults[key] ? (
                   <div class="lah-actions">
-                    <Button size="sm" variant="ghost" icon="undo" onClick={() => set(key, defaults[key])}>{`Default: ${defaults[key]}`}</Button>
+                    <Button size="sm" variant="ghost" icon="undo" onClick={() => set(key, defaults[key])}>{`Default: ${count(defaults[key])}`}</Button>
                   </div>
                 ) : null}
               </div>
@@ -106,6 +118,7 @@ export function SettingsPage() {
   const form = useMemo(() => (settings ? formOf(settings) : null), [settings]);
   const nav = useMemo(() => (form ? navOf(form) : []), [form]);
   const sections = useMemo(() => allSections(nav), [nav]);
+  const starts = useMemo(() => startHere(nav), [nav]);
   const groups = useMemo(() => [...new Set((texts?.defs ?? []).map((d) => d.group))], [texts]);
   const [chosen, setChosen] = useState<Chosen | null>(null);
   const [opened, setOpened] = useState(false);
@@ -128,6 +141,9 @@ export function SettingsPage() {
   const modelLists = useRef(new Map<string, Promise<string[]>>());
   // A section picked from the list starts at its head: the panel may be scrolled far down the one shown before it or, in one column, far down the list.
   const [picked, setPicked] = useState(0);
+  const details = useSelect(detailsOf(app), (on) => on);
+  /** The user's own opening or closing of a section's folded part: it holds for that section and that lead, so a new lead into the fold opens it again. */
+  const [more, setMore] = useState<{ key: string; found: string | null; open: boolean } | null>(null);
   useLayoutEffect(() => {
     if (picked > 0 && found === null) revealInScroller(detail.current, "start");
   }, [picked]);
@@ -137,6 +153,36 @@ export function SettingsPage() {
   }, [found, chosen]);
   // The connections changed: a connection's models may have, too.
   useEffect(() => modelLists.current.clear(), [connections]);
+  // The tools' names, for the tables that hold a row per tool: read when the page shows and again when a definition changes. Where they can't be read a name is typed instead.
+  const defsRev = useSelect(app.client.state, (s) => s?.defs ?? 0);
+  const [tools, setTools] = useState<readonly string[] | null>(null);
+  useEffect(() => {
+    let live = true;
+    app.client.request("lah.defs.get", {}).then(
+      (r) => live && setTools(r.tools.map((t) => t.name)),
+      () => live && setTools(null),
+    );
+    return () => {
+      live = false;
+    };
+  }, [defsRev]);
+  // Another page led here to one setting (a cap to its limit, a kind of stored thing to how long it is kept): its section opens with it marked, and the lead is taken so coming back later opens nothing by itself.
+  const led = useSelect(app.nav, (n) => n.setting);
+  useEffect(() => {
+    if (led === null || nav.length === 0 || !settings) return;
+    // A page names a setting by its place among the core's own or the transport's: here it is found where these settings keep it.
+    const placed = settingPlace(settings.schema, led) ?? [...led];
+    const target = sectionFor(nav, placed) ?? sectionAt(nav, placed);
+    if (target) {
+      setFound(pathKey(placed));
+      setChosen({ kind: "section", key: target.key });
+      setOpened(true);
+    } else {
+      // A lead that names nothing here is said, never dropped: the page would otherwise open on its first section as if that were the answer.
+      app.toast("That setting isn't among the settings shown here. Search for it by its name.", "error");
+    }
+    app.nav.update((n) => ({ ...n, setting: null }));
+  }, [led, nav]);
   if (!settings || !texts || !form) return <Empty icon="hourglass">Reading the settings…</Empty>;
 
   const save = (set: { path: SettingPath; value: JsonValue }[], reset: SettingPath[] = []): Promise<boolean> => {
@@ -170,7 +216,9 @@ export function SettingsPage() {
     problems,
     connections,
     found,
+    details,
     at: (path) => valueAt(settings.values, path),
+    ...(tools !== null ? { tools } : {}),
     models: (connectionId) => {
       const key = connectionId ?? "";
       let list = modelLists.current.get(key);
@@ -188,11 +236,17 @@ export function SettingsPage() {
     setOpened(true);
     setPicked((n) => n + 1);
   };
-  const shown: Chosen = chosen ?? (sections[0] ? { kind: "section", key: sections[0].key } : { kind: "device" });
+  // Beside the list (where there is room for both), the first thing most people change shows until something is picked.
+  const first = starts[0]?.section ?? sections[0];
+  const shown: Chosen = chosen ?? (first ? { kind: "section", key: first.key } : { kind: "device" });
   const section = shown.kind === "section" ? (sections.find((s) => s.key === shown.key) ?? null) : null;
   const text = shown.kind === "text" ? (texts.defs.find((d) => d.id === shown.id) ?? null) : null;
   const ownCount = Object.keys(texts.own).length;
   const changedAll = changedCount(form);
+  // An agent's section opens on its connection and model; the rest is folded, and opens by itself where a search or another page led to a setting inside it.
+  const fold = section !== null ? foldOf(section.node) : null;
+  const moreOpen = section !== null && fold !== null && (more !== null && more.key === section.key && more.found === found ? more.open : found !== null && foldHolds(fold, found));
+  const sectionProblem = section !== null ? (problems.get(pathKey(section.node.path)) ?? null) : null;
 
   const saveText = (def: TextDef, body: string): void =>
     runText(async () => {
@@ -317,27 +371,54 @@ export function SettingsPage() {
           )
         ) : (
           <nav class="lah-navlist" aria-label="Settings">
-            {nav.map((group) => (
-              <Fragment key={group.heading}>
-                <div class="lah-navhead">{group.heading}</div>
-                {group.sections.flatMap((s) => [sectionRow(s, false), ...s.parts.map((p) => sectionRow(p, true))])}
-              </Fragment>
-            ))}
-            <div class="lah-navhead">Texts sent to models</div>
-            {groups.map((group) => {
-              const defs = texts.defs.filter((d) => d.group === group);
-              const n = defs.filter((d) => Object.hasOwn(texts.own, d.id)).length;
+            {starts.length > 0 ? (
+              <>
+                <div class="lah-navhead">Most people change only these</div>
+                {starts.map((start) => (
+                  <button key={start.path.join(".")} type="button" class="lah-navrow" data-lah-start={start.path.join(".")} aria-current={shown.kind === "section" && shown.key === start.section.key} onClick={() => (setFound(null), open({ kind: "section", key: start.section.key }))}>
+                    <span class="lah-navrow-text">
+                      <span class="lah-navrow-title">{start.label}</span>
+                      <span class="lah-navrow-sub">{start.about}</span>
+                    </span>
+                    {changedCount(start.section.node) > 0 ? <Badge tone="accent">{`${changedCount(start.section.node)} changed`}</Badge> : null}
+                    <Icon name="chevron-right" size={16} class="lah-chev" />
+                  </button>
+                ))}
+              </>
+            ) : null}
+            {nav.map((group) => {
+              const rows = group.sections.flatMap((s) => [sectionRow(s, false), ...s.parts.map((p) => sectionRow(p, true))]);
+              // Where the few settings most people change lead the list, the rest is folded under its heading until asked for; the search finds any of it either way.
+              if (starts.length === 0)
+                return (
+                  <Fragment key={group.heading}>
+                    <div class="lah-navhead">{group.heading}</div>
+                    {rows}
+                  </Fragment>
+                );
+              const changed = group.sections.reduce((n, s) => n + changedCount(s.node), 0);
               return (
-                <button key={group} type="button" class="lah-navrow" data-lah-nav={`texts:${group}`} aria-current={(shown.kind === "texts" && shown.group === group) || (text !== null && text.group === group)} onClick={() => open({ kind: "texts", group })}>
-                  <span class="lah-navrow-text">
-                    <span class="lah-navrow-title">{group}</span>
-                    <span class="lah-navrow-sub">{counted(defs.length, "text")}</span>
-                  </span>
-                  {n > 0 ? <Badge tone="accent">{`${n} yours`}</Badge> : null}
-                  <Icon name="chevron-right" size={16} class="lah-chev" />
-                </button>
+                <Disclosure key={group.heading} class="lah-navfold" summary={`Every setting of ${group.heading} (${counted(rows.length, "section")}${changed > 0 ? `, ${changed} changed` : ""})`}>
+                  {rows}
+                </Disclosure>
               );
             })}
+            <Disclosure class="lah-navfold" summary={`Every text sent to a model (${counted(texts.defs.length, "text")}${ownCount > 0 ? `, ${ownCount} yours` : ""})`} defaultOpen={starts.length === 0}>
+              {groups.map((group) => {
+                const defs = texts.defs.filter((d) => d.group === group);
+                const n = defs.filter((d) => Object.hasOwn(texts.own, d.id)).length;
+                return (
+                  <button key={group} type="button" class="lah-navrow" data-lah-nav={`texts:${group}`} aria-current={(shown.kind === "texts" && shown.group === group) || (text !== null && text.group === group)} onClick={() => open({ kind: "texts", group })}>
+                    <span class="lah-navrow-text">
+                      <span class="lah-navrow-title">{group}</span>
+                      <span class="lah-navrow-sub">{counted(defs.length, "text")}</span>
+                    </span>
+                    {n > 0 ? <Badge tone="accent">{`${n} yours`}</Badge> : null}
+                    <Icon name="chevron-right" size={16} class="lah-chev" />
+                  </button>
+                );
+              })}
+            </Disclosure>
             <div class="lah-navhead">Here</div>
             <button type="button" class="lah-navrow" data-lah-nav="device" aria-current={shown.kind === "device"} onClick={() => open({ kind: "device" })}>
               <span class="lah-navrow-text">
@@ -364,13 +445,40 @@ export function SettingsPage() {
               <span class="lah-set-status" role="status" aria-live="polite">
                 {saving > 0 ? "Saving…" : status}
               </span>
-              {changedCount(section.node) > 0 ? (
-                <Button size="sm" icon="undo" onClick={() => ctx.save([], section.resets)}>
-                  {`Put this section back to its defaults (${changedCount(section.node)} changed)`}
-                </Button>
-              ) : null}
+              <span class="lah-actions">
+                {changedCount(section.node) > 0 ? (
+                  <Button size="sm" icon="undo" onClick={() => ctx.save([], section.resets)}>
+                    {`Put this section back to its defaults (${changedCount(section.node)} changed)`}
+                  </Button>
+                ) : null}
+                <span data-lah-details={details ? "on" : "off"}>
+                  <Button size="sm" variant="ghost" icon="code" pressed={details} onClick={() => detailsOf(app).set(!details)}>
+                    Details
+                  </Button>
+                </span>
+              </span>
             </div>
-            <FieldNode key={`${section.key}:${formKey}`} node={section.node} ctx={ctx} top />
+            {details ? <p class="lah-field-help">Each setting shows the key it is kept under, as a backup names it.</p> : null}
+            {fold !== null ? (
+              <Fragment key={`${section.key}:${formKey}`}>
+                {sectionProblem !== null ? (
+                  <span class="lah-field-error" role="alert">
+                    <Icon name="alert" size={16} />
+                    {sectionProblem}
+                  </span>
+                ) : null}
+                <div class="lah-set-group" data-lah-group={section.node.path.join(".")}>
+                  <Fields nodes={fold.first} ctx={ctx} />
+                </div>
+                <Disclosure class="lah-set-more" summary={fold.label} open={moreOpen} onToggle={(open) => setMore({ key: section.key, found, open })}>
+                  <div class="lah-set-group" data-lah-more={section.node.path.join(".")}>
+                    <Fields nodes={fold.more} ctx={ctx} />
+                  </div>
+                </Disclosure>
+              </Fragment>
+            ) : (
+              <FieldNode key={`${section.key}:${formKey}`} node={section.node} ctx={ctx} top />
+            )}
           </>
         ) : shown.kind === "texts" ? (
           <>

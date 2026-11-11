@@ -16,11 +16,14 @@
 //   record's own segment and those after it. It lands with the record of the turn that makes it, so
 //   no earlier record changes, and the turns it replaced stay on their own records.
 // - A rollback marks a summary's record (`rolledBack`): the walk then reads past it, back to the
-//   summary before it or to the start, which is exactly the span it replaced.
+//   summary before it or to the start, which is exactly the span it replaced. A regenerate, a swipe
+//   or a continue of that reply carries the marked summary on its own record, so the rollback holds
+//   whichever swipe the chat shows afterwards.
 
 import type { Blobs } from "./blobs";
 import { isHash, nextPath, ROOT_PATH } from "./hash";
-import type { AgentUsage, HarnessHost, JsonObject, PathMessage, TurnKind, TurnRecord, TurnRequest } from "./ports";
+import { DOC } from "./paths";
+import type { AgentUsage, HarnessHost, JobState, JsonObject, PathMessage, RecordJob, TurnKind, TurnRecord, TurnRequest } from "./ports";
 import { isRecord } from "./ports";
 import type { PastTurn } from "./tools";
 import { emptyUsage } from "./usage";
@@ -92,6 +95,14 @@ function usageOf(raw: unknown): AgentUsage {
   return out;
 }
 
+const JOB_STATES: readonly JobState[] = ["queued", "running", "done", "failed", "cancelled", "interrupted", "off_path", "spent", "paused"];
+
+/** A job as a record lists it; null for what isn't one. */
+function recordJobOf(raw: unknown): RecordJob | null {
+  if (!isRecord(raw) || typeof raw.id !== "string" || typeof raw.agent !== "string" || typeof raw.state !== "string" || !(JOB_STATES as readonly string[]).includes(raw.state)) return null;
+  return { id: raw.id, agent: raw.agent, state: raw.state as JobState, ...(isHash(raw.report) ? { report: raw.report } : {}) };
+}
+
 /**
  * A message's anchor as a record; null when it isn't one. Records come from a message's metadata,
  * which anything may have written, so every hash is checked to be one (it can then name only a blob)
@@ -100,17 +111,91 @@ function usageOf(raw: unknown): AgentUsage {
 export function recordOf(anchor: unknown): TurnRecord | null {
   if (!isRecord(anchor) || anchor.v !== 1 || typeof anchor.generationId !== "string" || !isTurnKind(anchor.kind) || typeof anchor.at !== "number" || typeof anchor.path !== "string" || !isHash(anchor.segment)) return null;
   const summary = isHash(anchor.summary) ? anchor.summary : undefined;
+  const jobs = Array.isArray(anchor.jobs) ? anchor.jobs.flatMap((job) => recordJobOf(job) ?? []) : [];
   return {
     v: 1,
     generationId: anchor.generationId,
     kind: anchor.kind,
+    ...(typeof anchor.began === "number" ? { began: anchor.began } : {}),
+    ...(typeof anchor.heard === "number" ? { heard: anchor.heard } : {}),
     at: anchor.at,
     path: anchor.path,
     segment: anchor.segment,
     ...(isHash(anchor.transcript) ? { transcript: anchor.transcript } : {}),
     ...(summary !== undefined ? { summary, kept: Array.isArray(anchor.kept) ? anchor.kept.filter(isHash) : [], folded: isCount(anchor.folded) ? anchor.folded : 0 } : {}),
     ...(summary !== undefined && typeof anchor.rolledBack === "number" ? { rolledBack: anchor.rolledBack } : {}),
+    ...(isHash(anchor.workspace) ? { workspace: anchor.workspace } : {}),
+    ...(isCount(anchor.changed) && anchor.changed > 0 ? { changed: anchor.changed } : {}),
+    ...(jobs.length > 0 ? { jobs } : {}),
+    ...(anchor.recovered === "restart" || anchor.recovered === "late" ? { recovered: anchor.recovered } : {}),
     usage: usageOf(anchor.usage),
+  };
+}
+
+// ---------------------------------------------------------------- a turn waiting for its reply
+
+/**
+ * A turn handed over to the host's own generation (DESIGN §25), as stored while it waits for its
+ * reply (`DOC.pending`): what its record needs that only the run knew, so the record can still be
+ * made once the run is gone from memory. It holds hashes and counts, never a text: the turn's steps
+ * are a blob (`draft`), as every segment is.
+ *
+ * `draft` is the turn's segment as far as it is known before the reply (a continue's earlier steps
+ * first). The steps that state the reply are filled in once it is written: `replied` names them by
+ * their place, and `asBrief` is where the note goes that an answer was taken as the brief (null:
+ * the main agent gave a brief). `basis` is the chat area's index as the turn before left it and
+ * `workspace` as this turn's stood at the hand-over; `jobs` the jobs its agents started, as they
+ * stood then.
+ */
+export interface PendingTurn {
+  v: 1;
+  kind: "pending";
+  /** When the turn was handed over. */
+  at: number;
+  /** When the wait for its reply runs out (Settings' time for it, counted from the hand-over); null where it has no end. A reply that comes from then on is late. */
+  until: number | null;
+  userId: string;
+  chatId: string;
+  generationId: string;
+  turn: TurnKind;
+  began: number;
+  heard?: number;
+  path: string;
+  draft: string;
+  replied: number[];
+  asBrief: number | null;
+  /** The summary the turn made, or the rolled-back one it carries on (`rolledBack`). */
+  summary?: Compaction & { rolledBack?: number };
+  basis: string | null;
+  workspace: string | null;
+  jobs: RecordJob[];
+  usage: AgentUsage;
+}
+
+/** A stored waiting turn, read; null when the document isn't one. */
+export function pendingOf(raw: unknown): PendingTurn | null {
+  if (!isRecord(raw) || raw.v !== 1 || raw.kind !== "pending" || typeof raw.at !== "number" || typeof raw.userId !== "string" || typeof raw.chatId !== "string" || typeof raw.generationId !== "string" || !isTurnKind(raw.turn) || typeof raw.began !== "number" || typeof raw.path !== "string" || !isHash(raw.draft)) return null;
+  const summary = isRecord(raw.summary) && isHash(raw.summary.summary) ? raw.summary : null;
+  return {
+    v: 1,
+    kind: "pending",
+    at: raw.at,
+    until: typeof raw.until === "number" ? raw.until : null,
+    userId: raw.userId,
+    chatId: raw.chatId,
+    generationId: raw.generationId,
+    turn: raw.turn,
+    began: raw.began,
+    ...(typeof raw.heard === "number" ? { heard: raw.heard } : {}),
+    path: raw.path,
+    draft: raw.draft,
+    replied: Array.isArray(raw.replied) ? raw.replied.filter(isCount) : [],
+    asBrief: isCount(raw.asBrief) ? raw.asBrief : null,
+    ...(summary ? { summary: { summary: summary.summary as string, kept: Array.isArray(summary.kept) ? summary.kept.filter(isHash) : [], folded: isCount(summary.folded) ? summary.folded : 0, ...(typeof summary.rolledBack === "number" ? { rolledBack: summary.rolledBack } : {}) } } : {}),
+    basis: isHash(raw.basis) ? raw.basis : null,
+    workspace: isHash(raw.workspace) ? raw.workspace : null,
+    jobs: Array.isArray(raw.jobs) ? raw.jobs.flatMap((job) => recordJobOf(job) ?? []) : [],
+    usage: usageOf(raw.usage),
   };
 }
 
@@ -160,8 +245,15 @@ export interface SessionRefs {
   segments: string[];
   /** The replies whose records are off the path, by their place in the chat, oldest first. */
   dropped: number[];
+  /**
+   * Those of them no turn has been told of yet: the ones after the latest record that stands on the
+   * path. A turn that left a record was told of every one before it, so each is said once.
+   */
+  fresh: number[];
   /** The latest summary a rollback undid that the walk read past; null when it passed none. */
   rolledBack: string | null;
+  /** When that rollback was made. */
+  rolledBackAt: number | null;
 }
 
 /**
@@ -171,23 +263,29 @@ export interface SessionRefs {
 export function sessionAt(turns: readonly PathTurn[]): SessionRefs {
   const segments: string[] = [];
   const dropped: number[] = [];
+  let fresh: number[] | null = null;
   let rolledBack: string | null = null;
+  let rolledBackAt: number | null = null;
   for (let i = turns.length - 1; i >= 0; i--) {
     const turn = turns[i] as PathTurn;
     if (!turn.onPath) {
       dropped.unshift(turn.index);
       continue;
     }
+    fresh ??= [...dropped];
     const { record } = turn;
     segments.unshift(record.segment);
     if (record.summary === undefined) continue;
     if (record.rolledBack !== undefined) {
-      rolledBack ??= record.summary;
+      if (rolledBack === null) {
+        rolledBack = record.summary;
+        rolledBackAt = record.rolledBack;
+      }
       continue;
     }
-    return { summary: record.summary, segments: [...(record.kept ?? []), ...segments], dropped, rolledBack };
+    return { summary: record.summary, segments: [...(record.kept ?? []), ...segments], dropped, fresh, rolledBack, rolledBackAt };
   }
-  return { summary: null, segments, dropped, rolledBack };
+  return { summary: null, segments, dropped, fresh: fresh ?? [...dropped], rolledBack, rolledBackAt };
 }
 
 // ---------------------------------------------------------------- reading a session
@@ -209,6 +307,21 @@ export interface ResumedSession {
   path: string;
   /** For a continue: the turn the continued swipe's own record holds, whose steps this turn's segment keeps before its own. */
   continued: PastTurn | null;
+  /**
+   * The records on the path before the reply that still stand on it, oldest first: the turns this
+   * one follows. What the chat's area and the chat's jobs are read from (§11, §15).
+   */
+  records: TurnRecord[];
+  /** For a continue: the continued swipe's own record, where it still stands on the path. */
+  own: TurnRecord | null;
+  /**
+   * The summary made on this very reply that the user rolled back, where the turn answers that
+   * reply again (a regenerate, a swipe or a continue of it). The walk never passes it, since it
+   * reads only the records before the reply, so `refs` names it from here; and this turn's record
+   * carries it on, marked as it was, so the rollback holds for the turns after whichever swipe the
+   * chat then shows. Null when the reply holds none.
+   */
+  held: (Compaction & { rolledBack: number }) | null;
 }
 
 /** What a compaction lands on the record of the turn that makes it. */
@@ -234,7 +347,15 @@ export class Sessions {
     const found = turn.target.messageId === null ? -1 : path.findIndex((m) => m.id === turn.target.messageId);
     const at = found < 0 ? path.length : found;
     const hashes = await pathHashes(path);
-    const refs = sessionAt((await pathTurns(path, hashes)).filter((t) => t.at < at));
+    const earlier = (await pathTurns(path, hashes)).filter((t) => t.at < at);
+    const walked = sessionAt(earlier);
+    const target = path[at];
+    // The record on the reply itself, for the swipe the chat shows, while the messages before it are still the ones it was made on: what a regenerate, a swipe or a continue answers again.
+    const shown = target ? recordOf(target.anchor) : null;
+    const again = shown && shown.path === hashes[at] ? shown : null;
+    const held = again && again.summary !== undefined && again.rolledBack !== undefined ? { summary: again.summary, kept: again.kept ?? [], folded: again.folded ?? 0, rolledBack: again.rolledBack } : null;
+    // It is later than any the walk passed, so it is the one the session says it read past.
+    const refs: SessionRefs = held ? { ...walked, rolledBack: held.summary, rolledBackAt: held.rolledBack } : walked;
     let missing = 0;
     const summary = refs.summary === null ? null : await this.blobs.get(refs.summary);
     if (refs.summary !== null && summary === null) missing++;
@@ -244,11 +365,10 @@ export class Sessions {
       if (segment) turns.push({ reply: segment.reply, hash, segment });
       else missing++;
     }
-    const target = path[at];
-    const own = turn.kind === "continue" && target ? recordOf(target.anchor) : null;
-    const before = own && own.path === hashes[at] ? segmentOf(await this.blobs.getJson(own.segment)) : null;
+    const own = turn.kind === "continue" ? again : null;
+    const before = own ? segmentOf(await this.blobs.getJson(own.segment)) : null;
     const continued = own && before ? { reply: before.reply, hash: own.segment, segment: before } : null;
-    return { refs, summary, turns, missing, before: path.slice(0, at), reply: target ? target.index : (path.at(-1)?.index ?? -1) + 1, path: hashes[at] ?? ROOT_PATH, continued };
+    return { refs, summary, turns, missing, before: path.slice(0, at), reply: target ? target.index : (path.at(-1)?.index ?? -1) + 1, path: hashes[at] ?? ROOT_PATH, continued, records: earlier.filter((t) => t.onPath).map((t) => t.record), own, held };
   }
 
   /** Stores what a turn added to the session, and gives its hash. */
@@ -269,18 +389,68 @@ export class Sessions {
 
 /**
  * Rolls back the compaction made at a turn: its record, on the swipe the chat shows, is written back
- * marked, so the session reads the turns its summary replaced again from the next turn on. Refused,
- * with why in plain words, when there is nothing there to roll back.
+ * marked, so the session reads the turns its summary replaced again from the next turn on, and the
+ * notes aren't summarized again until they have grown by Settings' margin or the user asks for it
+ * (`askCompaction`). Refused, with why in plain words, when rolling it back would change nothing.
  */
 export async function rollback(host: Pick<HarnessHost, "chat" | "clock">, chatId: string, messageId: string, swipeId: number): Promise<{ record: TurnRecord } | { refused: string }> {
-  const message = (await host.chat.path(chatId)).find((m) => m.id === messageId);
+  const path = await host.chat.path(chatId);
+  const message = path.find((m) => m.id === messageId);
   if (!message) return { refused: "That reply is no longer on the chat's active path." };
   if (message.swipeId !== swipeId) return { refused: "The chat shows another swipe of that reply now. Switch to the swipe whose summary you want to roll back, then try again." };
-  const record = recordOf(message.anchor);
-  if (!record) return { refused: "That reply has no record of LumiAH's." };
+  const turns = await pathTurns(path);
+  const turn = turns.find((t) => t.messageId === messageId);
+  if (!turn) return { refused: "That reply has no record of LumiAH's." };
+  const { record } = turn;
   if (record.summary === undefined) return { refused: "No summary was made at that turn, so there is nothing to roll back." };
   if (record.rolledBack !== undefined) return { refused: "That summary was already rolled back." };
+  // The session reads from the latest summary that stands and never looks beneath it: rolling back one that isn't read would change nothing.
+  if (!turn.onPath) return { refused: "An earlier message of the chat changed since that turn, so its notes and its summary are no longer read: there is nothing to roll back." };
+  const later = turns.find((t) => t.at > turn.at && t.onPath && t.record.summary !== undefined && t.record.rolledBack === undefined);
+  if (later) return { refused: `A later summary, made at reply #${later.index}, stands over this one: the notes are read from that one on. Roll that one back first.` };
   const marked: TurnRecord = { ...record, rolledBack: host.clock.now() };
   if (!(await host.chat.anchor(chatId, messageId, swipeId, marked as unknown as JsonObject))) return { refused: "That reply is gone, so its record couldn't be written." };
   return { record: marked };
+}
+
+// ---------------------------------------------------------------- summarizing on request
+
+/** What the user asked of a chat's session, as stored (`DOC.session`): when they last asked for its notes to be summarized. */
+interface SessionDoc {
+  v: 1;
+  kind: "session";
+  compactAsked: number;
+}
+
+/** The user asks for the chat's notes to be summarized: the next turn does it, whatever their length and whatever a rollback holds. */
+export async function askCompaction(host: Pick<HarnessHost, "store" | "clock">, chatId: string): Promise<{ asked: number }> {
+  const doc: SessionDoc = { v: 1, kind: "session", compactAsked: host.clock.now() };
+  await host.store.write(DOC.session(chatId), doc as unknown as JsonObject);
+  return { asked: doc.compactAsked };
+}
+
+/** When the user last asked for the chat's notes to be summarized; null when they never did. */
+export async function compactionAsked(host: Pick<HarnessHost, "store">, chatId: string): Promise<number | null> {
+  const doc = await host.store.read(DOC.session(chatId));
+  return isRecord(doc) && doc.v === 1 && doc.kind === "session" && typeof doc.compactAsked === "number" ? doc.compactAsked : null;
+}
+
+/**
+ * Whether a turn summarizes the main agent's notes (DESIGN §5), and why not where a rollback holds
+ * it back.
+ *
+ * - The user asked for it since the last summary was made or rolled back: it does.
+ * - The session read past a summary the user rolled back: it doesn't, until the notes have grown by
+ *   Settings' margin over what they were at the rollback. Summarizing at once would undo what the
+ *   user just did.
+ * - Else it does once the notes pass Summarize past.
+ */
+export function compactionDue(input: { tokens: number; limit: number; asked: number | null; records: readonly TurnRecord[]; rolledBackAt: number | null; tokensAtRollback: number; margin: number }): "due" | "held" | "no" {
+  // The latest moment a summary was made or rolled back on this path, the reply's own rolled-back one with them: an ask older than it was answered already. A rolled-back summary counts from its rollback alone: a record that only carries one on is later than that, and made nothing.
+  let last = input.rolledBackAt ?? 0;
+  for (const record of input.records) if (record.summary !== undefined) last = Math.max(last, record.rolledBack ?? record.at);
+  if (input.asked !== null && input.asked > last) return "due";
+  if (input.tokens <= input.limit) return "no";
+  if (input.rolledBackAt !== null && input.tokens <= input.tokensAtRollback + input.margin) return "held";
+  return "due";
 }

@@ -1,0 +1,28 @@
+{
+  "version": "0.1.0",
+  "name": "Dice Tools",
+  "identifier": "dice_tools",
+  "author": "Your name",
+  "github": "https://github.com/your-name/dice-tools",
+  "homepage": "https://github.com/your-name/dice-tools",
+  "description": "LumiAH's agent harness with real dice: a roll_dice tool, a Dice clerk agent and a skill for contested rolls.",
+  "permissions": [
+    "generation",
+    "interceptor",
+    "generation_parameters",
+    "chats",
+    "chat_mutation",
+    "world_books",
+    "presets",
+    "characters",
+    "personas",
+    "mcp_servers",
+    "embeddings",
+    "memories",
+    "databanks",
+    "web_search"
+  ],
+  "interceptorTimeoutMs": 300000,
+  "entry_backend": "dist/backend.js",
+  "entry_frontend": "dist/frontend.js"
+}

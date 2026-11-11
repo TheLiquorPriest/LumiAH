@@ -8,9 +8,9 @@
 // Lumiverse about its session, which renews it, and it keeps its origin in its account's
 // local-inference scheduler exclusions.
 
-import type { ChunkPush, ConnectionPush, LinkNotice, LinkRequests, LinkRequestType, OpenStream, RuntimeReport, SchedulerState, SessionReport, StopPush } from "../link/contract";
+import type { AskPush, ChunkPush, ConnectionPush, ExtensionOffer, LinkNotice, LinkRequests, LinkRequestType, OpenStream, RuntimeReport, SchedulerState, SessionReport, StopPush } from "../link/contract";
 import { LINK, LINK_VERSION, versionWords } from "../link/contract";
-import { pushOf } from "../link/frames";
+import { extensionOfferOf, linkedBackendOf, pushOf } from "../link/frames";
 import type { RuntimeTuning } from "../link/settings";
 import type { OpenSocket } from "./connection";
 import { HostConnection, LinkError } from "./connection";
@@ -43,6 +43,13 @@ export interface RuntimeLink {
   readonly out: OutOfReach | null;
   /** Why the link can't serve at all (the registration is gone, the versions differ), or null. */
   readonly refused: string | null;
+  /**
+   * True while LumiAH itself refused the link (this runtime's registration, or its link version):
+   * it runs, and sees this runtime as not linked. Nothing answers a chat in the runtime's place
+   * (DESIGN §25), so a chat's failed reply is told what the user can do about the chat. Absent or
+   * false: whether LumiAH runs isn't known, and nothing is said of the chat.
+   */
+  readonly refusedByLumiAH?: boolean;
   /** One request, sent once the link is up (waiting `waitMs` at most), with the relay's secret. */
   request<T extends AskType>(type: T, fields: Asked<T>, waitMs: number): Promise<LinkRequests[T]["result"]>;
   /** A notice, sent now when the link is up and dropped when it isn't: nothing waits for it. */
@@ -64,12 +71,18 @@ export interface LinkHandlers {
   settings(revision: number): void;
   /** A loopback key to put in the loopback connection. */
   connection(push: ConnectionPush): void;
+  /** Something a page asked for that the core does here. */
+  ask(push: AskPush): void;
+  /** What the extension LumiAH is built into supplies to the core, as it said on this hello; null for LumiAH on its own. */
+  offer(offer: ExtensionOffer | null): void;
   /** The turns under way, for the ping and the report. */
   turns(): string[];
 }
 
 export interface LinkOptions {
   base: string;
+  /** The identifier of the extension it links to. */
+  identifier: string;
   credentials(): StoredLogin | null;
   http: Http;
   openSocket: OpenSocket;
@@ -99,6 +112,15 @@ export function stoppedWords(why: "stopped" | "crashed", detail: string | null |
   return `LumiAH stopped with an error${said !== "" ? ` (${said})` : ""}, so this reply ended here. Lumiverse doesn't restart it by itself: restart it in Lumiverse's Extensions tab, then press Retry.`;
 }
 
+/** What the user can do about a chat whose runtime LumiAH refuses, as the chat's failed reply is told it: the runtime way has no fallback, so nothing is promised. */
+const NO_FALLBACK = "Nothing answers this chat in the runtime's place: once the runtime links again, send your message again, or set the chat to Built in on LumiAH's Home, which needs no runtime.";
+
+/** What a chat's reply is told when the link is refused: why, and what the user can do about the chat where LumiAH is known to run. Null while the link isn't refused. */
+export function refusedReply(link: RuntimeLink): string | null {
+  if (link.refused === null) return null;
+  return link.refusedByLumiAH === true ? `${link.refused} ${NO_FALLBACK}` : link.refused;
+}
+
 export class LinkClient implements RuntimeLink {
   private readonly conn: HostConnection;
   private handlers: LinkHandlers | null = null;
@@ -112,6 +134,8 @@ export class LinkClient implements RuntimeLink {
   private pingedAt = 0;
   private pinging = false;
   private refusal: string | null = null;
+  /** The refusal is LumiAH's own word (`RuntimeLink.refusedByLumiAH`). */
+  private refusedThere = false;
   /** Requests the extension hasn't answered yet, by when each was sent. */
   private readonly asked = new Map<number, number>();
   private askSeq = 0;
@@ -137,6 +161,7 @@ export class LinkClient implements RuntimeLink {
   constructor(private readonly options: LinkOptions) {
     this.conn = new HostConnection({
       base: options.base,
+      identifier: options.identifier,
       credentials: options.credentials,
       http: options.http,
       openSocket: options.openSocket,
@@ -163,6 +188,10 @@ export class LinkClient implements RuntimeLink {
 
   get refused(): string | null {
     return this.refusal;
+  }
+
+  get refusedByLumiAH(): boolean {
+    return this.refusal !== null && this.refusedThere;
   }
 
   /**
@@ -285,15 +314,16 @@ export class LinkClient implements RuntimeLink {
     try {
       answer = await this.ask("hello", { secret: this.options.secret(), version: LINK_VERSION, build: this.options.build, report: this.report(), open: this.handlers?.open() ?? [] });
     } catch (error) {
-      if (error instanceof LinkError && error.code === "forbidden") this.refuse(`LumiAH refused this runtime (${error.message}) Register it again with its start line on LumiAH's Runtime page.`);
-      else if (error instanceof LinkError && error.code === "version") this.refuse(error.message);
-      else if (error instanceof LinkError && error.code === "bad_request") this.refuse(`LumiAH on ${this.options.base} doesn't know this runtime's hello (${error.message}): update LumiAH (Extensions → LumiAH → Update).`);
+      if (error instanceof LinkError && error.code === "forbidden") this.refuse(`LumiAH refused this runtime (${error.message}) Register it again with its start line on LumiAH's Runtime page.`, true);
+      else if (error instanceof LinkError && error.code === "version") this.refuse(error.message, true);
+      // An extension that doesn't know the hello is a build from before it, which may not stand in for a runtime either.
+      else if (error instanceof LinkError && error.code === "bad_request") this.refuse(`LumiAH on ${this.options.base} doesn't know this runtime's hello (${error.message}): update LumiAH (Extensions → LumiAH → Update).`, false);
       else if (error instanceof LiveError && error.problem === "timeout") throw new LiveError("timeout", `LumiAH on ${this.options.base} didn't answer the runtime's hello. Check that it's running in Lumiverse's Extensions tab.`);
       throw error;
     }
-    // An extension that didn't refuse another version itself is refused here, in the same words.
+    // An extension that didn't refuse another version itself is refused here, in the same words. It takes this runtime as linked, so nothing is said of what it does meanwhile.
     if (answer.version !== LINK_VERSION) {
-      this.refuse(versionWords(LINK_VERSION, answer.version));
+      this.refuse(versionWords(LINK_VERSION, answer.version, linkedBackendOf(answer.backend).name), false);
       throw new LiveError("too_old", this.refusal ?? "");
     }
     const again = this.hello !== null || this.failures > 0;
@@ -305,13 +335,15 @@ export class LinkClient implements RuntimeLink {
     this.suspect = null;
     if (Array.isArray(answer.lost) && answer.lost.length > 0) this.handlers?.lost(answer.lost);
     if (typeof answer.settings === "number") this.handlers?.settings(answer.settings);
-    this.options.log(`${again ? "linked again" : "linked"} to LumiAH ${answer.build} on ${this.options.base}`);
+    this.handlers?.offer(extensionOfferOf(answer.extension));
+    this.options.log(`${again ? "linked again" : "linked"} to ${linkedBackendOf(answer.backend).name} ${answer.build} on ${this.options.base}`);
     this.failures = 0;
     this.lastProblem = "";
   }
 
-  private refuse(why: string): void {
+  private refuse(why: string, there: boolean): void {
     this.refusal = why;
+    this.refusedThere = there;
     this.options.log(why);
     this.conn.close();
   }
@@ -333,6 +365,9 @@ export class LinkClient implements RuntimeLink {
         return;
       case "connection":
         this.handlers?.connection(push);
+        return;
+      case "ask":
+        this.handlers?.ask(push);
         return;
       case "secret":
         if (push.relay !== this.options.relay) return;
@@ -375,7 +410,7 @@ export class LinkClient implements RuntimeLink {
         if (Array.isArray(answer.lost) && answer.lost.length > 0) this.handlers?.lost(answer.lost);
       })
       .catch((error: unknown) => {
-        if (error instanceof LinkError && error.code === "forbidden") this.refuse(`LumiAH refused this runtime (${error.message}) Register it again with its start line on LumiAH's Runtime page.`);
+        if (error instanceof LinkError && error.code === "forbidden") this.refuse(`LumiAH refused this runtime (${error.message}) Register it again with its start line on LumiAH's Runtime page.`, true);
       })
       .finally(() => {
         this.pinging = false;

@@ -5,6 +5,7 @@
 
 import { isRecord } from "../link/json";
 import type { SchedulerState } from "../link/contract";
+import { loopsBack } from "../link/contract";
 
 export interface HttpRequest {
   method: "GET" | "POST" | "PUT";
@@ -215,12 +216,27 @@ export async function setConnectionKey(http: Http, base: string, token: string, 
 }
 
 /**
- * The user's loopback connection for a runtime at `url` (`http://127.0.0.1:<port>/v1`): the first of
- * their Custom connections that names the loopback's model or sits at the runtime's address.
+ * Stops a generation as Lumiverse's own Stop button does (`POST /api/v1/generate/stop`): Lumiverse
+ * closes its request to the provider, keeps what was written and shows the reply as stopped, not as
+ * failed. Spindle gives an extension no call for it, so the runtime asks with the user's own
+ * session. The chat goes with it as the button sends it: Lumiverse stops by it when it has given the
+ * reply another generation id since. False when Lumiverse had nothing of the kind running.
+ */
+export async function stopGeneration(http: Http, base: string, token: string, generationId: string, chatId: string): Promise<boolean> {
+  const reply = await exchange(http, base, "POST", "/api/v1/generate/stop", token, JSON.stringify({ generation_id: generationId, chat_id: chatId }));
+  if (reply.status !== 200) throw refused(base, reply, "was asked to stop the reply");
+  const body = parse(reply.text);
+  return isRecord(body) && body.stopped === true;
+}
+
+/**
+ * The user's loopback connection for a runtime at `url` (`http://127.0.0.1:<port>/v1`) of the
+ * extension whose loopback model is `model`: the first of their Custom connections that names that
+ * model, or sits at the runtime's address and names no other extension's (`loopsBack`, which the
+ * extension asks too).
  */
 export function loopbackProfile(profiles: readonly ConnectionProfileSummary[], url: string, model: string): ConnectionProfileSummary | null {
-  const want = url.replace(/\/+$/, "").toLowerCase();
-  return profiles.find((p) => p.provider === "custom" && (p.model === model || p.apiUrl.trim().replace(/\/+$/, "").toLowerCase() === want)) ?? null;
+  return profiles.find((p) => p.provider === "custom" && loopsBack({ model: p.model, url: p.apiUrl }, model, [url])) ?? null;
 }
 
 /**

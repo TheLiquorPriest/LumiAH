@@ -2,10 +2,13 @@
 // the small documents, kept in the user's own storage; the world books that apply to a chat and their
 // entries; and the active preset's blocks, each switched as it is for the chat.
 
-import type { JsonValue, LoreBook, LoreEntry, PresetBlock } from "../../core/ports";
+import type { BlobInfo, JsonValue, LoreBook, LoreEntry, PresetBlock } from "../../core/ports";
 import { BLOB_HASH } from "../../link/contract";
 import { LinkRefused } from "./errors";
 import type { BackendHost, HostChat } from "./spindle";
+
+/** A prefix of documents' paths: as a path's names, and it may end with `/` or inside a name; empty for every document. */
+const DOC_PREFIX = /^(?!.*(?:^|\/)\.{1,2}(?:\/|$))(?:[A-Za-z0-9._-]{1,128}\/){0,7}[A-Za-z0-9._-]{0,128}$/;
 
 /** Where a blob is kept: by its hash, under its first two characters so no directory holds them all. */
 const blobPath = (hash: string): string => `blobs/${hash.slice(0, 2)}/${hash}`;
@@ -38,8 +41,8 @@ export class Storage {
   }
 
   /** A stored blob's size in bytes; null when none is stored. */
-  blobSize(userId: string, hash: string): Promise<number | null> {
-    return this.host.storage.size(blobPath(Storage.hash(hash)), userId);
+  async blobSize(userId: string, hash: string): Promise<number | null> {
+    return (await this.host.storage.stat(blobPath(Storage.hash(hash)), userId))?.bytes ?? null;
   }
 
   /** The document at a path; null when there is none, or it isn't JSON. */
@@ -60,6 +63,43 @@ export class Storage {
 
   async removeDoc(userId: string, path: unknown): Promise<void> {
     await this.host.storage.remove(Storage.path(path), userId);
+  }
+
+  /**
+   * `doc.list`: the path of every document under a prefix (`chats/abc/`), at any depth. A prefix
+   * that ends inside a name lists the documents whose paths start with it.
+   */
+  async docs(userId: string, prefix: unknown): Promise<string[]> {
+    if (typeof prefix !== "string" || !DOC_PREFIX.test(prefix)) throw new LinkRefused("bad_request", "A documents' prefix is names of letters, digits, '.', '_' and '-' joined by '/'.");
+    const cut = prefix.lastIndexOf("/");
+    const dir = cut < 0 ? "" : prefix.slice(0, cut);
+    const found = await this.host.storage.list(dir === "" ? "docs" : `docs/${dir}`, userId);
+    return found.map((rel) => (dir === "" ? rel : `${dir}/${rel}`)).filter((path) => path.startsWith(prefix));
+  }
+
+  /**
+   * `blob.list`: every blob stored, a page at a time. Blobs are kept under the first two characters
+   * of their hashes, and a page is the blobs under one such pair, so the listing holds still while
+   * it is read and no page grows with the store beyond one part in 256 of it. `cursor` is the pair
+   * the page before named as next; null for the first.
+   */
+  async blobs(userId: string, cursor: unknown): Promise<{ blobs: BlobInfo[]; next: string | null }> {
+    const at = cursor === null || cursor === undefined ? 0 : typeof cursor === "string" && /^[0-9a-f]{2}$/.test(cursor) ? Number.parseInt(cursor, 16) : -1;
+    if (at < 0) throw new LinkRefused("bad_request", "That page of the stored blobs isn't one LumiAH gave.");
+    const pair = at.toString(16).padStart(2, "0");
+    const blobs: BlobInfo[] = [];
+    for (const name of await this.host.storage.list(`blobs/${pair}`, userId)) {
+      if (!BLOB_HASH.test(name)) continue;
+      const stat = await this.host.storage.stat(blobPath(name), userId);
+      if (stat !== null) blobs.push({ hash: name, bytes: stat.bytes, at: stat.writtenAt });
+    }
+    return { blobs, next: at < 255 ? (at + 1).toString(16).padStart(2, "0") : null };
+  }
+
+  /** `blob.remove`: removes blobs by their hashes; one that isn't stored is passed over. */
+  async removeBlobs(userId: string, hashes: unknown): Promise<void> {
+    if (!Array.isArray(hashes)) throw new LinkRefused("bad_request", "The blobs to remove are named by their hashes.");
+    for (const hash of hashes) await this.host.storage.remove(blobPath(Storage.hash(hash)), userId);
   }
 }
 

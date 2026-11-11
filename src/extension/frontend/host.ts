@@ -5,7 +5,7 @@
 
 import type { SpindleFrontendContext } from "lumiverse-spindle-types";
 import { isRecord } from "../../shared/ui";
-import type { HostBridge } from "./app";
+import type { HostBridge, HostCan } from "./app";
 import { createStore } from "./store";
 
 export interface Host extends HostBridge {
@@ -35,6 +35,10 @@ function copyBySelection(text: string): boolean {
   return copied;
 }
 
+/** Lumiverse's names for its world book editor and for what its own Stop button runs (its developer docs, "Host Navigation and Actions"): the host's, so no setting. */
+const LORE_EDITOR = "world_book_editor";
+const STOP_COMMAND = "action-stop-generation";
+
 export function createHost(ctx: SpindleFrontendContext): Host {
   const activeChat = createStore<string | null>(ctx.getActiveChat().chatId);
   const pointer = window.matchMedia?.("(pointer: coarse)");
@@ -49,11 +53,46 @@ export function createHost(ctx: SpindleFrontendContext): Host {
   const syncChat = (): void => activeChat.set(ctx.getActiveChat().chatId);
   if (ctx.state) cleanups.push(ctx.state.subscribe<{ chatId: string | null }>("chat.active", (value) => activeChat.set(value.chatId)));
   else for (const event of ["CHAT_CHANGED", "CHAT_SWITCHED"]) cleanups.push(ctx.events.on(event, syncChat));
+  // What a page may do in Lumiverse's own UI, from the host's own list of its places and actions (an older Lumiverse has none): its world book editor, and the command its Stop button runs. The list changes (a permission is granted, a chat opens), so it is read again when the host says so.
+  const surfaces = ctx.host.surfaces;
+  const canNow = (): HostCan => {
+    try {
+      const listed = surfaces?.list(["modal", "command"]) ?? [];
+      const offers = (kind: string, id: string): boolean => listed.some((s) => s.kind === kind && s.id === id && s.invocable !== false);
+      return { loreEditor: offers("modal", LORE_EDITOR), stopReply: offers("command", STOP_COMMAND) };
+    } catch {
+      return { loreEditor: false, stopReply: false };
+    }
+  };
+  const can = createStore<HostCan>(canNow());
+  if (surfaces) cleanups.push(surfaces.subscribe(() => can.set(canNow())));
+  /** Runs one of the host's own actions; false where it has none such, or it refused. */
+  const invoke = async (kind: "modal" | "command", id: string, params?: Record<string, string>): Promise<boolean> => {
+    if (!surfaces) return false;
+    try {
+      await surfaces.invoke({ kind, id }, params);
+      return true;
+    } catch {
+      return false;
+    }
+  };
   return {
     activeChat,
     coarse,
     drawerOpen,
+    can,
+    openLoreEntry: (bookId, entryId) => invoke("modal", LORE_EDITOR, { id: bookId, entryId }),
+    stopReply: () => invoke("command", STOP_COMMAND),
     origin: window.location.origin,
+    activeConnection() {
+      // An optional host API (an older Lumiverse has none), and one that reads the host's own state: where it is missing or throws, the page says nothing rather than something wrong.
+      try {
+        const active = ctx.connections?.getActive?.();
+        return active ? active.activeProfileId : undefined;
+      } catch {
+        return undefined;
+      }
+    },
     async copy(text) {
       if (navigator.clipboard && window.isSecureContext) {
         try {
@@ -85,6 +124,18 @@ export function createHost(ctx: SpindleFrontendContext): Host {
       const r = ctx.ui.geometry ? ctx.ui.geometry.layoutElementRect(el) : el.getBoundingClientRect();
       return { x: r.x, y: r.y, width: r.width, height: r.height };
     },
+    async grant(permissions, reason) {
+      // An optional host API: an older Lumiverse has no request a page can make, and grants only in its Extensions panel.
+      const request = ctx.permissions?.request;
+      if (typeof request !== "function") return "unavailable";
+      try {
+        const granted = await request.call(ctx.permissions, [...permissions], { reason });
+        return permissions.every((p) => granted.includes(p)) ? "granted" : "denied";
+      } catch {
+        // Lumiverse rejects when the user says no (or when one of them needs an owner's approval they can't give).
+        return "denied";
+      }
+    },
     watch(again) {
       // Lumiverse drops what a page sends while its socket is down and while the extension's worker
       // restarts, without a word. The page learns only that the socket is back (its CONNECTED names
@@ -99,11 +150,16 @@ export function createHost(ctx: SpindleFrontendContext): Host {
       const shown = (): void => {
         if (document.visibilityState === "visible") again();
       };
+      // The drawer was opened, or brought to another of its tabs and perhaps back to this one: what only a page can tell the backend (the connection profile active in Lumiverse) may have changed in the tab the user came from.
+      const offDrawer = ctx.ui.events.onDrawerChange((state) => {
+        if (state.open) again();
+      });
       window.addEventListener("online", again);
       document.addEventListener("visibilitychange", shown);
       return () => {
         offConnected();
         offLoaded();
+        offDrawer();
         window.removeEventListener("online", again);
         document.removeEventListener("visibilitychange", shown);
       };

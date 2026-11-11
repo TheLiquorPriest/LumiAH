@@ -5,7 +5,7 @@
 // line; each tool call a card), the totals as cards in one column and as tables where there is
 // room, and the events as traced. Texts are monospace and keep their line breaks; everything wraps.
 
-import { WIDE_MIN_PX } from "../layout";
+import { STACKED_TABS_MAX_PX, WIDE_MIN_PX } from "../layout";
 
 export const LIVE_CSS = `
 .lah-chatbar{display:flex;align-items:center;gap:var(--lah-s2);min-width:0}
@@ -37,7 +37,7 @@ export const LIVE_CSS = `
 .lah-filters-body[data-open=false]{display:none}
 .lah-filters-row{display:flex;flex-wrap:wrap;align-items:center;gap:var(--lah-s1) var(--lah-s2);min-width:0}
 .lah-filters-row>.lah-input{flex:1 1 140px}
-.lah-turn-search{position:sticky;top:calc(var(--lah-stick-top,0px) + var(--lah-bar-h,0px));z-index:4;display:flex;flex-wrap:wrap;align-items:center;gap:var(--lah-s1);min-width:0;padding:var(--lah-s1) 0;background:var(--lah-bar-bg)}
+.lah-turn-search{position:sticky;top:calc(var(--lah-stick-top,0px) + var(--lah-bar-h,0px) + var(--lah-pin-h,0px));z-index:4;display:flex;flex-wrap:wrap;align-items:center;gap:var(--lah-s1);min-width:0;padding:var(--lah-s1) 0;background:var(--lah-bar-bg)}
 .lah-turn-search>.lah-search{flex:1 1 150px}
 .lah-turn-matches{display:flex;align-items:center;gap:2px;font-size:var(--lah-fs-sm);font-variant-numeric:tabular-nums;white-space:nowrap}
 .lah-filters-toggle{display:flex;align-items:center;gap:var(--lah-s1);min-width:0}
@@ -111,8 +111,58 @@ export const LIVE_CSS = `
 .lah-tool-label{display:flex;align-items:center;justify-content:space-between;gap:var(--lah-s2);font-size:var(--lah-fs-xs);font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--lah-muted);min-width:0}
 .lah-prompt{display:flex;flex-direction:column;gap:var(--lah-s2);min-width:0}
 .lah-prompt-facts{font-size:var(--lah-fs-sm);color:var(--lah-muted);overflow-wrap:anywhere}
-.lah-follow{position:sticky;bottom:var(--lah-s2);z-index:5;display:flex;justify-content:center;pointer-events:none}
+/* While a turn runs, its state and what the user can do to it stay at the top of what the panel shows, under the page bar (transcript.tsx measures it as --lah-pin-h for the search row under it): never at the foot, where the drawer lies over Lumiverse's own Send and Stop. */
+.lah-pin{position:sticky;top:calc(var(--lah-stick-top,0px) + var(--lah-bar-h,0px));z-index:6;display:flex;flex-direction:column;gap:var(--lah-s1);min-width:0}
+.lah-pin-skip{display:flex;flex-wrap:wrap;align-items:center;gap:var(--lah-s1) var(--lah-s2);min-width:0;padding:var(--lah-s1) var(--lah-s2);border:1px solid var(--lah-border);border-radius:var(--lah-r-lg);background:var(--lah-bar-bg);box-shadow:var(--lah-shadow-lg);font-size:var(--lah-fs-sm)}
+.lah-pin-skip>span{flex:1 1 14em;min-width:0;color:var(--lah-muted);overflow-wrap:anywhere}
+/* What a turn came to for its reply: the brief as prose, the lore by name. */
+.lah-brief{display:flex;flex-direction:column;gap:var(--lah-s1);min-width:0}
+.lah-brief-text{overflow-wrap:anywhere}
+.lah-brief-more{display:flex}
+/* What stays at the foot of what the panel shows while a turn runs: the way back to the newest step, and the calls held for the user's word. */
+.lah-foot{position:sticky;bottom:var(--lah-s2);z-index:5;display:flex;flex-direction:column;gap:var(--lah-s2);min-width:0;pointer-events:none}
+.lah-foot>*{pointer-events:auto}
+.lah-foot>.lah-follow{display:flex;justify-content:center;pointer-events:none}
 .lah-follow>.lah-btn{pointer-events:auto;box-shadow:var(--lah-shadow-lg)}
+.lah-pinned{display:flex;align-items:center;gap:var(--lah-s2);min-width:0;padding:var(--lah-s1) var(--lah-s1) var(--lah-s1) var(--lah-s3);border:1px solid var(--lah-border);border-radius:var(--lah-r-xl);background:var(--lah-bar-bg);box-shadow:var(--lah-shadow-lg);font-size:var(--lah-fs-sm)}
+.lah-pinned-text{flex:1 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}
+/* With no buttons beside it the bar's line has the room to say itself whole, on two lines where it must. */
+.lah-pinned-text.lah-is-whole{white-space:normal;overflow:visible;padding:var(--lah-s2) var(--lah-s2) var(--lah-s2) 0}
+.lah-held{display:flex;flex-direction:column;gap:var(--lah-s2);min-width:0;max-height:min(60vh,440px);overflow-y:auto;overscroll-behavior:contain}
+.lah-held>*{flex-shrink:0}
+.lah-heldcall{display:flex;flex-direction:column;gap:var(--lah-s2);min-width:0;padding:var(--lah-s3);border:1px solid color-mix(in srgb,var(--lah-warning) 55%,transparent);border-radius:var(--lah-r-xl);background:var(--lah-bar-bg);box-shadow:var(--lah-shadow-lg)}
+.lah-heldcall-head{display:flex;flex-wrap:wrap;align-items:center;gap:var(--lah-s1) var(--lah-s2);min-width:0}
+.lah-heldcall-head>.lah-icon{color:var(--lah-warn)}
+.lah-heldcall-what{flex:1 1 12em;min-width:0;overflow-wrap:anywhere}
+.lah-heldcall-args{max-height:160px;overflow:auto;padding:var(--lah-s2);border-radius:var(--lah-r);background:var(--lah-well)}
+.lah-say{display:flex;align-items:flex-end;gap:var(--lah-s2);min-width:0;padding:var(--lah-s2);border:1px solid var(--lah-border);border-radius:var(--lah-r-xl);background:var(--lah-bar-bg);box-shadow:var(--lah-shadow-lg)}
+.lah-say>textarea.lah-input{flex:1 1 0;min-height:calc(2 * 1.5em + 2 * var(--lah-s2) + 2px);max-height:30vh}
+.lah-say-state{display:flex;align-items:center;gap:var(--lah-s1);min-width:0;padding:var(--lah-s1) var(--lah-s3);border:1px solid color-mix(in srgb,var(--lah-warning) 45%,transparent);border-radius:var(--lah-r-lg);background:var(--lah-bar-bg);font-size:var(--lah-fs-sm);color:var(--lah-warn)}
+.lah-changed{display:flex;flex-direction:column;gap:2px;min-width:0;margin:0;padding:0;list-style:none}
+.lah-changed-row{display:flex;flex-wrap:wrap;align-items:center;gap:var(--lah-s1) var(--lah-s2);min-width:0;padding:2px var(--lah-s1);font-size:var(--lah-fs-sm)}
+.lah-changed-path{flex:0 1 auto;min-width:0}
+.lah-changed-row[data-change=added]>.lah-icon{color:var(--lah-pos)}
+.lah-changed-row[data-change=dropped]>.lah-icon{color:var(--lah-muted)}
+.lah-changed-row[data-change=refused]{color:var(--lah-warn)}
+.lah-lorechange{display:flex;flex-direction:column;gap:2px;min-width:0}
+.lah-replyclock{display:inline-flex;align-items:center;gap:var(--lah-s2);min-width:0;font-weight:600;overflow-wrap:anywhere}
+.lah-replyclock.lah-is-short{flex:0 0 auto;gap:var(--lah-s1);white-space:nowrap}
+.lah-replyclock[data-lah-clock=urgent],.lah-replyclock[data-lah-clock=over]{color:var(--lah-warn)}
+.lah-turn-clock{display:flex;min-width:0}
+.lah-heldprompt{min-width:0}
+.lah-heldprompt-sizes{color:var(--lah-muted)}
+.lah-heldprompt>.lah-disclosure-body{gap:var(--lah-s3)}
+.lah-heldprompt-part{display:flex;flex-direction:column;gap:var(--lah-s1);min-width:0}
+.lah-entryrows{display:flex;flex-direction:column;min-width:0}
+.lah-entryrow{display:flex;align-items:center;gap:var(--lah-s2);width:100%;min-width:0;min-height:var(--lah-tap);padding:var(--lah-s1) var(--lah-s2);border:0;border-radius:var(--lah-r);background:none;text-align:left}
+.lah-entryrow:hover{background:var(--lah-hover)}
+.lah-entryrow>.lah-icon{flex:0 0 auto;color:var(--lah-muted)}
+.lah-entryrow-text{flex:1 1 0;min-width:0;display:flex;flex-direction:column}
+.lah-entryrow-title{font-weight:600;color:var(--lah-fg);overflow-wrap:anywhere}
+.lah-entryrow-note{font-size:var(--lah-fs-sm);color:var(--lah-muted);overflow-wrap:anywhere}
+/* On a phone the bar has no room for its words beside the clock and the three controls: they were cut to a letter. The clock and the pulse say that it runs, so there the clock takes the words' room. */
+@container lah (max-width:${STACKED_TABS_MAX_PX}px){.lah-pinned-word{display:none}.lah-pinned.lah-is-timed>.lah-pinned-text{display:none}.lah-pinned.lah-is-timed>.lah-replyclock{flex:1 1 0}}
+.lah-tool[data-state=held]>summary>.lah-tool-state{color:var(--lah-warn);font-weight:600}
 .lah-statgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,132px),1fr));gap:var(--lah-s2);min-width:0}
 .lah-statcard{display:flex;flex-direction:column;gap:2px;min-width:0;padding:var(--lah-s2) var(--lah-s3);border:1px solid var(--lah-hairline);border-radius:var(--lah-r-lg);background:var(--lah-card)}
 .lah-statcard-label{font-size:var(--lah-fs-xs);font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--lah-muted)}

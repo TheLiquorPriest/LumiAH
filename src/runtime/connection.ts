@@ -61,6 +61,8 @@ export interface ConnectionLimits {
 
 export interface ConnectionOptions {
   base: string;
+  /** The identifier of the extension to find in Lumiverse: LumiAH's own, or that of an extension LumiAH is built into. */
+  identifier: string;
   /** The sign-in to use, read again every time the socket opens: after `lumiah login`, a running runtime uses the new token. */
   credentials(): StoredLogin | null;
   http: Http;
@@ -211,11 +213,14 @@ export class HostConnection {
     } catch {
       // Not JSON: no extension found below.
     }
-    const found = isRecord(body) && Array.isArray(body.extensions) ? body.extensions.find((e): e is Record<string, unknown> => isRecord(e) && e.identifier === EXTENSION_IDENTIFIER) : undefined;
-    if (!found || typeof found.id !== "string") throw new LiveError("not_installed", `LumiAH isn't installed on ${base}, or your account can't use it. Install it in Lumiverse's Extensions tab.`);
+    const { identifier } = this.options;
+    // With LumiAH and an extension that includes it installed together, the words say which of the two this runtime links to.
+    const named = identifier === EXTENSION_IDENTIFIER ? "LumiAH" : `The extension "${identifier}", which LumiAH is part of,`;
+    const found = isRecord(body) && Array.isArray(body.extensions) ? body.extensions.find((e): e is Record<string, unknown> => isRecord(e) && e.identifier === identifier) : undefined;
+    if (!found || typeof found.id !== "string") throw new LiveError("not_installed", `${named} isn't installed on ${base}, or your account can't use it. Install it in Lumiverse's Extensions tab.`);
     const extension: ExtensionInfo = { id: found.id, version: typeof found.version === "string" ? found.version : null, enabled: found.enabled === true, status: typeof found.status === "string" ? found.status : "unknown" };
     this.lastExtension = extension;
-    if (extension.status !== "running") throw new LiveError("not_running", `LumiAH is installed on ${base} but not running (${extension.enabled ? extension.status : "disabled"}). Enable it in Lumiverse's Extensions tab.`);
+    if (extension.status !== "running") throw new LiveError("not_running", `${named} is installed on ${base} but not running (${extension.enabled ? extension.status : "disabled"}). Enable it in Lumiverse's Extensions tab.`);
     return extension;
   }
 

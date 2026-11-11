@@ -2,7 +2,9 @@
 // HTTP routes the runtime calls, the event socket its link travels (to the fake host's backend and
 // back), pages that send the backend requests, and a generation as Lumiverse runs one: its start
 // event, the prompt through the interceptor, the request to the loopback connection, the reply read
-// as it streams, the message saved and the end event.
+// as it streams, the message saved and the end event. Where the host has other extensions beside it
+// (fake-host.ts), all of them are listed, the socket carries each one's frames by its id, and a
+// generation goes through every one's interceptor and is told to every one.
 
 import { isRecord, type ChatRole, type JsonObject } from "../../src/core/ports";
 import type { HostGenerationType, PromptMessage } from "../../src/extension/backend/spindle";
@@ -79,9 +81,12 @@ export interface Generated {
   usage: JsonObject | null;
   /** The request's body as Lumiverse sent it. */
   body: JsonObject;
+  /** The messages an interceptor put in and named for the Prompt Breakdown: each by its place in the prompt as sent. */
+  breakdown: { index: number; name: string }[];
 }
 
 export class FakeLumiverse {
+  /** The first extension's id, which a socket's frames are addressed by; another's is `idOf` its host. */
   readonly extensionId = "ext-lumiah";
   readonly base = "http://127.0.0.1:7860";
   token = "session-token-mara";
@@ -91,6 +96,22 @@ export class FakeLumiverse {
   readonly sockets = new Map<string, { close(code: number, reason: string): void }>();
   /** The keys put in connections, by connection. */
   readonly keys = new Map<string, string>();
+  /** The generations under way, by id: what Lumiverse's Stop ends each with. */
+  private readonly generating = new Map<string, { chatId: string; stop: AbortController }>();
+  /** Every call of the stop route, as it was asked. */
+  readonly stops: { generationId: string; chatId: string }[] = [];
+  /** A test's switch: the stop route answers an error, as a Lumiverse that can't be made to stop a reply. */
+  stopFails = false;
+  /**
+   * What the model on a connection that is no loopback answers, as Lumiverse's own generation gets
+   * it: the reply's text, for the prompt it was sent on the connection named. A test of a chat that
+   * runs built in sets it; it may take its time, and rejects to fail the generation.
+   */
+  writes: (body: JsonObject, connectionId: string) => string | Promise<string> = () => "Joss trims the wick and says nothing.";
+  /** Every prompt Lumiverse's own generation sent, in order. */
+  readonly provided: { connectionId: string; body: JsonObject }[] = [];
+  /** What Lumiverse logged of an interceptor that threw: it passes such a one over, unless it is required. */
+  readonly interceptorErrors: { identifier: string; message: string }[] = [];
   private n = 0;
 
   constructor(
@@ -98,12 +119,17 @@ export class FakeLumiverse {
     readonly userId: string,
   ) {}
 
+  /** An extension's id in this Lumiverse (its database id there), by its host. */
+  idOf(host: FakeHost): string {
+    return host === this.host ? this.extensionId : `ext-${host.identifier}`;
+  }
+
   /** The routes the runtime calls with its session. */
   readonly http: Http = async (request) => {
     const url = new URL(request.url);
     const path = url.pathname;
     if (request.headers.Authorization !== `Bearer ${this.token}` && path !== "/api/auth/sign-in/username") return reply(401, { error: "Unauthorized" });
-    if (path === "/api/v1/spindle" && request.method === "GET") return reply(200, { extensions: [{ id: this.extensionId, identifier: "lumi_ah", version: "0.0.1", enabled: true, status: "running" }] });
+    if (path === "/api/v1/spindle" && request.method === "GET") return reply(200, { extensions: this.host.extensions.map((host) => ({ id: this.idOf(host), identifier: host.identifier, version: "0.0.1", enabled: true, status: "running" })) });
     if (path === "/api/v1/ws-ticket" && request.method === "POST") return reply(200, { ticket: `ticket-${++this.n}` });
     if (path === "/api/auth/get-session") return reply(200, { session: { expiresAt: "2099-01-01T00:00:00.000Z" }, user: { id: this.userId } });
     if (path === "/api/v1/connections" && request.method === "GET") return reply(200, { data: this.host.connectionList.map((c) => ({ id: c.id, name: c.name, provider: c.provider, api_url: c.url, model: c.model })) });
@@ -120,28 +146,41 @@ export class FakeLumiverse {
       this.keys.set(decodeURIComponent(key[1] ?? ""), isRecord(body) && typeof body.api_key === "string" ? body.api_key : "");
       return reply(200, { ok: true });
     }
+    if (path === "/api/v1/generate/stop" && request.method === "POST") {
+      const body: unknown = JSON.parse(request.body ?? "{}");
+      const text = (key: string): string => (isRecord(body) && typeof body[key] === "string" ? (body[key] as string) : "");
+      this.stops.push({ generationId: text("generation_id"), chatId: text("chat_id") });
+      if (this.stopFails) return reply(500, { error: "Internal Server Error" });
+      // The generation named; else, as Lumiverse does for an id it no longer knows, whatever runs in the chat.
+      const held = this.generating.get(text("generation_id")) ?? [...this.generating.values()].find((g) => g.chatId === text("chat_id"));
+      held?.stop.abort();
+      return reply(200, { stopped: held !== undefined });
+    }
     return reply(404, { error: "Not found" });
   };
 
-  /** The event socket: a runtime's frames go to the backend with the socket's session, and the backend's to that session come back. */
+  /** The event socket: a runtime's frames go to the backend of the extension they name, with the socket's session, and every backend's to that session come back under its own extension's id. */
   readonly openSocket: OpenSocket = (url, events) => {
     const session = new URL(url).searchParams.get("frontend_session") ?? hex(16);
+    const { extensions } = this.host;
     let open = true;
-    this.host.outlets.set(session, {
-      userId: this.userId,
-      receive: (message) => {
-        if (!open) return;
-        const frame = message as Record<string, unknown>;
-        if (frame.link === LINK && !this.filter(frame)) return;
-        events.message(JSON.stringify({ event: "SPINDLE_FRONTEND_MSG", payload: { extensionId: this.extensionId, data: message } }));
-      },
-    });
+    for (const host of extensions) {
+      host.outlets.set(session, {
+        userId: this.userId,
+        receive: (message) => {
+          if (!open) return;
+          const frame = message as Record<string, unknown>;
+          if (frame.link === LINK && !this.filter(frame)) return;
+          events.message(JSON.stringify({ event: "SPINDLE_FRONTEND_MSG", payload: { extensionId: this.idOf(host), data: message } }));
+        },
+      });
+    }
     this.sockets.set(session, {
       close: (code, reason) => {
         if (!open) return;
         open = false;
         this.sockets.delete(session);
-        this.host.closeSession(session);
+        for (const host of extensions) host.closeSession(session);
         events.close(code, reason);
       },
     });
@@ -150,13 +189,13 @@ export class FakeLumiverse {
       send: (text) => {
         if (!open) return;
         const message = JSON.parse(text) as { type?: string; extensionId?: string; payload?: unknown };
-        if (message.type === "SPINDLE_BACKEND_MSG" && message.extensionId === this.extensionId) this.host.deliver(message.payload, this.userId, session);
+        if (message.type === "SPINDLE_BACKEND_MSG") extensions.find((host) => this.idOf(host) === message.extensionId)?.deliver(message.payload, this.userId, session);
       },
       close: () => {
         if (!open) return;
         open = false;
         this.sockets.delete(session);
-        this.host.closeSession(session);
+        for (const host of extensions) host.closeSession(session);
       },
     };
     return socket;
@@ -195,12 +234,27 @@ export class FakeLumiverse {
    * One generation in a chat, as Lumiverse runs it on the connection the chat generates on: the start
    * event, the prompt through the interceptor, the request to the loopback (`fetch` is the runtime's
    * handler), the reply read as it streams, the message saved, the end event. `before` runs once the
-   * request is on its way; `signal` is Lumiverse's Stop.
+   * request is on its way. Lumiverse's Stop is `signal`, or the stop route asked for the generation:
+   * the request is closed, what was written is kept (a new reply with nothing written is deleted),
+   * and the stopped event is said in the end event's place.
    */
   async generate(
     fetch: (request: Request) => Promise<Response>,
     chatId: string,
-    options: { key: string; port: number; type?: HostGenerationType; presetId?: string | null; system?: string; signal?: AbortSignal; onStarted?(generationId: string): void; onPiece?(text: string): void } = { key: "", port: 0 },
+    options: {
+      key: string;
+      port: number;
+      type?: HostGenerationType;
+      presetId?: string | null;
+      system?: string;
+      /** World Info entries Lumiverse activated for the prompt, each put in as a message of its own. */
+      lore?: { entryId: string; bookId: string | null; title: string; text: string; how?: "key" | "vector"; score?: number }[];
+      signal?: AbortSignal;
+      onStarted?(generationId: string): void;
+      /** The prompt has been through every interceptor and is about to be sent. */
+      onPrompt?(body: JsonObject): void;
+      onPiece?(text: string): void;
+    } = { key: "", port: 0 },
   ): Promise<Generated> {
     const { host, userId } = this;
     const chat = host.chatList.get(chatId);
@@ -216,54 +270,145 @@ export class FakeLumiverse {
       if (type !== "continue") {
         target.swipes.push("");
         target.swipeId = target.swipes.length - 1;
-        host.emit.touched(chatId);
+        host.everywhere((emit) => emit.touched(chatId));
       }
     }
-    host.emit.started({ generationId, chatId, userId, type, targetMessageId: target.id, targetSwipeId: target.swipeId });
+    // Lumiverse's Stop ends the generation wherever it is: while an interceptor works, or while the reply is written.
+    const stop = new AbortController();
+    const stopped = (): void => stop.abort();
+    if (options.signal?.aborted === true) stopped();
+    else options.signal?.addEventListener("abort", stopped, { once: true });
+    this.generating.set(generationId, { chatId, stop });
+    host.everywhere((emit) => emit.started({ generationId, chatId, userId, type, targetMessageId: target.id, targetSwipeId: target.swipeId }));
     options.onStarted?.(generationId);
 
+    // As Lumiverse picks it: the chat's own pin, else the connection the user has selected, else their default, else the first listed.
     const pin = chat.metadata.connection_profile_id;
-    const connection = host.connectionList.find((c) => c.id === pin) ?? host.connectionList.find((c) => c.isDefault);
+    const selected = host.selected(userId);
+    const connection = host.connectionList.find((c) => c.id === pin) ?? host.connectionList.find((c) => c.id === selected) ?? host.connectionList.find((c) => c.isDefault) ?? host.connectionList[0];
     if (connection === undefined) throw new Error("the chat has no connection");
     const prompt: PromptMessage[] = [{ role: "system", text: options.system ?? "You are Joss, keeper of the harbour light.", history: false }];
+    for (const entry of options.lore ?? []) prompt.push({ role: "system", text: entry.text, history: false, lore: true });
     chat.messages.forEach((m, index) => {
       if (m === target && type !== "continue") return;
       prompt.push({ role: m.role as ChatRole, text: m.swipes[m.swipeId] ?? "", history: true, sourceId: m.id, sourceIndex: index });
     });
+    const activated = (options.lore ?? []).map((e) => ({ entryId: e.entryId, bookId: e.bookId, title: e.title, ...(e.how !== undefined ? { how: e.how } : {}), ...(e.score !== undefined ? { score: e.score } : {}) }));
     let parameters: Record<string, unknown> = {};
     let kept = prompt;
-    const interceptor = host.interceptor;
-    if (interceptor !== null && interceptor.options.types.includes(type)) {
-      const verdict = await interceptor.handler({ chatId, userId, generationId: null, type, dryRun: false, connectionId: connection.id, presetId: options.presetId ?? null, personaId: null, activated: [], messages: prompt });
-      const omit = new Set(verdict.omit ?? []);
-      kept = prompt.filter((_, i) => !omit.has(i));
-      parameters = verdict.parameters ?? {};
+    const breakdown: { index: number; name: string }[] = [];
+    let failed: string | null = null;
+    // Every extension's interceptor, the lowest priority first and equals in the order they were installed, each on what the one before left; a later one's parameters go over an earlier one's (Lumiverse's interceptor pipeline). Each has the time its extension's manifest asks for; one that fails or runs out of it is passed over and the prompt goes on as the one before left it, unless it is required, which fails the generation.
+    const interceptors = host.extensions.flatMap((extension) => (extension.interceptor !== null && extension.interceptor.options.types.includes(type) ? [{ ...extension.interceptor, limit: extension.interceptorMs, identifier: extension.identifier }] : []));
+    for (const interceptor of interceptors.sort((a, b) => a.options.priority - b.options.priority)) {
+      if (stop.signal.aborted) break;
+      const call = new AbortController();
+      const halted = (): void => call.abort("Aborted");
+      stop.signal.addEventListener("abort", halted, { once: true });
+      const late = Promise.withResolvers<"late">();
+      const timer = setTimeout(() => {
+        call.abort(`Interceptor from ${interceptor.identifier} timed out (${Math.round(interceptor.limit / 1000)}s)`);
+        late.resolve("late");
+      }, interceptor.limit);
+      const gone = Promise.withResolvers<"stopped">();
+      const said = (): void => gone.resolve("stopped");
+      stop.signal.addEventListener("abort", said, { once: true });
+      try {
+        const verdict = await Promise.race([interceptor.handler({ chatId, userId, generationId: null, type, dryRun: false, connectionId: connection.id, presetId: options.presetId ?? null, personaId: null, activated, messages: kept, signal: call.signal }), late.promise, gone.promise]);
+        if (verdict === "stopped") break;
+        if (verdict === "late") {
+          if (interceptor.options.required) failed = `Interceptor from ${interceptor.identifier} timed out`;
+          continue;
+        }
+        if (verdict.messages !== undefined) {
+          const before = kept;
+          kept = [];
+          for (const slot of verdict.messages) {
+            if ("keep" in slot) {
+              const came = before[slot.keep];
+              if (came !== undefined) kept.push(came);
+              continue;
+            }
+            if (slot.label !== undefined) breakdown.push({ index: kept.length, name: slot.label });
+            kept.push({ role: slot.role, text: slot.text, history: false });
+          }
+        } else {
+          const omit = new Set(verdict.omit ?? []);
+          kept = kept.filter((_, i) => !omit.has(i));
+        }
+        parameters = { ...parameters, ...verdict.parameters };
+      } catch (error) {
+        if (interceptor.options.required) failed = error instanceof Error ? error.message : String(error);
+        this.interceptorErrors.push({ identifier: interceptor.identifier, message: error instanceof Error ? error.message : String(error) });
+      } finally {
+        clearTimeout(timer);
+        stop.signal.removeEventListener("abort", halted);
+        stop.signal.removeEventListener("abort", said);
+      }
+      if (failed !== null) break;
     }
     const body = { model: connection.model, stream: true, messages: kept.map((m) => ({ role: m.role, content: m.text })), temperature: 0.8, max_tokens: 600, ...parameters } as JsonObject;
 
-    const out: Generated = { generationId, messageId: null, status: 0, content: "", reasoning: "", error: null, finish: null, usage: null, body };
-    Object.assign(out, await this.post(fetch, body, options));
+    const out: Generated = { generationId, messageId: null, status: 0, content: "", reasoning: "", error: null, finish: null, usage: null, body, breakdown };
+    try {
+      if (failed !== null) Object.assign(out, { status: 500, error: { message: failed, code: "interceptor" } });
+      else if (!stop.signal.aborted) {
+        options.onPrompt?.(body);
+        // A connection that is the runtime's loopback is the runtime's to answer; any other is a provider Lumiverse calls itself.
+        if (connection.url === `http://127.0.0.1:${options.port}/v1`) Object.assign(out, await this.post(fetch, body, { ...options, signal: stop.signal }));
+        else Object.assign(out, await this.provide(body, connection.id, stop.signal, options.onPiece));
+      }
+    } finally {
+      this.generating.delete(generationId);
+      options.signal?.removeEventListener("abort", stopped);
+    }
 
-    if (options.signal?.aborted === true) {
-      // Stop: Lumiverse keeps what was written on the message it was writing, and says so.
-      target.swipes[target.swipeId] = out.content;
-      host.emit.touched(chatId);
-      host.emit.stopped({ generationId, chatId, userId });
+    // A continue adds to what the swipe held; any other kind writes a swipe that was empty.
+    const before = type === "continue" ? (target.swipes[target.swipeId] ?? "") : "";
+    if (stop.signal.aborted) {
+      // Stop: Lumiverse keeps what was written on the message it was writing, and deletes a new reply's message that got neither text nor reasoning; then it says so.
+      if (type === "normal" && out.content === "" && out.reasoning === "") chat.messages.splice(chat.messages.indexOf(target), 1);
+      else target.swipes[target.swipeId] = before + out.content;
+      host.everywhere((emit) => emit.touched(chatId));
+      host.everywhere((emit) => emit.stopped({ generationId, chatId, userId }));
       return out;
     }
     if (out.error !== null || out.status !== 200) {
       if (type === "normal") {
         chat.messages.splice(chat.messages.indexOf(target), 1);
-        host.emit.touched(chatId);
+        host.everywhere((emit) => emit.touched(chatId));
       }
-      host.emit.ended({ generationId, chatId, userId, messageId: null, error: out.error?.message ?? `status ${out.status}` });
+      host.everywhere((emit) => emit.ended({ generationId, chatId, userId, messageId: null, error: out.error?.message ?? `status ${out.status}` }));
       return out;
     }
-    target.swipes[target.swipeId] = out.content;
+    target.swipes[target.swipeId] = before + out.content;
     out.messageId = target.id;
-    host.emit.touched(chatId);
-    host.emit.ended({ generationId, chatId, userId, messageId: target.id, error: null });
+    host.everywhere((emit) => emit.touched(chatId));
+    // Lumiverse says what the generation wrote with its end, as it saved it.
+    host.everywhere((emit) => emit.ended({ generationId, chatId, userId, messageId: target.id, content: before + out.content, error: null }));
     return out;
+  }
+
+  /**
+   * Lumiverse's own generation on a connection that is no loopback: the prompt goes to that
+   * connection's model (`writes`), and its answer is the reply. A Stop while it writes ends it with
+   * nothing written; a model that fails, fails the generation in its own words.
+   */
+  private async provide(body: JsonObject, connectionId: string, signal: AbortSignal, onPiece?: (text: string) => void): Promise<Pick<Generated, "status" | "content" | "reasoning" | "error" | "finish" | "usage">> {
+    this.provided.push({ connectionId, body });
+    const halted = Promise.withResolvers<null>();
+    const stopped = (): void => halted.resolve(null);
+    signal.addEventListener("abort", stopped, { once: true });
+    try {
+      const content = await Promise.race([Promise.resolve().then(() => this.writes(body, connectionId)), halted.promise]);
+      if (content === null || signal.aborted) return { status: 0, content: "", reasoning: "", error: null, finish: null, usage: null };
+      onPiece?.(content);
+      return { status: 200, content, reasoning: "", error: null, finish: "stop", usage: null };
+    } catch (error) {
+      return { status: 502, content: "", reasoning: "", error: { message: error instanceof Error ? error.message : String(error), code: "provider" }, finish: null, usage: null };
+    } finally {
+      signal.removeEventListener("abort", stopped);
+    }
   }
 
   /**

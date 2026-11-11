@@ -9,7 +9,7 @@
 // path reads of one turn cost one; and when it is read again, a message whose text didn't change
 // keeps its fingerprint instead of being hashed again.
 
-import type { ChatMessage, JsonObject, JsonValue, PathMessage } from "../../core/ports";
+import type { ChatInfo, ChatMessage, JsonObject, JsonValue, PathMessage, StoredAnchor } from "../../core/ports";
 import { textHash } from "../../core/hash";
 import { contentMark } from "../../link/contract";
 import { isRecord } from "../../link/json";
@@ -31,9 +31,60 @@ function anchorsOf(own: JsonValue | null): Anchors {
   return out;
 }
 
-/** LumiAH's record for the swipe a message shows, as stored; null when it has none. */
-export function shownAnchor(message: Pick<HostMessage, "own" | "swipeId">): JsonValue | null {
-  return anchorsOf(message.own).swipes[String(message.swipeId)] ?? null;
+/**
+ * Where a turn's record sits in what the extension keeps on a message: its own entry in the
+ * message's extension metadata. An extension that builds LumiAH into itself and keeps a record of
+ * its own per message supplies this (DESIGN §5, §21), so a message holds one record and not two:
+ * it says where in its own entry LumiAH's record for a swipe is read and written.
+ */
+export interface AnchorCodec {
+  /** The record for a swipe; null when the entry holds none. */
+  read(own: JsonValue | null, swipe: number): JsonValue | null;
+  /** The entry with the record for a swipe put in, everything else of it kept. */
+  write(own: JsonValue | null, swipe: number, record: JsonValue): JsonValue;
+  /** The entry once a swipe is deleted: the later swipes' records moved down by one, the deleted one's gone. Null: the entry stays as it is. */
+  swipeDeleted(own: JsonValue | null, swipe: number): JsonValue | null;
+}
+
+/** LumiAH's own: the entry is nothing but the records, `{ v: 1, swipes: { "<swipe>": record } }`. */
+export const OWN_ANCHORS: AnchorCodec = {
+  read: (own, swipe) => anchorsOf(own).swipes[String(swipe)] ?? null,
+  write(own, swipe, record) {
+    const anchors = anchorsOf(own);
+    anchors.swipes[String(swipe)] = record;
+    return anchors as unknown as JsonObject;
+  },
+  swipeDeleted(own, deleted) {
+    const anchors = anchorsOf(own);
+    const held = Object.keys(anchors.swipes).map(Number);
+    if (!held.some((swipe) => swipe >= deleted)) return null;
+    const moved: Anchors = { v: 1, swipes: {} };
+    for (const swipe of held) {
+      if (swipe === deleted) continue;
+      const record = anchors.swipes[String(swipe)];
+      if (record !== undefined) moved.swipes[String(swipe > deleted ? swipe - 1 : swipe)] = record;
+    }
+    return moved as unknown as JsonObject;
+  },
+};
+
+/**
+ * The records under `key` of an entry that is otherwise the extension's own to use:
+ * `{ …, [key]: { v: 1, swipes } }`, everything else of the entry kept as it is. For an extension
+ * that builds LumiAH into itself, keeps something of its own on a message, and supplies no codec
+ * (`BackendIdentity.anchorKey`).
+ */
+export function anchorsUnder(key: string): AnchorCodec {
+  const records = (own: JsonValue | null): JsonValue | null => (isRecord(own) ? ((own[key] as JsonValue | undefined) ?? null) : null);
+  const entry = (own: JsonValue | null, held: JsonValue): JsonValue => ({ ...(isRecord(own) ? (own as JsonObject) : {}), [key]: held });
+  return {
+    read: (own, swipe) => OWN_ANCHORS.read(records(own), swipe),
+    write: (own, swipe, record) => entry(own, OWN_ANCHORS.write(records(own), swipe, record)),
+    swipeDeleted(own, deleted) {
+      const moved = OWN_ANCHORS.swipeDeleted(records(own), deleted);
+      return moved === null ? null : entry(own, moved);
+    },
+  };
 }
 
 /**
@@ -65,8 +116,9 @@ export class Chats {
    * @param kept How many chats' paths a user's settings keep in memory between reads; 0 keeps none.
    */
   constructor(
-    private readonly host: Pick<BackendHost, "chats">,
+    private readonly host: Pick<BackendHost, "chats" | "granted">,
     private readonly kept: (userId: string) => Promise<number>,
+    private readonly codec: AnchorCodec = OWN_ANCHORS,
   ) {}
 
   /** The chat, when it is the user's; refused (`not_found`) otherwise, in the same words whether it is another user's or no chat at all. A read that fails is the host's failure and stays one. */
@@ -115,7 +167,7 @@ export class Chats {
         const old = before.get(m.id);
         // The mark is a 32-bit hash with the text's length: a text that changed and kept both would keep its old fingerprint, which no session's safety hangs on.
         const hash = old !== undefined && old.swipeId === m.swipeId && old.mark === mark ? old.hash : await textHash(m.content);
-        return { id: m.id, index: m.index, role: m.role, name: m.name, swipeId: m.swipeId, chars: m.content.length, hash, anchor: shownAnchor(m), mark };
+        return { id: m.id, index: m.index, role: m.role, name: m.name, swipeId: m.swipeId, chars: m.content.length, hash, anchor: this.codec.read(m.own, m.swipeId), mark };
       }),
     );
     const most = await this.kept(userId);
@@ -158,39 +210,101 @@ export class Chats {
 
   /**
    * Writes LumiAH's record for one swipe of a message, in place of the one it holds; false when the
-   * message or the swipe is gone. `swipe` null: the swipe the message shows.
+   * message or the swipe is gone. `swipe` null: the swipe the message shows. A function is asked as
+   * the write takes its place among the message's writes: the answer then counts every swipe
+   * deletion heard so far, whose move of the stored records runs before this write, and none heard
+   * later, whose move runs after it and carries this record along. Without the permission to change
+   * a chat's messages nothing is written and nothing fails: false, as for a message that is gone.
    */
-  async anchor(userId: string, chatId: string, messageId: string, swipe: number | null, record: JsonValue): Promise<boolean> {
+  async anchor(userId: string, chatId: string, messageId: string, swipe: number | null | (() => number), record: JsonValue): Promise<boolean> {
     await this.own(userId, chatId);
+    if (!this.host.granted("chat_mutation")) return false;
+    const aimed = typeof swipe === "function" ? swipe() : swipe;
     return this.writes.run(`${chatId}\u0000${messageId}`, async () => {
       const message = await this.find(chatId, messageId);
       if (message === null) return false;
-      const at = swipe ?? message.swipeId;
+      const at = aimed ?? message.swipeId;
       if (!Number.isSafeInteger(at) || at < 0 || at >= message.swipes) return false;
-      const anchors = anchorsOf(message.own);
-      anchors.swipes[String(at)] = record;
-      await this.host.chats.setOwn(chatId, messageId, anchors as unknown as JsonObject);
+      // What this backend keeps on a record beside the core's own fields (`ran`: where its turn ran) stays when the core rewrites the record of the same turn, as a rollback or a job's end does: the core hands back only the fields it reads.
+      const held = this.codec.read(message.own, at);
+      const kept: JsonValue = isRecord(record) && record.ran === undefined && isRecord(held) && held.ran !== undefined && held.generationId === record.generationId ? { ...(record as JsonObject), ran: held.ran as JsonValue } : record;
+      await this.host.chats.setOwn(chatId, messageId, this.codec.write(message.own, at, kept));
       this.touched(chatId);
       return true;
     });
   }
 
-  /** A swipe of a message was deleted: the records of the later swipes move down with them, and the deleted one's is gone. */
+  /** Whether a swipe of a message bears the record of a generation already. */
+  async recorded(chatId: string, messageId: string, swipe: number, generationId: string): Promise<boolean> {
+    const message = await this.find(chatId, messageId);
+    const held = message === null ? null : this.codec.read(message.own, swipe);
+    return isRecord(held) && held.generationId === generationId;
+  }
+
+  /** A swipe of a message was deleted: the records of the later swipes move down with them, and the deleted one's is gone. Without the permission to change a chat's messages there is nothing to move, and nothing is tried. */
   async swipeDeleted(chatId: string, messageId: string, deleted: number): Promise<void> {
+    if (!this.host.granted("chat_mutation")) return;
     await this.writes.run(`${chatId}\u0000${messageId}`, async () => {
       const message = await this.find(chatId, messageId);
       if (message === null) return;
-      const anchors = anchorsOf(message.own);
-      const held = Object.keys(anchors.swipes).map(Number);
-      if (!held.some((swipe) => swipe >= deleted)) return;
-      const moved: Anchors = { v: 1, swipes: {} };
-      for (const swipe of held) {
-        if (swipe === deleted) continue;
-        const record = anchors.swipes[String(swipe)];
-        if (record !== undefined) moved.swipes[String(swipe > deleted ? swipe - 1 : swipe)] = record;
-      }
-      await this.host.chats.setOwn(chatId, messageId, moved as unknown as JsonObject);
+      const moved = this.codec.swipeDeleted(message.own, deleted);
+      if (moved === null) return;
+      await this.host.chats.setOwn(chatId, messageId, moved);
       this.touched(chatId);
+    });
+  }
+
+  /** `chat.info`: the chat itself (its name, the character it is with, the chat it was branched from); null when the user has no such chat. */
+  async info(userId: string, chatId: string): Promise<ChatInfo | null> {
+    const chat = await this.host.chats.get(chatId, userId);
+    if (chat === null) return null;
+    const from = chat.metadata.branched_from;
+    return {
+      id: chat.id,
+      name: chat.name,
+      characterId: chat.characterId,
+      characterName: chat.characterId === null ? null : await this.host.chats.characterName(chat.characterId, userId),
+      branchedFrom: typeof from === "string" && from !== "" ? from : null,
+    };
+  }
+
+  /**
+   * `chat.anchors`: every record LumiAH holds on a swipe of a message, in every chat of the user's.
+   * A page is one chat's records, so no page grows with how many chats there are; `cursor` is the
+   * place of the chat among the user's, as the page before named it (null: the first).
+   */
+  async anchors(userId: string, cursor: string | null): Promise<{ anchors: StoredAnchor[]; next: string | null }> {
+    const at = cursor === null ? 0 : Number(cursor);
+    if (!Number.isSafeInteger(at) || at < 0) throw new LinkRefused("bad_request", "That page of the chats' records isn't one LumiAH gave.");
+    const { chats, total } = await this.host.chats.list(userId, at, 1);
+    const chat = chats[0];
+    const anchors: StoredAnchor[] = [];
+    if (chat !== undefined) {
+      for (const message of await this.host.chats.messages(chat.id)) {
+        if (message.own === null) continue;
+        for (let swipe = 0; swipe < message.swipes; swipe++) {
+          const anchor = this.codec.read(message.own, swipe);
+          if (anchor !== null) anchors.push({ chatId: chat.id, messageId: message.id, swipeId: swipe, anchor });
+        }
+      }
+    }
+    return { anchors, next: chat !== undefined && at + 1 < total ? String(at + 1) : null };
+  }
+
+  /**
+   * Deletes a reply's message that holds nothing: an assistant's, with one swipe and no text. True
+   * when it was deleted; a message with text, or one the user swiped, is never touched, and nothing
+   * is without the permission to change a chat's messages.
+   */
+  async deleteEmpty(userId: string, chatId: string, messageId: string): Promise<boolean> {
+    await this.own(userId, chatId);
+    if (!this.host.granted("chat_mutation")) return false;
+    return this.writes.run(`${chatId}\u0000${messageId}`, async () => {
+      const message = await this.find(chatId, messageId);
+      if (message === null || message.role !== "assistant" || message.swipes !== 1 || message.content !== "") return false;
+      await this.host.chats.deleteMessage(chatId, messageId);
+      this.touched(chatId);
+      return true;
     });
   }
 }

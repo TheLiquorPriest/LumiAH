@@ -3,12 +3,11 @@
 // the call's inputs (`foldOf`), the guard on its answer (`summaryOf`) and the memory of summaries
 // already made (`CompactionMemo`); the turn makes the call and lands it (`harness.ts`).
 //
-// A summary cut off at its limit, or one that stops mid-sentence, never lands: the session goes on
-// whole, the trace says so, and the next turn tries again.
+// A summary whose call was cut off at its limit never lands: the session goes on whole, the trace
+// says so, and the next turn tries again.
 
 import { partsHash } from "./hash";
-import type { AgentReply } from "./loop";
-import { cutShort } from "./loop";
+import { type AgentReply, cutShort } from "./loop";
 import { receiptOf, toldOf } from "./receipts";
 import { TEXT, type Texts } from "./texts";
 import type { PastTurn } from "./tools";
@@ -27,12 +26,12 @@ export interface Fold {
  * be at most `limit` tokens long; the summary so far and the receipts of the turns to fold are its
  * message. Null when the session holds no more than `keep` turns: there is nothing to fold.
  */
-export function foldOf(session: { summary: string | null; turns: readonly PastTurn[] }, input: { keep: number; limit: number; receiptChars: number; texts: Texts }): Fold | null {
+export function foldOf(session: { summary: string | null; turns: readonly PastTurn[] }, input: { keep: number; limit: number; receiptChars: number; receiptArgChars: number; texts: Texts }): Fold | null {
   const { texts } = input;
   const cut = Math.max(0, session.turns.length - input.keep);
   const folded = session.turns.slice(0, cut);
   if (folded.length === 0) return null;
-  const turns = folded.map((t) => texts.render(TEXT.session.summarizerTurn, { told: toldOf(t.segment, texts), receipt: receiptOf(t.segment, input.receiptChars, texts) }));
+  const turns = folded.map((t) => texts.render(TEXT.session.summarizerTurn, { told: toldOf(t.segment, texts), receipt: receiptOf(t.segment, input, texts) }));
   return {
     system: texts.render(TEXT.session.summarizer, { keep: texts.counted(input.keep, TEXT.word.turn), limit: String(input.limit) }),
     message: texts.render(TEXT.session.summarizerInput, { summary: session.summary ?? texts.render(TEXT.session.none), turns: turns.join("\n\n") }),
@@ -41,27 +40,20 @@ export function foldOf(session: { summary: string | null; turns: readonly PastTu
   };
 }
 
-/** A fold's outcome: the summary, or why there is none (`cut`: its answer stopped at its limit, or mid-sentence). */
+/** A fold's outcome: the summary, or why there is none (`cut`: its call stopped at its limit). */
 export type FoldResult = { summary: string } | { failed: string; cut?: true };
 
 /**
- * What a sentence never ends on: a summary that stops on one was cut off mid-sentence. Not a
- * setting: it is what the guard reads, in the punctuation and the English words a cut answer ends
- * on; the provider's own finish reason is checked first and needs none of it.
- */
-const DANGLING = /(?:[,;:([{/&+\-–—]|\b(?:and|or|but|nor|the|a|an|of|to|with|from|for|that|which|whose|than|into))$/i;
-
-/**
  * The summary a compaction's call answered, or why it can't land: its call failed or answered
- * nothing, or its answer stopped at its limit (`cutShort`: the provider's finish reason) or
- * mid-sentence, which a cut answer does where the provider never said.
+ * nothing, or its answer stopped at its limit. Whether it was cut is told from how the call ended
+ * (`cutShort`: the provider's finish reason) and never from its words: a whole summary may end on
+ * any word, and one taken for cut would never land.
  */
 export function summaryOf(reply: Pick<AgentReply, "status" | "text" | "reason" | "finish">, texts: Texts): FoldResult {
   const summary = reply.text.trim();
   if (reply.status !== "answered") return { failed: reply.reason ?? texts.render(TEXT.session.failedNothing) };
   if (summary === "") return { failed: texts.render(TEXT.session.failedNothing) };
   if (cutShort(reply.finish)) return { failed: texts.render(TEXT.session.failedCut), cut: true };
-  if (DANGLING.test(summary)) return { failed: texts.render(TEXT.session.failedMidSentence), cut: true };
   return { summary };
 }
 

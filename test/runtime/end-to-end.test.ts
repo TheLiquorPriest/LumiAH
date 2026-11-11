@@ -61,21 +61,20 @@ describe("a chat on the loopback connection", () => {
 
     // The live view holds the turn, ended (its last events follow the record over the link).
     await until(() => it.backend.live.runningOf(USER).length === 0, "the turn's end in the live view");
-    const live = await it.page.request("lah.live.open", { chatId });
+    const live = await it.page.request("lah.live.open", { stream: chatId });
     expect(live.live?.turn).toBe(out.generationId);
     expect(live.live?.ended?.state).toBe("done");
     expect(live.live?.events[0]?.event.kind).toBe("turn_started");
 
-    // First-time setup is done, down to its last step.
+    // First-time setup is done, down to its last step. A runtime is no step of it (§25): it is an option, and the state says this one is there to choose (linked, its key minted, its connection made).
     await it.backend.settle();
     const state = await it.page.request("lah.hello", {});
     expect(state.setup.steps).toEqual([
-      { id: "runtime", done: true },
-      { id: "key", done: true },
-      { id: "connection", done: true },
+      { id: "permissions", done: true },
       { id: "chat", done: true },
       { id: "reply", done: true },
     ]);
+    expect(state.runtime.ready).toBe(true);
   });
 
   test("resumes its session on the next reply, and the Sessions page lists both turns", async () => {
@@ -109,7 +108,7 @@ describe("a chat on the loopback connection", () => {
 
     // The stored transcript reads back as the live view showed it.
     const transcript = turns.turns[1]?.transcript ?? "";
-    const stored = await it.page.request("lah.transcript.get", { chatId, transcript, from: 1 });
+    const stored = await it.page.request("lah.transcript.get", { transcript, from: 1 });
     expect(stored.view.turn).toBe(first.generationId);
     expect(stored.view.ended?.state).toBe("done");
     expect(stored.view.events.length).toBeGreaterThan(3);

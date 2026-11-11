@@ -15,6 +15,49 @@ import { hasOwn, isRecord } from "./json";
 /** The key of this section in the user's settings. */
 export const TRANSPORT_KEY = "transport";
 
+const MI = 1024 * 1024;
+
+/**
+ * The ceilings that protect the worker every account shares (DESIGN §7). A setting that bounds what
+ * the extension holds in memory is an account's own to lower, and to raise as far as its ceiling
+ * here (the schema's maximum); the totals bound what all accounts hold together. None of these is a
+ * setting: a bound an account could raise is no bound on that account, and a total any one account
+ * could set would be one account deciding for the others. Each per-account ceiling is a small part
+ * of its total, so one account at its ceiling leaves the others their room.
+ */
+export const CEILINGS = Object.freeze({
+  /** Frames coming in parts (parts.ts): the largest frame joined, how long its first parts wait, and what one account may have under way; then every account's together. */
+  joinMaxUnits: 64 * MI,
+  partStaleMs: 5 * 60_000,
+  joinFrames: 16,
+  joinHeldUnits: 64 * MI,
+  joinFramesTotal: 64,
+  joinHeldUnitsTotal: 256 * MI,
+  /** Streams to a runtime (streams.ts): how long a finished one waits for its acknowledgement, how many one account may have held, and every account's together. */
+  streamKeepMs: 60 * 60_000,
+  streams: 256,
+  streamsTotal: 2_048,
+  /** A tool's name as a refusal says it back: a name longer than any tool has is cut to this. */
+  nameChars: 200,
+  /** The jobs not yet over that the pages are told of (jobs.ts), for one account and for all. */
+  jobsActive: 512,
+  jobsActiveTotal: 8_192,
+  /** The live view (live.ts): events kept of one run, runs under way for one account (one still running is never let go for room, so their number is bounded itself), chats whose latest run is kept, and every account's events and runs together. */
+  liveEvents: 50_000,
+  liveRunning: 64,
+  liveChats: 256,
+  liveEventsTotal: 2_000_000,
+  liveRunsTotal: 4_096,
+  /** The interceptor's bookkeeping (turns.ts): one account's turns, verdicts and waiting records, and every account's together. A generation whose account Lumiverse didn't name is nobody's until its prompt comes: those are bounded apart. */
+  tagsHeld: 1_024,
+  tagsKnown: 8_192,
+  recordsWaiting: 512,
+  turnsTotal: 8_192,
+  verdictsTotal: 65_536,
+  recordsTotal: 4_096,
+  generationsUnowned: 1_024,
+});
+
 /** The runtime's limits and timings, in milliseconds unless named. */
 export interface RuntimeTuning {
   /** A keep-alive comment after this much silence on a reply's stream to Lumiverse. */
@@ -68,6 +111,8 @@ export interface RuntimeTuning {
   traceHeld: number;
   /** How long a new turn waits for the chat's earlier one to stop before it is refused. */
   turnWaitMs: number;
+  /** How long Lumiverse may take to answer when the runtime asks it to stop a reply (Stop in the live view) before the runtime ends the reply itself. */
+  stopAskMs: number;
   /** The largest frame, in characters, the runtime puts together from parts. */
   joinMaxUnits: number;
   /** How long a frame's first parts wait for the rest. */
@@ -83,6 +128,10 @@ export interface TransportSettings {
     lifeMs: number;
     /** The most tags remembered at once, the oldest let go first. */
     held: number;
+    /** How long the interceptor waits to learn whether a prompt is on the loopback when it doesn't know: past it, a chat not known to be answered here goes on untouched. */
+    checkMs: number;
+    /** How many connections and chats are remembered as answered here or not, the oldest let go first. */
+    known: number;
   };
   streams: {
     /** How long a stream's text waits to be sent with what follows it. */
@@ -93,6 +142,26 @@ export interface TransportSettings {
   connections: {
     /** The connections, by id, that take one tool call per answer: a call on one asks its provider for no parallel tool calls. */
     oneToolAtATime: string[];
+  };
+  mcp: {
+    /** How long one call of an MCP tool may take. */
+    callMs: number;
+  };
+  builtin: {
+    /** How long before Lumiverse stops waiting for the extension a built-in turn hands the prompt back with what it has (DESIGN §25). */
+    marginMs: number;
+  };
+  jobs: {
+    /** The user holds every job: those running wait at their agents' next round, and one that begins waits at its first. */
+    paused: boolean;
+  };
+  pages: {
+    /** How many notices of jobs (finished, failed, interrupted, waiting on the user) are kept until dismissed; past it the oldest go first. */
+    noticesKept: number;
+    /** How long a page's request waits for the runtime to do what it asked of it (a file written, a job started). */
+    askMs: number;
+    /** How much of a job's opening a notice keeps. */
+    noticeChars: number;
   };
   link: {
     /** How long without a hello or a ping before a runtime shows as quiet. */
@@ -105,6 +174,10 @@ export interface TransportSettings {
     joinMaxUnits: number;
     /** How long a frame's first parts wait for the rest. */
     partStaleMs: number;
+    /** The most frames the extension puts together at once for one account, over all its sessions (each runtime's, each page's). */
+    joinFrames: number;
+    /** The most characters it holds of them, for that account. */
+    joinHeldUnits: number;
   };
   live: {
     /** The most events kept of a chat's live turn; past it the turn's later events stay out of the live view. */
@@ -161,16 +234,25 @@ export const RUNTIME_DEFAULTS: Readonly<RuntimeTuning> = Object.freeze({
   traceBatch: 64,
   traceHeld: 20_000,
   turnWaitMs: 30_000,
+  stopAskMs: 5_000,
   joinMaxUnits: 32 * 1024 * 1024,
   partStaleMs: 60_000,
 });
 
 export const TRANSPORT_DEFAULTS: Readonly<TransportSettings> = Object.freeze({
   history: Object.freeze({ keep: "last" as const, count: 40 }),
-  tags: Object.freeze({ lifeMs: 2 * 60 * 60_000, held: 256 }),
+  // The interceptor is never a required one and the manifest asks Lumiverse for five minutes, so no wait here fails a reply. The check stays short all the same: it is made before LumiAH knows a prompt is its own, so a reply of a chat that isn't answered here waits it out too, and gets nothing for the wait.
+  tags: Object.freeze({ lifeMs: 2 * 60 * 60_000, held: 256, checkMs: 3_000, known: 1024 }),
   streams: Object.freeze({ coalesceMs: 40, keepMs: 10 * 60_000 }),
   connections: Object.freeze({ oneToolAtATime: Object.freeze([]) as unknown as string[] }),
-  link: Object.freeze({ quietMs: 120_000, relays: 8, connectionMs: 15_000, joinMaxUnits: 32 * 1024 * 1024, partStaleMs: 60_000 }),
+  // 30 seconds is Lumiverse's own default for a call it is given no time for.
+  mcp: Object.freeze({ callMs: 30_000 }),
+  // The handover writes nothing that waits on a model: it builds the request and answers Lumiverse. Fifteen seconds covers a slow storage write and still leaves the agents nearly all of the five minutes.
+  builtin: Object.freeze({ marginMs: 15_000 }),
+  jobs: Object.freeze({ paused: false }),
+  pages: Object.freeze({ noticesKept: 200, askMs: 30_000, noticeChars: 400 }),
+  // A runtime sends a large frame's parts one after another, so one account seldom has two frames under way: eight, and twice the largest frame, leave room without letting an account fill the extension's memory.
+  link: Object.freeze({ quietMs: 120_000, relays: 8, connectionMs: 15_000, joinMaxUnits: 32 * 1024 * 1024, partStaleMs: 60_000, joinFrames: 8, joinHeldUnits: 64 * 1024 * 1024 }),
   live: Object.freeze({ events: 20_000, page: 500, chats: 32, lostMs: 30_000 }),
   anchors: Object.freeze({ waitMs: 10 * 60_000, held: 64 }),
   sessions: Object.freeze({ previewChars: 120, page: 50, pathsKept: 16 }),
@@ -186,7 +268,7 @@ const DAY_MS = 24 * 60 * 60_000;
 export const TRANSPORT_SCHEMA: JsonObject = {
   type: "object",
   title: "Transport",
-  description: "How LumiAH's runtime, its link to this extension and the extension itself carry a reply. The defaults suit a runtime on the same machine as Lumiverse.",
+  description: "How LumiAH carries a reply: built in, inside this extension before Lumiverse sends the prompt, or in a runtime beside Lumiverse over its link. The defaults suit a runtime on the same machine as Lumiverse.",
   additionalProperties: false,
   properties: {
     history: {
@@ -212,7 +294,10 @@ export const TRANSPORT_SCHEMA: JsonObject = {
       additionalProperties: false,
       properties: {
         lifeMs: ms("A tag's life", "How long after a generation starts its tag still admits its request.", 60_000, DAY_MS),
-        held: whole("Tags remembered", "The most tags remembered at once; the oldest is let go first.", 8, 4096),
+        held: whole("Tags remembered", "The most tags remembered at once; the oldest is let go first.", 8, CEILINGS.tagsHeld),
+        // Lumiverse would wait five minutes, and fails no reply over an interceptor that isn't required. The most is still seconds: this wait is spent by replies LumiAH may have no part in, with nothing shown for it.
+        checkMs: ms("Loopback check", "How long a reply waits while it is checked whether its connection is the loopback, when that isn't known yet. Past it, a chat not known to be answered here goes on untouched.", 100, 9_000),
+        known: whole("Connections remembered", "How many connections and chats are remembered as answered here or not; the oldest is let go first.", 16, CEILINGS.tagsKnown),
       },
     },
     streams: {
@@ -222,7 +307,7 @@ export const TRANSPORT_SCHEMA: JsonObject = {
       additionalProperties: false,
       properties: {
         coalesceMs: ms("Text held back", "How long a stream's text waits to be sent with what follows it. Lower shows text sooner in more, smaller pieces.", 0, 2_000),
-        keepMs: ms("Unacknowledged chunks kept", "How long a finished stream's chunks are kept for an acknowledgement that never came.", 10_000, DAY_MS),
+        keepMs: ms("Unacknowledged chunks kept", "How long a finished stream's chunks are kept for an acknowledgement that never came.", 10_000, CEILINGS.streamKeepMs),
       },
     },
     connections: {
@@ -240,6 +325,46 @@ export const TRANSPORT_SCHEMA: JsonObject = {
         },
       },
     },
+    mcp: {
+      type: "object",
+      title: "MCP servers",
+      description: "The tools of the MCP servers you set up in Lumiverse, which LumiAH's agents may be given. Each tool is named mcp:<server>:<tool>, and every call goes through Lumiverse. A server, or one tool of it, is switched off on the Agents page.",
+      additionalProperties: false,
+      properties: {
+        // Lumiverse holds a call's time between 1 and 120 seconds, whatever it is asked for.
+        callMs: ms("Call time", "How long one call of an MCP tool may take before it is given up.", 1_000, 120_000),
+      },
+    },
+    builtin: {
+      type: "object",
+      title: "Built in",
+      description: "A chat set to run built in is worked on inside Lumiverse, before the reply: Lumiverse waits up to five minutes for an extension, then sends the prompt as it was.",
+      additionalProperties: false,
+      properties: {
+        // Under four of Lumiverse's five minutes, so the agents always have some time; the least is what answering Lumiverse itself takes.
+        marginMs: ms("Margin before Lumiverse's limit", "How long before Lumiverse stops waiting the main agent's turn hands the prompt back with what it has. Too small, and a slow moment costs the turn its part in the reply; larger, and the agents have that much less time.", 2_000, 240_000),
+      },
+    },
+    jobs: {
+      type: "object",
+      title: "Jobs",
+      description: "The switch that holds every job. Whether jobs run at all, how many at once and what each may spend are with the core's settings, under Jobs.",
+      additionalProperties: false,
+      properties: {
+        paused: { type: "boolean", title: "Hold all jobs", description: "While on, every running job waits at its agents' next round, and a job that begins waits at its first. Switch it off and they go on." },
+      },
+    },
+    pages: {
+      type: "object",
+      title: "Pages",
+      description: "What LumiAH's pages keep, and how long they wait for the runtime.",
+      additionalProperties: false,
+      properties: {
+        noticesKept: whole("Notices kept", "How many notices of jobs (finished, failed, interrupted, waiting on you) are kept until you dismiss them. Past it the oldest go first.", 10, 2_000),
+        askMs: ms("Runtime wait", "How long a page waits for the runtime to do what it asked of it (write a file, start a job, read a list) before it says the runtime didn't answer.", 1_000, 600_000),
+        noticeChars: whole("Notice length", "How much of a job's opening a notice keeps. The job's page shows it whole.", 40, 4_000, "characters"),
+      },
+    },
     link: {
       type: "object",
       title: "Link",
@@ -249,8 +374,10 @@ export const TRANSPORT_SCHEMA: JsonObject = {
         quietMs: ms("Quiet after", "How long without a word from a runtime before the Runtime page shows it as quiet.", 10_000, DAY_MS),
         relays: whole("Runtimes per account", "The runtimes one account may have registered at once.", 1, 64, "runtimes"),
         connectionMs: ms("Wait for the connection", "How long minting a key waits for your linked runtime to make the loopback connection.", 1_000, 5 * 60_000),
-        joinMaxUnits: whole("Largest frame joined", "The largest frame the extension puts together from parts: a stored transcript or a model call's prompt may be this long.", 1024 * 1024, 256 * 1024 * 1024, "characters"),
-        partStaleMs: ms("Parts kept", "How long the first parts of a frame wait for the rest.", 1_000, 60 * 60_000),
+        joinMaxUnits: whole("Largest frame joined", "The largest frame the extension puts together from parts: a stored transcript or a model call's prompt may be this long.", MI, CEILINGS.joinMaxUnits, "characters"),
+        partStaleMs: ms("Parts kept", "How long the first parts of a frame wait for the rest.", 1_000, CEILINGS.partStaleMs),
+        joinFrames: whole("Frames joined at once", "The most frames sent in parts that the extension puts together at once for one account. A runtime sends a large frame's parts one after another, so only frames left unfinished add up: a frame begun past this is refused.", 1, CEILINGS.joinFrames, "frames"),
+        joinHeldUnits: whole("Characters held while joining", "The most characters the extension holds, for one account, of frames still coming in parts. A frame that would pass it is refused. Keep it at least as large as the largest frame joined.", MI, CEILINGS.joinHeldUnits, "characters"),
       },
     },
     live: {
@@ -259,9 +386,9 @@ export const TRANSPORT_SCHEMA: JsonObject = {
       description: "What the extension keeps of each chat's current turn for the Live page.",
       additionalProperties: false,
       properties: {
-        events: whole("Events kept per turn", "The most events kept of a chat's live turn; past it the reply's later events stay out of the Live page (its stored transcript is whole all the same).", 100, 1_000_000, "events"),
+        events: whole("Events kept per turn", "The most events kept of a chat's live turn; past it the reply's later events stay out of the Live page (its stored transcript is whole all the same).", 100, CEILINGS.liveEvents, "events"),
         page: whole("Events per read", "The most events one read of a live view or a stored transcript answers.", 10, 10_000, "events"),
-        chats: whole("Chats kept", "The most chats whose latest turn is kept for the Live page.", 1, 1024, "chats"),
+        chats: whole("Chats kept", "The most chats whose latest turn is kept for the Live page.", 1, CEILINGS.liveChats, "chats"),
         lostMs: ms("Lost after", "How long after its generation ended a turn that never said it ended counts as lost.", 1_000, 60 * 60_000),
       },
     },
@@ -272,7 +399,7 @@ export const TRANSPORT_SCHEMA: JsonObject = {
       additionalProperties: false,
       properties: {
         waitMs: ms("Wait for the reply", "How long a turn's record waits for Lumiverse to save the reply before it is let go.", 10_000, DAY_MS),
-        held: whole("Records waiting", "The most records waiting for their replies at once.", 1, 4096, "records"),
+        held: whole("Records waiting", "The most records waiting for their replies at once.", 1, CEILINGS.recordsWaiting, "records"),
       },
     },
     sessions: {
@@ -317,6 +444,7 @@ export const TRANSPORT_SCHEMA: JsonObject = {
         traceBatch: whole("Trace events per request", "The most trace events one request carries to the Live page.", 1, 4096, "events"),
         traceHeld: whole("Trace events held", "The most trace events held while they can't be sent; past it a reply's later events stay out of the Live page (its stored transcript is whole all the same).", 100, 1_000_000, "events"),
         turnWaitMs: ms("Wait for the earlier reply", "How long a new reply waits for the chat's earlier one to stop before it is refused.", 1_000, 10 * 60_000),
+        stopAskMs: ms("Wait for Lumiverse's Stop", "How long Lumiverse may take to answer when the runtime asks it to stop a reply you stopped in the Live page, before the runtime ends the reply itself.", 500, 60_000),
         joinMaxUnits: whole("Largest frame joined", "The largest frame the runtime puts together from parts.", 1024 * 1024, 256 * 1024 * 1024, "characters"),
         partStaleMs: ms("Parts kept", "How long the first parts of a frame wait for the rest.", 1_000, 60 * 60_000),
       },

@@ -84,19 +84,25 @@ describe("the session resumes", () => {
     expect(carried(r.host)).not.toContain('"brief":"brief 2"');
   });
 
-  test("after a regenerate: the new reply's record takes the old one's place", async () => {
+  test("after a regenerate: Lumiverse keeps the reply it replaces as an earlier swipe, the new reply's record is on the swipe shown, and later turns read that one", async () => {
     const r = rig();
     await r.turn();
-    const before = recordOf(r.host.last(CHAT).anchors[0]);
+    const reply = r.host.last(CHAT);
+    const before = recordOf(reply.anchors[0]);
     await r.turn(CHAT, { kind: "regenerate" });
     expect(lastSession(r.host)?.turns).toBe(0);
-    const after = recordOf(r.host.last(CHAT).anchors[0]);
+    expect(reply.swipes).toEqual(["Reply 1.", "Reply 2."]);
+    expect(reply.swipeId).toBe(1);
+    const after = recordOf(reply.anchors[1]);
     expect(after?.kind).toBe("regenerate");
     expect(after?.path).toBe(before?.path ?? "");
     expect(after?.segment).not.toBe(before?.segment ?? "");
+    // The record of the reply it replaced stays on its own swipe.
+    expect(recordOf(reply.anchors[0])).toEqual(before);
     await r.exchange("I knock.");
     expect(carried(r.host)).toContain("Reply #2 (regenerate)");
     expect(carried(r.host)).toContain('"brief":"brief 2"');
+    expect(carried(r.host)).not.toContain('"brief":"brief 1"');
   });
 
   test("after a branch: the branch reads the records it was copied with, and each chat goes on alone", async () => {
@@ -138,6 +144,23 @@ describe("a record off the path", () => {
     expect(carried(r.host)).not.toContain('"brief":"brief 2"');
     expect(carried(r.host)).toContain("An earlier message of this chat was changed or removed, so your notes from reply #4 no longer fit it and were dropped");
     expect(sink.progressLines).toContain("An earlier message changed, so its notes from reply #4 were dropped.");
+  });
+
+  test("dropped notes are said once: the turn after the one that was told isn't told again, though the session still counts them", async () => {
+    const r = rig();
+    await r.turn();
+    await r.exchange("I knock.");
+    r.host.edit(CHAT, r.host.chats.get(CHAT)![3]!.id, "I knock twice.");
+    await r.exchange("I wait.");
+    const { sink } = await r.exchange("I wait longer.");
+    expect(lastSession(r.host)).toMatchObject({ turns: 2, dropped: [4] });
+    expect(carried(r.host).split("An earlier message of this chat was changed or removed").length - 1).toBe(0);
+    expect(sink.progressLines.some((line) => line.includes("were dropped"))).toBe(false);
+    // A swipe of the turn that was told reads the session from before it, so it is told as that turn was.
+    r.host.remove(CHAT, r.host.last(CHAT).id);
+    r.host.remove(CHAT, r.host.last(CHAT).id);
+    await r.turn(CHAT, { kind: "swipe" });
+    expect(carried(r.host)).toContain("your notes from reply #4 no longer fit it and were dropped");
   });
 
   test("an edit before every turn drops them all; editing a reply's own text keeps that reply's notes", async () => {
@@ -252,6 +275,52 @@ describe("compaction and rollback", () => {
     expect((await r.exchange("I call again.")).result.record?.summary).toBeDefined();
   });
 
+  for (const finish of ["length", "max_tokens", "MAX_TOKENS", "max_output_tokens"]) {
+    test(`a summary whose call ended as ${finish} never lands, though it ends on a full stop`, async () => {
+      const r = rig(tight);
+      await r.turn();
+      await r.exchange("I knock.");
+      await r.exchange("I wait.");
+      r.summaries.push({ content: "Okoro keeps the lighthouse.", finishReason: finish });
+      const { result } = await r.exchange("I call out.");
+      expect(result.record?.summary).toBeUndefined();
+      expect(lastSession(r.host)).toMatchObject({ turns: 3, summary: false });
+    });
+  }
+
+  test("a whole summary lands whatever its last word: whether it was cut is told from how its call ended", async () => {
+    const r = rig(tight);
+    await r.turn();
+    await r.exchange("I knock.");
+    await r.exchange("I wait.");
+    // It ends on a word few sentences end on, with no full stop, and its call ended of itself.
+    const whole = "Okoro keeps the lighthouse; the door is the one Mara was sent to";
+    r.summaries.push({ content: whole, finishReason: "stop" });
+    const { result, sink } = await r.exchange("I call out.");
+    expect(r.host.blobStore.get(result.record?.summary ?? "")).toBe(whole);
+    expect(lastSession(r.host)).toMatchObject({ turns: 1, summary: true });
+    expect(sink.progressLines.some((line) => line.startsWith("Its notes weren't summarized"))).toBe(false);
+  });
+
+  test("a summary that can't be stored never costs the main agent its part: the notes go on whole, and the next turn tries again", async () => {
+    const r = rig(tight);
+    await r.turn();
+    await r.exchange("I knock.");
+    await r.exchange("I wait.");
+    r.summaries.push("Okoro keeps the lighthouse.");
+    const put = r.host.blobs.put;
+    r.host.blobs.put = (hash, text) => (text === "Okoro keeps the lighthouse." ? Promise.reject(new Error("the store is full")) : put(hash, text));
+    const { result, sink } = await r.exchange("I call out.");
+    r.host.blobs.put = put;
+    // The main agent worked from its notes whole and briefed the writer, as on any turn.
+    expect(result).toMatchObject({ status: "done", reply: "Reply 4." });
+    expect(result.record?.summary).toBeUndefined();
+    expect(lastSession(r.host)).toMatchObject({ turns: 3, summary: false });
+    expect(sink.progressLines).toContain("Its notes weren't summarized (the store is full); they go on whole.");
+    r.summaries.push("Okoro keeps the lighthouse still.");
+    expect((await r.exchange("I call again.")).result.record?.summary).toBeDefined();
+  });
+
   test("a swipe of the turn that compacted finds the summary made: no second call", async () => {
     const r = await compacted();
     const count = (): number => r.host.calls.filter((c) => c.messages[0]?.content.startsWith(SUMMARIZER)).length;
@@ -261,9 +330,10 @@ describe("compaction and rollback", () => {
     expect(swipe.result.record?.summary).toBe(r.fourth.result.record?.summary ?? "");
   });
 
+  const summarized = (host: MemoryHost): number => host.calls.filter((c) => c.messages[0]?.content.startsWith(SUMMARIZER)).length;
+
   test("a rollback marks the record, and the session reads the turns its summary replaced again", async () => {
     const r = await compacted();
-    r.stored.values.session.summarizeAtTokens = null;
     const reply = r.host.last(CHAT);
     const rolled = await rollback(r.host, CHAT, reply.id, reply.swipeId);
     expect("record" in rolled && rolled.record.rolledBack).toBe(r.host.clock.now());
@@ -276,7 +346,128 @@ describe("compaction and rollback", () => {
     expect(text).toContain("The user rolled back a summary of your notes: the turns it had replaced are back as their own receipts.");
   });
 
-  test("a rollback is refused, in plain words, where there is nothing to roll back", async () => {
+  test("a rollback holds: with Summarize past as it was, the next turns don't summarize again, and the thinking block says why", async () => {
+    const r = await compacted();
+    const reply = r.host.last(CHAT);
+    await rollback(r.host, CHAT, reply.id, reply.swipeId);
+    expect(summarized(r.host)).toBe(1);
+    const fifth = await r.exchange("I listen.");
+    const sixth = await r.exchange("I listen longer.");
+    // The notes are well past Summarize past (140 tokens) on both turns, and whole on both.
+    expect(summarized(r.host)).toBe(1);
+    expect(fifth.result.record?.summary).toBeUndefined();
+    expect(sixth.result.record?.summary).toBeUndefined();
+    expect(lastSession(r.host)).toMatchObject({ turns: 5, summary: false });
+    expect(fifth.sink.progressLines).toContain("Its notes stay whole after your rollback: they are summarized again once they have grown by 8000 tokens (After a rollback), or when you ask for it.");
+  });
+
+  test("after a rollback the notes are summarized again once they have grown by After a rollback", async () => {
+    // Each turn adds about 57 tokens: two more turns stay within a margin of 100, the third passes it.
+    const r = await compacted();
+    r.stored.values.session.rollbackMarginTokens = 100;
+    const reply = r.host.last(CHAT);
+    await rollback(r.host, CHAT, reply.id, reply.swipeId);
+    // Time passes between the rollback and the turns after it, as it does for a user.
+    r.host.clock.advance(1000);
+    await r.exchange("I listen.");
+    await r.exchange("I listen longer.");
+    expect(summarized(r.host)).toBe(1);
+    r.summaries.push("Okoro keeps the lighthouse. Six visits, and the door has stayed shut.");
+    const again = await r.exchange("I go home.");
+    expect(summarized(r.host)).toBe(2);
+    expect(r.host.blobStore.get(again.result.record?.summary ?? "")).toBe("Okoro keeps the lighthouse. Six visits, and the door has stayed shut.");
+  });
+
+  test("after a rollback the notes are summarized at the next turn when the user asks for it", async () => {
+    const r = await compacted();
+    const reply = r.host.last(CHAT);
+    await rollback(r.host, CHAT, reply.id, reply.swipeId);
+    r.host.clock.advance(1000);
+    await r.harness.session.summarize({ chatId: CHAT });
+    r.host.clock.advance(1000);
+    r.summaries.push("Okoro keeps the lighthouse. The door is still shut.");
+    const asked = await r.exchange("I listen.");
+    expect(summarized(r.host)).toBe(2);
+    expect(asked.result.record?.summary).toBeDefined();
+    // The ask was answered: the turn after doesn't summarize again on its account (Summarize past is lifted, so nothing else asks for it either).
+    r.stored.values.session.summarizeAtTokens = null;
+    r.host.clock.advance(1000);
+    await r.exchange("I listen longer.");
+    expect(summarized(r.host)).toBe(2);
+  });
+
+  for (const kind of ["regenerate", "swipe", "continue"] as const) {
+    test(`a rollback holds for a ${kind} of the reply it was made on, and for the turn after it`, async () => {
+      const r = await compacted();
+      const reply = r.host.last(CHAT);
+      await rollback(r.host, CHAT, reply.id, reply.swipeId);
+      const rolledBack = r.host.clock.now();
+      const summary = r.fourth.result.record?.summary ?? "";
+      r.host.clock.advance(1000);
+      const again = await r.turn(CHAT, { kind });
+      // It reads the three turns before the reply whole, as the user left them: no summary is made, and none is taken from the memory of summaries.
+      expect(summarized(r.host)).toBe(1);
+      expect(lastSession(r.host)).toMatchObject({ turns: 3, summary: false, rolledBack: { summary } });
+      expect(lastSession(r.host)?.compacted).toBeUndefined();
+      const text = carried(r.host);
+      for (const n of [1, 2, 3]) expect(text).toContain(`"brief":"brief ${n}"`);
+      expect(text).not.toContain("Okoro keeps the lighthouse.");
+      expect(again.sink.progressLines).toContain("Its notes stay whole after your rollback: they are summarized again once they have grown by 8000 tokens (After a rollback), or when you ask for it.");
+      // Its own record carries the rolled-back summary on, marked as it was, so the swipe the chat shows now holds the rollback too.
+      expect(again.result.record).toMatchObject({ summary, rolledBack, folded: 2 });
+      expect(await rollback(r.host, CHAT, reply.id, r.host.last(CHAT).swipeId)).toEqual({ refused: "That summary was already rolled back." });
+      r.host.clock.advance(1000);
+      const next = await r.exchange("I listen.");
+      expect(summarized(r.host)).toBe(1);
+      expect(next.result.record?.summary).toBeUndefined();
+      expect(lastSession(r.host)).toMatchObject({ turns: 4, summary: false, rolledBack: { summary } });
+      expect(carried(r.host)).not.toContain("Okoro keeps the lighthouse.");
+    });
+  }
+
+  test("after a regenerate of the rolled-back reply, the notes are still summarized once they have grown by After a rollback, or when the user asks", async () => {
+    const r = await compacted();
+    r.stored.values.session.rollbackMarginTokens = 100;
+    const reply = r.host.last(CHAT);
+    await rollback(r.host, CHAT, reply.id, reply.swipeId);
+    r.host.clock.advance(1000);
+    await r.turn(CHAT, { kind: "regenerate" });
+    r.host.clock.advance(1000);
+    await r.exchange("I listen.");
+    expect(summarized(r.host)).toBe(1);
+    r.summaries.push("Okoro keeps the lighthouse. Five visits, and the door has stayed shut.");
+    r.host.clock.advance(1000);
+    const grown = await r.exchange("I listen longer.");
+    expect(summarized(r.host)).toBe(2);
+    expect(r.host.blobStore.get(grown.result.record?.summary ?? "")).toBe("Okoro keeps the lighthouse. Five visits, and the door has stayed shut.");
+  });
+
+  test("an ask the rolled-back summary had answered isn't answered again by a regenerate of its reply; one made since the rollback is", async () => {
+    const r = rig(tight);
+    await r.turn();
+    await r.exchange("I knock.");
+    await r.exchange("I wait.");
+    r.host.clock.advance(1000);
+    await r.harness.session.summarize({ chatId: CHAT });
+    r.summaries.push("Okoro keeps the lighthouse.");
+    r.host.clock.advance(1000);
+    const fourth = await r.exchange("I call out.");
+    expect(fourth.result.record?.summary).toBeDefined();
+    const reply = r.host.last(CHAT);
+    r.host.clock.advance(1000);
+    await rollback(r.host, CHAT, reply.id, reply.swipeId);
+    r.host.clock.advance(1000);
+    const again = await r.turn(CHAT, { kind: "regenerate" });
+    expect(lastSession(r.host)?.compacted).toBeUndefined();
+    expect(again.result.record?.rolledBack).toBeDefined();
+    r.host.clock.advance(1000);
+    await r.harness.session.summarize({ chatId: CHAT });
+    r.host.clock.advance(1000);
+    await r.turn(CHAT, { kind: "regenerate" });
+    expect(lastSession(r.host)?.compacted).toBeDefined();
+  });
+
+  test("a rollback is refused, in plain words, where it would change nothing", async () => {
     const r = await compacted();
     const reply = r.host.last(CHAT);
     const plain = r.host.chats.get(CHAT)![2]!;
@@ -285,5 +476,29 @@ describe("compaction and rollback", () => {
     expect(await rollback(r.host, CHAT, reply.id, 3)).toMatchObject({ refused: expect.stringContaining("shows another swipe") as unknown as string });
     expect(await rollback(r.host, CHAT, reply.id, reply.swipeId)).toHaveProperty("record");
     expect(await rollback(r.host, CHAT, reply.id, reply.swipeId)).toEqual({ refused: "That summary was already rolled back." });
+  });
+
+  test("a rollback beneath a later summary is refused: the notes are read from the later one, so it would change nothing", async () => {
+    const r = await compacted();
+    const first = r.host.last(CHAT);
+    // Turns go on until the notes are summarized a second time.
+    r.summaries.push("Okoro keeps the lighthouse. Many visits, and the door has stayed shut.");
+    let second = await r.exchange("I listen.");
+    for (let i = 0; i < 6 && second.result.record?.summary === undefined; i++) second = await r.exchange(`I wait, ${i}.`);
+    expect(second.result.record?.summary).toBeDefined();
+    const later = r.host.last(CHAT);
+    const index = r.host.chats.get(CHAT)!.indexOf(later);
+    expect(await rollback(r.host, CHAT, first.id, first.swipeId)).toEqual({ refused: `A later summary, made at reply #${index}, stands over this one: the notes are read from that one on. Roll that one back first.` });
+    expect(recordOf(first.anchors[first.swipeId])?.rolledBack).toBeUndefined();
+    // The later one can be rolled back, and then the first.
+    expect(await rollback(r.host, CHAT, later.id, later.swipeId)).toHaveProperty("record");
+    expect(await rollback(r.host, CHAT, first.id, first.swipeId)).toHaveProperty("record");
+  });
+
+  test("a rollback of a summary whose turn left the path is refused: its notes aren't read any more", async () => {
+    const r = await compacted();
+    const reply = r.host.last(CHAT);
+    r.host.edit(CHAT, r.host.chats.get(CHAT)![1]!.id, "I walk down to the quay instead.");
+    expect(await rollback(r.host, CHAT, reply.id, reply.swipeId)).toMatchObject({ refused: expect.stringContaining("An earlier message of the chat changed since that turn") as unknown as string });
   });
 });

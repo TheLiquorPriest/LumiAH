@@ -21,6 +21,8 @@ export interface KeysDeps {
   registry: RegistryStore;
   relays: Relays;
   settings: SettingsStore;
+  /** What the runtime calls the loopback connection when it makes one (`BackendIdentity.connectionName`). */
+  connectionName: string;
   now(): number;
   /** Runs `fn` once after `ms`; what it returns cancels that. */
   later(ms: number, fn: () => void): () => void;
@@ -64,7 +66,7 @@ export class Keys {
       resolve(answer);
     });
     // With nowhere to push it, there is nothing to wait for.
-    if (!relays.push(userId, relay.id, { link: LINK, type: "connection", ref, key })) this.waiting.get(k)?.(null);
+    if (!relays.push(userId, relay.id, { link: LINK, type: "connection", ref, key, name: this.deps.connectionName })) this.waiting.get(k)?.(null);
     const made = await promise;
     if (made === null) this.host.log("warn", `[LumiAH] runtime "${relay.name}" didn't say it put the new loopback key in a connection`);
     else if (made.problem !== null) this.host.log("warn", `[LumiAH] runtime "${relay.name}" couldn't put the new loopback key in a connection: ${made.problem}`);

@@ -3,8 +3,7 @@
 // here is the core's: it stands where the runtime and the extension stand.
 
 import { textHash } from "../../../src/core/hash";
-import type { ActivatedLore, ChatMessage, ChatRole, ConnectionInfo, ConnectionProfile, HarnessHost, JsonObject, JsonValue, LogLevel, LoreBook, LoreEntry, ModelDelta, ModelRequest, ModelResult, ModelToolCall, PathMessage, PresetBlock, ReplySink, RequestMessage, TraceDelta, TracePort, TraceRecord, TurnKind, TurnRequest, TurnResult } from "../../../src/core/ports";
-import type { AgentUsage } from "../../../src/core/ports";
+import type { ActivatedLore, AgentUsage, ApprovalsPort, BlobInfo, BookEntry, BookPort, ChatInfo, ChatMessage, ChatRole, ConnectionInfo, ConnectionProfile, HarnessHost, JobsPort, JobView, JsonObject, JsonValue, LogLevel, LoreBook, LoreEntry, ModelDelta, ModelRequest, ModelResult, ModelToolCall, PathMessage, PresetBlock, ReplySink, RequestMessage, StoredAnchor, ToolsPort, TraceDelta, TracePort, TraceRecord, TurnKind, TurnRequest, TurnResult } from "../../../src/core/ports";
 
 // ---------------------------------------------------------------- the clock
 
@@ -55,8 +54,8 @@ export class TestClock {
 
 // ---------------------------------------------------------------- the scripted model
 
-/** One scripted answer: its text alone, or its parts; `error` fails the call with those words; `hang` never answers until the call's signal ends it; `pace` moves the clock on that many milliseconds before each piece it streams after the first. */
-export type Answer = string | { content?: string; toolCalls?: ModelToolCall[]; reasoning?: string; finishReason?: string; usage?: JsonObject; model?: string; error?: string; hang?: true; deltas?: string[]; pace?: number };
+/** One scripted answer: its text alone, or its parts; `error` fails the call with those words; `hang` never answers until the call's signal ends it (`"after"`: once it has streamed its pieces, so part of the answer is out when it is stopped); `pace` moves the clock on that many milliseconds before each piece it streams after the first. */
+export type Answer = string | { content?: string; toolCalls?: ModelToolCall[]; reasoning?: string; finishReason?: string; usage?: JsonObject; model?: string; error?: string; hang?: true | "after"; deltas?: string[]; pace?: number };
 
 /** A script: the answers in the order the calls are made, or what answers each call. */
 export type Script = Answer[] | ((request: ModelRequest, n: number) => Answer | Promise<Answer>);
@@ -65,13 +64,24 @@ export const call = (name: string, args: JsonObject = {}, callId = `call_${name}
 
 // ---------------------------------------------------------------- the chat
 
-interface StoredMessage {
+export interface StoredMessage {
   id: string;
   role: ChatRole;
   name: string;
   swipes: string[];
   swipeId: number;
   anchors: Record<number, JsonValue>;
+}
+
+/** A chat's LumiBooks book as a test gives it: its entries, and the message hashes it kept (none unless the test says: LumiBooks' own book for a chat keeps none). */
+export interface StoredBook {
+  entries: BookEntry[];
+  kept: { index: number; hash: string }[];
+}
+
+/** LumiBooks' hash of a message (its `sha256-role-content-v1`): the SHA-256 of its role and its text as JSON, in hex. */
+export function lumibooksHash(role: ChatRole, text: string): Promise<string> {
+  return textHash(JSON.stringify([role, text]));
 }
 
 export const MAIN = "conn-main";
@@ -104,6 +114,44 @@ export class MemoryHost implements HarnessHost {
   readonly logs: { level: LogLevel; message: string }[] = [];
   /** How many times the chat's text was read from the host. */
   messageReads = 0;
+  /** When each blob was first stored, by the host's clock. */
+  readonly blobTimes = new Map<string, number>();
+  /** What the host knows of a chat besides its messages: its name, its character, the chat it was branched from. */
+  readonly infos = new Map<string, Partial<ChatInfo>>();
+  /** The tools that run in the extension, when a test mounts some; absent: the host has none. */
+  tools?: ToolsPort;
+  /** How the user answers a held tool call, when a test says; absent: the host has no way to ask. */
+  approvals?: ApprovalsPort;
+  /** Every job the host was told waits to run, and every change of a job it heard, in order. */
+  readonly queued: JobView[] = [];
+  readonly jobChanges: JobView[] = [];
+  /** The host's side of jobs: it only notes what it is told, so a test decides when a job runs. Set undefined for a host that can't run jobs. */
+  jobs?: JobsPort = { queued: (job) => void this.queued.push(structuredClone(job)), changed: (job) => void this.jobChanges.push(structuredClone(job)) };
+  /** A chat's LumiBooks book, when a test gives it one; a chat without one has no book. */
+  readonly storyBooks = new Map<string, StoredBook>();
+  /** The host's side of a story's book (DESIGN §23): the chat's book as the test set it, each hash it kept beside the same hash of the message at that place now. Set undefined for a host without the port. */
+  book?: BookPort = {
+    read: async (chatId) => {
+      const stored = this.storyBooks.get(chatId);
+      if (!stored) return null;
+      const messages = this.chats.get(chatId) ?? [];
+      const hashes = await Promise.all(
+        stored.kept.map(async ({ index, hash }) => {
+          const m = messages[index];
+          return { index, kept: hash, now: m ? await lumibooksHash(m.role, this.shown(m)) : null };
+        }),
+      );
+      return { entries: structuredClone(stored.entries), hashes };
+    },
+  };
+  /**
+   * How this host keeps LumiAH's record on a message: as it is, or, when a test sets a codec (an
+   * extension that keeps its own record per message, DESIGN §5), folded into that record. The core
+   * sees LumiAH's record alone either way.
+   */
+  anchorCodec?: { read(stored: JsonValue): JsonValue | null; write(record: JsonValue, stored: JsonValue | null): JsonValue };
+  /** How many blobs and anchors one page of a listing holds: small, so a test of a few holds several pages. */
+  listPage = 3;
   private nextId = 1;
 
   readonly models = {
@@ -114,11 +162,12 @@ export class MemoryHost implements HarnessHost {
       const scripted = typeof this.script === "function" ? await this.script(request, n) : this.script[n];
       if (scripted === undefined) throw new Error(`no answer scripted for call ${n + 1}`);
       const answer = typeof scripted === "string" ? { content: scripted } : scripted;
-      if (answer.hang) {
+      const hangs = (): Promise<never> => {
         const { promise, reject } = Promise.withResolvers<never>();
         signal.addEventListener("abort", () => reject(signal.reason), { once: true });
         return promise;
-      }
+      };
+      if (answer.hang === true) return hangs();
       const content = answer.content ?? "";
       if (request.stream && onDelta) {
         const pieces: ModelDelta[] = [...(answer.reasoning ? [{ reasoning: answer.reasoning }] : []), ...(answer.deltas ?? (content === "" ? [] : (content.match(/\S+\s*/g) ?? [content]))).map((piece) => ({ content: piece }))];
@@ -127,6 +176,7 @@ export class MemoryHost implements HarnessHost {
           onDelta(piece);
         }
       }
+      if (answer.hang === "after") return hangs();
       // A call that fails after it streamed part of its answer: the pieces above went out first.
       if (answer.error !== undefined) throw new Error(answer.error);
       return { content, finishReason: answer.finishReason ?? (answer.toolCalls?.length ? "tool_calls" : "stop"), model: answer.model ?? "scripted", ...(answer.toolCalls?.length ? { toolCalls: answer.toolCalls } : {}), ...(answer.reasoning !== undefined ? { reasoning: answer.reasoning } : {}), ...(answer.usage ? { usage: answer.usage } : {}) };
@@ -139,18 +189,45 @@ export class MemoryHost implements HarnessHost {
   };
 
   readonly blobs = {
-    put: async (hash: string, text: string): Promise<void> => void this.blobStore.set(hash, text),
+    put: async (hash: string, text: string): Promise<void> => {
+      if (!this.blobStore.has(hash)) this.blobTimes.set(hash, this.clock.now());
+      this.blobStore.set(hash, text);
+    },
     get: async (hash: string): Promise<string | null> => this.blobStore.get(hash) ?? null,
+    list: async (cursor?: string): Promise<{ blobs: BlobInfo[]; next: string | null }> => {
+      const all = [...this.blobStore.entries()];
+      const from = Number(cursor ?? 0);
+      const blobs = all.slice(from, from + this.listPage).map(([hash, text]) => ({ hash, bytes: new TextEncoder().encode(text).length, at: this.blobTimes.get(hash) ?? 0 }));
+      return { blobs, next: from + this.listPage < all.length ? String(from + this.listPage) : null };
+    },
+    remove: async (hashes: readonly string[]): Promise<void> => {
+      for (const hash of hashes) {
+        this.blobStore.delete(hash);
+        this.blobTimes.delete(hash);
+      }
+    },
   };
 
   readonly store = {
-    read: async (path: string): Promise<JsonValue | null> => this.documents.get(path) ?? null,
-    write: async (path: string, value: JsonValue): Promise<void> => void this.documents.set(path, value),
+    read: async (path: string): Promise<JsonValue | null> => structuredClone(this.documents.get(path) ?? null),
+    write: async (path: string, value: JsonValue): Promise<void> => void this.documents.set(path, structuredClone(value)),
     remove: async (path: string): Promise<void> => void this.documents.delete(path),
+    list: async (prefix: string): Promise<string[]> => [...this.documents.keys()].filter((path) => path.startsWith(prefix)),
   };
 
+  /** LumiAH's record as stored on one swipe of a message, read back as the core is given it. */
+  private anchorOf(m: StoredMessage, swipeId: number): JsonValue | null {
+    const stored = m.anchors[swipeId] ?? null;
+    return stored === null || !this.anchorCodec ? stored : this.anchorCodec.read(stored);
+  }
+
+  /** Stores LumiAH's record on one swipe of a message, as the extension does when Lumiverse saves a reply. */
+  anchorOn(m: StoredMessage, swipeId: number, record: JsonValue): void {
+    m.anchors[swipeId] = this.anchorCodec ? this.anchorCodec.write(structuredClone(record), m.anchors[swipeId] ?? null) : structuredClone(record);
+  }
+
   readonly chat = {
-    path: async (chatId: string): Promise<PathMessage[]> => Promise.all((this.chats.get(chatId) ?? []).map(async (m, index) => ({ id: m.id, index, role: m.role, name: m.name, swipeId: m.swipeId, chars: this.shown(m).length, hash: await textHash(this.shown(m)), anchor: m.anchors[m.swipeId] ?? null }))),
+    path: async (chatId: string): Promise<PathMessage[]> => Promise.all((this.chats.get(chatId) ?? []).map(async (m, index) => ({ id: m.id, index, role: m.role, name: m.name, swipeId: m.swipeId, chars: this.shown(m).length, hash: await textHash(this.shown(m)), anchor: this.anchorOf(m, m.swipeId) }))),
     messages: async (chatId: string, from: number, to: number): Promise<ChatMessage[]> => {
       this.messageReads++;
       return (this.chats.get(chatId) ?? []).flatMap((m, index) => (index >= from && index < to ? [{ id: m.id, index, role: m.role, name: m.name, swipeId: m.swipeId, content: this.shown(m) }] : []));
@@ -158,8 +235,26 @@ export class MemoryHost implements HarnessHost {
     anchor: async (chatId: string, messageId: string, swipeId: number, record: JsonValue): Promise<boolean> => {
       const m = this.chats.get(chatId)?.find((x) => x.id === messageId);
       if (!m || m.swipes[swipeId] === undefined) return false;
-      m.anchors[swipeId] = structuredClone(record);
+      this.anchorOn(m, swipeId, record);
       return true;
+    },
+    info: async (chatId: string): Promise<ChatInfo | null> => {
+      const known = this.infos.get(chatId);
+      if (!known && !this.chats.has(chatId)) return null;
+      return { id: chatId, name: known?.name ?? chatId, characterId: known?.characterId ?? null, characterName: known?.characterName ?? null, branchedFrom: known?.branchedFrom ?? null, ...(known?.connectionId !== undefined ? { connectionId: known.connectionId } : {}) };
+    },
+    anchors: async (cursor?: string): Promise<{ anchors: StoredAnchor[]; next: string | null }> => {
+      const all: StoredAnchor[] = [];
+      for (const [chatId, messages] of this.chats) {
+        for (const m of messages) {
+          for (const swipe of Object.keys(m.anchors)) {
+            const anchor = this.anchorOf(m, Number(swipe));
+            if (anchor !== null) all.push({ chatId, messageId: m.id, swipeId: Number(swipe), anchor });
+          }
+        }
+      }
+      const from = Number(cursor ?? 0);
+      return { anchors: all.slice(from, from + this.listPage), next: from + this.listPage < all.length ? String(from + this.listPage) : null };
     },
   };
 
@@ -232,9 +327,10 @@ export class MemoryHost implements HarnessHost {
     this.message(chatId, messageId).swipeId = swipeId;
   }
 
-  /** A branch: a new chat holding copies of the first `count` messages, their records with them, as Lumiverse copies a chat. */
+  /** A branch: a new chat holding copies of the first `count` messages, their records with them, as Lumiverse copies a chat, and noted as branched from the first. */
   branch(chatId: string, count: number, into: string): void {
     this.chats.set(into, structuredClone(this.messagesOf(chatId).slice(0, count)).map((m) => ({ ...m, id: `m${this.nextId++}` })));
+    this.infos.set(into, { ...this.infos.get(chatId), branchedFrom: chatId });
   }
 
   // ---------------------------------------------------------------- a turn, as the runtime drives one
@@ -300,7 +396,8 @@ let generation = 1;
  * called, and, as Lumiverse saves the reply, the reply's message written with the turn's record on
  * its swipe. `kind`:
  * - `new`: the reply is a new message after the chat's last;
- * - `regenerate`: the chat's last message is the reply, replaced in place;
+ * - `regenerate`: the chat's last message is the reply, and it gets one more swipe, which the chat
+ *   then shows: Lumiverse keeps the reply it replaces as an earlier swipe;
  * - `swipe`: the chat's last message gets one more swipe, which the chat then shows;
  * - `continue`: the chat's last message is carried on.
  */
@@ -309,7 +406,7 @@ export async function runTurn(host: MemoryHost, harness: { answer(turn: TurnRequ
   const messages = host.chats.get(chatId) ?? [];
   const target = kind === "new" ? null : host.last(chatId);
   const upTo = kind === "new" || kind === "continue" ? messages.length : messages.length - 1;
-  const swipeId = target === null ? 0 : kind === "swipe" ? target.swipes.length : target.swipeId;
+  const swipeId = target === null ? 0 : kind === "swipe" || kind === "regenerate" ? target.swipes.length : target.swipeId;
   const request: TurnRequest = {
     userId: "user-1",
     chatId,
@@ -328,7 +425,7 @@ export async function runTurn(host: MemoryHost, harness: { answer(turn: TurnRequ
     if (kind === "continue") saved.swipes[swipeId] = `${saved.swipes[swipeId] ?? ""}${result.reply}`;
     else saved.swipes[swipeId] = result.reply;
     saved.swipeId = swipeId;
-    if (result.record) saved.anchors[swipeId] = structuredClone(result.record) as unknown as JsonValue;
+    if (result.record) host.anchorOn(saved, swipeId, result.record as unknown as JsonValue);
     else delete saved.anchors[swipeId];
   }
   return { result, sink, request };

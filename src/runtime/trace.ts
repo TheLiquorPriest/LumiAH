@@ -131,7 +131,7 @@ export class TraceSink {
   }
 
   /** Gives a turn's trace up: what waits of it is dropped, and nothing more of it is taken. */
-  private give(turn: string, why: string): void {
+  give(turn: string, why: string): void {
     if (this.broken.has(turn)) return;
     this.broken.add(turn);
     this.queue = this.queue.filter((r) => r.turn !== turn);

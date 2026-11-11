@@ -1,21 +1,22 @@
-// A turn's trace (DESIGN §4.2 `trace`, §8 Live): every step of every agent of the turn, numbered from
-// 1 with no gap, handed to the host's trace port as it happens and kept for the turn's transcript,
-// the blob a turn's record names so the Sessions page shows a past turn with the same feed as Live.
+// A run's trace (DESIGN §4.2 `trace`, §8 Live): every step of every agent of a turn, a job's run or
+// a side session's turn, numbered from 1 with no gap, handed to the host's trace port as it happens
+// and kept for the run's transcript: the blob a turn's record, a job or a side session's turn names,
+// so a past run is shown with the same feed as a live one.
 
 import type { Blobs } from "./blobs";
 import type { AgentTrace, AgentTurn } from "./loop";
-import type { AgentStarted, AgentUsage, CallUsage, HarnessHost, JsonObject, ModelRequest, TraceEvent, TraceRecord, TranscriptEntry, TurnKind, TurnStatus } from "./ports";
+import type { AgentStarted, AgentUsage, CallUsage, HarnessHost, JsonObject, ModelRequest, RunKind, TraceEvent, TraceRecord, TranscriptEntry, TurnStatus } from "./ports";
 import { isRecord } from "./ports";
 import { PromptKeeper } from "./prompts";
 import { errorText, parseJson } from "./util";
 
-/** A turn's transcript as stored: the turn, how it ended, and every trace record of it in order. */
+/** A run's transcript as stored: the run (`turn`: its id; `chatId` `""` for a side session about no chat), how it ended, and every trace record of it in order. */
 export interface TurnTranscript {
   v: 1;
   kind: "transcript";
   turn: string;
   chatId: string;
-  generation: TurnKind;
+  generation: RunKind;
   messageId: string | null;
   startedAt: number;
   ended: { status: TurnStatus; at: number; reason?: string };
@@ -71,8 +72,8 @@ export class TurnTrace implements AgentTrace {
     this.emit({ kind: "agent_entry", agentId, entry });
   }
 
-  usage(agentId: string, call: CallUsage, agent: AgentUsage): void {
-    this.emit({ kind: "usage", agentId, call, agent, turn: { ...(this.turn?.usage ?? agent) }, at: this.host.clock.now() });
+  usage(agentId: string, call: CallUsage, agent: AgentUsage, on: { connection: string; model: string }): void {
+    this.emit({ kind: "usage", agentId, call, agent, turn: { ...(this.turn?.usage ?? agent) }, connection: on.connection, model: on.model, at: this.host.clock.now() });
   }
 
   idle(agentId: string, spent: AgentUsage): void {
@@ -98,8 +99,8 @@ export class TurnTrace implements AgentTrace {
     }
   }
 
-  /** The turn's transcript as it stands, for its blob. */
-  transcript(turn: { generation: TurnKind; messageId: string | null; startedAt: number; ended: TurnTranscript["ended"] }): JsonObject {
+  /** The run's transcript as it stands, for its blob. */
+  transcript(turn: { generation: RunKind; messageId: string | null; startedAt: number; ended: TurnTranscript["ended"] }): JsonObject {
     const transcript: TurnTranscript = { v: 1, kind: "transcript", turn: this.ids.turn, chatId: this.ids.chatId, ...turn, events: [...this.records] };
     return transcript as unknown as JsonObject;
   }

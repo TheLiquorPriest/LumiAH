@@ -5,13 +5,13 @@
 
 import { describe, expect, test } from "bun:test";
 import { createHarness } from "../../src/core/harness";
-import type { JsonObject, TraceEvent } from "../../src/core/ports";
+import type { JsonObject, TraceEvent, TurnRequest } from "../../src/core/ports";
 import { readCallPrompt } from "../../src/core/prompts";
 import { recordOf, segmentOf } from "../../src/core/sessions";
 import { defaultSettings, type Settings } from "../../src/core/settings";
 import { transcriptOf } from "../../src/core/transcript";
 import { parseJson } from "../../src/core/util";
-import { call, MAIN, MemoryHost, promptText, runTurn, type Script, until, WRITER } from "./support/host";
+import { call, MAIN, MemoryHost, promptText, runTurn, type Script, Sink, settle, until, WRITER } from "./support/host";
 
 const CHAT = "chat-1";
 
@@ -67,11 +67,14 @@ describe("a whole turn", () => {
     expect(told).toContain("[1] system · preset instruction “Main prompt”: the reply must achieve this\nWrite in the present tense. Never speak for Mara.");
     expect(told).toContain("[2] assistant · chat message #0, Joss\nThe harbour is quiet tonight.");
     expect(told).toContain("[3] user · chat message #1, Mara\nI walk down to the lighthouse and knock.");
-    expect(told).toEndWith("Work out what this reply needs, then call write_reply with your brief.");
-    expect(first?.tools?.map((t) => t.name)).toEqual(["chat_search", "chat_grep", "chat_read", "lore_index", "lore_search", "lore_grep", "lore_read", "active_lore", "preset_instructions", "past_turn", "write_reply", "scratch_read"]);
+    expect(told).toContain("Work out what this reply needs, then call write_reply with your brief.");
+    // Its budget is told up front, so it can end its work within it.
+    expect(told).toEndWith("[You have 24 rounds of tool calls for this. A round is one answer of yours that calls tools, however many. An answer that calls a tool after your last round isn't run and your work stops there, so keep a round for what must come last.]");
+    // Every tool the core has that has something to offer here, in the order its tools name them: the book tools are left out (the chat has no book), and those that need a port this host doesn't have (memories, databanks).
+    expect(first?.tools?.map((t) => t.name)).toEqual(["chat_search", "chat_grep", "chat_read", "lore_index", "lore_search", "lore_grep", "lore_read", "active_lore", "preset_instructions", "past_turn", "workspace_list", "workspace_read", "workspace_grep", "workspace_write", "workspace_edit", "workspace_move", "workspace_delete", "workspace_pin", "skill_load", "delegate", "agent_message", "job_start", "job_list", "job_read", "job_cancel", "write_reply", "chat_outline", "chat_about", "chat_around", "lore_related", "lore_about", "chronicle_check", "scratch_read"]);
     // The tool it called ran over the chat: its result is what the next call was sent.
     const result = r.host.calls[1]?.messages.at(-1)?.parts?.[0];
-    expect(result?.type === "tool_result" ? result.content : "").toContain("1 message found; showing 1 to 1.\n- #1 (Mara, 40 characters): I walk down to the lighthouse and knock.");
+    expect(result?.type === "tool_result" ? result.content : "").toContain("I walk down to the lighthouse and knock.");
   });
 
   test("the writer's call is Lumiverse's messages as they came, with the brief put in, the request's sampling and no tools", async () => {
@@ -105,7 +108,7 @@ describe("a whole turn", () => {
     // What it called and what came back; the reply itself isn't kept: it is in the chat.
     expect(segment?.steps).toEqual([
       { kind: "said", text: "Let me check what the chat says of the lighthouse." },
-      { kind: "call", name: "chat_search", args: { query: "lighthouse" }, result: expect.stringContaining("1 message found") as unknown as string },
+      { kind: "call", name: "chat_search", args: { query: "lighthouse" }, result: expect.stringContaining("I walk down to the lighthouse and knock.") as unknown as string },
       { kind: "call", name: "write_reply", args: { brief: "Okoro keeps the lighthouse; he was last seen leaving at dusk." }, result: "the writer wrote the reply (61 characters; it is chat message #2)" },
     ]);
     expect(JSON.stringify(segment)).not.toContain("The door opens");
@@ -164,7 +167,7 @@ describe("the main agent writing the reply itself", () => {
     expect(r.host.calls).toHaveLength(2);
     expect(r.host.calls[0]?.tools?.map((t) => t.name)).not.toContain("write_reply");
     expect(r.host.calls[0]?.messages[0]?.content).toContain("Each turn a reply is needed, and you write it.");
-    expect(r.host.calls[0]?.messages.at(-1)?.content).toEndWith("Work out what this reply needs, then answer with the reply itself.");
+    expect(r.host.calls[0]?.messages.at(-1)?.content).toContain("Work out what this reply needs, then answer with the reply itself.");
     expect(events(r.host).flatMap((e) => (e.kind === "agent_started" ? [e.agent.role] : []))).toEqual(["main"]);
     const segment = segmentOf(parseJson(r.host.blobStore.get(result.record?.segment ?? "") ?? ""));
     expect(segment?.steps.at(-1)).toEqual({ kind: "reply", chars: 40 });
@@ -172,13 +175,42 @@ describe("the main agent writing the reply itself", () => {
 });
 
 describe("a main agent that stops short", () => {
-  test("an answer without write_reply is taken as the brief", async () => {
+  test("an answer without write_reply goes to the writer in the brief's place, and the thinking block, the trace and the notes all say that is what happened", async () => {
     const r = rig(["Okoro is away; the door is locked.", "Nobody answers."]);
-    const { result } = await r.turn();
+    const { result, sink } = await r.turn();
     expect(result).toMatchObject({ status: "done", reply: "Nobody answers." });
     expect(promptText(r.host.calls[1])).toContain("never quote them.]\nOkoro is away; the door is locked.");
+    expect(sink.progressLines).toContain("The main agent ended without calling write_reply; the writer is given its last answer as the brief.");
+    expect(sink.progressLines).not.toContain("Writing the reply from the main agent's brief…");
+    const writer = events(r.host).flatMap((e) => (e.kind === "agent_started" && e.agent.role === "writer" ? [e.agent.task] : []));
+    expect(writer).toEqual(["write the reply from the main agent's last answer, taken as its brief: it never called write_reply"]);
+    // Its notes keep what it wrote, and what became of it: never a write_reply call, which it didn't make.
     const segment = segmentOf(parseJson(r.host.blobStore.get(result.record?.segment ?? "") ?? ""));
-    expect(segment?.steps).toEqual([{ kind: "call", name: "write_reply", args: { brief: "Okoro is away; the door is locked." }, result: "the writer wrote the reply (15 characters; it is chat message #2)" }]);
+    expect(segment?.steps).toEqual([
+      { kind: "said", text: "Okoro is away; the door is locked." },
+      { kind: "stop", reason: "you ended without calling write_reply, so that answer was handed to the writer as your brief, and the writer wrote the reply (15 characters; it is chat message #2)" },
+    ]);
+    expect(segment?.steps.some((step) => step.kind === "call")).toBe(false);
+  });
+
+  test("an answer cut at its length limit is no brief: the main agent stopped short, and the writer writes from the request alone", async () => {
+    const r = rig([{ content: "I'll check the lore fir", finishReason: "length" }, "A reply from the preset alone."]);
+    const { result, sink, request } = await r.turn();
+    expect(result).toMatchObject({ status: "done", reply: "A reply from the preset alone." });
+    expect(r.host.calls.at(-1)?.messages).toEqual(request.messages.map(({ source: _source, ...m }) => m));
+    expect(sink.progressLines.at(-1)).toStartWith("The main agent stopped before its brief (its answer was cut at its length limit (Answer per call)");
+    const segment = segmentOf(parseJson(r.host.blobStore.get(result.record?.segment ?? "") ?? ""));
+    expect(segment?.steps[0]).toEqual({ kind: "said", text: "I'll check the lore fir" });
+  });
+
+  test("a call isn't made with its answer tokens nearly spent: the agent stops instead of writing an answer that would be cut", async () => {
+    const usage = { prompt_tokens: 50, completion_tokens: 900 };
+    const r = rig([{ toolCalls: [call("chat_search", { query: "lamp" })], usage }, "A reply from the preset alone."], (s) => (s.agents.main!.budget.tokensOut = 1000));
+    const { result, sink } = await r.turn();
+    // 100 answer tokens were left of 1000, fewer than Least answer room: the main agent's second call was never made, and the writer's was.
+    expect(r.host.calls).toHaveLength(2);
+    expect(result).toMatchObject({ status: "done", reply: "A reply from the preset alone." });
+    expect(sink.progressLines.some((line) => line.includes("fewer than Least answer room (256)"))).toBe(true);
   });
 
   const looping: Script = (request, n) => (request.tools ? { toolCalls: [call("chat_search", { query: `try ${n}` })] } : "A reply from the preset alone.");
@@ -273,7 +305,7 @@ describe("a main agent that stops short", () => {
     expect(sink.failed?.message).toBe("the agent has had its 1 round of tool calls (Tool rounds per agent)");
   });
 
-  test("the turn's signal stops it: the sink gets one error, and nothing is recorded", async () => {
+  test("the turn's signal stops it before any text: the sink gets one error, and nothing is recorded", async () => {
     const r = rig([{ hang: true }]);
     const stop = new AbortController();
     const running = r.turn({ signal: stop.signal });
@@ -285,14 +317,153 @@ describe("a main agent that stops short", () => {
     expect(events(r.host).at(-1)).toMatchObject({ kind: "turn_ended", status: "stopped" });
   });
 
-  test("settings that can't be read fail the turn before any model is called", async () => {
+  test("stopped while the reply streams, the turn ends as stopped, not failed, and the text already sent is kept with its record", async () => {
+    const r = rig([{ toolCalls: [call("write_reply", { brief: "Okoro opens the door." }, "c1")] }, { content: "The door opens a hand's width. Okoro's lamp", hang: "after" }]);
+    const stop = new AbortController();
+    const running = r.turn({ signal: stop.signal });
+    await until(() => r.host.calls.length === 2);
+    await settle();
+    stop.abort(new Error("you pressed Stop"));
+    const { result, sink } = await running;
+    expect(result.status).toBe("stopped");
+    expect(result.reason).toBe("you pressed Stop");
+    expect(result.reply).toBe("The door opens a hand's width. Okoro's lamp");
+    expect(sink.text).toBe(result.reply);
+    expect(sink.failed).toBeNull();
+    expect(sink.ended?.finish).toBe("stop");
+    expect(result.record).not.toBeNull();
+    expect(events(r.host).at(-1)).toMatchObject({ kind: "turn_ended", status: "stopped", reason: "you pressed Stop" });
+  });
+
+  test("a turn whose notes can't be stored says so in the reply's thinking block and in the trace, and leaves no record", async () => {
+    const r = rig([{ toolCalls: [call("write_reply", { brief: "Okoro opens the door." }, "c1")] }, "The door opens."], (s) => (s.keep.prompts = false));
+    const put = r.host.blobs.put;
+    // The store refuses the turn's notes (the first blob the turn writes, since it keeps no prompts).
+    r.host.blobs.put = () => Promise.reject(new Error("the store is full"));
+    const { result, sink } = await r.turn();
+    r.host.blobs.put = put;
+    expect(result).toMatchObject({ status: "done", record: null, reply: "The door opens." });
+    expect(sink.progressLines.at(-1)).toBe("This turn's notes couldn't be stored (the store is full): the reply stands, but the main agent won't remember this turn.");
+    expect(sink.order.at(-1)).toBe("done");
+    expect(events(r.host).some((e) => e.kind === "notice" && e.text.includes("the store is full"))).toBe(true);
+  });
+});
+
+describe("LumiAH failing never costs the reply", () => {
+  const briefs: Script = (request) => (request.tools ? { toolCalls: [call("write_reply", { brief: "Okoro opens the door." })] } : "The door opens.");
+  const asCame = (request: TurnRequest) => request.messages.map(({ source: _source, ...m }) => m);
+  const writerTasks = (host: MemoryHost): (string | undefined)[] => events(host).flatMap((e) => (e.kind === "agent_started" && e.agent.role === "writer" ? [e.agent.task] : []));
+
+  /** A chat with one turn made, the user's next message, and the chat's path failing to be read: once, or every time. */
+  async function unread(times: number, change: (s: Settings) => void = () => undefined) {
+    const r = rig(briefs, change);
+    await r.turn();
+    r.host.say(CHAT, "user", "I knock again.");
+    const path = r.host.chat.path;
+    let left = times;
+    r.host.chat.path = (chatId) => (left-- > 0 ? Promise.reject(new Error("chat.path: no answer in time")) : path(chatId));
+    return { ...r, before: r.host.calls.length };
+  }
+
+  const why = "chat.path: no answer in time";
+
+  test("a session that can't be resumed: the writer writes from the request alone, and the thinking block and the trace say what failed", async () => {
+    const r = await unread(1);
+    const { result, sink, request } = await r.turn();
+    expect(result).toMatchObject({ status: "done", reply: "The door opens." });
+    expect(sink.text).toBe("The door opens.");
+    expect(sink.failed).toBeNull();
+    expect(sink.order.at(-1)).toBe("done");
+    // The main agent never began: the turn's one call is the writer's, sent the request as it came.
+    expect(r.host.calls.slice(r.before)).toHaveLength(1);
+    expect(r.host.calls.at(-1)?.messages).toEqual(asCame(request));
+    const line = `The main agent had no part in this reply (${why}); the writer writes from your preset alone.`;
+    expect(sink.progressLines).toContain(line);
+    expect(events(r.host).some((e) => e.kind === "notice" && e.text === line)).toBe(true);
+    expect(writerTasks(r.host).at(-1)).toBe(`write the reply without a brief: LumiAH failed before the main agent gave one (${why})`);
+    expect(events(r.host).at(-1)).toMatchObject({ kind: "turn_ended", status: "done" });
+  });
+
+  test("the turn's record says what failed, and the main agent reads it in its notes on the next turn", async () => {
+    const r = await unread(1);
+    const { result } = await r.turn();
+    // The chat was read once more for the record, after the reply was written.
+    const kept = "LumiAH failed before you gave a brief (chat.path: no answer in time), so the writer was started on the reply from the request alone";
+    expect(segmentOf(parseJson(r.host.blobStore.get(result.record?.segment ?? "") ?? ""))?.steps).toEqual([{ kind: "stop", reason: kept }]);
+    r.host.say(CHAT, "user", "I wait.");
+    await r.turn();
+    expect(promptText(r.host.calls.findLast((c) => c.tools !== undefined))).toContain(`- you stopped before you were done: ${kept}`);
+  });
+
+  test("a chat that can't be read at all still gets its reply: the turn leaves no record, and the log says so", async () => {
+    const r = await unread(Number.POSITIVE_INFINITY);
+    const { result, sink } = await r.turn();
+    expect(result).toMatchObject({ status: "done", reply: "The door opens.", record: null });
+    expect(sink.text).toBe("The door opens.");
+    expect(r.host.logs.some((log) => log.level === "warn" && log.message.startsWith(`the chat couldn't be read for the turn's record (${why})`))).toBe(true);
+  });
+
+  test("where Settings say a turn without a brief fails, it fails with what failed, and no model is called", async () => {
+    const r = await unread(1, (s) => (s.reply.withoutBrief = "fail"));
+    const { result, sink } = await r.turn();
+    expect(result).toMatchObject({ status: "failed", reason: why, record: null, reply: "" });
+    expect(sink.failed).toEqual({ message: why, code: "failed" });
+    expect(r.host.calls).toHaveLength(r.before);
+  });
+
+  test("a main agent that writes the reply itself has no writer to fall back on: the turn fails with what failed", async () => {
+    const r = rig(["The door opens.", "never reached"], (s) => (s.reply.writer = "main"));
+    r.host.chat.path = () => Promise.reject(new Error(why));
+    const { result, sink } = await r.turn();
+    expect(result).toMatchObject({ status: "failed", reason: why, reply: "" });
+    expect(sink.failed?.message).toBe(why);
+    expect(r.host.calls).toHaveLength(0);
+  });
+
+  test("stopped while the writer writes alone, the turn ends as stopped", async () => {
+    const r = await unread(1);
+    r.host.script = () => ({ hang: true });
+    const stop = new AbortController();
+    const running = r.turn({ signal: stop.signal });
+    await until(() => r.host.calls.length === r.before + 1);
+    stop.abort();
+    expect((await running).result).toMatchObject({ status: "stopped", record: null, reply: "" });
+  });
+
+  const unreadWhy = "LumiAH couldn't read its settings (the link is down): check that the runtime is linked to the extension";
+
+  test("settings that can't be read: the writer writes from the request alone on the host's default connection, and nothing the user may have switched off is kept", async () => {
     const host = new MemoryHost();
+    host.script = ["A reply from the preset alone."];
     host.say(CHAT, "user", "Hello?");
     const harness = createHarness(host, { settings: () => Promise.reject(new Error("the link is down")) });
-    const { result, sink } = await runTurn(host, harness, CHAT);
-    expect(result.status).toBe("failed");
-    expect(sink.failed?.message).toContain("couldn't read its settings (the link is down)");
-    expect(host.calls).toHaveLength(0);
+    const { result, sink, request } = await runTurn(host, harness, CHAT);
+    expect(result).toMatchObject({ status: "done", reply: "A reply from the preset alone." });
+    expect(sink.failed).toBeNull();
+    // One call, the writer's: the request as it came, with its own sampling and answer room, on no connection of LumiAH's choosing (null: the user's default).
+    expect(host.calls).toHaveLength(1);
+    expect(host.calls[0]).toMatchObject({ connectionId: null, model: null, maxTokens: 700, params: { temperature: 0.9 } });
+    expect(host.calls[0]?.tools).toBeUndefined();
+    expect(host.calls[0]?.messages).toEqual(asCame(request));
+    // The thinking block's line is clipped at Progress line length; the trace has it whole.
+    expect(sink.progressLines.some((line) => line.startsWith("The main agent had no part in this reply (LumiAH couldn't read its settings (the link is down)"))).toBe(true);
+    expect(events(host).some((e) => e.kind === "notice" && e.text === `The main agent had no part in this reply (${unreadWhy}); the writer writes from your preset alone.`)).toBe(true);
+    expect(writerTasks(host)).toEqual([`write the reply without a brief: LumiAH failed before the main agent gave one (${unreadWhy})`]);
+    // Its notes say why; no prompt and no transcript is kept, since whether the user keeps them couldn't be read.
+    expect(segmentOf(parseJson(host.blobStore.get(result.record?.segment ?? "") ?? ""))?.steps).toEqual([{ kind: "stop", reason: `LumiAH failed before you gave a brief (${unreadWhy}), so the writer was started on the reply from the request alone` }]);
+    expect(result.record?.transcript).toBeUndefined();
+    expect(events(host).some((e) => e.kind === "agent_entry" && e.entry.kind === "answer" && e.entry.prompt !== undefined)).toBe(false);
+  });
+
+  test("settings that can't be read, on a request that names its connection: the writer's call goes there", async () => {
+    const host = new MemoryHost();
+    host.script = ["A reply from the preset alone."];
+    host.say(CHAT, "user", "Hello?");
+    const harness = createHarness(host, { settings: () => Promise.reject(new Error("the link is down")) });
+    const sink = new Sink();
+    const result = await harness.answer({ userId: "user-1", chatId: CHAT, generationId: "gen-named", kind: "new", target: { messageId: null, swipeId: 0 }, presetId: null, messages: host.requestOf(CHAT, 1, null), params: { temperature: 0.9 }, maxTokens: null, connectionId: WRITER }, sink, new AbortController().signal);
+    expect(result).toMatchObject({ status: "done", reply: "A reply from the preset alone." });
+    expect(host.calls.map((c) => c.connectionId)).toEqual([WRITER]);
   });
 });
 
@@ -336,7 +507,7 @@ describe("a changed setting and a replaced text", () => {
   test("an extension's own tool, registered and given to the main agent, is offered and run", async () => {
     const r = rig([{ toolCalls: [call("tide_table", {}, "c1")] }, { toolCalls: [call("write_reply", { brief: "High water at six." }, "c2")] }, "The tide is in."]);
     const asked: JsonObject[] = [];
-    r.harness.tools.register({ name: "tide_table", build: (env) => ({ name: "tide_table", description: `Tides for ${env.turn.chatId}.`, parameters: { type: "object", properties: {} }, run: async (args) => (asked.push(args), { text: "High water at six." }) }) });
+    r.harness.tools.register({ name: "tide_table", family: "tides", tier: "read", build: (env) => ({ name: "tide_table", description: `Tides for ${env.run.chatId}.`, parameters: { type: "object", properties: {} }, run: async (args) => (asked.push(args), { text: "High water at six." }) }) });
     r.stored.values.agents.main!.tools.push("tide_table");
     await r.turn();
     expect(r.host.calls[0]?.tools?.map((t) => t.name)).toContain("tide_table");

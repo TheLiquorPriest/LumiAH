@@ -8,13 +8,17 @@
 // stop, what it waits on now, and what it spent. A long transcript shows its latest steps and the
 // earlier ones a page at a time; a long text shows its start and the rest on request.
 
+import type { ComponentChildren } from "preact";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
-import type { CallPrompt, LiveView } from "../../shared/ui";
+import { type CallPrompt, isReply, type LiveView, replyDid } from "../../shared/ui";
 import { errorWords, useApp } from "./app";
-import { Badge, Button, Chip, CopyButton, IconButton, SearchField, Seg, Select, type Tone, useBusy } from "./components";
-import { compact, count, counted, dateTime, duration, elapsed } from "./format";
+import { Badge, Button, Chip, CopyButton, Disclosure, IconButton, SearchField, Seg, Select, type Tone, useBusy } from "./components";
+import type { FileChange } from "../../shared/ui";
+import { clock, compact, count, counted, dateTime, duration, elapsed } from "./format";
 import { Icon } from "./icons";
 import {
+  loreNamesWords,
+  mendOf,
   activityWords,
   streamingWords,
   AGENT_STATE_WORDS,
@@ -25,9 +29,13 @@ import {
   agentMs,
   ALL_KINDS,
   callWords,
+  fileChangeWord,
+  filePath,
+  wordWords,
   type Totals,
   END_LINE_WORDS,
-  END_SENTENCE_WORDS,
+  endReason,
+  endSentence,
   END_STATE_WORDS,
   exportJson,
   exportName,
@@ -53,13 +61,18 @@ import {
   totalTokensWords,
   totalsCsv,
   transcriptMarkdown,
-  TURN_KIND_WORDS,
+  runningWords,
+  runTitle,
+  turnPhase,
   type TurnTotals,
   type TurnView,
   turnTotals,
   turnView,
 } from "./live-model";
 import { atFoot, revealInScroller, scrollParent } from "./scroll";
+import { SKIP_ABOUT, SKIP_REPLY } from "./nav-model";
+import { neededPermissions, PLACE_LABEL } from "./setup-model";
+import { HeldPrompt, LoreChange, MendBanner, ReplyBrief, ReplyClock } from "./turn-parts";
 import { useSelect } from "./store";
 import { EventsView, PromptBlock, TotalsView } from "./transcript-views";
 import { type Folds, FeedText, Hits, Marked, TextBlock, useNow } from "./feed-parts";
@@ -70,7 +83,38 @@ type EndState = NonNullable<LiveView["ended"]>["state"];
 const END_TONE: Readonly<Record<EndState, Tone>> = { done: "pos", failed: "neg", stopped: "warn", lost: "neg" };
 
 
-const CALL_STATE_WORDS = { running: "running…", done: "done", error: "failed", none: "no result" } as const;
+const CALL_STATE_WORDS = { running: "running…", held: "waits for your word", done: "done", error: "failed", none: "no result" } as const;
+
+/** The way to a job on the Jobs page. */
+function JobLink(props: { job: { id: string; chatId: string }; children: ComponentChildren }) {
+  const app = useApp();
+  const active = useSelect(app.host.activeChat, (c) => c);
+  return (
+    <Button size="sm" icon="clock" onClick={() => app.nav.update((n) => ({ ...n, page: "jobs", job: props.job.id, chatId: props.job.chatId === active ? null : props.job.chatId }))}>
+      {props.children}
+    </Button>
+  );
+}
+
+/** The workspace files a tool call changed, each with the way to it as the call left it (DESIGN §18: from a result to the file it changed). */
+function ChangedFiles(props: { files: readonly FileChange[] }) {
+  const app = useApp();
+  if (props.files.length === 0) return null;
+  return (
+    <ul class="lah-changed" data-lah-changed aria-label="The workspace files this call changed">
+      {props.files.map((f) => (
+        <li key={`${f.area}:${f.path}`} class="lah-changed-row" data-change={fileChangeWord(f)}>
+          <Icon name="file" size={14} />
+          <code class="lah-mono lah-changed-path">{filePath(f)}</code>
+          <span class="lah-dim">{fileChangeWord(f)}</span>
+          <Button size="sm" icon="folder" onClick={() => app.nav.update((n) => ({ ...n, page: "workspace", changes: null, file: { area: f.area, path: f.path, hash: f.after } }))}>
+            {f.after === null ? "Its history" : "Open"}
+          </Button>
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 /** A 64-character hash in lower-case hex names a blob the backend can read back whole. */
 const BLOB_HASH = /^[0-9a-f]{64}$/;
@@ -142,11 +186,31 @@ function ToolCard(props: { item: Extract<FeedItem, { kind: "tool" }>; folds: Fol
               ) : null}
             </>
           ) : (
-            <p class="lah-line lah-dim">{state === "running" ? "Waiting for it…" : "None came: its agent stopped first."}</p>
+            <p class="lah-line lah-dim">{state === "running" ? "Waiting for it…" : state === "held" ? "It runs once you approve it: the card at the foot of the view asks." : "None came: its agent stopped first."}</p>
           )}
         </div>
       ) : null}
     </details>
+  );
+}
+
+/** What stands under a tool call's card whether it is open or not: that the call was held and what the user said to it, the way from its result to each file it changed, and what it did to the lore the writer saw. */
+function ToolAfter(props: { item: Extract<FeedItem, { kind: "tool" }>; folds: Folds }) {
+  const { item, folds } = props;
+  const { word, files, lore } = item;
+  // The lore's lines are the fourth of the texts a search reads of a tool call (`itemTexts`).
+  const now = folds.current !== null && folds.current.key === item.key && folds.current.field === 3 ? folds.current.nth : -1;
+  return (
+    <>
+      {word ? (
+        <p class="lah-line lah-is-warn" data-lah-word={word.ended?.decision ?? "waiting"}>
+          <Icon name="shield" size={14} />
+          <span>{wordWords(word.asked, word.ended)}</span>
+        </p>
+      ) : null}
+      <ChangedFiles files={files} />
+      {lore ? <LoreChange lore={lore} query={folds.query} now={now} /> : null}
+    </>
   );
 }
 
@@ -161,6 +225,43 @@ function Item(props: { item: FeedItem; folds: Folds; now: number; thinkingOpen: 
       return <p class="lah-line lah-dim">{`Takes up ${counted(item.messages, "message")} of its session.`}</p>;
     case "told":
       return <TextBlock item={item.key} kind="told" title="Told" text={item.text} folds={folds} />;
+    case "note":
+      return <TextBlock item={item.key} kind="told" title="You said" text={item.text} folds={folds} byDefault />;
+    case "word":
+      return (
+        <p class="lah-line lah-is-warn" data-lah-key={item.key} data-lah-word={item.ended?.decision ?? "waiting"}>
+          <Icon name="shield" size={14} />
+          <span>
+            <Marked text={item.text} query={folds.query} now={now} />
+          </span>
+        </p>
+      );
+    case "notice":
+      return (
+        <p class={item.of === "run" && item.info !== true ? "lah-line lah-is-warn" : "lah-line lah-dim"} data-lah-key={item.key} data-lah-notice={item.info === true ? "info" : item.of}>
+          <Icon name={item.of === "run" && item.info !== true ? "alert" : "info"} size={14} />
+          <span>
+            <Marked text={item.text} query={folds.query} now={now} />
+          </span>
+        </p>
+      );
+    case "hold":
+      return (
+        <p class="lah-line lah-dim" data-lah-hold={item.on ? "paused" : "resumed"}>
+          <Icon name={item.on ? "pause" : "play"} size={14} />
+          <span>{`${item.on ? "You paused the run here" : "You let the run go on"} · ${clock(item.at)}`}</span>
+        </p>
+      );
+    case "job":
+      return (
+        <p class="lah-line" data-lah-key={item.key} data-lah-job={item.job.id}>
+          <Icon name="clock" size={14} />
+          <span>
+            <Marked text={item.text} query={folds.query} now={now} />
+          </span>
+          <JobLink job={item.job}>Open the job</JobLink>
+        </p>
+      );
     case "call": {
       const e = item.entry;
       return (
@@ -189,7 +290,12 @@ function Item(props: { item: FeedItem; folds: Folds; now: number; thinkingOpen: 
     case "said":
       return <TextBlock item={item.key} kind="said" title="Answer" text={item.text} folds={folds} byDefault live={item.live} />;
     case "tool":
-      return <ToolCard item={item} folds={folds} openByDefault={props.toolsOpen} />;
+      return (
+        <>
+          <ToolCard item={item} folds={folds} openByDefault={props.toolsOpen} />
+          <ToolAfter item={item} folds={folds} />
+        </>
+      );
     case "result":
       return <TextBlock item={item.key} field={1} kind={item.entry.error ? "failed" : "result"} title={`${item.entry.error ? "✗" : "←"} ${item.entry.name}`} text={item.entry.text} folds={folds} meta={duration(item.entry.ms)} />;
     case "refused":
@@ -324,13 +430,19 @@ function filtered(filter: Filter): number {
 
 export interface TurnFeedProps {
   view: LiveView;
-  /** The chat's live turn: it can be stopped while it runs, and the feed follows its newest step. */
+  /** The stream's live turn: while it runs, its state and what the user can do to it stay in view at the top, and the feed follows its newest step. */
   live: boolean;
   /** Events the backend has couldn't all be read. */
   partial?: boolean;
   onStop?(): Promise<unknown>;
   /** Reads the turn again, where some of it couldn't be read. */
   onRetry?(): void;
+  /** What stands at the foot while the turn runs: the calls held for the user's word. */
+  dock?: ComponentChildren;
+  /** What the user can do to a running turn besides ending it, in the pinned bar. */
+  controls?: ComponentChildren;
+  /** What opens under the pinned bar: the box to say something, and that the turn is held. */
+  below?: ComponentChildren;
 }
 
 export function TurnFeed(props: TurnFeedProps) {
@@ -357,6 +469,37 @@ export function TurnFeed(props: TurnFeedProps) {
   const [stopping, stop] = useBusy();
   const [bundling, bundle] = useBusy();
   const root = useRef<HTMLDivElement>(null);
+  const foot = useRef<HTMLDivElement>(null);
+  const pin = useRef<HTMLDivElement>(null);
+  const pinned = props.live && running;
+  // What stays under the page bar while the turn runs is measured for the search row, which sticks right under it (styles/live.ts): the stylesheet can't know how tall the box to say something makes it.
+  useLayoutEffect(() => {
+    const el = pin.current;
+    const host = root.current;
+    if (!el || !host) return;
+    const publish = (): void => host.style.setProperty("--lah-pin-h", `${Math.ceil(el.getBoundingClientRect().height)}px`);
+    publish();
+    const observer = new ResizeObserver(publish);
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      host.style.removeProperty("--lah-pin-h");
+    };
+  }, [pinned]);
+  // What stands at the foot while the turn runs is measured for the notices, which rise over it (styles/components.ts): the stylesheet can't know how tall a held call's card makes it.
+  useLayoutEffect(() => {
+    const el = foot.current;
+    const host = el?.closest<HTMLElement>("[data-lah-root]");
+    if (!el || !host) return;
+    const publish = (): void => host.style.setProperty("--lah-foot-h", `${Math.ceil(el.getBoundingClientRect().height + (Number.parseFloat(getComputedStyle(el).rowGap) || 0))}px`);
+    publish();
+    const observer = new ResizeObserver(publish);
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      host.style.removeProperty("--lah-foot-h");
+    };
+  }, [pinned]);
   // Another turn is another transcript: nothing filtered, folded or paged carries over.
   useEffect(() => {
     setFilter(NO_FILTER);
@@ -450,8 +593,43 @@ export function TurnFeed(props: TurnFeedProps) {
   };
   const tools = toolsCalled(turn);
   const connection = (id: string): string => connections?.find((c) => c.id === id)?.name ?? id;
-  const stateLine = ended === null ? `Running · ${elapsed(now, view.startedAt)}` : `${END_LINE_WORDS[ended.state]} ${duration(ended.at - view.startedAt)}`;
+  const phase = turnPhase(turn);
+  const replyBy = phase.at === "working" ? phase.replyBy : null;
   const t = totals.turn;
+  // How long and how much, where a cost is known: "Finished in 12.4 s, $0.0018".
+  const priced = t.calls > 0 && !(t.unpriced >= t.calls && t.cost === 0);
+  const stateLine = ended === null ? `${runningWords(phase, turn.paused)} · ${elapsed(now, view.startedAt)}` : `${END_LINE_WORDS[ended.state]} ${duration(ended.at - view.startedAt)}${priced ? `, ${totalCostWords(t)}` : ""}`;
+  // For a reply: what the turn came to in words, and, where it failed or LumiAH had no part in it, the cause with the step that mends it. A permission missing now says nothing of a reply long past.
+  const reply = isReply(view.kind);
+  const did = useMemo(() => (reply ? replyDid(view.events) : null), [reply, view.events]);
+  const lacking = useSelect(app.client.state, (s) => s !== null && neededPermissions(s).length > 0);
+  const mend = ended !== null && did !== null ? mendOf(ended, did, props.live && lacking) : null;
+  // Built in, ending the agents' work stops no reply: Lumiverse writes it without them. So it isn't called Stop there.
+  const skips = reply && view.place === "builtin";
+  const stats = (
+    <p class="lah-stats" data-lah-turn-totals>
+      <span>
+        <b>{count(t.calls)}</b> {t.calls === 1 ? "call" : "calls"}
+      </span>
+      <span>
+        <b>{`${t.estimated ? "≈" : ""}${count(t.in)}`}</b> in{t.cachedIn > 0 ? ` (${count(t.cachedIn)} cached)` : ""}
+      </span>
+      <span>
+        <b>{`${t.estimated ? "≈" : ""}${count(t.out)}`}</b> out{t.reasoningOut > 0 ? ` (${count(t.reasoningOut)} reasoning)` : ""}
+      </span>
+      <span>
+        <b>{duration(t.modelMs)}</b> in the model
+      </span>
+      {t.toolCalls > 0 ? (
+        <span>
+          <b>{count(t.toolCalls)}</b> {`tool ${t.toolCalls === 1 ? "call" : "calls"} (${duration(t.toolMs)})`}
+        </span>
+      ) : null}
+      <span>
+        <b>{totalCostWords(t)}</b>
+      </span>
+    </p>
+  );
   const foldButtons = (
     <>
       <IconButton icon="expand" label="Open every block" onClick={() => (setAll(true), setChosen({}), setFolded({}))} />
@@ -460,40 +638,68 @@ export function TurnFeed(props: TurnFeedProps) {
   );
   return (
     <div ref={root} class="lah-turn" data-lah-turn={view.turn} data-state={ended === null ? "running" : ended.state}>
+      {/*
+        While the turn runs, its state and what the user can do to it stay at the top of what the
+        panel shows: the feed follows its newest step, so the head is soon scrolled out of reach, and
+        the foot is where the drawer lies over Lumiverse's own Send and Stop.
+      */}
+      {pinned ? (
+        <div ref={pin} class="lah-pin" data-lah-pin>
+          <div class={replyBy !== null && phase.at === "working" ? "lah-pinned lah-is-timed" : "lah-pinned"} data-lah-pinned={phase.at}>
+            <span class="lah-pulse" aria-hidden="true" />
+            <span class={phase.at === "working" ? "lah-pinned-text" : "lah-pinned-text lah-is-whole"}>{phase.at === "working" ? stateLine : `${stateLine}. Stop it in the chat, as any reply.`}</span>
+            {replyBy !== null ? <ReplyClock replyBy={replyBy} startedAt={view.startedAt} now={now} short /> : null}
+            {phase.at === "working" ? props.controls : null}
+            {phase.at === "working" && props.onStop && !skips ? (
+              <Button variant="danger" size="sm" icon="stop" busy={stopping} onClick={() => props.onStop && stop(props.onStop)}>
+                Stop
+              </Button>
+            ) : null}
+          </div>
+          {phase.at === "working" && props.onStop && skips ? (
+            <div class="lah-pin-skip" data-lah-skip>
+              <Button size="sm" icon="arrow-right" busy={stopping} onClick={() => props.onStop && stop(props.onStop)}>
+                {SKIP_REPLY}
+              </Button>
+              <span>{SKIP_ABOUT}</span>
+            </div>
+          ) : null}
+          {phase.at === "working" ? props.below : null}
+        </div>
+      ) : null}
       <header class="lah-turn-head">
         <div class="lah-stack lah-turn-what">
           <div class="lah-turn-title">
-            <strong class="lah-h">{TURN_KIND_WORDS[view.kind]}</strong>
-            <Badge tone={ended === null ? "accent" : END_TONE[ended.state]}>{ended === null ? "running" : END_STATE_WORDS[ended.state]}</Badge>
+            <strong class="lah-h">{runTitle(view)}</strong>
+            {ended?.noPart !== undefined ? <Badge tone="warn">no part in the reply</Badge> : <Badge tone={ended === null ? "accent" : END_TONE[ended.state]}>{ended === null ? "running" : END_STATE_WORDS[ended.state]}</Badge>}
+            {view.place !== undefined && isReply(view.kind) ? <Badge>{PLACE_LABEL[view.place]}</Badge> : null}
             <span class="lah-dim lah-small">{dateTime(view.startedAt)}</span>
           </div>
           <p class="lah-turn-state" role="status" aria-live="polite">
             {ended === null ? <span class="lah-pulse" aria-hidden="true" /> : null}
             <span>{stateLine}</span>
-            {ended?.reason ? <span class="lah-warn">{ended.reason}</span> : null}
+            {ended !== null && mend === null && endReason(ended, stateLine) !== null ? <span class="lah-warn">{endReason(ended, stateLine)}</span> : null}
           </p>
-          <p class="lah-stats" data-lah-turn-totals>
-            <span>
-              <b>{count(t.calls)}</b> {t.calls === 1 ? "call" : "calls"}
-            </span>
-            <span>
-              <b>{`${t.estimated ? "≈" : ""}${count(t.in)}`}</b> in{t.cachedIn > 0 ? ` (${count(t.cachedIn)} cached)` : ""}
-            </span>
-            <span>
-              <b>{`${t.estimated ? "≈" : ""}${count(t.out)}`}</b> out{t.reasoningOut > 0 ? ` (${count(t.reasoningOut)} reasoning)` : ""}
-            </span>
-            <span>
-              <b>{duration(t.modelMs)}</b> in the model
-            </span>
-            {t.toolCalls > 0 ? (
-              <span>
-                <b>{count(t.toolCalls)}</b> {`tool ${t.toolCalls === 1 ? "call" : "calls"} (${duration(t.toolMs)})`}
-              </span>
-            ) : null}
-            <span>
-              <b>{totalCostWords(t)}</b>
-            </span>
-          </p>
+          {replyBy !== null ? (
+            <p class="lah-turn-clock" data-lah-turn-clock>
+              <ReplyClock replyBy={replyBy} startedAt={view.startedAt} now={now} />
+            </p>
+          ) : null}
+          {phase.at === "writing" ? (
+            <p class="lah-line lah-dim" data-lah-writing>
+              <Icon name="info" size={14} />
+              <span>LumiAH's work on this reply is over. The reply itself streams in the chat, and this turn is recorded once it is saved.</span>
+            </p>
+          ) : null}
+          {did !== null ? <ReplyBrief brief={did.brief} lore={loreNamesWords(did.lore)} /> : null}
+          {/* A reply's head leads with what was done for it; its counts and tokens are a press away. Any other run's figures are what its head is for. */}
+          {reply ? (
+            <Disclosure class="lah-turn-details" summary={<span class="lah-small">Details: calls, tokens and time</span>}>
+              {stats}
+            </Disclosure>
+          ) : (
+            stats
+          )}
           {props.partial ? (
             <p class="lah-line lah-is-warn">
               <Icon name="alert" size={14} />
@@ -507,11 +713,6 @@ export function TurnFeed(props: TurnFeedProps) {
           ) : null}
         </div>
         <div class="lah-actions">
-          {props.live && ended === null && props.onStop ? (
-            <Button variant="danger" icon="stop" busy={stopping} onClick={() => props.onStop && stop(props.onStop)}>
-              Stop
-            </Button>
-          ) : null}
           <CopyButton text={() => markdown(narrowed)} label={narrowed ? "Copy what is shown, as Markdown" : "Copy the transcript, as Markdown"} size="md" variant="secondary">
             {narrowed ? "Copy shown" : "Copy"}
           </CopyButton>
@@ -541,6 +742,15 @@ export function TurnFeed(props: TurnFeedProps) {
           </div>
         ) : null}
       </header>
+      {mend !== null ? (
+        <MendBanner
+          mend={mend}
+          onProblems={() => {
+            setMode("steps");
+            setFilter((f) => ({ ...f, problems: true }));
+          }}
+        />
+      ) : null}
       <Seg<TurnMode> label="What to show of the turn" value={mode} options={MODES} onChange={setMode} />
       {mode === "totals" ? (
         <TotalsView turn={turn} totals={totals} connection={connection} />
@@ -626,6 +836,18 @@ export function TurnFeed(props: TurnFeedProps) {
                     {sessionWords(turn.session).map((line) => (
                       <p key={line}>{line}</p>
                     ))}
+                    {turn.session.jobs && turn.session.jobs.length > 0 ? (
+                      <div class="lah-actions">
+                        {turn.session.jobs.map((job) => (
+                          <JobLink key={job.id} job={job}>{`${roleLabel(job.agent)}: ${job.opening ?? job.task}`}</JobLink>
+                        ))}
+                      </div>
+                    ) : null}
+                  </li>
+                ) : null}
+                {turn.held && filter.agent === null && !filter.problems ? (
+                  <li class="lah-mark lah-session" data-lah-held-prompt>
+                    <HeldPrompt held={turn.held} />
                   </li>
                 ) : null}
                 {feeds.length === 0 ? <li class="lah-mark">{filter.problems ? "Nothing went wrong in this turn." : running ? "Starting the main agent…" : "No agent ran in this turn."}</li> : null}
@@ -646,17 +868,24 @@ export function TurnFeed(props: TurnFeedProps) {
                     onFocus={() => setFilter((f) => ({ ...f, agent: f.agent === feed.agent.start.id ? null : feed.agent.start.id }))}
                   />
                 ))}
-                {ended ? <li class="lah-mark lah-ended" data-lah-ended={ended.state}>{`${END_SENTENCE_WORDS[ended.state]}${ended.reason ? `: ${ended.reason}` : "."}`}</li> : null}
+                {ended ? <li class="lah-mark lah-ended" data-lah-ended={ended.state}>{endSentence(ended)}</li> : null}
               </ol>
             )}
           </div>
         </div>
       )}
-      {props.live && running && !following && mode === "steps" ? (
-        <div class="lah-follow">
-          <Button size="sm" variant="primary" icon="chevron-down" onClick={() => setFollowing(true)}>
-            Jump to the newest
-          </Button>
+      {/* At the foot while the turn runs: the way back to the newest step, and the calls held for the user's word, whose answers must stay in reach. */}
+      {pinned ? (
+        <div ref={foot} class="lah-foot">
+          {!following && mode === "steps" ? (
+            <div class="lah-follow">
+              <Button size="sm" variant="primary" icon="chevron-down" onClick={() => setFollowing(true)}>
+                Jump to the newest
+              </Button>
+            </div>
+          ) : null}
+          {/* Built in, once the agents are at rest Lumiverse writes the reply: nothing of LumiAH's waits for an answer any more. */}
+          {phase.at === "working" ? props.dock : null}
         </div>
       ) : null}
     </div>

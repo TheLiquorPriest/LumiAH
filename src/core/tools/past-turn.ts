@@ -6,13 +6,15 @@
 import type { JsonObject } from "../ports";
 import { stepText, toldOf } from "../receipts";
 import type { SegmentStep } from "../sessions";
-import { TEXT, TOOL } from "../texts";
+import { FAMILY, TEXT, TOOL } from "../texts";
 import type { PastTurn, ToolDefinition, ToolEnv, ToolOutcome } from "../tools";
 import { clip, textArg, wholeArg } from "../util";
-import { around, fitted, grepLines, listPage, pagerOf, readCursor, textPage } from "./paging";
+import { around, fitted, grepLines, listPage, pagerOf, readCursor, saidBack, textPage } from "./paging";
 
 const pastTurn: ToolDefinition = {
   name: TOOL.pastTurn,
+  family: FAMILY.session,
+  tier: "read",
   build(env: ToolEnv) {
     const { texts, past } = env;
     const p = pagerOf(env, TOOL.pastTurn);
@@ -47,7 +49,7 @@ const pastTurn: ToolDefinition = {
           const steps = read.flatMap((t) => t.segment.steps.map((step, i) => ({ turn: t, n: i + 1, step })));
           const found = grepLines(steps.map((s) => stepText(s.step)), needle);
           const where = turn ? texts.render(TEXT.answer.pastWhereReply, { reply: String(turn.reply) }) : texts.render(TEXT.answer.pastWhereLatest, { turns: texts.counted(read.length, TEXT.word.turn) });
-          if (found.length === 0) return { text: texts.render(TEXT.answer.pastGrepNothing, { where, query: needle }) };
+          if (found.length === 0) return { text: saidBack(p, needle, (said) => texts.render(TEXT.answer.pastGrepNothing, { where, query: said })) };
           return listPage(p, {
             total: found.length,
             noun: TEXT.word.line,

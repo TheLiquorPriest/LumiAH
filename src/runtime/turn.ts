@@ -5,25 +5,40 @@
 // once Lumiverse has saved it.
 //
 // One turn runs per chat at a time: a new one for a chat whose earlier turn hasn't ended stops that
-// one first and waits for it, since Lumiverse has already let its generation go. A turn stops when
-// Lumiverse closes its request (Stop), when the extension says so (Stop in the live view, or
-// Lumiverse's own stop heard there), or when the runtime shuts down; the core hears each as its
-// signal, and its model calls under way are cancelled with it.
+// one first and waits for it, since Lumiverse has already let its generation go. An earlier turn
+// that still hasn't ended after `turnWaitMs` is let go: taken off its chat, its answer ended, and
+// whatever it does from then on ignored, so a stuck turn never costs its chat the next reply. A
+// turn stops when Lumiverse closes its request (Stop), when the extension says so (Stop in the live
+// view, or Lumiverse's own stop heard there), or when the runtime shuts down; the core hears each
+// as its signal, and its model calls under way are cancelled with it.
+//
+// A reply the user stopped never ends as an error, which Lumiverse would show as a failed
+// generation. Lumiverse knows of its own Stop and has closed the request. It doesn't know of a stop
+// from the live view, so the runtime asks it to stop the generation as its own Stop does; where that
+// can't be done, the reply ends as a finished one with whatever it had written.
 
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { AgentUsage, JsonObject, ReplySink, TurnRequest, TurnResult } from "../core/ports";
-import type { StopPush, TurnFacts } from "../link/contract";
+import type { AgentUsage, JsonObject, ReplySink, TraceRecord, TurnRequest, TurnResult } from "../core/ports";
+import type { StopBy, StopPush, TurnFacts } from "../link/contract";
 import type { RuntimeTuning } from "../link/settings";
+import type { WorkHarness } from "../link/work";
 import type { RuntimeLink } from "./link";
+import { refusedReply } from "./link";
 import { LiveError } from "./lumiverse";
 import { maxTokensOf, modelMessages, samplingOf, withSources } from "./openai";
 import type { TaggedRequest, TurnRunner } from "./relay";
+import type { Answer, ReplyPiece } from "./sse";
 import type { RuntimeSettings } from "./settings";
 import { problemOf } from "./streams";
 import type { TraceSink } from "./trace";
 
-/** What answers a turn: the core's harness (`createHarness(host, …).answer`). It never rejects, and ends the sink with one `done` or one `error`. */
-export interface Harness {
+/**
+ * The core's harness (`createHarness(host, …)`). `answer` answers a turn: it never rejects, and ends
+ * the sink with one `done` or one `error`. The rest is what the work runner reaches of it
+ * (`WorkHarness`: jobs, side sessions, the user's words to a run), and its page-facing methods
+ * (`workspace.list`, `jobs.start`, …), which are reached by name.
+ */
+export interface Harness extends WorkHarness {
   answer(turn: TurnRequest, sink: ReplySink, signal: AbortSignal): Promise<TurnResult>;
 }
 
@@ -33,6 +48,20 @@ export interface TurnsEnv {
   tuning(): RuntimeTuning;
   /** The writer's connection, from the settings' values (the core's section names it); null: the user's default. */
   writerConnection(values: JsonObject): string | null;
+  /** A reply turn of a chat has returned, however it ended: the jobs that waited for the reply may start. */
+  replied(chatId: string): void;
+  /** Asks Lumiverse to stop a generation as its own Stop does; false when it had none such running. Rejects when it can't be asked (no session, Lumiverse out of reach). */
+  stopGeneration(generation: string, chat: string): Promise<boolean>;
+}
+
+/** The user stopped the turn: its words say where, and are what the turn's end says. `by` is null for an extension from before it said where. */
+export class UserStop extends Error {
+  constructor(
+    message: string,
+    readonly by: StopBy | null,
+  ) {
+    super(message);
+  }
 }
 
 interface Running {
@@ -41,6 +70,12 @@ interface Running {
   stop: AbortController;
   /** Resolves once the turn has let go of everything: the next turn of its chat may start. */
   done: Promise<void>;
+  /** Lumiverse being asked to stop the turn's generation (Stop in the live view); settles once it answered or wasn't heard in time. Null when it wasn't asked. */
+  asked: Promise<void> | null;
+  /** Where the turn's reply goes. */
+  answer: Answer;
+  /** The chat's next reply stopped waiting for this turn to end: it is no turn of the chat's any more, and nothing it does from then on counts. */
+  letGo: boolean;
 }
 
 /** The turn's usage as an OpenAI completion says usage, with the turn's id and the harness's own counts beside it: Lumiverse keeps the whole object with the reply. */
@@ -83,7 +118,12 @@ export class Turns implements TurnRunner {
   readonly current = (): string | null => this.scope.getStore()?.turn ?? null;
 
   /** The chat of the turn the caller works for; null outside one. */
-  readonly currentChat = (): string | null => this.scope.getStore()?.chat ?? null;
+  readonly currentChat = (): string | null => this.scope.getStore()?.chat || null;
+
+  /** Runs `fn` as the work of a run that is no reply (a job's, a side session's turn), so its model calls name it too. `chat` is `""` where it has none. */
+  within<T>(run: { turn: string; chat: string }, fn: () => Promise<T>): Promise<T> {
+    return this.scope.run(run, fn);
+  }
 
   async writerConnection(): Promise<string | null> {
     return this.env.writerConnection((await this.settings.get()).values);
@@ -91,7 +131,36 @@ export class Turns implements TurnRunner {
 
   /** The extension says a turn is to stop: the user pressed Stop. */
   stop(push: StopPush): void {
-    this.byTurn.get(push.turn)?.stop.abort(new Error(push.why));
+    const running = this.byTurn.get(push.turn);
+    if (running === undefined || running.stop.signal.aborted) return;
+    // The turn's signal first, so its end says the live view stopped it and not Lumiverse, whose closing of the request follows. The turn can't have ended the reply before `asked` is set: it only goes on from its signal a tick later.
+    running.stop.abort(new UserStop(push.why, push.by ?? null));
+    if (push.by === "live") running.asked = this.askLumiverse(running);
+  }
+
+  /**
+   * The core's event as the live view gets it: the end of a turn the user stopped says where they
+   * stopped it. The core is handed those words as its signal's reason and says only that the turn
+   * was stopped, so they are put on the event here.
+   */
+  traced(record: TraceRecord): TraceRecord {
+    if (record.event.kind !== "turn_ended" || record.event.status !== "stopped") return record;
+    const reason: unknown = this.byTurn.get(record.turn)?.stop.signal.reason;
+    return reason instanceof UserStop ? { ...record, event: { ...record.event, reason: reason.message } } : record;
+  }
+
+  /** Asks Lumiverse to stop a turn's generation. Never rejects: what kept Lumiverse from stopping it is logged, and the turn then ends the reply itself. */
+  private async askLumiverse(running: Running): Promise<void> {
+    const asking = this.env.stopGeneration(running.turn, running.chat).then(
+      (stopped) => (stopped ? null : "Lumiverse had no such generation running"),
+      // Lumiverse's own words for it: `problemOf` reads a failed call to Lumiverse as the link's.
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    );
+    const { promise: late, resolve } = Promise.withResolvers<string>();
+    const timer = setTimeout(() => resolve("Lumiverse didn't answer in time"), this.env.tuning().stopAskMs);
+    const kept = await Promise.race([asking, late]);
+    clearTimeout(timer);
+    if (kept !== null) this.env.log(`turn ${running.turn.slice(0, 8)}: Lumiverse wasn't made to stop the reply (${kept}), so the runtime ended it as a finished one`);
   }
 
   /** The runtime is stopping: every turn ends. */
@@ -105,21 +174,23 @@ export class Turns implements TurnRunner {
     try {
       facts = await this.begin(request);
     } catch (error) {
-      const p = problemOf(error);
+      // A link refused while the tag was checked is said as a request that found it refused is (relay.ts).
+      const refused = refusedReply(this.link);
+      const p = refused !== null ? { message: refused, code: "revoked" } : problemOf(error);
       answer.fail(p.message, p.code === "forbidden" ? "invalid_api_key" : p.code, this.env.now());
       return;
     }
     const stop = new AbortController();
-    const closed = (): void => stop.abort(request.signal.reason instanceof Error ? request.signal.reason : new Error("Lumiverse closed the request (Stop)"));
+    // Lumiverse closes a reply's request when the user stops it there.
+    const closed = (): void => stop.abort(new UserStop(request.signal.reason instanceof Error ? request.signal.reason.message : "The reply was stopped in Lumiverse.", "lumiverse"));
     if (request.signal.aborted) closed();
     else request.signal.addEventListener("abort", closed, { once: true });
     const finished = Promise.withResolvers<void>();
-    const running: Running = { turn: facts.turn, chat: facts.chat, stop, done: finished.promise };
+    const running: Running = { turn: facts.turn, chat: facts.chat, stop, done: finished.promise, asked: null, answer, letGo: false };
+    const stoppedByUser = (): boolean => stop.signal.reason instanceof UserStop;
+    let last: ReplyPiece | null = null;
     try {
-      if (!(await this.takeChat(running))) {
-        answer.fail("The chat's earlier reply hasn't stopped yet, so this one wasn't started. Try again in a moment.", "conflict", this.env.now());
-        return;
-      }
+      await this.takeChat(running);
       this.settings.note(facts.settings);
       const turn: TurnRequest = {
         userId: facts.user,
@@ -136,11 +207,25 @@ export class Turns implements TurnRunner {
         progress: (text) => answer.piece({ kind: "progress", text }, this.env.now()),
         reasoning: (text) => answer.piece({ kind: "reasoning", text }, this.env.now()),
         content: (text) => answer.piece({ kind: "content", text }, this.env.now()),
-        done: (finish, usage) => answer.piece({ kind: "finish", finish: finish === "" ? "stop" : finish, usage: usageJson(usage, facts.turn) }, this.env.now()),
-        // A turn that was stopped ends with the stop's own words (who stopped it, and where), which say more than the core's.
-        error: (message, code) => answer.fail(stop.signal.aborted && stop.signal.reason instanceof Error ? stop.signal.reason.message : message, code ?? "turn_failed", this.env.now()),
+        // The end of a reply the user stopped is written once the turn is over (below).
+        done: (finish, usage) => {
+          const piece: ReplyPiece = { kind: "finish", finish: finish === "" ? "stop" : finish, usage: usageJson(usage, facts.turn) };
+          if (stoppedByUser()) last = piece;
+          else answer.piece(piece, this.env.now());
+        },
+        // Any other stop (the runtime restarting, another reply asked for in the chat) ends with its own words, which say more than the core's.
+        error: (message, code) => {
+          if (!stoppedByUser()) answer.fail(stop.signal.aborted && stop.signal.reason instanceof Error ? stop.signal.reason.message : message, code ?? "turn_failed", this.env.now());
+        },
       };
       const result = await this.scope.run({ turn: facts.turn, chat: facts.chat }, () => this.harness.answer(turn, sink, stop.signal));
+      // Let go meanwhile: its answer ended then, and what it came to is no turn of the chat's.
+      if (running.letGo) return;
+      if (!answer.ended && stoppedByUser()) {
+        // Lumiverse, asked, closes the request itself; where it didn't, the reply ends as a finished one.
+        await running.asked;
+        if (!answer.ended) answer.piece(last ?? { kind: "finish", finish: "stop" }, this.env.now());
+      }
       if (!answer.ended) answer.fail(result.reason ?? "The turn ended without a reply.", "turn_failed", this.env.now());
       if (result.record !== null) await this.commit(facts, result.record);
       else if (result.status !== "done") this.env.log(`turn ${facts.turn.slice(0, 8)} ${result.status}${result.reason !== undefined ? `: ${result.reason}` : ""}`);
@@ -157,6 +242,8 @@ export class Turns implements TurnRunner {
       if (this.byTurn.get(facts.turn) === running) this.byTurn.delete(facts.turn);
       if (this.byChat.get(facts.chat) === running) this.byChat.delete(facts.chat);
       finished.resolve();
+      // The jobs that wait for the chat's reply wait for the one that took its place.
+      if (!running.letGo) this.env.replied(facts.chat);
     }
   }
 
@@ -174,22 +261,36 @@ export class Turns implements TurnRunner {
     }
   }
 
-  /** Makes `running` its chat's one turn: the chat's earlier turn is stopped and waited for. False when that one doesn't end in time. */
-  private async takeChat(running: Running): Promise<boolean> {
-    const earlier = this.byChat.get(running.chat);
-    if (earlier !== undefined) {
+  /** Makes `running` its chat's one turn: the chat's earlier turn is stopped and waited for, and let go when it doesn't end in time. */
+  private async takeChat(running: Running): Promise<void> {
+    // Again after each wait: another turn of the chat may have got in first meanwhile.
+    for (let earlier = this.byChat.get(running.chat); earlier !== undefined; earlier = this.byChat.get(running.chat)) {
       earlier.stop.abort(new Error("Another reply was asked for in this chat."));
+      const waitMs = this.env.tuning().turnWaitMs;
       const { promise: late, resolve } = Promise.withResolvers<"late">();
-      const timer = setTimeout(() => resolve("late"), this.env.tuning().turnWaitMs);
+      const timer = setTimeout(() => resolve("late"), waitMs);
       const outcome = await Promise.race([earlier.done.then(() => "ended" as const), late]);
       clearTimeout(timer);
-      if (outcome === "late") return false;
-      // Another turn of the chat may have got in first while this one waited.
-      if (this.byChat.has(running.chat)) return this.takeChat(running);
+      if (outcome === "late" && this.byChat.get(running.chat) === earlier) this.letGo(earlier, waitMs);
     }
     this.byChat.set(running.chat, running);
     this.byTurn.set(running.turn, running);
-    return true;
+  }
+
+  /**
+   * A turn that didn't end within the time its chat's next reply waited for it, though its signal
+   * said to: it is taken off its chat, its answer ends here in words that say so, and the trace it
+   * still writes is dropped. What it comes to, if it ever returns, is left (`run`).
+   */
+  private letGo(running: Running, waitedMs: number): void {
+    running.letGo = true;
+    this.byChat.delete(running.chat);
+    this.byTurn.delete(running.turn);
+    const seconds = Math.round(waitedMs / 1000);
+    const waited = seconds === 1 ? "a second" : `${seconds} seconds`;
+    this.trace.give(running.turn, `it hadn't stopped ${waited} after its chat's next reply was asked for, and was let go`);
+    running.answer.fail(`LumiAH let this reply go: another reply was asked for in its chat, and this one hadn't stopped ${waited} later.`, "conflict", this.env.now());
+    this.env.log(`turn ${running.turn.slice(0, 8)} hadn't stopped ${waited} after its chat's next reply was asked for: it was let go, so the next reply could start`);
   }
 
   /** Hands the turn's record to the extension (DESIGN §2 step 8). */

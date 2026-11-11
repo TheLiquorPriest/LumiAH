@@ -3,24 +3,27 @@
 //   the same call with that cursor gives the next page;
 // - a search or a listing says how many it found and which of them the page shows;
 // - an error says what to do next;
-// - nothing returns more than Answer length allows (`Settings.tools.pageChars`), and a page of a
-//   search or a listing shows at most Hits per page.
+// - nothing returns more than Answer length allows (`Settings.tools.pageChars`), whatever the call's
+//   arguments are: an argument an answer says back is clipped, and a page of a search or a listing
+//   shows at most Hits per page.
 
 import type { JsonObject } from "../ports";
 import { TEXT, type Texts } from "../texts";
 import type { ToolEnv, ToolOutcome } from "../tools";
 import { clip, cutAt } from "../util";
 
-/** What one tool pages by: its name, the user's texts, and the page's limits. */
+/** What one tool pages by: its name, the user's texts, the page's limits, and Line length, the most of an argument an answer says back. */
 export interface Pager {
   tool: string;
   texts: Texts;
   pageChars: number;
   pageItems: number;
+  lineChars: number;
 }
 
 export function pagerOf(env: ToolEnv, tool: string): Pager {
-  return { tool, texts: env.texts, pageChars: env.settings.tools.pageChars, pageItems: env.settings.tools.pageItems };
+  const { pageChars, pageItems, lineChars } = env.settings.tools;
+  return { tool, texts: env.texts, pageChars, pageItems, lineChars };
 }
 
 /** Where a page starts: an item of a list, or a place in a text ("40"); or an item and a place in it ("12:3000"). `given`: the call named one. */
@@ -43,7 +46,8 @@ export function readCursor(p: Pager, args: JsonObject): Cursor | ToolOutcome {
 }
 
 export function badCursor(p: Pager, raw: unknown): ToolOutcome {
-  return { text: p.texts.render(TEXT.answer.badCursor, { cursor: typeof raw === "string" ? raw : (JSON.stringify(raw) ?? ""), tool: p.tool }), error: true };
+  const given = typeof raw === "string" ? raw : (JSON.stringify(raw) ?? "");
+  return { text: saidBack(p, given, (cursor) => p.texts.render(TEXT.answer.badCursor, { cursor, tool: p.tool })), error: true };
 }
 
 /** The error for a call that lacks an argument its tool can't do without: what the argument is, in its own description's words. */
@@ -116,6 +120,16 @@ export function textPage(p: Pager, input: { text: string; from: number; given: b
 /** An answer that names a list (the books there are, the turns there are), the list clipped so the whole stays within Answer length. */
 export function fitted(p: Pager, list: string, render: (list: string) => string): string {
   return render(clip(list, Math.max(1, p.pageChars - render("").length)));
+}
+
+/**
+ * An answer that says an argument back (the query that found nothing, the id that names nothing, a
+ * cursor that isn't one): at most Line length of the argument, and less where the answer has no room
+ * for that much. A model may send an argument of any length, and an answer that said it back whole
+ * would be as long as it. Inside `fitted`, the argument is fitted first and the list takes the rest.
+ */
+export function saidBack(p: Pager, arg: string, render: (arg: string) => string): string {
+  return fitted(p, clip(arg, p.lineChars), render);
 }
 
 /** A line around what was found in it at `at`, at most `max` characters long. */

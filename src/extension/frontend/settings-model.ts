@@ -4,7 +4,8 @@
 // for becomes JSON to edit, so no setting is out of reach. The schema is the backend's, read as
 // outside data: a keyword that isn't what it should be is left out, never trusted.
 
-import { isRecord, type JsonObject, type JsonValue, type SettingPath, type SettingsView, type UiProblem } from "../../shared/ui";
+import { ADDED_TOOLS, isRecord, type JsonObject, type JsonValue, type SettingPath, type SettingsView, type UiProblem } from "../../shared/ui";
+import { count } from "./format";
 
 export interface Choice {
   value: JsonValue;
@@ -12,8 +13,8 @@ export interface Choice {
   help: string | null;
 }
 
-/** What names a table's rows: one of the user's connections, a model, or any name. */
-export type TableKeys = "connection" | "model" | "name";
+/** What names a table's rows: one of the user's connections, a model, a tool, or any name. */
+export type TableKeys = "connection" | "model" | "tool" | "name";
 
 /** One shape of a setting that has several, with the value of the property that chooses it. */
 export interface Variant extends Choice {
@@ -29,6 +30,7 @@ export type Control =
   | { kind: "number"; integer: boolean; min: number | null; max: number | null; step: number | null; unit: string | null }
   | { kind: "choice"; options: Choice[] }
   | { kind: "connection" }
+  | { kind: "connections" }
   | { kind: "model"; connection: SettingPath | null }
   | { kind: "text"; multiline: boolean; maxLength: number | null }
   | { kind: "set"; options: Choice[] }
@@ -89,9 +91,25 @@ function typesOf(schema: JsonObject): string[] {
   return Array.isArray(t) ? t.filter((x): x is string => typeof x === "string") : [];
 }
 
+/**
+ * Core's reserved entries among tool names: `@added` is every tool that isn't built in, `@family`
+ * every tool of a family, those gained later too. Each names a group and no one tool, so it is said
+ * in words; null for any other value, which is its own label.
+ */
+function groupWords(value: string): { label: string; help: string } | null {
+  if (value === ADDED_TOOLS) return { label: "Tools you added (MCP servers and extensions)", help: "Every tool of the MCP servers you switched on for agents and of your extensions, those added later too." };
+  if (value.startsWith("@mcp:")) return { label: `Every tool of the MCP server ${value.slice("@mcp:".length)}`, help: "Those it gains later too." };
+  if (value.startsWith("@")) return { label: `Every ${value.slice(1)} tool`, help: "Those the family gains later too." };
+  return null;
+}
+
 /** A schema's choices: its `enum`, or its `oneOf` when every member is a `const` with words; null when it has neither. */
 function choicesOf(schema: JsonObject): Choice[] | null {
-  if (Array.isArray(schema.enum)) return schema.enum.map((value) => ({ value, label: value === null ? "None" : String(value), help: null }));
+  if (Array.isArray(schema.enum))
+    return schema.enum.map((value) => {
+      const group = typeof value === "string" ? groupWords(value) : null;
+      return { value, label: group?.label ?? (value === null ? "None" : String(value)), help: group?.help ?? null };
+    });
   if (!Array.isArray(schema.oneOf) || schema.oneOf.length === 0) return null;
   const out: Choice[] = [];
   for (const member of schema.oneOf) {
@@ -157,7 +175,8 @@ function controlOf(schema: JsonObject, path: SettingPath, value: JsonValue, fall
   if (isRecord(schema.properties)) return { kind: "group", fields: fieldsOf(schema.properties as JsonObject, path, value, fallback, null) };
   if (types.includes("object") && isRecord(schema.additionalProperties)) {
     const row = schema.additionalProperties as JsonObject;
-    const keys: TableKeys = schema["x-keys"] === "connection" || schema["x-keys"] === "model" ? schema["x-keys"] : "name";
+    const named = schema["x-keys"];
+    const keys: TableKeys = named === "connection" || named === "model" || named === "tool" ? named : "name";
     const held = isRecord(value) ? value : {};
     const rows = Object.keys(held).map((key) => nodeOf(key, row, [...path, key], held[key] as JsonValue, valueAt(fallback, [key]), null, key));
     return { kind: "table", keys, row, rows };
@@ -175,6 +194,8 @@ function controlOf(schema: JsonObject, path: SettingPath, value: JsonValue, fall
   if (types.includes("array") && isRecord(schema.items)) {
     const options = choicesOf(schema.items as JsonObject);
     if (options) return { kind: "set", options };
+    // A list of connection ids is picked from the user's connections, never typed: a typed name would be kept and match nothing.
+    if ((schema.items as JsonObject).format === "connection") return { kind: "connections" };
     if (typesOf(schema.items as JsonObject).includes("string")) return { kind: "list" };
   }
   return { kind: "json" };
@@ -298,15 +319,194 @@ export function sectionFor(nav: readonly NavGroup[], path: readonly string[]): N
   return best;
 }
 
-/** A setting's value in a few words, for a search's result and a row's summary. */
+/** The section that shows the group at `path` (or a setting under it): the one whose own place is the longest start of `path`; null when none is. A lead from another page may name a group, where `sectionFor` finds only a setting. */
+export function sectionAt(nav: readonly NavGroup[], path: readonly string[]): NavSection | null {
+  let best: NavSection | null = null;
+  for (const s of allSections(nav)) {
+    const own = s.node.path;
+    if (own.length <= path.length && own.every((key, i) => key === path[i]) && (best === null || own.length > best.node.path.length)) best = s;
+  }
+  return best;
+}
+
+/**
+ * Where the settings shown keep a setting another page names by its place among the core's own
+ * settings or the transport's (`["guidance", "chars"]`): at their root, or inside one section
+ * (`core`, `transport` in LumiAH's own). Null where they hold none such.
+ */
+export function settingPlace(schema: JsonObject, tail: readonly string[]): string[] | null {
+  const holds = (root: JsonObject): boolean => {
+    let at: JsonObject = root;
+    for (const key of tail) {
+      const next = isRecord(at.properties) ? at.properties[key] : undefined;
+      if (!isRecord(next)) return false;
+      at = next as JsonObject;
+    }
+    return true;
+  };
+  if (holds(schema)) return [...tail];
+  for (const [key, section] of Object.entries(isRecord(schema.properties) ? schema.properties : {})) if (isRecord(section) && holds(section as JsonObject)) return [key, ...tail];
+  return null;
+}
+
+/** A way straight to one of the few settings most people change first: what it is called there, a line on it, and the section it opens. */
+export interface StartHere {
+  path: readonly string[];
+  label: string;
+  about: string;
+  section: NavSection;
+}
+
+/**
+ * The few groups of LumiAH's own settings most people change first, by their place, in the words a
+ * newcomer would look for them under. Which they are is a judgement about the page, not a limit on
+ * anything: every setting stays in the full list under them and in the search.
+ */
+const START_HERE: readonly { path: readonly string[]; label: string; about: string }[] = [
+  { path: ["core", "agents", "main"], label: "The main agent's model", about: "The connection and model the agent that reads your story thinks with. Left alone, it is the chat's own." },
+  { path: ["transport", "history"], label: "How much of the chat stays in the prompt", about: "The latest messages stay word for word; the agents read the rest when a reply needs it." },
+  { path: ["core", "spend"], label: "Spending caps", about: "The most tokens or money a day. Once reached, the next model call is refused and says so." },
+  { path: ["core", "approval"], label: "Ask before a tool runs", about: "Which kinds of tool call go ahead, and which ask permission first." },
+  { path: ["core", "recall", "meaning"], label: "Search by meaning", about: "Let lore and chat searches also find what says the same in other words. It is off until you switch it on: each text is then sent once to your embedding connection." },
+];
+
+/** The ways straight to those settings that the settings shown hold (none where they are another's, as the preview's sample is). */
+export function startHere(nav: readonly NavGroup[]): StartHere[] {
+  return START_HERE.flatMap((start) => {
+    const section = sectionAt(nav, start.path);
+    return section !== null && section.node.path.length === start.path.length ? [{ ...start, section }] : [];
+  });
+}
+
+/**
+ * How a section opens: `first` are the settings shown at once, `more` those folded under `label`
+ * until asked for.
+ */
+export interface SectionFold {
+  first: FormNode[];
+  more: FormNode[];
+  label: string;
+}
+
+/**
+ * An agent's section opens on its connection and its model, which is what most people come to
+ * change; its effort, its tools and its budget are folded under one disclosure, which says how many
+ * of them were changed so none is changed out of sight. Null for any other section: it shows whole.
+ */
+export function foldOf(node: FormNode): SectionFold | null {
+  if (node.control.kind !== "group") return null;
+  const fields = node.control.fields;
+  const leads = (f: FormNode): boolean => f.control.kind === "connection" || f.control.kind === "model";
+  const more = fields.filter((f) => !leads(f));
+  if (!fields.some((f) => f.control.kind === "connection") || !fields.some((f) => f.control.kind === "model") || more.length === 0) return null;
+  const changed = more.reduce((n, f) => n + changedCount(f), 0);
+  return { first: fields.filter(leads), more, label: changed > 0 ? `More for this agent (${count(changed)} changed)` : "More for this agent" };
+}
+
+/** Whether a fold's folded part holds the setting or the group at `key` (`pathKey`): the page opens it then, so a lead from a search or another page is never left hidden. */
+export function foldHolds(fold: SectionFold, key: string): boolean {
+  const within = (node: FormNode): boolean => pathKey(node.path) === key || childrenOf(node).some(within);
+  return fold.more.some(within);
+}
+
+// ---------------------------------------------------------------- numbers as shown
+
+type NumberControl = Extract<Control, { kind: "number" }>;
+
+/** The unit the settings' schema names a span of time by. No page shows it: a time reads in seconds or minutes. */
+const TIME_UNIT = "ms";
+const SECOND_MS = 1000;
+const MINUTE_MS = 60_000;
+
+/** A step for − and + that suits a number's size: a tenth of its magnitude, so 32,000 steps by 1,000 and 8 by 1. */
+export function niceStep(value: number, integer: boolean): number {
+  const size = Math.abs(value);
+  if (size < 10) return integer ? 1 : size < 1 ? 0.05 : 0.5;
+  return 10 ** (Math.floor(Math.log10(size)) - 1) * (size < 100 ? 10 : 1);
+}
+
+/**
+ * A number as its setting shows it and takes it typed. A span of time is kept in milliseconds and
+ * shown in seconds or minutes; every other number is shown as it is kept.
+ */
+export interface NumberShown {
+  /** The value in the unit shown; null where the setting holds none. */
+  value: number | null;
+  /** The unit's word, fitted to the value ("1 minute", "5 minutes"); null where the schema names none. */
+  unit: string | null;
+  /** What one of the unit shown comes to as the setting is kept: 1 where they are the same. */
+  per: number;
+  integer: boolean;
+  min: number | null;
+  max: number | null;
+  step: number;
+}
+
+/**
+ * What a span of time is shown in, by its size and its step: minutes where it is a whole number of
+ * them and steps by whole minutes, seconds otherwise. So five minutes read "5 minutes", ninety
+ * seconds "90 seconds" and a quarter of a second "0.25 seconds".
+ */
+function timePer(ms: number, step: number | null): number {
+  const whole = (n: number): boolean => n >= MINUTE_MS && n % MINUTE_MS === 0;
+  return whole(ms) && (step === null || whole(step)) ? MINUTE_MS : SECOND_MS;
+}
+
+/** A bound of a time in the unit shown, kept to thousandths on the side that stays within it: a bound of one millisecond would else be a minute's sixty-thousandth, written out. */
+function boundShown(bound: number | null, per: number, round: (n: number) => number): number | null {
+  return bound === null ? null : round((bound / per) * 1000) / 1000;
+}
+
+/** A number setting as shown: `value` as kept (null: none), `fallback` its default where that is a number (a setting with no value takes its unit and step from it). */
+export function shownNumber(control: NumberControl, value: number | null, fallback: number | null = null): NumberShown {
+  const size = value ?? fallback ?? control.min ?? 0;
+  if (control.unit !== TIME_UNIT) return { value, unit: control.unit, per: 1, integer: control.integer, min: control.min, max: control.max, step: control.step ?? niceStep(size, control.integer) };
+  const per = timePer(size, control.step);
+  const shown = value === null ? null : value / per;
+  const word = per === MINUTE_MS ? "minute" : "second";
+  return {
+    value: shown,
+    unit: shown === 1 ? word : `${word}s`,
+    per,
+    // Half a second and a minute and a half are both times someone sets.
+    integer: false,
+    min: boundShown(control.min, per, Math.ceil),
+    max: boundShown(control.max, per, Math.floor),
+    step: control.step !== null ? control.step / per : niceStep(size / per, Number.isInteger(size / per)),
+  };
+}
+
+/** What a number typed in the unit shown is kept as: a time in whole milliseconds, any other number as typed. */
+export function storedNumber(shown: Pick<NumberShown, "per">, typed: number): number {
+  return shown.per === 1 ? typed : Math.round(typed * shown.per);
+}
+
+/** A setting's number with its thousands marked. Its fraction is kept to six places, as far as a typed number is: a price of 0.0125 isn't rounded away. */
+const GROUPED = new Intl.NumberFormat("en-US", { maximumFractionDigits: 6 });
+
+/**
+ * What stands beside a number's field: its unit, with the number itself grouped before it once it is
+ * long enough for grouping to help ("400,000 tokens"). The field holds the number plain, as it is
+ * typed. Null where there is neither.
+ */
+export function besideNumber(value: number | null, unit: string | null): string | null {
+  // From a thousand up a grouped number reads differently from the plain one.
+  if (value === null || Math.abs(value) < 1000) return unit;
+  return unit !== null ? `${GROUPED.format(value)} ${unit}` : GROUPED.format(value);
+}
+
+/** A setting's value in a few words, for a search's result and a row's summary. A number reads grouped, in the unit it is shown in ("400,000 tokens", "5 minutes"). */
 export function valueWords(node: FormNode): string {
   const v = node.value;
   if (v === null) return node.none;
   if (node.control.kind === "choice") return node.control.options.find((o) => sameJson(o.value, v))?.label ?? String(v);
-  if (node.control.kind === "number") return `${String(v)}${node.control.unit ? ` ${node.control.unit}` : ""}`;
+  if (node.control.kind === "number" && typeof v === "number") {
+    const shown = shownNumber(node.control, v);
+    return `${GROUPED.format(shown.value ?? v)}${shown.unit !== null ? ` ${shown.unit}` : ""}`;
+  }
   if (typeof v === "boolean") return v ? "On" : "Off";
   if (typeof v === "string") return v === "" ? "(empty)" : v;
-  if (typeof v === "number") return String(v);
+  if (typeof v === "number") return GROUPED.format(v);
   if (Array.isArray(v)) return v.length === 0 ? "(none)" : v.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(", ");
   return JSON.stringify(v);
 }
@@ -321,7 +521,8 @@ export function searchSettings(root: FormNode, query: string): { node: FormNode;
       for (const child of childrenOf(node)) walk(child, node.path.length === 0 ? trail : [...trail, node.label]);
       return;
     }
-    const hay = [...trail, node.label, node.help ?? "", node.path.join("."), valueWords(node)].join("\n").toLowerCase();
+    // A number is found as it is typed too ("400000"), beside how it reads ("400,000 tokens").
+    const hay = [...trail, node.label, node.help ?? "", node.path.join("."), valueWords(node), typeof node.value === "number" ? String(node.value) : ""].join("\n").toLowerCase();
     if (words.every((w) => hay.includes(w))) out.push({ node, trail });
   };
   walk(root, []);

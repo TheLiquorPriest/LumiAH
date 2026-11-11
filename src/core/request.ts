@@ -6,6 +6,7 @@
 // The writer is sent them as they came, with the main agent's brief put in as one message more.
 
 import type { ModelMessage, PathMessage, PresetBlock, RequestMessage } from "./ports";
+import type { RequestRecall } from "./recall/turn";
 import type { Settings } from "./settings";
 import { TEXT, type Texts } from "./texts";
 
@@ -30,9 +31,11 @@ function shown(m: RequestMessage, texts: Texts): string {
 /**
  * The request as a document. `blocks` are the active preset's (none when it couldn't be read: no
  * message is then marked as an instruction, and each says only what Lumiverse's tag says of it);
- * `path` names who wrote each chat message.
+ * `path` names who wrote each chat message. `recall` (§24.1): what names each world-info message of
+ * the request, and the notes that follow its messages (what the prompt holds of the lore and the
+ * chat).
  */
-export function requestDocument(messages: readonly RequestMessage[], blocks: readonly PresetBlock[], path: readonly PathMessage[], texts: Texts): RequestDocument {
+export function requestDocument(messages: readonly RequestMessage[], blocks: readonly PresetBlock[], path: readonly PathMessage[], texts: Texts, recall?: RequestRecall): RequestDocument {
   const blockOf = new Map(blocks.map((b) => [b.id, b]));
   const nameOf = new Map(path.map((m) => [m.id, m.name]));
   let last: number | null = null;
@@ -50,35 +53,43 @@ export function requestDocument(messages: readonly RequestMessage[], blocks: rea
       const from = block ? texts.render(TEXT.request.fromMarker, { marker: block.marker ?? block.name, name: block.name }) : texts.render(TEXT.request.fromBlock, { name: source.blockId });
       return texts.render(TEXT.request.message, { ...base, from });
     }
-    return texts.render(TEXT.request.message, { ...base, from: "" });
+    return texts.render(TEXT.request.message, { ...base, from: (source?.kind === "lore" ? recall?.fromLore.get(i) : undefined) ?? "" });
   });
-  return { text: parts.length > 0 ? parts.join("\n\n") : texts.render(TEXT.request.empty), messages: messages.length, last };
+  const told = recall && recall.notes !== "" ? `\n\n${recall.notes}` : "";
+  return { text: `${parts.length > 0 ? parts.join("\n\n") : texts.render(TEXT.request.empty)}${told}`, messages: messages.length, last };
 }
 
 /** A message of the request as a model call takes it: without where it came from. */
-function plain(m: RequestMessage): ModelMessage {
+export function sentMessage(m: RequestMessage): ModelMessage {
   const { source: _source, ...message } = m;
   return message;
 }
 
 /**
- * The writer's conversation: Lumiverse's assembled messages as they came, with the brief put in as
- * one message, framed by the writer's own text, where Settings say and as whose. Without a brief
- * (null), the messages alone.
+ * The request with the main agent's brief put in, each message that came still bearing where it
+ * came from: Lumiverse's assembled messages as they came, and one message more, framed by the
+ * writer's own text, where Settings say and as whose. `beside` goes in that same message, before
+ * the brief: the agents' guidance, where Settings give it to the writer. With neither a brief (null)
+ * nor anything beside it, the messages alone.
  *
  * "Before your last message" is before the last message of the user's that came from the chat; where
  * no message is traced to the chat, before the last user message; where there is none, at the end.
  */
-export function writerMessages(messages: readonly RequestMessage[], brief: string | null, reply: Readonly<Pick<Settings["reply"], "briefAt" | "briefRole">>, texts: Texts): ModelMessage[] {
-  const out = messages.map(plain);
-  if (brief === null) return out;
-  const message: ModelMessage = { role: reply.briefRole, content: texts.render(TEXT.writer.brief, { brief }) };
+export function briefedRequest(messages: readonly RequestMessage[], brief: string | null, reply: Readonly<Pick<Settings["reply"], "briefAt" | "briefRole">>, texts: Texts, beside: readonly string[] = []): RequestMessage[] {
+  const out = [...messages];
+  const said = [...beside, ...(brief === null ? [] : [texts.render(TEXT.writer.brief, { brief })])];
+  if (said.length === 0) return out;
   let at = reply.briefAt === "start" ? 0 : out.length;
   if (reply.briefAt === "before_last_user") {
     const traced = messages.findLastIndex((m) => m.role === "user" && m.source?.kind === "history");
     const found = traced >= 0 ? traced : messages.findLastIndex((m) => m.role === "user");
     if (found >= 0) at = found;
   }
-  out.splice(at, 0, message);
+  out.splice(at, 0, { role: reply.briefRole, content: said.join("\n\n") });
   return out;
+}
+
+/** The writer's conversation (DESIGN §3.2): the request with the brief put in, as a model call takes it. */
+export function writerMessages(messages: readonly RequestMessage[], brief: string | null, reply: Readonly<Pick<Settings["reply"], "briefAt" | "briefRole">>, texts: Texts, beside: readonly string[] = []): ModelMessage[] {
+  return briefedRequest(messages, brief, reply, texts, beside).map(sentMessage);
 }

@@ -3,7 +3,7 @@
 
 import type { ComponentChildren } from "preact";
 import { useEffect, useState } from "preact/hooks";
-import type { ChatView, RunningTurn } from "../../shared/ui";
+import { type ChatView, isReply, type RunningTurn } from "../../shared/ui";
 import { useApp } from "./app";
 import { Select } from "./components";
 import { useSelect } from "./store";
@@ -60,8 +60,8 @@ export function ChatBar(props: { aside?: ComponentChildren }) {
   const running = useSelect(app.client.state, (s) => s?.running ?? NONE_RUNNING);
   const open = useChatView(active);
   const name = (id: string): string => chatLabel(chats.find((c) => c.chatId === id) ?? (open !== null && open.chatId === id ? open : { chatId: id, name: null }));
-  const busy = (id: string): string => (running.some((r) => r.chatId === id) ? " · answering now" : "");
-  const others = [...new Set([...chats.map((c) => c.chatId), ...running.map((r) => r.chatId), ...(picked !== null ? [picked] : [])])].filter((id) => id !== active);
+  const busy = (id: string): string => (running.some((r) => isReply(r.kind) && r.chatId === id) ? " · answering now" : "");
+  const others = [...new Set([...chats.map((c) => c.chatId), ...running.flatMap((r) => (isReply(r.kind) && r.chatId !== null ? [r.chatId] : [])), ...(picked !== null ? [picked] : [])])].filter((id) => id !== active);
   const options = [{ value: "", label: active !== null ? `Open chat: ${name(active)}${busy(active)}` : "The open chat (none is open)" }, ...others.map((id) => ({ value: id, label: `${name(id)}${busy(id)}` }))];
   return (
     <div class="lah-chatbar" data-lah-chatbar>

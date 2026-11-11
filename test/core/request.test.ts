@@ -2,7 +2,7 @@
 // writer's conversation with the brief put in; and the agent definitions that run them.
 
 import { describe, expect, test } from "bun:test";
-import { AgentRegistry, baseAgents } from "../../src/core/agents";
+import { type AgentDefinition, AgentRegistry, baseAgents, resolveAgent } from "../../src/core/agents";
 import type { PathMessage, PresetBlock, RequestMessage } from "../../src/core/ports";
 import { requestDocument, writerMessages } from "../../src/core/request";
 import { defaultSettings } from "../../src/core/settings";
@@ -74,33 +74,47 @@ describe("the writer's conversation", () => {
 });
 
 describe("agent definitions", () => {
+  /** A definition of the core's, by its id. */
+  const base = (id: string): AgentDefinition => {
+    const definition = baseAgents().find((d) => d.id === id);
+    if (!definition) throw new Error(`no base agent ${id}`);
+    return definition;
+  };
+
   test("the core ships the main agent, the writer and the summarizer, each run as the user's settings say", () => {
     const agents = new AgentRegistry();
     agents.register(...baseAgents());
     const settings = defaultSettings();
     settings.agents.main = { ...settings.agents.main!, connectionId: "conn-a", model: "model-a", effort: "high" };
-    expect(agents.ids()).toEqual(["main", "writer", "summarizer"]);
-    expect(agents.resolve("main", settings)).toMatchObject({ connectionId: "conn-a", model: "model-a", effort: "high", tools: settings.agents.main.tools });
-    expect(agents.resolve("writer", settings)).toMatchObject({ connectionId: null, model: null, tools: [] });
-    expect(agents.resolve("nobody", settings)).toBeUndefined();
+    expect(agents.all().map((d) => d.id)).toEqual(["main", "writer", "summarizer"]);
+    expect(resolveAgent(base("main"), settings)).toMatchObject({ connectionId: "conn-a", model: "model-a", effort: "high", tools: settings.agents.main.tools });
+    expect(resolveAgent(base("writer"), settings)).toMatchObject({ connectionId: null, model: null, tools: [] });
+    expect(agents.get("nobody")).toBeUndefined();
+    // Each says what it is for (what a delegating agent reads when it chooses) and what it is given.
+    for (const d of agents.all()) expect(d.description.length).toBeGreaterThan(20);
+    expect(agents.all().map((d) => d.given)).toEqual(["request", "request", "task"]);
   });
 
   test("the summarizer runs where the main agent does until it is given a connection of its own", () => {
-    const agents = new AgentRegistry();
-    agents.register(...baseAgents());
     const settings = defaultSettings();
     settings.agents.main = { ...settings.agents.main!, connectionId: "conn-a", model: "model-a" };
-    expect(agents.resolve("summarizer", settings)).toMatchObject({ connectionId: "conn-a", model: "model-a" });
+    const summarizer = base("summarizer");
+    expect(summarizer.follows).toBe("main");
+    expect(resolveAgent(summarizer, settings, base("main"))).toMatchObject({ connectionId: "conn-a", model: "model-a" });
     settings.agents.summarizer = { ...settings.agents.summarizer!, model: "model-small" };
-    expect(agents.resolve("summarizer", settings)).toMatchObject({ connectionId: "conn-a", model: "model-small" });
+    expect(resolveAgent(summarizer, settings, base("main"))).toMatchObject({ connectionId: "conn-a", model: "model-small" });
     settings.agents.summarizer = { ...settings.agents.summarizer!, connectionId: "conn-b", model: null };
-    expect(agents.resolve("summarizer", settings)).toMatchObject({ connectionId: "conn-b", model: null });
+    expect(resolveAgent(summarizer, settings, base("main"))).toMatchObject({ connectionId: "conn-b", model: null });
   });
 
-  test("an extension's definition joins them, with defaults of its own until the user sets it up", () => {
+  test("a definition registered beside them runs with its own values until Settings hold others for it", () => {
+    const scout: AgentDefinition = { id: "scout", name: "Scout", description: "Reads ahead along the shore and says what it found.", instructions: "You scout.", given: "task", ...defaultSettings().agents.writer!, effort: "low" };
     const agents = new AgentRegistry();
-    agents.register(...baseAgents(), { id: "scout", label: "Scout", instructions: "main.system", defaults: { ...defaultSettings().agents.writer!, effort: "low" } });
-    expect(agents.resolve("scout", defaultSettings())).toMatchObject({ effort: "low" });
-    expect(agents.extra()).toEqual([{ id: "scout", label: "Scout", note: "", defaults: { ...defaultSettings().agents.writer!, effort: "low" } }]);
+    agents.register(...baseAgents(), scout);
+    expect(agents.get("scout")).toEqual(scout);
+    expect(resolveAgent(scout, defaultSettings())).toMatchObject({ effort: "low", tools: [] });
+    const settings = defaultSettings();
+    settings.agents.scout = { ...defaultSettings().agents.writer!, effort: "high", tools: ["chat_read"] };
+    expect(resolveAgent(scout, settings)).toMatchObject({ effort: "high", tools: ["chat_read"] });
   });
 });

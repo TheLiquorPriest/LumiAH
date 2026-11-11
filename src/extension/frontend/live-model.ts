@@ -6,8 +6,13 @@
 // and cost per call, per agent and for the turn, and `transcriptMarkdown` and `exportJson` are the
 // turn as text, for Copy and Export. The view (transcript.tsx) only renders what these give.
 
-import type { AgentStarted, AgentUsage, CallPrompt, CallUsage, LivePartial, LiveView, SessionTrace, ToolCallView, TraceEvent, TranscriptEntry, TurnKind } from "../../shared/ui";
-import { count, counted, duration, money } from "./format";
+import { type AgentStarted, type AgentStopCode, type AgentUsage, type CallPrompt, type CallUsage, type FileChange, isReply, type JobState, type JobView, type LiveEnded, type LivePartial, type LiveView, type LoreChanges, loreChangesOf, type PromptHeld, promptHeldOf, type ReplyDid, type RunKind, type SessionTrace, type ToolCallView, type ToolTier, type TraceEvent, type TranscriptEntry, type TurnKind } from "../../shared/ui";
+import type { PageId } from "./app";
+import { count, counted, duration, elapsed, money } from "./format";
+import { whyWords } from "./lore-model";
+import { plainWords } from "./prose-model";
+import type { SettingLink } from "./setting-links";
+import { PLACE_LABEL } from "./setup-model";
 
 type Ended = Extract<TraceEvent, { kind: "turn_ended" }>;
 type Started = Extract<TraceEvent, { kind: "turn_started" }>;
@@ -16,6 +21,8 @@ export type Result = Extract<TranscriptEntry, { kind: "result" }>;
 export type Refusal = Extract<TranscriptEntry, { kind: "tools_refused" }>;
 export type Retry = Extract<TranscriptEntry, { kind: "retry" }>;
 export type Stop = Extract<TranscriptEntry, { kind: "stop" }>;
+export type Asked = Extract<TranscriptEntry, { kind: "approval_asked" }>;
+export type Worded = Extract<TranscriptEntry, { kind: "approval" }>;
 
 /** One step of an agent's work, with its place in the turn. */
 export interface Step {
@@ -26,8 +33,8 @@ export interface Step {
 /** How an agent stands: at work, finished its message, failed, stopped short (a limit, the loop detector, the turn's end), or cancelled. */
 export type AgentState = "working" | "done" | "failed" | "stopped" | "cancelled";
 
-/** What an agent at work waits on: its model's answer, or the results of the tools it called (by name), and since when. */
-export type AgentActivity = { waits: "model"; since: number } | { waits: "tools"; since: number; names: string[] };
+/** What an agent at work waits on: its model's answer, the results of the tools it called (by name), or the user's word on a tool call of its that is held for approval; and since when. */
+export type AgentActivity = { waits: "model"; since: number } | { waits: "tools"; since: number; names: string[] } | { waits: "word"; since: number; tool: string };
 
 export interface AgentView {
   start: AgentStarted;
@@ -48,14 +55,24 @@ export interface AgentView {
   lastAt: number;
 }
 
+/** Something that happened to a run as a whole, or was started from it, at its place in the run: the user held it or let it go on (DESIGN §18), one of its agents started a job (§15), or the runtime has something to tell the user about the run that is no agent's step: something that went wrong (its notes couldn't be stored), or, `info`, something that only says how it went (built in, the brief was handed to Lumiverse). */
+export type TurnMark = { seq: number; at: number; kind: "paused" | "resumed" } | { seq: number; at: number; kind: "job"; job: JobView } | { seq: number; at: number; kind: "notice"; text: string; info: boolean };
+
 export interface TurnView {
   view: LiveView;
   started: Started | null;
   session: SessionTrace | null;
+  /** What the prompt held, as the main agent was told (DESIGN §24.1); null where the trace doesn't say (a run that answers no generation, a transcript kept before it was traced). */
+  held: (PromptHeld & { at: number }) | null;
   /** The agents no other agent started (the main agent), with the rest under them. */
   roots: AgentView[];
   /** Every agent, in the order it started. */
   agents: AgentView[];
+  /** Every agent, each right under the agent that started it: the order the feed and the outline show them in, so an agent's sub-agents never stand under another's. */
+  nested: AgentView[];
+  /** The user holds the run: its agents wait before their next round. */
+  paused: boolean;
+  marks: TurnMark[];
   /** Core's tally for the turn: after its latest call, or what it ended with. */
   spent: AgentUsage | null;
   ended: Ended | null;
@@ -89,9 +106,18 @@ function foldEvents(view: LiveView): Omit<TurnView, "partials"> {
   const agents: AgentView[] = [];
   let started: Started | null = null;
   let session: SessionTrace | null = null;
+  let held: TurnView["held"] = null;
   let spent: AgentUsage | null = null;
   let ended: Ended | null = null;
+  let paused = false;
+  const marks: TurnMark[] = [];
   for (const { seq, event } of view.events) {
+    // What the prompt held is read by its shape (`promptHeldOf` says why), so it is taken before the events core's union names.
+    const prompt = promptHeldOf(event);
+    if (prompt !== null) {
+      held = prompt;
+      continue;
+    }
     switch (event.kind) {
       case "turn_started":
         started = event;
@@ -132,6 +158,21 @@ function foldEvents(view: LiveView): Omit<TurnView, "partials"> {
         a.lastAt = Math.max(a.lastAt, event.at);
         break;
       }
+      case "turn_paused":
+        paused = true;
+        marks.push({ seq, at: event.at, kind: "paused" });
+        break;
+      case "turn_resumed":
+        paused = false;
+        marks.push({ seq, at: event.at, kind: "resumed" });
+        break;
+      case "job":
+        marks.push({ seq, at: event.at, kind: "job", job: event.job });
+        break;
+      case "notice":
+        // Whether a notice is no problem is read by its shape: a transcript kept by a build whose trace didn't say takes every one as a problem, as it was shown then.
+        marks.push({ seq, at: event.at, kind: "notice", text: event.text, info: "info" in event && event.info === true });
+        break;
       case "turn_ended":
         ended = event;
         spent = event.usage;
@@ -149,7 +190,13 @@ function foldEvents(view: LiveView): Omit<TurnView, "partials"> {
     a.state = agentState(a, over);
     a.activity = a.state === "working" ? agentActivity(a) : null;
   }
-  return { view, started, session, roots, agents, spent, ended };
+  const nested: AgentView[] = [];
+  const walk = (a: AgentView): void => {
+    nested.push(a);
+    for (const child of a.children) walk(child);
+  };
+  for (const root of roots) walk(root);
+  return { view, started, session, held, roots, agents, nested, paused: paused && !over, marks, spent, ended };
 }
 
 /** An agent's steps since the last message it was sent. */
@@ -169,10 +216,12 @@ function agentState(a: AgentView, turnEnded: boolean): AgentState {
   return turnEnded ? "stopped" : "working";
 }
 
-/** What an agent at work waits on: the results of its latest answer's calls while any is missing, else its model. */
+/** What an agent at work waits on: the user's word while a call of its is held; else the results of its latest answer's calls while any is missing; else its model. */
 function agentActivity(a: AgentView): AgentActivity | null {
   const last = a.steps.at(-1);
   if (!last) return { waits: "model", since: a.start.at };
+  const asked = a.steps.findLast((s) => s.entry.kind === "approval_asked")?.entry;
+  if (asked?.kind === "approval_asked" && !a.steps.some((s) => s.entry.kind === "approval" && s.entry.callId === asked.callId)) return { waits: "word", since: asked.at, tool: asked.tool };
   const answer = a.steps.findLast((s) => s.entry.kind === "answer")?.entry;
   if (answer?.kind === "answer" && answer.calls.length > 0) {
     const answered = new Set(a.steps.flatMap((s) => (s.entry.kind === "result" ? [s.entry.callId] : [])));
@@ -205,6 +254,16 @@ export function agentInstructions(start: AgentStarted): string {
 
 export const TURN_KIND_WORDS: Readonly<Record<TurnKind, string>> = { new: "New reply", regenerate: "Regenerate", swipe: "Swipe", continue: "Continue" };
 
+/** What a run is called at its head: a reply by the generation it answers, a job's run and a side session's turn by what they are. */
+export const RUN_KIND_WORDS: Readonly<Record<RunKind, string>> = { ...TURN_KIND_WORDS, job: "Job", side: "Conversation turn" };
+
+export function runTitle(view: Pick<LiveView, "kind">): string {
+  return RUN_KIND_WORDS[view.kind];
+}
+
+/** A tool's tier in a word, as a badge says it. */
+export const TIER_WORDS: Readonly<Record<ToolTier, string>> = { read: "reads", write: "writes", external: "reaches outside" };
+
 export const AGENT_STATE_WORDS: Readonly<Record<AgentState, string>> = { working: "working", done: "done", failed: "failed", stopped: "stopped", cancelled: "cancelled" };
 
 export const END_STATE_WORDS: Readonly<Record<NonNullable<LiveView["ended"]>["state"], string>> = { done: "done", failed: "failed", stopped: "stopped", lost: "lost with its runtime" };
@@ -214,6 +273,239 @@ export const END_LINE_WORDS: Readonly<Record<NonNullable<LiveView["ended"]>["sta
 
 /** How a turn ended, as a sentence: "The turn was stopped: …". */
 export const END_SENTENCE_WORDS: Readonly<Record<NonNullable<LiveView["ended"]>["state"], string>> = { done: "The turn finished", failed: "The turn failed", stopped: "The turn was stopped", lost: "The turn was lost with its runtime" };
+
+// ---------------------------------------------------------------- two ways to run (§25)
+
+/**
+ * The share of a built-in turn's time at which its countdown turns urgent: its last fifth. A way of
+ * drawing the clock, not a limit on anything, so it is no setting: the time itself is one, and this
+ * follows whatever it is set to.
+ */
+const URGENT_SHARE = 0.2;
+
+/** A built-in turn's time before the reply, as a clock says it: the most it still has, in words (`short` for a narrow bar), whether it is nearly gone, and whether it is over (Lumiverse then sends the prompt as it is). It is a limit, not the wait: most replies are prepared long before it. */
+export function replyClock(replyBy: number, startedAt: number, now: number): { text: string; short: string; urgent: boolean; over: boolean } {
+  const left = replyBy - now;
+  if (left <= 0) return { text: "Out of time before the reply", short: "out of time", urgent: true, over: true };
+  const time = elapsed(replyBy, now);
+  return { text: `At most ${time} before the reply`, short: `at most ${time}`, urgent: left <= (replyBy - startedAt) * URGENT_SHARE, over: false };
+}
+
+/**
+ * Where a run stands for the user who waits on it. Built in, a reply's turn works against the time
+ * Lumiverse allows before a reply (`working`, with when that time ends); once its agents have come
+ * to rest nothing of LumiAH's is under way, and Lumiverse's own generation writes the reply
+ * (`writing`). A run with no such time (a runtime's turn, a job's run, a side session's turn) is
+ * `working` with no clock until it is `over`.
+ */
+export type TurnPhase = { at: "working"; replyBy: number | null } | { at: "writing" } | { at: "over" };
+
+export function turnPhase(turn: Pick<TurnView, "view" | "agents">): TurnPhase {
+  const { view } = turn;
+  if (view.ended !== null) return { at: "over" };
+  const builtin = view.place === "builtin" && isReply(view.kind);
+  if (builtin && turn.agents.length > 0 && turn.agents.every((a) => a.state !== "working")) return { at: "writing" };
+  return { at: "working", replyBy: builtin ? (view.replyBy ?? null) : null };
+}
+
+/** How a run that is under way stands, in the words its head and its pinned bar open with. */
+export function runningWords(phase: TurnPhase, paused: boolean): string {
+  if (phase.at === "writing") return "Lumiverse is writing the reply";
+  return paused ? "Paused" : "Running";
+}
+
+/** What stands over a reply LumiAH had no part in. */
+export const NO_PART_TITLE = "LumiAH had no part in this reply";
+
+// ---------------------------------------------------------------- what a reply's turn came to, in words (the head of Live, Home's last reply)
+
+/**
+ * How much of a brief shows before the rest folds behind "Show all of it": about four lines of a
+ * phone's card. Not a setting: nothing is hidden for good, it only says where the fold is.
+ */
+const BRIEF_SHOWN_CHARS = 280;
+
+/** A brief's opening as plain words, cut at a word's end; null where the brief is short enough to show whole. */
+export function briefOpening(brief: string): string | null {
+  const words = plainWords(brief);
+  if (words.length <= BRIEF_SHOWN_CHARS) return null;
+  const cut = words.slice(0, BRIEF_SHOWN_CHARS);
+  const space = cut.lastIndexOf(" ");
+  return `${(space > BRIEF_SHOWN_CHARS / 2 ? cut.slice(0, space) : cut).replace(/[\s,;:]+$/, "")}…`;
+}
+
+/** Names in a row, each in quotes: “The night key” and “Joss”. */
+function named(titles: readonly string[]): string {
+  return listed(titles.map((title) => `“${title}”`));
+}
+
+/** What the main agent did to the lore the model that writes the reply saw, by name: "Added “The night key”. Left out of this prompt: “Joss”." Empty where it changed none. */
+export function loreNamesWords(lore: ReplyDid["lore"]): string {
+  return [...(lore.added.length > 0 ? [`Added ${named(lore.added)}.`] : []), ...(lore.dropped.length > 0 ? [`Left out of this prompt: ${named(lore.dropped)}.`] : [])].join(" ");
+}
+
+/** How long a turn took and what it cost, as its head and Home say it: "12.4 s, $0.0018"; the time alone where no cost is known. */
+export function tookWords(ms: number, usage: { cost?: number } | null): string {
+  const time = duration(Math.max(0, ms));
+  return usage?.cost !== undefined ? `${time}, ${money(usage.cost)}` : time;
+}
+
+/** The step that mends a reply that failed or that LumiAH had no part in: a setting to change, a page to go to, permissions to grant, or the steps that went wrong to look at. */
+export type MendStep = { go: "setting"; link: SettingLink } | { go: "page"; page: PageId } | { go: "grant" } | { go: "problems" };
+
+/**
+ * What a reply that failed, or that LumiAH had no part in, says of itself (ux B2): the cause in
+ * plain words, what happened in the backend's own sentence (never the cause over again), and the
+ * one step that mends it (null: there is nothing to mend, as where the user skipped it themselves).
+ */
+export interface Mend {
+  title: string;
+  text: string;
+  tone: "neutral" | "warn" | "neg";
+  action: { label: string; step: MendStep } | null;
+}
+
+/** The limits a stop may name, by whose they are: the place each is raised. */
+const LIMIT_OF: Partial<Record<AgentStopCode, "agent" | "turn" | "day">> = {
+  call_tokens_in: "agent",
+  tokens_in: "agent",
+  tokens_out: "agent",
+  tool_turns: "agent",
+  call_time: "agent",
+  wall_time: "agent",
+  revisions: "agent",
+  turn_tokens_in: "turn",
+  turn_tokens_out: "turn",
+  turn_tool_turns: "turn",
+  turn_time: "turn",
+  spend: "day",
+};
+
+const LIMIT_MEND: Readonly<Record<"agent" | "turn" | "day", Pick<Mend, "title" | "action">>> = {
+  agent: { title: "The main agent reached one of its limits", action: { label: "Raise the main agent's limits", step: { go: "setting", link: "agentLimits" } } },
+  turn: { title: "The reply's agents reached a limit they share", action: { label: "Raise the limits of a reply", step: { go: "setting", link: "turnLimits" } } },
+  day: { title: "A day's spending limit was reached", action: { label: "See the day's limits", step: { go: "page", page: "spend" } } },
+};
+
+/** A sentence without the phrase it would only say over again at its start ("LumiAH had no part in this reply. …" under that very heading), its first letter raised. */
+export function withoutPhrase(text: string, phrase: string): string {
+  const said = text.trim();
+  if (!said.toLowerCase().startsWith(phrase.toLowerCase())) return said;
+  const rest = said.slice(phrase.length).replace(/^[\s.:;,]+/, "");
+  return rest === "" ? "" : `${rest.charAt(0).toUpperCase()}${rest.slice(1)}`;
+}
+
+/**
+ * The cause and the step for a turn as it ended; null for one that needs neither (it finished with
+ * LumiAH's part in the reply, or the user stopped a reply the runtime was writing). `did` is what
+ * the run's events say it came to (`replyDid`; null where they aren't at hand), and `lacking`
+ * whether a permission LumiAH needs is missing now. The backend's cause code decides where it sends
+ * one; else what the page can tell for itself does.
+ */
+export function mendOf(ended: LiveEnded, did: Pick<ReplyDid, "stop"> | null, lacking: boolean): Mend | null {
+  const part = ended.noPart;
+  if (part === undefined && (ended.state === "done" || ended.state === "stopped")) return null;
+  const said = part?.text ?? ended.reason ?? "";
+  const stop = did?.stop ?? null;
+  const limit = stop !== null ? LIMIT_OF[stop.code] : undefined;
+  const cause = ended.cause ?? (lacking ? "permission" : part?.why === "time" ? "time" : limit !== undefined ? "limit" : null);
+  const of = (title: string, tone: Mend["tone"], action: Mend["action"]): Mend => ({ title, text: withoutPhrase(withoutPhrase(said, NO_PART_TITLE), title), tone, action });
+  switch (cause) {
+    case "skipped":
+      return of("You skipped LumiAH for this reply", "neutral", null);
+    case "no_tools":
+      return of("The agents' model can't call tools", "neg", { label: "Choose another model for the agents", step: { go: "setting", link: "agentsModel" } });
+    case "permission":
+      return of("LumiAH is missing a permission it needs", "neg", { label: "Allow it", step: { go: "grant" } });
+    case "time":
+      return of("LumiAH ran out of time before the reply", "warn", { label: "See how a runtime lifts the limit", step: { go: "page", page: "runtime" } });
+    case "limit": {
+      const mend = limit !== undefined ? LIMIT_MEND[limit] : { title: "A limit was reached", action: { label: "Show what went wrong", step: { go: "problems" as const } } };
+      return of(mend.title, "warn", mend.action);
+    }
+    case null:
+      break;
+  }
+  if (ended.state === "lost") return of("The turn was lost with its runtime", "neg", { label: "Open Runtime", step: { go: "page", page: "runtime" } });
+  // A connection that can't be used is mended where the agents' model is chosen, whatever else the stop says.
+  if (stop?.code === "connection") return of("The agents have no model they can use", "neg", { label: "Choose another model for the agents", step: { go: "setting", link: "agentsModel" } });
+  // The user's own doing (another reply asked for meanwhile, the generation stopped) is no failure, and there is nothing to mend.
+  if (part?.why === "stopped") return of(NO_PART_TITLE, "neutral", null);
+  return of(part !== undefined ? NO_PART_TITLE : "The turn failed", part !== undefined ? "warn" : "neg", { label: "Show what went wrong", step: { go: "problems" } });
+}
+
+// ---------------------------------------------------------------- what the prompt held (§24.1) and the lore the writer saw (§24.3)
+
+/** Things in a row, as a sentence joins them: "a", "a and b", "a, b and c". */
+function listed(parts: readonly string[]): string {
+  if (parts.length <= 1) return parts[0] ?? "";
+  return `${parts.slice(0, -1).join(", ")} and ${parts.at(-1) ?? ""}`;
+}
+
+/** Runs of message numbers in words: "#30 to #47", "#1 to #12 and #20 to #29". */
+export function rangesWords(ranges: readonly (readonly [number, number])[]): string {
+  return listed(ranges.map(([from, to]) => (from === to ? `#${from}` : `#${from} to #${to}`)));
+}
+
+/** How many messages runs of them hold. */
+export function rangeCount(ranges: readonly (readonly [number, number])[]): number {
+  return ranges.reduce((n, [from, to]) => n + Math.max(0, to - from + 1), 0);
+}
+
+/** What the prompt held, in a line for its fold: how much lore, and how much of the chat word for word. */
+export function heldLine(held: PromptHeld): string {
+  const tokens = held.lore.reduce((n, e) => n + e.tokens, 0);
+  const inPrompt = rangeCount(held.history.held);
+  const all = inPrompt + rangeCount(held.history.missing);
+  const lore = held.lore.length === 0 ? "no lore" : `${counted(held.lore.length, "lore entry", "lore entries")} (≈${count(tokens)} tokens)`;
+  const chat = all === 0 ? "none of the chat" : inPrompt === all ? `all ${counted(all, "message")} of the chat` : `${count(inPrompt)} of the chat's ${counted(all, "message")}`;
+  return `${lore} and ${chat}`;
+}
+
+/** The entries not in the prompt that the main agent was shown, in a sentence. */
+export function indexWords(index: PromptHeld["index"]): string {
+  if (index.listed.length === 0 && index.more === 0) return "Every entry of the chat's books is in the prompt.";
+  if (index.listed.length === 0) return `${counted(index.more, "more entry is", "more entries are")} in the chat's books. None was listed for the main agent; it looks them up with its tools.`;
+  return `The main agent was shown ${counted(index.listed.length, "entry", "entries")} that ${index.listed.length === 1 ? "isn't" : "aren't"} in the prompt, by title and keys, to look up if the reply needs ${index.listed.length === 1 ? "it" : "them"}${index.more > 0 ? `; ${count(index.more)} more ${index.more === 1 ? "was" : "were"} only counted` : ""}.`;
+}
+
+const STAND_WORDS: Readonly<Record<PromptHeld["history"]["stands"][number]["kind"], (name: string) => string>> = {
+  book: (name) => `the chat's book (${name})`,
+  summary: (name) => `Lumiverse's summary (${name})`,
+  memories: (name) => `Lumiverse's memories (${name})`,
+};
+
+/** The chat's messages in the prompt, a sentence a line: which it holds word for word, which it doesn't, and what stands in for those. */
+export function historyWords(history: PromptHeld["history"]): string[] {
+  const lines: string[] = [];
+  const inPrompt = rangeCount(history.held);
+  lines.push(inPrompt === 0 ? "None of the chat's messages is in the prompt word for word." : `${inPrompt === 1 ? "Message" : "Messages"} ${rangesWords(history.held)} ${inPrompt === 1 ? "is" : "are"} in the prompt word for word.`);
+  const missing = rangeCount(history.missing);
+  if (missing === 0) return lines;
+  const stands = history.stands.map((s) => STAND_WORDS[s.kind](s.name));
+  const what = stands.length === 0 ? "Nothing stands in for them: the main agent reads them with its tools when the reply needs them." : `${listed(stands)} ${stands.length === 1 ? "stands" : "stand"} in for them.`;
+  lines.push(`${rangesWords(history.missing)} ${missing === 1 ? "is" : "are"} not. ${what.charAt(0).toUpperCase()}${what.slice(1)}`);
+  return lines;
+}
+
+/** What a `write_reply` call did to the lore the model that writes the reply saw, in a line. */
+export function loreChangeLine(lore: LoreChanges): string {
+  const did = [lore.added.length > 0 ? `added ${counted(lore.added.length, "lore entry", "lore entries")}` : null, lore.dropped.length > 0 ? `left ${count(lore.dropped.length)} out of this prompt` : null].filter((p) => p !== null);
+  const refused = lore.refused.length > 0 ? `${counted(lore.refused.length, "entry", "entries")} it named ${lore.refused.length === 1 ? "was" : "were"} refused` : null;
+  if (did.length === 0) return refused !== null ? `The main agent changed no lore: ${refused}.` : "The main agent left the lore in the prompt as Lumiverse had it.";
+  return `The main agent ${did.join(" and ")}${refused !== null ? `; ${refused}` : ""}.`;
+}
+
+/** The same, an entry a line: what a search reads, and what Copy and Export say. */
+export function loreChangeText(lore: LoreChanges): string {
+  return [...lore.added.map((e) => `Added: ${e.title}`), ...lore.dropped.map((e) => `Left out of this prompt: ${e.title}`), ...lore.refused.map((r) => `Refused: ${r.entryId} (${r.reason})`)].join("\n");
+}
+
+/** What the prompt held, as Markdown, for Copy and Export. */
+function heldMarkdown(held: PromptHeld): string {
+  const lore = held.lore.map((e) => `- ${e.title} (${counted(e.chars, "character")}): ${whyWords(e.why)}`);
+  return [`What the prompt held: ${heldLine(held)}.`, ...lore, indexWords(held.index), ...historyWords(held.history)].join("\n");
+}
 
 /** A role as a heading: "main" → "Main agent", "writer" → "Writer", anything else with its first letter raised. */
 export function roleLabel(role: string): string {
@@ -250,6 +542,8 @@ export function spentWords(u: AgentUsage): string {
   return [counted(u.calls, "call"), tokensWords(u), duration(u.ms), costWords(u), ...(u.estimated ? ["some of it estimated"] : [])].join(" · ");
 }
 
+export const JOB_STATE_WORDS: Readonly<Record<JobState, string>> = { queued: "queued", running: "running", done: "done", failed: "failed", cancelled: "cancelled", interrupted: "interrupted", off_path: "off the path", spent: "out of budget", paused: "paused" };
+
 /** What the main agent carries into the turn, a sentence a line. */
 export function sessionWords(s: SessionTrace): string[] {
   const lines: string[] = [];
@@ -258,12 +552,47 @@ export function sessionWords(s: SessionTrace): string[] {
   if (s.missing > 0) lines.push(`${counted(s.missing, "stored part")} ${s.missing === 1 ? "was" : "were"} missing and left out.`);
   if (s.compacted) lines.push(`This turn compacted the session: ${counted(s.compacted.folded, "turn")} summarized, ${count(s.compacted.kept)} kept as ${s.compacted.kept === 1 ? "it was" : "they were"}.`);
   if (s.rolledBack) lines.push("A compaction was rolled back: the turns it summarized are read again in full.");
+  if (s.jobs && s.jobs.length > 0) lines.push(`Told of ${counted(s.jobs.length, "job")} that ended since its last turn: ${s.jobs.map((j) => `${roleLabel(j.agent)} (${JOB_STATE_WORDS[j.state]})`).join(", ")}.`);
   return lines;
 }
 
-/** A stop in a sentence. */
+/** Words that carry no news of their own in a reason: "the turn was stopped" says only "stopped". */
+const FILLER: Readonly<Record<string, true>> = { the: true, a: true, an: true, agent: true, turn: true, run: true, was: true, were: true, is: true, it: true, its: true, has: true, had: true, been: true, by: true };
+
+const wordsOf = (text: string): string[] => text.toLowerCase().match(/[a-z0-9]+/g) ?? [];
+
+/**
+ * Whether `text` says something `said` doesn't. A reason that only repeats the state it stands
+ * beside ("Stopped: the turn was stopped", "cancelled, cancelled") is said once: the page drops it.
+ */
+export function addsTo(text: string, said: string): boolean {
+  const known = new Set(wordsOf(said));
+  return wordsOf(text).some((word) => !Object.hasOwn(FILLER, word) && !known.has(word));
+}
+
+/** Why a run ended, where that says more than the words it stands beside. */
+export function endReason(ended: LiveEnded, beside: string): string | null {
+  return ended.reason !== undefined && addsTo(ended.reason, beside) ? ended.reason : null;
+}
+
+/** How a run ended, as a sentence, with why where that says more: "The turn was stopped: you stopped it from the live view." */
+export function endSentence(ended: LiveEnded): string {
+  const said = END_SENTENCE_WORDS[ended.state];
+  const reason = endReason(ended, said);
+  return reason !== null ? `${said}: ${reason}` : `${said}.`;
+}
+
+const STOP_STATUS_WORDS: Readonly<Record<Stop["status"], string>> = { answered: "Answered", refused: "Refused", stopped: "Stopped", cancelled: "Cancelled", failed: "Failed" };
+
+/**
+ * A stop in a sentence: how the agent's work ended, core's short name for why where it isn't that
+ * over again (a search may look for `tool turns`), and the reason where it says more than both.
+ */
 export function stopWords(e: Stop): string {
-  return `Stopped (${e.status}, ${e.code}): ${e.reason}`;
+  const status = STOP_STATUS_WORDS[e.status];
+  const code = e.code.replace(/_/g, " ");
+  const said = addsTo(code, status) ? `${status} (${code})` : status;
+  return addsTo(e.reason, said) ? `${said}: ${e.reason}` : `${said}.`;
 }
 
 /** A refusal of native tools in a sentence. */
@@ -279,7 +608,40 @@ export function retryWords(e: Retry): string {
 /** What a working agent waits on, in words. */
 export function activityWords(activity: AgentActivity): string {
   if (activity.waits === "model") return "Waiting for its model";
+  if (activity.waits === "word") return `Waiting for your word on ${activity.tool}`;
   return activity.names.length === 1 ? `Running ${activity.names[0]}` : `Running ${activity.names.length} tools: ${activity.names.join(", ")}`;
+}
+
+/** A held tool call in a sentence: that it was held and for what, and how the wait ended. */
+export function wordWords(asked: Asked, ended: Worded | null): string {
+  const held = `Held for your word (it ${TIER_WORDS[asked.tier]})`;
+  if (ended === null) return `${held}: waiting.`;
+  const after = `after ${duration(ended.ms)}`;
+  switch (ended.decision) {
+    case "once":
+      return `${held}: you approved it this once ${after}.`;
+    case "chat":
+      return `${held}: you approved this tool for this chat from now on ${after}.`;
+    case "refused":
+      return `${held}: you refused it ${after}${ended.reason ? `: ${ended.reason}` : "."}`;
+    case "timed_out":
+      return `${held}: no answer came in ${duration(ended.ms)}, so it was refused.`;
+  }
+}
+
+/** A workspace file as agents write its path and as the Workspace page says it: bare in the chat's area (`notes/ledger.md`), then `learned/…`, and `~/…` for the user's own. */
+export function filePath(file: Pick<FileChange, "area" | "path">): string {
+  return `${file.area === "chat" ? "" : file.area === "learned" ? "learned/" : "~/"}${file.path}`;
+}
+
+/** What a tool call did to a workspace file, in a word. */
+export function fileChangeWord(change: FileChange): string {
+  return change.before === null ? "made" : change.after === null ? "deleted" : "changed";
+}
+
+/** A job a run's agent started, in a sentence. */
+export function jobWords(job: JobView): string {
+  return `Started a job as ${roleLabel(job.agent)}, to run ${job.when === "now" ? "beside this turn" : "once this reply is written"}: ${job.task}`;
 }
 
 /** A call in flight, in words: which of the agent's calls it is and how much of its thinking and its answer has arrived. */
@@ -312,34 +674,41 @@ export interface Filter {
 
 export const NO_FILTER: Filter = { agent: null, kinds: ALL_KINDS, tool: null, problems: false, query: "" };
 
-/** How a tool call stands: waiting for its result, answered, failed, or left with none (its agent stopped first). */
-export type CallState = "running" | "done" | "error" | "none";
+/** How a tool call stands: waiting for its result, held for the user's word, answered, failed, or left with none (its agent stopped first). */
+export type CallState = "running" | "held" | "done" | "error" | "none";
 
-export function callState(result: Result | null, agentWorking: boolean): CallState {
+export function callState(result: Result | null, agentWorking: boolean, held = false): CallState {
   if (result) return result.error ? "error" : "done";
-  return agentWorking ? "running" : "none";
+  return agentWorking ? (held ? "held" : "running") : "none";
 }
 
 /**
  * One thing the feed shows of an agent, by a key that stays the same as the turn grows:
- * its instructions; the messages of its session it takes up; a message it was told; a call's line
- * (`call`: its number among the agent's calls) with the call's thinking, text and tool calls as
- * items of their own; a result no call shown asked for; a refusal; a retry; a stop; what it waits on
- * now, or the call in flight with what has arrived of its thinking and its answer (`live`); and its
- * finish.
+ * its instructions; the messages of its session it takes up; a message it was told; something the
+ * user said to it while it worked (`note`); a call's line (`call`: its number among the agent's
+ * calls) with the call's thinking, text and tool calls as items of their own (a tool call with the
+ * user's word on it where it was held, and the workspace files it changed); a result no call shown
+ * asked for, and a held call whose call isn't shown (`word`); a refusal; a retry; a stop; the user
+ * holding the run and letting it go on (`hold`); a job it started; what it waits on now, or the
+ * call in flight with what has arrived of its thinking and its answer (`live`); and its finish.
  */
 export type FeedItem =
   | { key: string; kind: "instructions"; seq: number; text: string }
   | { key: string; kind: "history"; seq: number; messages: number }
   | { key: string; kind: "told"; seq: number; text: string; at: number }
+  | { key: string; kind: "note"; seq: number; text: string; at: number }
   | { key: string; kind: "call"; seq: number; entry: Answer; call: number }
   | { key: string; kind: "thinking"; seq: number; text: string; live?: true }
   | { key: string; kind: "said"; seq: number; text: string; live?: true }
-  | { key: string; kind: "tool"; seq: number; call: ToolCallView; args: string; result: Result | null; state: CallState }
+  | { key: string; kind: "tool"; seq: number; call: ToolCallView; args: string; result: Result | null; state: CallState; word: { asked: Asked; ended: Worded | null } | null; files: readonly FileChange[]; lore: LoreChanges | null }
   | { key: string; kind: "result"; seq: number; entry: Result }
+  | { key: string; kind: "word"; seq: number; asked: Asked; ended: Worded | null; text: string }
   | { key: string; kind: "refused"; seq: number; entry: Refusal; text: string }
   | { key: string; kind: "retry"; seq: number; entry: Retry; text: string }
   | { key: string; kind: "stop"; seq: number; entry: Stop; text: string }
+  | { key: string; kind: "hold"; seq: number; on: boolean; at: number }
+  | { key: string; kind: "job"; seq: number; job: JobView; at: number; text: string }
+  | { key: string; kind: "notice"; seq: number; text: string; at: number; of: "agent" | "run"; info?: true }
   | { key: string; kind: "activity"; seq: number; activity: AgentActivity }
   | { key: string; kind: "streaming"; seq: number; call: number; since: number; text: number; reasoning: number }
   | { key: string; kind: "finished"; seq: number; spent: AgentUsage; at: number };
@@ -363,11 +732,11 @@ export function finishedShort(e: Answer): boolean {
   return SHORT_FINISH.test(e.finishReason);
 }
 
-/** The agents a filter shows: the one it names and those it started, or all. */
+/** The agents a filter shows, each under the agent that started it: the one it names and those it started, or all. */
 export function agentsShown(turn: TurnView, agent: string | null): AgentView[] {
-  if (agent === null) return turn.agents;
+  if (agent === null) return turn.nested;
   const root = turn.agents.find((a) => a.start.id === agent);
-  if (!root) return turn.agents;
+  if (!root) return turn.nested;
   const out: AgentView[] = [];
   const walk = (a: AgentView): void => {
     out.push(a);
@@ -397,8 +766,12 @@ export function feedOf(turn: TurnView, filter: Filter, from = 0): AgentFeed[] {
     const items: FeedItem[] = [];
     const results = new Map<string, Result>();
     const called = new Set<string>();
+    const asks = new Map<string, Asked>();
+    const words = new Map<string, Worded>();
     for (const s of a.steps) {
       if (s.entry.kind === "result") results.set(s.entry.callId, s.entry);
+      else if (s.entry.kind === "approval_asked") asks.set(s.entry.callId, s.entry);
+      else if (s.entry.kind === "approval") words.set(s.entry.callId, s.entry);
       // A call counts as shown only where its answer is in the window: a result whose call scrolled out of it stands on its own.
       else if (s.entry.kind === "answer" && s.seq >= from) for (const c of s.entry.calls) called.add(c.id);
     }
@@ -420,6 +793,21 @@ export function feedOf(turn: TurnView, filter: Filter, from = 0): AgentFeed[] {
         case "message":
           if (kinds.has("told") && !filter.problems) items.push({ key: `m:${s.seq}`, kind: "told", seq: s.seq, text: e.text, at: e.at });
           break;
+        case "notice":
+          // What the runtime told it beside a round's results (how few rounds of tool calls it has left): among what it was told.
+          if (kinds.has("told") && !filter.problems) items.push({ key: `u:${s.seq}`, kind: "notice", seq: s.seq, text: `The runtime told it: ${e.text}`, at: e.at, of: "agent" });
+          break;
+        case "note":
+          if (kinds.has("told") && !filter.problems) items.push({ key: `n:${s.seq}`, kind: "note", seq: s.seq, text: e.text, at: e.at });
+          break;
+        case "approval_asked":
+          // A held call shows in its call's card; one whose call isn't in the transcript stands on its own.
+          if (called.has(e.callId) || !kinds.has("tools") || filter.problems) break;
+          if (filter.tool !== null && e.tool !== filter.tool) break;
+          items.push({ key: `q:${s.seq}`, kind: "word", seq: s.seq, asked: e, ended: words.get(e.callId) ?? null, text: `${e.tool}: ${wordWords(e, words.get(e.callId) ?? null)}` });
+          break;
+        case "approval":
+          break;
         case "answer": {
           const parts: FeedItem[] = [];
           if (kinds.has("thinking") && !filter.problems && e.reasoning !== undefined && e.reasoning !== "") parts.push({ key: `r:${s.seq}`, kind: "thinking", seq: s.seq, text: e.reasoning });
@@ -429,7 +817,9 @@ export function feedOf(turn: TurnView, filter: Filter, from = 0): AgentFeed[] {
               const result = results.get(c.id) ?? null;
               if (filter.tool !== null && c.name !== filter.tool) continue;
               if (filter.problems && result?.error !== true) continue;
-              parts.push({ key: `c:${s.seq}:${c.id}`, kind: "tool", seq: s.seq, call: c, args: JSON.stringify(c.args, null, 2), result, state: callState(result, a.state === "working") });
+              const asked = asks.get(c.id);
+              const word = asked ? { asked, ended: words.get(c.id) ?? null } : null;
+              parts.push({ key: `c:${s.seq}:${c.id}`, kind: "tool", seq: s.seq, call: c, args: JSON.stringify(c.args, null, 2), result, state: callState(result, a.state === "working", word !== null && word.ended === null), word, files: result?.files ?? [], lore: result ? loreChangesOf(result) : null });
             }
           const own = filter.problems ? finishedShort(e) && kinds.has("answer") : kinds.has("answer");
           if (own || parts.length > 0) items.push({ key: `a:${s.seq}`, kind: "call", seq: s.seq, entry: e, call: calls }, ...parts);
@@ -454,8 +844,20 @@ export function feedOf(turn: TurnView, filter: Filter, from = 0): AgentFeed[] {
           break;
       }
     }
+    // What happened to the run as a whole stands in the feed of the agent it concerns, at its place: a job in its starter's; the user's holds, and what the runtime says of the run, in the first agent's. What the runtime says of the run is something that went wrong, so it shows under that filter too.
+    const first = turn.roots[0]?.start.id;
+    const mine = turn.marks.filter((m) => {
+      if (m.seq < from) return false;
+      if (m.kind === "job") return !filter.problems && kinds.has("tools") && (m.job.by.who === "agent" ? m.job.by.id : first) === id;
+      return kinds.has("stops") && first === id && (m.kind === "notice" ? !(m.info && filter.problems) : !filter.problems);
+    });
+    if (mine.length > 0) {
+      for (const m of mine) items.push(m.kind === "job" ? { key: `j:${m.seq}`, kind: "job", seq: m.seq, job: m.job, at: m.at, text: jobWords(m.job) } : m.kind === "notice" ? { key: `v:${m.seq}`, kind: "notice", seq: m.seq, text: m.text, at: m.at, of: "run", ...(m.info ? { info: true as const } : {}) } : { key: `p:${m.seq}`, kind: "hold", seq: m.seq, on: m.kind === "paused", at: m.at });
+      // Steps are in order already and the sort keeps equal places as they stand, so only the marks move, each to its place.
+      items.sort((x, y) => x.seq - y.seq);
+    }
     if (!filter.problems) {
-      const end = (a.steps.at(-1)?.seq ?? a.seq) + 0.5;
+      const end = Math.max(a.steps.at(-1)?.seq ?? a.seq, mine.at(-1)?.seq ?? 0) + 0.5;
       const live = turn.partials.get(id);
       if (live) {
         // The call in flight, in place of "waiting for its model": a line that says so, then what has arrived of its thinking and of its answer, each growing as it comes.
@@ -489,19 +891,24 @@ export function itemTexts(item: FeedItem): string[] {
   switch (item.kind) {
     case "instructions":
     case "told":
+    case "note":
     case "thinking":
     case "said":
+    case "word":
     case "refused":
     case "retry":
     case "stop":
+    case "job":
+    case "notice":
       return [item.text];
     case "call":
       return [callWords(item.entry)];
     case "tool":
-      return [item.call.name, item.args, item.result?.text ?? ""];
+      return [item.call.name, item.args, item.result?.text ?? "", item.lore ? loreChangeText(item.lore) : ""];
     case "result":
       return [item.entry.name, item.entry.text];
     case "history":
+    case "hold":
     case "activity":
     case "streaming":
     case "finished":
@@ -679,7 +1086,8 @@ export function turnTotals(turn: TurnView, now: number): TurnTotals {
   const calls: CallRow[] = [];
   const agents: AgentTotals[] = [];
   const all = noTotals();
-  for (const a of turn.agents) {
+  // In the nested order, so the outline and the table list a sub-agent under the agent that started it, as the feed does.
+  for (const a of turn.nested) {
     const sum = noTotals();
     let n = 0;
     const row = new Map<string, CallRow>();
@@ -760,6 +1168,8 @@ function itemMarkdown(item: FeedItem): string | null {
       return `Takes up ${counted(item.messages, "message")} of its session.`;
     case "told":
       return `**Told** · ${new Date(item.at).toISOString()}\n${fenced(item.text)}`;
+    case "note":
+      return `**The user said** · ${new Date(item.at).toISOString()}\n${fenced(item.text)}`;
     case "call":
       return `**Call ${item.call}** · ${callWords(item.entry)}${item.entry.tools === "text" ? " · tools as text" : ""}${item.entry.prompt ? ` · prompt ${item.entry.prompt}` : ""}`;
     case "thinking":
@@ -767,16 +1177,23 @@ function itemMarkdown(item: FeedItem): string | null {
     case "said":
       return `Answer${item.live ? " (so far)" : ""}:\n${fenced(item.text)}`;
     case "tool": {
-      const head = `→ \`${item.call.name}\` ${JSON.stringify(item.call.args)}`;
-      if (!item.result) return `${head}\n← ${item.state === "running" ? "(still running)" : "(no result: its agent stopped first)"}`;
-      return `${head}\n← ${item.result.error ? "failed" : "result"} · ${duration(item.result.ms)}${item.result.scratch ? ` · clipped, the whole kept as ${item.result.scratch}` : ""}\n${fenced(item.result.text)}`;
+      const head = `→ \`${item.call.name}\` ${JSON.stringify(item.call.args)}${item.word ? `\n${wordWords(item.word.asked, item.word.ended)}` : ""}`;
+      if (!item.result) return `${head}\n← ${item.state === "running" ? "(still running)" : item.state === "held" ? "(held for the user's word)" : "(no result: its agent stopped first)"}`;
+      const files = item.files.map((f) => `\n${filePath(f)} ${fileChangeWord(f)}${f.after !== null ? ` (version ${f.after.slice(0, 12)})` : ""}`).join("");
+      const lore = item.lore ? `\n${loreChangeLine(item.lore)}\n${loreChangeText(item.lore)}` : "";
+      return `${head}\n← ${item.result.error ? "failed" : "result"} · ${duration(item.result.ms)}${item.result.scratch ? ` · clipped, the whole kept as ${item.result.scratch}` : ""}\n${fenced(item.result.text)}${files}${lore}`;
     }
     case "result":
       return `← \`${item.entry.name}\`${item.entry.error ? " (failed)" : ""} · ${duration(item.entry.ms)}\n${fenced(item.entry.text)}`;
+    case "word":
     case "refused":
     case "retry":
     case "stop":
+    case "job":
+    case "notice":
       return item.text;
+    case "hold":
+      return item.on ? "(The user paused the run here.)" : "(The user let the run go on.)";
     case "activity":
       return `(${activityWords(item.activity)}…)`;
     case "streaming":
@@ -795,11 +1212,14 @@ export function transcriptMarkdown(turn: TurnView, feeds: readonly AgentFeed[] =
   const { view } = turn;
   const totals = turnTotals(turn, now);
   const out: string[] = [];
-  out.push(`# ${TURN_KIND_WORDS[view.kind]} · turn ${view.turn}`);
-  const ended = view.ended ? `${END_LINE_WORDS[view.ended.state].toLowerCase()} ${duration(view.ended.at - view.startedAt)}${view.ended.reason ? `: ${view.ended.reason}` : ""}` : "still running";
-  out.push(`Chat ${view.chatId}${view.messageId ? ` · message ${view.messageId}` : ""} · started ${new Date(view.startedAt).toISOString()} · ${ended}`);
+  out.push(`# ${runTitle(view)} · turn ${view.turn}`);
+  const why = view.ended ? endReason(view.ended, END_LINE_WORDS[view.ended.state]) : null;
+  const ended = view.ended ? `${END_LINE_WORDS[view.ended.state].toLowerCase()} ${duration(view.ended.at - view.startedAt)}${why !== null ? `: ${why}` : ""}` : "still running";
+  out.push(`${view.chatId !== null ? `Chat ${view.chatId}` : "No chat"}${view.messageId ? ` · message ${view.messageId}` : ""} · started ${new Date(view.startedAt).toISOString()} · ${ended}${view.place !== undefined ? ` · ${PLACE_LABEL[view.place].toLowerCase()}` : ""}`);
+  if (view.ended?.noPart !== undefined) out.push(`${NO_PART_TITLE}. ${view.ended.noPart.text}`);
   out.push(`Spent: ${totalsWords(totals.turn)}`);
   if (turn.session) out.push(`Session: ${sessionWords(turn.session).join(" ")}`);
+  if (turn.held) out.push(heldMarkdown(turn.held));
   if (totals.agents.length > 0) {
     const rows = totals.agents.map((t) => `| ${roleLabel(t.agent.start.role)} | ${t.calls} | ${count(t.in)} | ${count(t.cachedIn)} | ${count(t.out)} | ${count(t.reasoningOut)} | ${duration(t.modelMs)} | ${duration(t.toolMs)} | ${totalCostWords(t)} |`);
     out.push(["| Agent | Calls | In | Cached | Out | Reasoning | Model time | Tool time | Cost |", "|---|---:|---:|---:|---:|---:|---:|---:|---:|", ...rows].join("\n"));
@@ -814,7 +1234,8 @@ export function transcriptMarkdown(turn: TurnView, feeds: readonly AgentFeed[] =
       if (text !== null) out.push(text);
     }
   }
-  if (view.ended) out.push(`## Ended: ${END_STATE_WORDS[view.ended.state]}${view.ended.reason ? `: ${view.ended.reason}` : ""}`);
+  const whyEnded = view.ended ? endReason(view.ended, END_STATE_WORDS[view.ended.state]) : null;
+  if (view.ended) out.push(`## Ended: ${END_STATE_WORDS[view.ended.state]}${whyEnded !== null ? `: ${whyEnded}` : ""}`);
   return `${out.join("\n\n")}\n`;
 }
 

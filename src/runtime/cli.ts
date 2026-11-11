@@ -1,10 +1,11 @@
 // The `lumiah` command (DESIGN §1: the runtime runs beside Lumiverse): the runtime's one-line start,
 // its service and its upkeep.
 //
-//   up      signs in (or reuses the runtime's saved sign-in), registers the runtime with LumiAH, puts
-//           its address in the account's scheduler exclusions, writes its config, makes the loopback
-//           connection when the user has none, and serves; with --systemd it installs a stable copy
-//           of itself and a user unit that runs it instead
+//   up      signs in (or reuses the runtime's saved sign-in), registers the runtime with LumiAH (or
+//           keeps the registration of the runtime it sets up again), puts its address in the
+//           account's scheduler exclusions, writes its config, makes the loopback connection when
+//           the user has none, and serves; with --systemd it installs a stable copy of itself and a
+//           user unit that runs it instead, restarted once the replies under way have ended
 //   serve   what the unit runs: the runtime from its config, until stopped
 //   login   a new session for the runtime when its own ended (the Runtime page says so)
 //   status  the runtime's config, unit, link and session
@@ -17,7 +18,9 @@
 // RuntimeIO, which main.ts supplies, so the tests run every command against a fake machine.
 
 import type { HarnessHost, JsonObject } from "../core/ports";
-import { MODEL_ID, RUNTIME_NAME, runtimeBase, shellWord, unitName } from "../link/contract";
+import type { LinkedBackend, LinkRequests } from "../link/contract";
+import { EXTENSION_IDENTIFIER, RUNTIME_NAME, loopbackModel, runtimeBase, shellWord, unitName } from "../link/contract";
+import { linkedBackendOf } from "../link/frames";
 import { isRecord } from "../link/json";
 import { RUNTIME_DEFAULTS } from "../link/settings";
 import type { RuntimeConfig } from "./config";
@@ -26,7 +29,8 @@ import type { OpenSocket } from "./connection";
 import { HostConnection, LinkError } from "./connection";
 import type { Http, StoredLogin } from "./lumiverse";
 import { addConnectionProfile, connectionProfiles, editAndSendPrefersActive, excludeOrigins, inClear, LiveError, loopbackProfile, normalizeBase, runtimeOrigins, sessionOf, signIn } from "./lumiverse";
-import { CONNECTION_NAME, createRuntime } from "./runtime";
+import { healthProof } from "./relay";
+import { createRuntime } from "./runtime";
 import type { Harness } from "./turn";
 
 export interface ServeOptions {
@@ -91,11 +95,13 @@ export interface RuntimeIO {
   run(command: string, args: readonly string[], env?: Readonly<Record<string, string>>): Promise<{ code: number; out: string; err: string }>;
   sleep(ms: number): Promise<void>;
   now(): number;
+  /** The identifier of the extension a new runtime links to unless `--extension` names another: LumiAH's own. */
+  extension: string;
   /** This build's id and the package's version. */
   build: string;
   version: string;
   /** The core's harness over a host, and where the core's settings name the writer's connection. */
-  harness(host: HarnessHost, settings: () => Promise<{ values: unknown; texts: unknown }>): Harness;
+  harness: Parameters<typeof createRuntime>[1]["harness"];
   writerConnection(values: JsonObject): string | null;
 }
 
@@ -125,7 +131,9 @@ export const USAGE = `lumiah: LumiAH's runtime, which answers Lumiverse's loopba
                         Sign in, register with LumiAH, and serve on 127.0.0.1. --systemd installs it as
                         a service of your account instead, so it survives logout and reboot.
                         More: --listen <host>, --username <name>, --allow-http, --memory <size> (the
-                        service's memory cap, ${DEFAULT_MEMORY} by default), --bun <path>
+                        service's memory cap, ${DEFAULT_MEMORY} by default), --bun <path>, --extension
+                        <identifier> (the extension LumiAH is built into, when it isn't LumiAH's own:
+                        that runtime gets a name, a config, a service and a connection of its own)
   lumiah serve --config <file> | --name <name>
                         Run the runtime from its config (what the service runs)
   lumiah login | status | down [--name <name>]
@@ -180,7 +188,7 @@ export async function lumiah(argv: readonly string[], io: RuntimeIO): Promise<nu
     if (refused !== null) throw new Error(refused);
     switch (sub) {
       case "up":
-        only(a, "up", ["--url", "--port", "--listen", "--name", "--username", "--memory", "--bun"], ["--systemd", "--allow-http"]);
+        only(a, "up", ["--url", "--port", "--listen", "--name", "--username", "--memory", "--bun", "--extension"], ["--systemd", "--allow-http"]);
         return await up(a, io);
       case "serve": {
         only(a, "serve", ["--config", "--name"], []);
@@ -207,21 +215,33 @@ export async function lumiah(argv: readonly string[], io: RuntimeIO): Promise<nu
 
 // ---------------------------------------------------------------- where things go
 
-/** Where a runtime's files go: its config, the stable copy its unit runs, and the unit. All the account's own (the XDG directories). */
+/** One of the account's XDG directories: the variable's when it is set and absolute (the spec says to ignore a relative one), else its fallback under home. */
+function xdgDir(io: RuntimeIO, variable: string, fallback: string): string {
+  const v = io.env[variable];
+  return v !== undefined && v.startsWith("/") ? v : `${io.home}/${fallback}`;
+}
+
+/** Where a runtime's files go by its name: its config and its unit. Both the account's own (the XDG directories). */
 interface Place {
   config: string;
-  data: string;
   unit: string;
   unitName: string;
 }
 
 function placeOf(name: string, io: RuntimeIO): Place {
-  const xdg = (variable: string, fallback: string): string => {
-    const v = io.env[variable];
-    return v !== undefined && v.startsWith("/") ? v : `${io.home}/${fallback}`;
-  };
   const name_ = unitName(name);
-  return { config: configPathOf(configDir(io.env, io.home), name), data: `${xdg("XDG_DATA_HOME", ".local/share")}/lumiah`, unit: `${xdg("XDG_CONFIG_HOME", ".config")}/systemd/user/${name_}`, unitName: name_ };
+  return { config: configPathOf(configDir(io.env, io.home), name), unit: `${xdgDir(io, "XDG_CONFIG_HOME", ".config")}/systemd/user/${name_}`, unitName: name_ };
+}
+
+/**
+ * Where the stable copy a unit runs is kept. Each extension ships its own build of the runtime, so
+ * each has a copy of its own: LumiAH's in the account's data directory, and that of an extension
+ * LumiAH is built into in a directory there named for the extension. Updating one extension never
+ * changes the file the other's service runs.
+ */
+function installDir(extension: string, io: RuntimeIO): string {
+  const own = `${xdgDir(io, "XDG_DATA_HOME", ".local/share")}/lumiah`;
+  return extension === EXTENSION_IDENTIFIER ? own : `${own}/${extension}`;
 }
 
 /** How systemctl reaches the account's units: `--user`, whose manager it finds by XDG_RUNTIME_DIR, which `sudo -u <account>` leaves unset (the account's is /run/user/<uid>). */
@@ -352,6 +372,20 @@ function nameFrom(username: string): string {
   return RUNTIME_NAME.test(name) ? name : "runtime";
 }
 
+/**
+ * A runtime's default name: its account's, and for an extension other than LumiAH's own the
+ * extension's identifier after it. So the runtime of an extension that has LumiAH built in never
+ * shares a config, a unit or a registration's name with LumiAH's own on the same machine. The
+ * identifier is kept whole, and as much of the account's name as a runtime's name has room for
+ * (`RUNTIME_NAME`: 40 characters).
+ */
+function nameFor(username: string, extension: string): string {
+  const account = nameFrom(username);
+  if (extension === EXTENSION_IDENTIFIER) return account;
+  const tail = `-${extension}`;
+  return `${account.slice(0, Math.max(1, 40 - tail.length))}${tail}`.slice(0, 40);
+}
+
 function givenName(a: Args): string | undefined {
   const name = a.values["--name"];
   if (name !== undefined && !RUNTIME_NAME.test(name)) throw new UsageError(`--name is "${name}": use lowercase letters, digits, _ and -, up to 40.`);
@@ -365,6 +399,35 @@ function configured(io: RuntimeIO): string[] {
     .filter((f) => f.endsWith(".json") && RUNTIME_NAME.test(f.slice(0, -5)))
     .map((f) => f.slice(0, -5))
     .sort();
+}
+
+/** A runtime's config by its name; null when there is none here that this build reads. */
+function configNamed(name: string, io: RuntimeIO): RuntimeConfig | null {
+  try {
+    const path = configPathOf(configDir(io.env, io.home), name);
+    return configOf(io.files.read(path), path);
+  } catch {
+    return null;
+  }
+}
+
+/** The one runtime set up here for an extension; null when there is none, or several. */
+function onlyOf(extension: string, io: RuntimeIO): RuntimeConfig | null {
+  const found = configured(io).flatMap((name) => {
+    const config = configNamed(name, io);
+    return config !== null && config.extension === extension ? [config] : [];
+  });
+  return found.length === 1 && found[0] !== undefined ? found[0] : null;
+}
+
+/**
+ * A name is one runtime's: its config, its unit and its registration go by it. Setting a runtime up
+ * under the name of one that links to another extension would take all three from that one, so it
+ * is refused, with what to do instead.
+ */
+function refuseAnothers(previous: RuntimeConfig | null, extension: string, io: RuntimeIO): void {
+  if (previous === null || previous.extension === extension) return;
+  throw new Error(`There is a runtime "${previous.name}" here already, and it links to the extension ${previous.extension}: this line would make it ${extension}'s instead. Give this one a name of its own with --name, or remove that one first (lumiah down --name ${previous.name}, then delete ${placeOf(previous.name, io).config}).`);
 }
 
 /** `--config`, else the config of `--name`, else the only runtime configured here. */
@@ -427,17 +490,25 @@ function portFree(io: RuntimeIO, listen: string, port: number): boolean {
   }
 }
 
-function portOf(a: Args, io: RuntimeIO, listen: string, previous: RuntimeConfig | null): number {
+/**
+ * The port a runtime serves on: the one asked for, the one it had, else the first free one. A port
+ * another runtime set up here holds is that one's though nothing serves on it now (a runtime that
+ * is stopped), so the pick passes over it, and asking for it on the same address is refused.
+ */
+function portOf(a: Args, io: RuntimeIO, listen: string, previous: RuntimeConfig | null, name: string): number {
+  const others = configured(io).flatMap((other) => (other === name ? [] : (configNamed(other, io) ?? [])));
   const given = a.values["--port"];
   if (given !== undefined) {
     const port = Number(given);
     if (!Number.isInteger(port) || port < 1 || port > 65535) throw new UsageError(`--port is "${given}": give a port number.`);
+    const holder = others.find((other) => other.port === port && other.listen === listen);
+    if (holder !== undefined) throw new Error(`Port ${port} on ${listen} is the runtime "${holder.name}"'s, set up here too. Pick another with --port.`);
     // The runtime already set up there holds it: `up` restarts that one.
     if (previous?.port !== port && !portFree(io, listen, port)) throw new Error(`Port ${port} on ${listen} is taken. Pick another with --port.`);
     return port;
   }
   if (previous !== null && previous.listen === listen) return previous.port;
-  for (let port = DEFAULT_PORT; port <= LAST_PORT; port++) if (portFree(io, listen, port)) return port;
+  for (let port = DEFAULT_PORT; port <= LAST_PORT; port++) if (!others.some((other) => other.port === port) && portFree(io, listen, port)) return port;
   throw new Error(`No port from ${DEFAULT_PORT} to ${LAST_PORT} is free on ${listen}: pick one with --port.`);
 }
 
@@ -446,11 +517,11 @@ function inContainer(io: RuntimeIO): boolean {
   return io.files.exists("/.dockerenv") || io.files.exists("/run/.containerenv");
 }
 
-function containerGuide(bun: string, self: string, config: string, base: string): string {
+function containerGuide(bun: string, self: string, config: string, base: string, extension: string): string {
   return [
     "Lumiverse runs in a container here: there is no systemd, and Lumiverse's 127.0.0.1 is the container's own.",
     "Run the runtime inside Lumiverse's container, as a second process:",
-    `  ${bun} ${self} up --url ${base}`,
+    `  ${bun} ${self} up --url ${base}${extension === EXTENSION_IDENTIFIER ? "" : ` --extension ${extension}`}`,
     "or as a compose service that shares Lumiverse's network (127.0.0.1 is then the same for both):",
     "  lumiah:",
     "    image: <Lumiverse's image>",
@@ -500,20 +571,11 @@ async function must(io: RuntimeIO, command: string, args: readonly string[], env
   return r.out.trim();
 }
 
-/** The address `up` reaches Lumiverse at: `--url`, LUMIVERSE_URL, the one the runtime of this name (or the only one here) was set up with, else asked for. */
-async function baseFor(a: Args, io: RuntimeIO): Promise<string> {
+/** The address `up` reaches Lumiverse at: `--url`, LUMIVERSE_URL, the one the runtime it sets up again was set up with, else asked for. */
+async function baseFor(a: Args, io: RuntimeIO, before: RuntimeConfig | null): Promise<string> {
   const given = a.values["--url"] ?? io.env.LUMIVERSE_URL;
   if (given !== undefined) return normalizeBase(given);
-  const names = configured(io);
-  const name = givenName(a) ?? (names.length === 1 ? names[0] : undefined);
-  if (name !== undefined) {
-    try {
-      const path = configPathOf(configDir(io.env, io.home), name);
-      return configOf(io.files.read(path), path).base;
-    } catch {
-      // None set up under that name: asked for below.
-    }
-  }
+  if (before !== null) return before.base;
   const asked = await io.ask("Lumiverse address (as you open it in a browser): ", false);
   if (asked === null || asked.trim() === "") throw new UsageError("lumiah up needs Lumiverse's address: --url <address>, or LUMIVERSE_URL.");
   return normalizeBase(asked);
@@ -522,52 +584,59 @@ async function baseFor(a: Args, io: RuntimeIO): Promise<string> {
 async function up(a: Args, io: RuntimeIO): Promise<number> {
   if (io.serve === null || io.bun === null) throw new UsageError("LumiAH's runtime runs on Bun (Bun.serve, idleTimeout 0): run this line with Bun, as LumiAH's Runtime page shows it.");
   const systemd = a.flags["--systemd"] === true;
-  const base = await baseFor(a, io);
+  const asked = a.values["--extension"];
+  if (asked !== undefined && !/^[a-z][a-z0-9_]*$/.test(asked)) throw new UsageError(`--extension is "${asked}": an extension's identifier is lowercase letters, digits and _.`);
+  const named = givenName(a);
+  // The runtime this line sets up again, as far as it says before anyone has signed in: the one it names, else the only one here of the extension it is for. That one's address and sign-in are this line's defaults.
+  const before = named !== undefined ? configNamed(named, io) : onlyOf(asked ?? io.extension, io);
+  // The extension it links to: the one named, else the one it linked to before, else LumiAH's own.
+  const extension = asked ?? before?.extension ?? io.extension;
+  if (named !== undefined) refuseAnothers(before, extension, io);
+  const base = await baseFor(a, io, before);
   const listen = a.values["--listen"] ?? LISTEN;
-  if (listen !== LISTEN && listen !== "localhost") io.err(`Warning: the runtime will listen on ${listen}, where other machines can reach it, not only this one. Every call still needs your loopback key and must be addressed to ${listen} itself, unless that is a wildcard address (0.0.0.0, ::), which answers any name; nothing else stands between them and it.`);
+  if (listen !== LISTEN && listen !== "localhost") io.err(`Warning: the runtime will listen on ${listen}, where other machines can reach it, not only this one. Your loopback key and every prompt cross to it in clear http, so keep it behind something that encrypts (a tunnel, a reverse proxy with HTTPS) or on a private network. Every call still needs the key and must be addressed to ${listen} itself, unless that is a wildcard address (0.0.0.0, ::), which answers any name; nothing else stands between them and it.`);
   const bun = a.values["--bun"] ?? io.bun;
   if (!bun.startsWith("/")) throw new UsageError(`--bun must be an absolute path (systemd searches no PATH that has Bun): ${bun}`);
   const memory = a.values["--memory"] ?? DEFAULT_MEMORY;
   if (!MEMORY.test(memory)) throw new UsageError(`--memory is "${memory}": give a size as systemd reads one, such as 768M or 2G.`);
   if (systemd && io.platform !== "linux") throw new Error(`--systemd installs a systemd service, and this is ${io.platform}. Run the runtime in the foreground instead (leave out --systemd), under your own service manager.`);
   if (systemd && io.uid === 0) throw new Error("--systemd installs a service of your own account, and root's account has none on most systems. Run the runtime as the account Lumiverse runs as (sudo -u <account> …): it needs no more rights than that.");
-  if (systemd && inContainer(io)) throw new Error(containerGuide(bun, io.self, placeOf(givenName(a) ?? "runtime", io).config, base));
+  if (systemd && inContainer(io)) throw new Error(containerGuide(bun, io.self, placeOf(named ?? "runtime", io).config, base, extension));
   if (systemd && /\.ts$/.test(io.self)) throw new Error(`The service runs a built runtime, and this runs from source (${io.self}). Build first (bun run build), then run dist/lumiah.js.`);
 
-  // A runtime set up here before under this name keeps its sign-in, its port and the limits it last read.
-  const readPrevious = (name: string): RuntimeConfig | null => {
-    try {
-      const path = placeOf(name, io).config;
-      return configOf(io.files.read(path), path);
-    } catch {
-      return null;
-    }
-  };
-  const named = givenName(a);
-  const names = configured(io);
-  const session = await sessionFor(base, a, io, readPrevious(named ?? (names.length === 1 && names[0] !== undefined ? names[0] : "")));
-  const name = named ?? nameFrom(session.username);
+  const session = await sessionFor(base, a, io, before);
+  const name = named ?? nameFor(session.username, extension);
   const place = placeOf(name, io);
-  const previous = readPrevious(name);
-  const port = portOf(a, io, listen, previous);
+  // A runtime set up here before under this name keeps its port and the limits it last read.
+  const previous = configNamed(name, io);
+  refuseAnothers(previous, extension, io);
+  const port = portOf(a, io, listen, previous, name);
 
   // The limits it last read here, else the defaults: its own settings aren't read until it has linked.
   const tuning = previous?.tuning ?? { ...RUNTIME_DEFAULTS };
-  // Registered before anything is written: a refusal leaves the machine as it was.
-  const conn = new HostConnection({ base, credentials: () => session, http: io.http, openSocket: io.openSocket, limits: () => tuning, now: io.now });
-  let registered: { relay: string; secret: string; model: string; user: string };
+  // The secret of the runtime set up here before, for this Lumiverse, extension and account. Shown with the registration, it stands while it is still the extension's: registering anew would replace it at once, and with it end the link of the runtime that is running with it and the replies it is writing. That runtime answers on with it until it is restarted below.
+  const held = previous !== null && previous.base === base && previous.extension === extension && previous.session.username === session.username ? previous.secret : undefined;
+  // Where there is none to show (the address or the account changed), registering replaces whatever this name holds there, which may be the secret of a runtime that is running now: that one first gets the time to finish its replies.
+  if (held === undefined && previous !== null) await drain(previous, io, "registering it anew");
+  const conn = new HostConnection({ base, identifier: extension, credentials: () => session, http: io.http, openSocket: io.openSocket, limits: () => tuning, now: io.now });
+  let registered: LinkRequests["register"]["result"];
   try {
     await conn.ensureOpen();
-    registered = await conn.request("register", { name, build: io.build, host: io.hostname, listen, port });
+    registered = await conn.request("register", { name, build: io.build, host: io.hostname, listen, port, ...(held !== undefined ? { secret: held } : {}) });
   } catch (error) {
-    if (error instanceof LinkError) throw new Error(`LumiAH didn't register the runtime: ${error.message}`);
-    if (error instanceof LiveError && error.problem === "timeout") throw new Error(`LumiAH on ${base} didn't answer the runtime's registration. Check that it's running in Lumiverse's Extensions tab.`);
+    // Before it has registered, the runtime knows the extension only by the identifier it was given.
+    const whom = extension === EXTENSION_IDENTIFIER ? "LumiAH" : `The extension "${extension}"`;
+    if (error instanceof LinkError) throw new Error(`${whom} didn't register the runtime: ${error.message}`);
+    if (error instanceof LiveError && error.problem === "timeout") throw new Error(`${whom} on ${base} didn't answer the runtime's registration. Check that it's running in Lumiverse's Extensions tab.`);
     throw error;
   } finally {
     conn.close();
   }
   const who = session.username;
-  io.out(`Registered the runtime "${name}" with LumiAH: it answers ${who}'s replies.`);
+  // Who it registered with: LumiAH, or the extension LumiAH is built into, whose pages and connection go by its own names.
+  const linked = linkedBackendOf(registered.backend);
+  const kept = held !== undefined && registered.secret === held;
+  io.out(kept ? `The runtime "${name}" keeps its registration with ${linked.name}: it answers ${who}'s replies.` : `Registered the runtime "${name}" with ${linked.name}: it answers ${who}'s replies.`);
 
   const origins = runtimeOrigins(listen, port);
   const scheduler = await excludeOrigins(io.http, base, session.token, origins);
@@ -576,22 +645,22 @@ async function up(a: Args, io: RuntimeIO): Promise<number> {
   else if (scheduler === "unavailable") io.out("This Lumiverse has no local-inference scheduler: nothing to exclude.");
   else io.err(`Couldn't put ${origins.join(" and ")} in ${who}'s local-inference scheduler exclusions. Before turning the scheduler on, add them under Settings → Inference scheduler → Excluded origins: a turn would otherwise wait on its own calls.`);
 
-  const config: RuntimeConfig = { name, base, listen, port, relay: registered.relay, secret: registered.secret, session, tuning };
-  const connection = await loopbackConnection(io, base, session.token, runtimeBase(listen, port), registered.model || MODEL_ID, config.tuning.connectionsRead);
+  const config: RuntimeConfig = { name, base, extension, listen, port, relay: registered.relay, secret: registered.secret, session, tuning };
+  const connection = await loopbackConnection(io, base, session.token, runtimeBase(listen, port), registered.model || loopbackModel(extension), config.tuning.connectionsRead, linked);
   // Lumiverse's "always use the active connection" acts on Edit and Send only: there it overrides a chat's pin to the loopback.
-  if ((await editAndSendPrefersActive(io.http, base, session.token)) === true) io.err(`${who} has "always use the active connection" on for Edit and Send: a message sent with Edit and Send goes on the active connection, not a chat's pin to the loopback, and LumiAH answers it only when the active connection is the loopback.`);
+  if ((await editAndSendPrefersActive(io.http, base, session.token)) === true) io.err(`${who} has "always use the active connection" on for Edit and Send: a message sent with Edit and Send goes on the active connection, not a chat's pin to the loopback, and ${linked.name} answers it only when the active connection is the loopback.`);
 
   if (!systemd) {
     writeConfig(place.config, config, io);
     io.out(`Saved the runtime's config in ${place.config} (readable only by you).`);
     io.out(connection);
-    if (inContainer(io)) io.out(containerGuide(bun, io.self, place.config, base));
+    if (inContainer(io)) io.out(containerGuide(bun, io.self, place.config, base, extension));
     return serve(config, place.config, io);
   }
 
-  writeConfig(place.config, config, io);
-  // A stable copy the unit owns: an update of LumiAH removes and replaces its install.
-  const script = `${place.data}/${io.self.slice(io.self.lastIndexOf("/") + 1)}`;
+  // A stable copy the unit owns: an update of the extension removes and replaces its install.
+  const installed = installDir(extension, io);
+  const script = `${installed}/${io.self.slice(io.self.lastIndexOf("/") + 1)}`;
   io.files.copy(io.self, script, 0o644);
   io.files.write(place.unit, unitText({ name, bun, script, config: place.config, memory }), 0o644, 0o755);
   const ctl = ctlOf(io);
@@ -606,10 +675,13 @@ async function up(a: Args, io: RuntimeIO): Promise<number> {
     throw new Error(`${user}'s service manager isn't running (lingering is off, and ${user} isn't logged in), so the runtime's service can't start. Turn lingering on with: sudo loginctl enable-linger ${user}, then run this again.`);
   }
   await must(io, "systemctl", [...ctl.args, "enable", place.unitName], ctl.env);
-  if (previous !== null) await drain(previous, io);
+  if (previous !== null) await drain(previous, io, "restarting it");
+  // Written only now: until it is restarted, the runtime that ran through the wait writes its own config (the limits it reads, a secret rotated on the Runtime page), over whatever is there. A secret it was handed meanwhile is the registration's now.
+  const latest = kept ? configNamed(name, io) : null;
+  writeConfig(place.config, latest !== null && latest.relay === config.relay ? { ...config, secret: latest.secret } : config, io);
   await must(io, "systemctl", [...ctl.args, "restart", place.unitName], ctl.env);
   const when = lingering ? "it is started, and starts at boot and keeps running when you log out" : "it is started, but only runs while you are logged in (see above)";
-  io.out(`Installed the runtime in ${place.data} and the unit ${place.unitName} (memory cap ${memory}); ${when}.`);
+  io.out(`Installed the runtime in ${installed} and the unit ${place.unitName} (memory cap ${memory}); ${when}.`);
   io.out(connection);
   return 0;
 }
@@ -632,19 +704,21 @@ async function linger(io: RuntimeIO, user: string): Promise<boolean> {
 }
 
 /**
- * The loopback's Custom connection: the user's own where one is already (Custom, on the runtime's
- * address or the loopback's model), else added for them with their own session, since Spindle gives
- * an extension no way to add one. It's added without a key: minting the key on the Runtime page puts
- * it in, through the running runtime. The line says what to do next.
+ * The loopback's Custom connection: the user's own where one is already (Custom, naming the
+ * extension's loopback model, or on the runtime's address and no other extension's), else added
+ * for them with their own session, since Spindle gives an extension no way to add one. It is named
+ * as the extension the runtime registered with says (`linked`), so the first link finds it and
+ * makes no second one. It's added without a key: minting the key on the Runtime page puts it in,
+ * through the running runtime. The line says what to do next.
  */
-async function loopbackConnection(io: RuntimeIO, base: string, token: string, url: string, model: string, read: number): Promise<string> {
+async function loopbackConnection(io: RuntimeIO, base: string, token: string, url: string, model: string, read: number, linked: LinkedBackend): Promise<string> {
   try {
     const found = loopbackProfile(await connectionProfiles(io.http, base, token, read), url, model);
-    if (found !== null) return `Your connection "${found.name}" is the loopback (${url}, model ${model}). Its API key is your loopback key: mint one on LumiAH's Runtime page and it is put in for you.`;
-    const made = await addConnectionProfile(io.http, base, token, { name: CONNECTION_NAME, provider: "custom", apiUrl: url, model });
-    return `Added the connection "${made.name}" to Lumiverse: Custom (OpenAI-compatible), base URL ${url}, model ${model}. Mint your loopback key on LumiAH's Runtime page next: it is put in the connection for you.`;
+    if (found !== null) return `Your connection "${found.name}" is the loopback (${url}, model ${model}). Its API key is your loopback key: mint one on ${linked.name}'s Runtime page and it is put in for you.`;
+    const made = await addConnectionProfile(io.http, base, token, { name: linked.connection, provider: "custom", apiUrl: url, model });
+    return `Added the connection "${made.name}" to Lumiverse: Custom (OpenAI-compatible), base URL ${url}, model ${model}. Mint your loopback key on ${linked.name}'s Runtime page next: it is put in the connection for you.`;
   } catch (error) {
-    return `Couldn't add the loopback connection for you (${error instanceof Error ? error.message : String(error)}). In Lumiverse, the loopback is a Custom (OpenAI-compatible) connection: base URL ${url}, model ${model}, and as its API key your loopback key (LumiAH's Runtime page).`;
+    return `Couldn't add the loopback connection for you (${error instanceof Error ? error.message : String(error)}). In Lumiverse, the loopback is a Custom (OpenAI-compatible) connection: base URL ${url}, model ${model}, and as its API key your loopback key (${linked.name}'s Runtime page).`;
   }
 }
 
@@ -713,28 +787,37 @@ export async function serve(config: RuntimeConfig, path: string, io: RuntimeIO):
 
 // ---------------------------------------------------------------- login, status, down
 
-/** The turns the runtime running with this config has under way, from its /healthz; 0 when it doesn't answer. */
+/**
+ * How the runtime running with this config says it is (`GET /healthz`), asked as the holder of its
+ * config (`healthProof`): so it answers in full wherever it listens, where a request that shows
+ * nothing is told only that it is up. Rejects when nothing answers there.
+ */
+async function healthOf(config: RuntimeConfig, io: RuntimeIO): Promise<unknown> {
+  const reply = await io.http({ method: "GET", url: `${runtimeBase(config.listen, config.port).replace(/\/v1$/, "")}/healthz`, headers: { Accept: "application/json", Authorization: `Bearer ${await healthProof(config.secret)}` } });
+  return JSON.parse(reply.text) as unknown;
+}
+
+/** The requests the runtime running with this config has under way; 0 when it doesn't answer. */
 async function turnsUnderWay(config: RuntimeConfig, io: RuntimeIO): Promise<number> {
   try {
-    const reply = await io.http({ method: "GET", url: `${runtimeBase(config.listen, config.port).replace(/\/v1$/, "")}/healthz`, headers: { Accept: "application/json" } });
-    const body: unknown = JSON.parse(reply.text);
+    const body = await healthOf(config, io);
     return isRecord(body) && typeof body.requests === "number" ? body.requests : 0;
   } catch {
     return 0;
   }
 }
 
-/** Before `up` restarts a running runtime: a restart cuts the replies it answers, so it waits for them to finish, up to `drainMs`. */
-async function drain(config: RuntimeConfig, io: RuntimeIO): Promise<void> {
+/** Before `up` ends a running runtime's link (`then`: restarting it, or registering it anew): either cuts the replies it answers, so it waits for them to finish, up to `drainMs`. */
+async function drain(config: RuntimeConfig, io: RuntimeIO, then: "restarting it" | "registering it anew"): Promise<void> {
   const { drainMs, drainPollMs } = config.tuning;
   let turns = await turnsUnderWay(config, io);
   if (turns === 0) return;
-  io.out(`The running runtime has ${turns} request(s) under way: waiting up to ${Math.round(drainMs / 60_000)} minutes for them to finish before restarting it.`);
+  io.out(`The running runtime has ${turns} request(s) under way: waiting up to ${Math.round(drainMs / 60_000)} minutes for them to finish before ${then}.`);
   for (let waited = 0; waited < drainMs && turns > 0; waited += drainPollMs) {
     await io.sleep(drainPollMs);
     turns = await turnsUnderWay(config, io);
   }
-  if (turns > 0) io.err(`${turns} request(s) still under way after ${Math.round(drainMs / 60_000)} minutes: restarting the runtime ends them.`);
+  if (turns > 0) io.err(`${turns} request(s) still under way after ${Math.round(drainMs / 60_000)} minutes: ${then} ends them.`);
 }
 
 async function login(a: Args, io: RuntimeIO): Promise<number> {
@@ -765,12 +848,11 @@ async function status(a: Args, io: RuntimeIO): Promise<number> {
   } else io.out("No service: it runs only while `lumiah up` or `lumiah serve` does.");
   let healthy = false;
   try {
-    const reply = await io.http({ method: "GET", url: `${runtimeBase(config.listen, config.port).replace(/\/v1$/, "")}/healthz`, headers: { Accept: "application/json" } });
-    const body: unknown = JSON.parse(reply.text);
-    if (isRecord(body)) {
+    const body = await healthOf(config, io);
+    if (isRecord(body) && typeof body.link === "string") {
       healthy = body.ok === true && body.link === "up";
-      io.out(`It answers: link to LumiAH ${String(body.link)}, ${String(body.turns)} turn(s) under way${typeof body.problem === "string" ? `. ${body.problem}` : ""}.`);
-    }
+      io.out(`It answers: link to LumiAH ${body.link}, ${String(body.turns)} turn(s) under way${typeof body.problem === "string" ? `. ${body.problem}` : ""}.`);
+    } else io.out(`Something answers on ${config.listen}:${config.port}, but not as the runtime this config is for: another runtime serves there, or this one was set up again and hasn't been restarted since.`);
   } catch (error) {
     io.out(`It doesn't answer on ${config.listen}:${config.port} (${error instanceof Error ? error.message : String(error)}).`);
   }

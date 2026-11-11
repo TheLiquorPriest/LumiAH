@@ -1,11 +1,12 @@
 // The user's connections as the core's port and the pages see them (DESIGN §4.2 `connections`):
 // which exist, each one's provider and model, what the loop must know of it (its cache breakpoints,
 // whether it takes several tool calls in one answer), and which are loopbacks. A loopback connection
-// is one whose calls come back to a runtime: LumiAH answers a chat exactly when the connection it
-// generates on is one, and no agent's own call may go on one.
+// is one whose calls come back to one of this extension's runtimes: LumiAH answers a chat exactly
+// when the connection it generates on is one, and no agent's own call may go on one. The loopback
+// of another extension that has LumiAH built in is none of this one's (DESIGN §21).
 
 import type { ConnectionInfo, ConnectionProfile } from "../../core/ports";
-import { MODEL_ID } from "../../link/contract";
+import { EXTENSION_IDENTIFIER, MODEL_ID, loopsBack } from "../../link/contract";
 import { isRecord } from "../../link/json";
 import type { ConnectionView } from "../../shared/ui";
 import type { BackendHost, HostChat, HostConnection } from "./spindle";
@@ -46,9 +47,22 @@ export function takesParallelFlag(provider: string): boolean {
   return !Object.hasOwn(NO_PARALLEL_FLAG, provider);
 }
 
-const sameUrl = (a: string, b: string): boolean => a.trim().replace(/\/+$/, "").toLowerCase() === b.trim().replace(/\/+$/, "").toLowerCase();
+/**
+ * The connection a chat generates on: which, whether it is this extension's loopback, and whether
+ * it is another's (`foreign`: the loopback of another extension that has LumiAH built in, or
+ * LumiAH's own seen from such an extension, by that extension's identifier; a reply there is that
+ * extension's runtime's to answer, and none of this one's).
+ */
+export interface ChatConnection {
+  id: string;
+  name: string;
+  loopback: boolean;
+  foreign: string | null;
+}
 
 export interface ConnectionsDeps {
+  /** The model this extension's loopback connection names (`loopbackModel`). */
+  model: string;
   /** Where Lumiverse reaches each of the user's runtimes (`http://127.0.0.1:<port>/v1`). */
   bases(userId: string): Promise<string[]>;
   /** The connections the user's settings say take one tool call per answer, by id. */
@@ -56,14 +70,24 @@ export interface ConnectionsDeps {
 }
 
 export class Connections {
+  /** The connection each user's page last said is selected in Lumiverse (null: none), for a Lumiverse that doesn't say so itself. One small entry a user, as long as the extension runs. */
+  private readonly told = new Map<string, string | null>();
+
   constructor(
     private readonly host: Pick<BackendHost, "connections">,
     private readonly deps: ConnectionsDeps,
   ) {}
 
-  /** A loopback: an OpenAI-compatible connection that names LumiAH's model, or whose address is one of the user's runtimes'. The runtime looks for the same when it puts the key in one. */
+  /** A page of the user's says which connection is selected in Lumiverse, as it reads it there (null: none). True when that is news. */
+  pageSaid(userId: string, active: string | null): boolean {
+    if (this.told.has(userId) && this.told.get(userId) === active) return false;
+    this.told.set(userId, active);
+    return true;
+  }
+
+  /** A loopback: an OpenAI-compatible connection that names this extension's loopback model, or whose address is one of the user's runtimes' and that names no other extension's. The runtime looks for the same when it puts the key in one. */
   private loops(c: HostConnection, bases: readonly string[]): boolean {
-    return c.provider === LOOPBACK_PROVIDER && (c.model === MODEL_ID || bases.some((base) => sameUrl(base, c.url)));
+    return c.provider === LOOPBACK_PROVIDER && loopsBack(c, this.deps.model, bases);
   }
 
   private info(c: HostConnection, bases: readonly string[]): ConnectionInfo {
@@ -84,7 +108,12 @@ export class Connections {
     return (await this.list(userId)).map((c) => ({ id: c.id, name: c.name, provider: c.provider, model: c.model, loopback: c.loopback }));
   }
 
-  /** One connection as Lumiverse has it (null: the user's default); null when there is none. */
+  /**
+   * One connection as Lumiverse has it; null when there is none. `connectionId` null is the user's
+   * default: where Lumiverse runs a call that names no connection, which is the connection marked
+   * default and no other (its `resolveConnection`). The connection the user has selected counts
+   * for a chat's own replies alone (`ofChat`).
+   */
   async one(userId: string, connectionId: string | null): Promise<HostConnection | null> {
     if (connectionId !== null) return this.host.connections.get(connectionId, userId);
     return (await this.raw(userId)).find((c) => c.isDefault) ?? null;
@@ -115,11 +144,29 @@ export class Connections {
     return (await this.resolve(userId, connectionId))?.loopback === true;
   }
 
-  /** The connection a chat generates on now: its own pin, else the user's default; null when Lumiverse names none. */
-  async ofChat(userId: string, chat: HostChat): Promise<{ id: string; name: string; loopback: boolean } | null> {
+  /**
+   * The connection a chat generates on now, by the order Lumiverse itself takes for a reply (its
+   * `resolveChatGenerationConnection`): the chat's own pin while that connection is there; else the
+   * connection the user has selected (their active profile); else their default; else the first of
+   * their connections as Lumiverse lists them, the one changed last. Null when they have none.
+   */
+  async ofChat(userId: string, chat: HostChat): Promise<ChatConnection | null> {
     const pin = chat.metadata.connection_profile_id;
+    const pinned = typeof pin === "string" && pin.trim() !== "" ? await this.host.connections.get(pin.trim(), userId) : null;
+    const c = pinned ?? (await this.unpinned(userId));
+    if (c === null) return null;
+    // Every extension's loopback model is LumiAH's own or starts with it (`loopbackModel`).
+    const theirs = c.provider === LOOPBACK_PROVIDER && c.model !== this.deps.model ? (c.model === MODEL_ID ? EXTENSION_IDENTIFIER : c.model.startsWith(`${MODEL_ID}-`) ? c.model.slice(MODEL_ID.length + 1) : null) : null;
+    return { id: c.id, name: c.name, loopback: this.loops(c, await this.deps.bases(userId)), foreign: theirs };
+  }
+
+  /** The connection a reply goes on in a chat that pins none. Which one is selected is Lumiverse's own word where it gives one, else the last word of a page of the user's. */
+  private async unpinned(userId: string): Promise<HostConnection | null> {
+    const said = await this.host.connections.active(userId);
+    const selected = said !== undefined ? said : (this.told.get(userId) ?? null);
+    const active = selected === null ? null : await this.host.connections.get(selected, userId);
+    if (active !== null) return active;
     const all = await this.raw(userId);
-    const c = (typeof pin === "string" && pin !== "" ? all.find((x) => x.id === pin) : undefined) ?? all.find((x) => x.isDefault) ?? null;
-    return c === null ? null : { id: c.id, name: c.name, loopback: this.loops(c, await this.deps.bases(userId)) };
+    return all.find((c) => c.isDefault) ?? all[0] ?? null;
   }
 }

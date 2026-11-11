@@ -2,7 +2,7 @@
 // starts the backend over the real host. Everything it does is in backend.ts; everything that
 // touches Lumiverse is in spindle.ts.
 
-import { startBackend } from "./backend";
+import { createBackend } from "./backend";
 import { createSpindleHost } from "./spindle";
 
 /** The build this bundle came from: `bun run build` defines it into every bundle; "dev" run from source. */
@@ -16,7 +16,7 @@ const BUILD: string = process.env.LAH_BUILD_ID ?? "dev";
 const TICK_MS = 1_000;
 
 const host = createSpindleHost();
-const backend = startBackend(host, {
+const backend = createBackend(host, {
   now: () => Date.now(),
   later: (ms, fn) => {
     const timer = setTimeout(fn, ms);

@@ -3,6 +3,8 @@
 
 import { describe, expect, test } from "bun:test";
 import { SAMPLE_SCHEMA, sampleDefaults } from "../../dev/preview/fixtures";
+import { MockBackend } from "../../dev/preview/mock-backend";
+import { realSettings } from "../../dev/preview/sections";
 import {
   allSections,
   backupJson,
@@ -22,7 +24,9 @@ import {
   problemsByPath,
   sameJson,
   searchSettings,
+  sectionAt,
   sectionFor,
+  startHere,
   textProblems,
   valueWords,
   withoutRow,
@@ -65,6 +69,25 @@ describe("each setting gets the control that fits it", () => {
     expect(at(form, "agents", "main", "effort").control).toMatchObject({ kind: "choice", options: [{ label: "inherit" }, { label: "off" }, { label: "low" }, { label: "medium" }, { label: "high" }] });
   });
 
+  test("among an agent's tools, the entries that stand for a group of tools are said in words; a tool keeps its name", () => {
+    const given: SettingsView = {
+      schema: { type: "object", properties: { tools: { type: "array", title: "Tools", uniqueItems: true, items: { type: "string", enum: ["lore_search", "@workspace", "@mcp:tides", "@added"] } } } },
+      defaults: { tools: [] },
+      values: { tools: ["@added"] },
+    };
+    const control = formOf(given).control;
+    const tools = control.kind === "group" ? control.fields[0]?.control : undefined;
+    expect(tools).toEqual({
+      kind: "set",
+      options: [
+        { value: "lore_search", label: "lore_search", help: null },
+        { value: "@workspace", label: "Every workspace tool", help: "Those the family gains later too." },
+        { value: "@mcp:tides", label: "Every tool of the MCP server tides", help: "Those it gains later too." },
+        { value: "@added", label: "Tools you added (MCP servers and extensions)", help: "Every tool of the MCP servers you switched on for agents and of your extensions, those added later too." },
+      ],
+    });
+  });
+
   test("a switch, a number with its range and unit, a text, a list", () => {
     expect(at(form, "reply", "progress").control).toEqual({ kind: "boolean" });
     expect(at(form, "agents", "main", "budget", "toolTurns")).toMatchObject({ nullable: true, none: "No limit", control: { kind: "number", integer: true, min: 0, max: null, unit: "rounds" } });
@@ -102,6 +125,33 @@ describe("each setting gets the control that fits it", () => {
 
   test("a setting the page has no form for is still there, as JSON to edit", () => {
     expect(at(form, "odd")).toMatchObject({ label: "Something the page has no form for", control: { kind: "json" } });
+  });
+
+  test("a list of connection ids is picked from the user's connections, never typed; a table can hold a row per tool", () => {
+    // The shapes LumiAH's own settings use: a list whose items are connection ids, and a table keyed by tool name.
+    const view: SettingsView = {
+      schema: {
+        type: "object",
+        properties: {
+          oneToolAtATime: { type: "array", title: "One tool call per answer", uniqueItems: true, items: { type: "string", format: "connection", maxLength: 256 } },
+          names: { type: "array", title: "Names", items: { type: "string" } },
+          tools: { type: "object", title: "By tool", "x-keys": "tool", additionalProperties: { type: "string", default: "ask", oneOf: [{ const: "allow", title: "Allow" }, { const: "ask", title: "Ask first" }] } },
+          other: { type: "object", title: "By anything", "x-keys": "planet", additionalProperties: { type: "integer" } },
+        },
+      },
+      defaults: { oneToolAtATime: [], names: [], tools: {}, other: {} },
+      values: { oneToolAtATime: ["conn-deepseek"], names: [], tools: { workspace_write: "ask" }, other: {} },
+    };
+    const root = formOf(view);
+    expect(nodeAt(root, ["oneToolAtATime"])?.control).toEqual({ kind: "connections" });
+    expect(nodeAt(root, ["oneToolAtATime"])?.changed).toBe(true);
+    // A list of plain strings is still typed, one a line.
+    expect(nodeAt(root, ["names"])?.control).toEqual({ kind: "list" });
+    const tools = nodeAt(root, ["tools"])?.control;
+    expect(tools?.kind === "table" && [tools.keys, tools.rows.map((r) => [r.key, r.value])]).toEqual(["tool", [["workspace_write", "ask"]]]);
+    // A kind of key the page doesn't know is a name to type.
+    const other = nodeAt(root, ["other"])?.control;
+    expect(other?.kind === "table" && other.keys).toBe("name");
   });
 
   test("a setting without a title is labelled from its key", () => {
@@ -184,6 +234,23 @@ describe("the list of sections", () => {
     expect(sectionFor(nav, ["sample", "stops"])?.node.label).toBe("General");
     expect(sectionFor(nav, ["sample", "history", "count"])?.node.label).toBe("History cutoff");
     expect(sectionFor(nav, ["sample", "nowhere"])).toBeNull();
+  });
+
+  test("a lead that names a group opens the section that is that group, or the nearest one that holds it", () => {
+    expect(sectionAt(nav, ["sample", "agents", "main"])?.node.label).toBe("Main agent");
+    expect(sectionAt(nav, ["sample", "agents"])?.node.label).toBe("Agents");
+    expect(sectionAt(nav, ["sample", "history", "count"])?.node.label).toBe("History cutoff");
+    expect(sectionAt(nav, ["elsewhere"])).toBeNull();
+  });
+
+  test("the few settings most people change lead LumiAH's own list; settings that aren't LumiAH's get no such lead", () => {
+    const settled = realSettings();
+    const real = new MockBackend(() => {}, { scenario: "ready", turn: "none", sections: settled.sections, texts: settled.texts, delay: 0, page: 50, fail: new Set(), now: () => 0, later: () => () => {} }).state.settings;
+    const starts = startHere(navOf(formOf(real)));
+    expect(starts.map((s) => s.path.join("."))).toEqual(["core.agents.main", "transport.history", "core.spend", "core.approval", "core.recall.meaning"]);
+    // Each opens the section that is exactly that group, so what the row promises is what shows.
+    for (const start of starts) expect(start.section.node.path).toEqual([...start.path]);
+    expect(startHere(nav)).toEqual([]);
   });
 
   test("settings that aren't sections of sections go under one heading, loose ones first", () => {

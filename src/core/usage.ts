@@ -4,8 +4,8 @@
 // provider never reports is the runtime's estimate, flagged as one: Lumiverse passes no cached count
 // for Gemini or OpenAI's Responses API, and Anthropic bills thinking as output without saying how
 // much. What a call wrote to the cache is no estimate: it is there only when the provider says. Cost
-// is the provider's own where it reports one (OpenRouter's `cost`), else what the user's prices for
-// the model make of the counts, flagged as an estimate, else unknown.
+// is the provider's own where it reports one (OpenRouter's `cost`), else what the user's price for
+// the model makes of the counts, flagged as an estimate and with the price's name, else unknown.
 
 import type { AgentUsage, CallUsage, JsonObject, ModelMessage, ModelTool, UsageField } from "./ports";
 import { isRecord } from "./ports";
@@ -112,19 +112,51 @@ export function parseUsage(raw: JsonObject | undefined, provider: string | null,
 }
 
 /**
- * A call's usage with its cost: the provider's where it said, else what the user's price for the
- * model makes of the counts (flagged as an estimate), else none. Prices are per million tokens.
+ * The name in the user's Prices that prices a call, from the names its model goes by, the one to go
+ * by first leading: the name its provider reported, then the model the call asked for. A name that
+ * is priced as it stands comes first, in that order. Else the longest priced name that one of them
+ * starts with, in that order again: a provider often reports a dated name for the model it was
+ * asked for (`gpt-x-2024-08-06` for `gpt-x`), and the user priced the one they chose. None where
+ * nothing matches.
  */
-export function priced(usage: CallUsage, model: string, prices: Readonly<Record<string, ModelPrice>>): CallUsage {
-  const price = hasOwn(prices, model) ? prices[model] : undefined;
-  if (usage.cost !== undefined || !price) return usage;
+function priceName(models: readonly string[], prices: Readonly<Record<string, ModelPrice>>): string | undefined {
+  const exact = models.find((model) => hasOwn(prices, model));
+  if (exact !== undefined) return exact;
+  for (const model of models) {
+    // Longer than nothing: every name starts with a price that has no name, and that is no match.
+    let longest = "";
+    for (const name of Object.keys(prices)) if (name.length > longest.length && model.startsWith(name)) longest = name;
+    if (longest !== "") return longest;
+  }
+  return undefined;
+}
+
+/**
+ * A call's usage with its cost: the provider's where it said, else what the user's price for the
+ * model makes of the counts (flagged as an estimate, with the name in Prices that gave it:
+ * `priceName`, by the model's names in `models`), else none. Prices are per million tokens.
+ */
+export function priced(usage: CallUsage, models: readonly string[], prices: Readonly<Record<string, ModelPrice>>): CallUsage {
+  const name = usage.cost === undefined ? priceName(models, prices) : undefined;
+  const price = name === undefined ? undefined : prices[name];
+  if (name === undefined || !price) return usage;
   const fresh = Math.max(0, usage.in - usage.cachedIn);
   const cost = (fresh * price.in + usage.cachedIn * price.cachedIn + usage.out * price.out) / 1_000_000;
-  return { ...usage, cost, estimated: [...usage.estimated, "cost"] };
+  return { ...usage, cost, estimated: [...usage.estimated, "cost"], pricedAs: name };
 }
 
 export function emptyUsage(): AgentUsage {
   return { calls: 0, toolTurns: 0, in: 0, cachedIn: 0, out: 0, reasoningOut: 0, estimated: false, ms: 0, cost: 0 };
+}
+
+/**
+ * Prompt tokens as a limit counts them (Settings' "What a cached re-read counts as"): those sent
+ * fresh in full, and each one read again from the provider's cache at `weight` of a token. A whole
+ * number, rounded up, so a limit is never passed by a fraction it didn't count.
+ */
+export function countedIn(usage: Readonly<{ in: number; cachedIn: number }>, weight: number): number {
+  const cached = Math.min(Math.max(0, usage.cachedIn), usage.in);
+  return Math.ceil(usage.in - cached + cached * Math.min(1, Math.max(0, weight)));
 }
 
 /** Adds one call's usage to each tally: its cache write only when its provider said, and its cost only while every call's was known (one unknown makes the tally's unknown). */
@@ -160,4 +192,21 @@ export function addUsage(into: AgentUsage, from: AgentUsage): void {
     if (from.cost === undefined) delete into.cost;
     else into.cost += from.cost;
   }
+}
+
+/** What was spent between two readings of one tally: `now` less `before`. Its cost is known only where both readings' are. */
+export function usageSince(now: AgentUsage, before: AgentUsage): AgentUsage {
+  const less = (a: number, b: number): number => Math.max(0, a - b);
+  return {
+    calls: less(now.calls, before.calls),
+    toolTurns: less(now.toolTurns, before.toolTurns),
+    in: less(now.in, before.in),
+    cachedIn: less(now.cachedIn, before.cachedIn),
+    ...(now.cacheWrite !== undefined ? { cacheWrite: less(now.cacheWrite, before.cacheWrite ?? 0) } : {}),
+    out: less(now.out, before.out),
+    reasoningOut: less(now.reasoningOut, before.reasoningOut),
+    estimated: now.estimated,
+    ms: less(now.ms, before.ms),
+    ...(now.cost !== undefined && before.cost !== undefined ? { cost: less(now.cost, before.cost) } : {}),
+  };
 }

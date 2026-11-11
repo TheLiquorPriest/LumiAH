@@ -4,10 +4,12 @@
 // runtime that reconnects gets what it missed. The bookkeeping itself is src/link/stream.ts, shared
 // with the runtime's reading end.
 
-import type { ModelDelta, ModelResult } from "../../core/ports";
+import type { JsonValue, ModelDelta, ModelResult } from "../../core/ports";
 import type { ChunkPush, OpenStream, StreamChunk } from "../../link/contract";
 import { LINK } from "../../link/contract";
+import { CEILINGS } from "../../link/settings";
 import { StreamSender } from "../../link/stream";
+import { LinkRefused } from "./errors";
 
 interface Sent {
   userId: string;
@@ -26,12 +28,13 @@ interface Sent {
   endedAt: number | null;
 }
 
-/** What a call writes its answer to. */
+/** What a call writes its answer to: a model call its deltas and its whole answer (`done`); anything else that takes its time, its outcome (`value`). */
 export interface StreamWriter {
   /** Ends when the runtime cancels the stream, or its turn is stopped. */
   signal: AbortSignal;
   delta(delta: ModelDelta): void;
   done(result: ModelResult): void;
+  value(value: JsonValue): void;
   error(message: string, code: string): void;
 }
 
@@ -47,6 +50,8 @@ const key = (userId: string, stream: string): string => `${userId}\u0000${stream
 
 export class StreamRegistry {
   private readonly streams = new Map<string, Sent>();
+  /** How many of them each account has: an account with none has no entry. */
+  private readonly held = new Map<string, number>();
 
   constructor(private readonly env: StreamsEnv) {}
 
@@ -93,12 +98,21 @@ export class StreamRegistry {
   /**
    * Opens the stream a request named. Null when it is open already: the runtime asked again after a
    * socket that closed under its request, and the call it asked for is the one under way.
+   *
+   * A stream is held until its runtime acknowledges its end, so what a runtime opens and never
+   * acknowledges adds up in the worker every account shares. Past what one account may have held,
+   * or all of them together, the request is refused aloud: a null here would tell its caller the
+   * call is under way, and the runtime would wait for an answer nothing is writing.
    */
   open(userId: string, relay: string, stream: string, turn: string | null, tuning: { coalesceMs: number; keepMs: number }): StreamWriter | null {
     const k = key(userId, stream);
     if (this.streams.has(k)) return null;
-    const sent: Sent = { userId, relay, stream, turn, sender: new StreamSender(), abort: new AbortController(), held: null, unhold: null, coalesceMs: tuning.coalesceMs, keepMs: tuning.keepMs, endedAt: null };
+    const own = this.held.get(userId) ?? 0;
+    if (own >= CEILINGS.streams) throw new LinkRefused("unavailable", `This account already has ${own} calls on LumiAH's link that are under way or whose answers its runtimes haven't acknowledged, the most one account may have at once. Try again once some have ended.`);
+    if (this.streams.size >= CEILINGS.streamsTotal) throw new LinkRefused("unavailable", "LumiAH is busy: its link holds as many calls' answers as it does at once, for every account together. Try again in a moment.");
+    const sent: Sent = { userId, relay, stream, turn, sender: new StreamSender(), abort: new AbortController(), held: null, unhold: null, coalesceMs: tuning.coalesceMs, keepMs: Math.min(tuning.keepMs, CEILINGS.streamKeepMs), endedAt: null };
     this.streams.set(k, sent);
+    this.held.set(userId, own + 1);
     return {
       signal: sent.abort.signal,
       delta: (delta) => {
@@ -106,6 +120,7 @@ export class StreamRegistry {
         if (delta.content !== undefined) this.text(sent, "content", delta.content);
       },
       done: (result) => this.end(sent, { kind: "done", result }),
+      value: (value) => this.end(sent, { kind: "value", value }),
       error: (message, code) => this.end(sent, { kind: "error", message, code }),
     };
   }
@@ -119,7 +134,10 @@ export class StreamRegistry {
     sent.unhold?.();
     sent.unhold = null;
     sent.held = null;
-    this.streams.delete(key(sent.userId, sent.stream));
+    if (!this.streams.delete(key(sent.userId, sent.stream))) return;
+    const left = (this.held.get(sent.userId) ?? 1) - 1;
+    if (left > 0) this.held.set(sent.userId, left);
+    else this.held.delete(sent.userId);
   }
 
   /** `stream.ack`: the runtime holds every chunk through `seq`. True once the stream is over and forgotten (or was never known: there is nothing left to acknowledge). */

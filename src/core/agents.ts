@@ -1,52 +1,74 @@
-// Agent definitions (DESIGN §3.3) and the registry they are kept in (§1: an extension that uses LumiAH
-// as a package registers its own beside these).
+// Agent definitions (DESIGN §3.3, §13) and the registry those written in code are kept in (§1: an
+// extension that runs beside the core registers its own).
 //
-// A definition says what something that calls a model is: its instructions (a text the user can
-// replace), and what it runs with unless the user's settings say otherwise: its tools, connection,
-// model, effort and budget. The core ships three. The main agent works with tools every turn. The
-// writer and the summarizer are definitions too, so the user sets them up the same way; they are
-// given no tools by default, so each makes one call and is no agent until the user gives it tools.
+// A definition says what something that calls a model is: its name and what it is for, its
+// instructions, what it is given when another agent starts it, and what it runs with unless the
+// user's settings say otherwise: its tools, connection, model, effort and budget. The core ships
+// three. The main agent works with tools every turn. The writer and the summarizer are definitions
+// too, so the user sets them up the same way; the writer is given no tools by default, so it makes
+// one call and is no agent until the user gives it tools.
+//
+// The definitions a run works with are these merged with an extension's and the user's
+// (`definitions.ts`); this file is the shape, the core's own, and how one runs under Settings.
 
 import type { ModelEffort } from "./ports";
-import { AGENT, type AgentBudget, type AgentSettings, agentSettings, defaultSettings, type Settings, type SettingsScope } from "./settings";
-import { TEXT } from "./texts";
+import { AGENT, type AgentBudget, type AgentSettings, agentSettings, defaultSettings, type Settings, type ToolCalls } from "./settings";
+import { renderDefault, TEXT } from "./texts";
 
-export interface AgentDefinition {
-  /** Its id: what its settings are kept under, and its role in the trace. */
+export interface AgentDefinition extends AgentSettings {
+  /** Its id: what `delegate` names it by, what its settings are kept under, and its role in the trace. */
   id: string;
-  /** The text its instructions are: its system prompt; for the writer, the frame its brief is put to it in. */
+  name: string;
+  /** What it is for: what an agent reads when it chooses whom to delegate to, and what the page says under its name. */
+  description: string;
+  /** Its instructions: its system prompt. */
   instructions: string;
-  /** Its name and what it is for, as the Settings page shows them; absent: its id. The core's own are named in the settings' schema. */
-  label?: string;
-  note?: string;
+  /**
+   * One of the core's texts that its instructions are, by id: the text as the user has it is what is
+   * sent, and `instructions` holds the shipped wording. Only the core's own definitions name one.
+   */
+  text?: string;
+  /** What it is given when another agent starts it: the request the turn answers along with its task, or its task alone. */
+  given: "request" | "task";
   /** Another definition whose connection and model it takes while it names no connection of its own. */
   follows?: string;
-  /** What it runs with while the user's settings hold nothing for it. */
-  defaults: AgentSettings;
+  /**
+   * What it is given of its tools when another agent starts it (§14): `own`, no tool that agent
+   * doesn't hold itself; `definition`, every tool this definition names, whoever starts it (for an
+   * agent whose tools are its own trade, which the agent that hands it tasks has no use for).
+   * Absent: Settings' "What a sub-agent may be given" decides.
+   */
+  grant?: "own" | "definition";
 }
 
-/** A definition as one turn runs it: the user's settings over its defaults, its connection and model resolved. */
+/** A definition as one run runs it: the user's settings over what it runs with by default, its connection and model resolved. */
 export interface ResolvedAgent {
   definition: AgentDefinition;
   connectionId: string | null;
   model: string | null;
   effort: ModelEffort;
   tools: readonly string[];
+  toolCalls: ToolCalls;
   budget: AgentBudget;
 }
 
-/** The definitions the core ships: the main agent, the writer, and the summarizer of the main agent's notes, which runs where the main agent does unless it is given a connection of its own. */
+/**
+ * The definitions the core ships: the main agent; the writer; and the summarizer, which summarizes
+ * what another agent delegates to it, makes the summary of the main agent's notes (that call has
+ * instructions of its own, among the texts), and runs where the main agent does unless it is given a
+ * connection of its own.
+ */
 export function baseAgents(): AgentDefinition[] {
   const defaults = defaultSettings().agents;
   const of = (id: string): AgentSettings => defaults[id] as AgentSettings;
   return [
-    { id: AGENT.main, instructions: TEXT.main.system, defaults: of(AGENT.main) },
-    { id: AGENT.writer, instructions: TEXT.writer.brief, defaults: of(AGENT.writer) },
-    { id: AGENT.summarizer, instructions: TEXT.session.summarizer, follows: AGENT.main, defaults: of(AGENT.summarizer) },
+    { id: AGENT.main, name: "Main agent", description: "Works out what each reply needs, with tools, then briefs the writer or writes the reply itself.", instructions: renderDefault(TEXT.main.system), text: TEXT.main.system, given: "request", ...of(AGENT.main) },
+    { id: AGENT.writer, name: "Writer", description: "Writes the reply from the prompt Lumiverse assembled and the main agent's brief.", instructions: "", given: "request", ...of(AGENT.writer) },
+    { id: AGENT.summarizer, name: "Summarizer", description: "Summarizes what it is asked to: a span of the chat, lore entries, workspace files, or a text given in its task. It reads them itself and answers with the summary.", instructions: renderDefault(TEXT.agents.summarizer), text: TEXT.agents.summarizer, given: "task", follows: AGENT.main, ...of(AGENT.summarizer) },
   ];
 }
 
-/** The agent definitions, by id. An id registered again replaces the one before it. */
+/** The agent definitions written in code, by id. An id registered again replaces the one before it. */
 export class AgentRegistry {
   private readonly byId = new Map<string, AgentDefinition>();
 
@@ -58,27 +80,19 @@ export class AgentRegistry {
     return this.byId.get(id);
   }
 
-  ids(): string[] {
-    return [...this.byId.keys()];
+  all(): AgentDefinition[] {
+    return [...this.byId.values()];
   }
+}
 
-  /** The definitions beyond the core's own, as the settings' schema lists them (`SettingsScope.agents`). */
-  extra(): SettingsScope["agents"] {
-    const core: readonly string[] = Object.values(AGENT);
-    return [...this.byId.values()].filter((d) => !core.includes(d.id)).map((d) => ({ id: d.id, label: d.label ?? d.id, note: d.note ?? "", defaults: d.defaults }));
-  }
-
-  /**
-   * How the definition `id` runs under `settings`; undefined when there is none. One that follows
-   * another and names no connection takes that one's connection, and its model unless it names one.
-   */
-  resolve(id: string, settings: Readonly<Settings>): ResolvedAgent | undefined {
-    const definition = this.byId.get(id);
-    if (!definition) return undefined;
-    const own = agentSettings(settings, id, definition.defaults);
-    // A definition can't follow itself, and one step is all there is: whom it follows is read as set, not resolved again.
-    const followed = definition.follows !== undefined && definition.follows !== id && own.connectionId === null ? this.byId.get(definition.follows) : undefined;
-    const base = followed ? agentSettings(settings, followed.id, followed.defaults) : null;
-    return { definition, connectionId: base ? base.connectionId : own.connectionId, model: base ? (own.model ?? base.model) : own.model, effort: own.effort, tools: own.tools, budget: own.budget };
-  }
+/**
+ * How `definition` runs under `settings`. One that follows another and names no connection takes
+ * that one's connection, and its model unless it names one (`followed`: the definition it follows,
+ * where the run has it).
+ */
+export function resolveAgent(definition: AgentDefinition, settings: Readonly<Settings>, followed?: AgentDefinition): ResolvedAgent {
+  const own = agentSettings(settings, definition.id, definition);
+  // A definition can't follow itself, and one step is all there is: whom it follows is read as set, not resolved again.
+  const base = followed && followed.id !== definition.id && own.connectionId === null ? agentSettings(settings, followed.id, followed) : null;
+  return { definition, connectionId: base ? base.connectionId : own.connectionId, model: base ? (own.model ?? base.model) : own.model, effort: own.effort, tools: own.tools, toolCalls: own.toolCalls, budget: own.budget };
 }

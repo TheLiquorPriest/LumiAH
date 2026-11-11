@@ -4,13 +4,15 @@
 // (the list, then the turn chosen, with Back), the list beside the turn where there is room.
 
 import { useEffect, useLayoutEffect, useRef, useState } from "preact/hooks";
-import type { LiveView, RollbackState, SessionView, TurnRow } from "../../../shared/ui";
+import type { RollbackState, SessionView, TurnRow } from "../../../shared/ui";
 import { errorWords, useApp } from "../app";
 import { ChatBar, useShownChat } from "../chat";
 import { Badge, Banner, Button, CopyButton, Empty, IconButton, Section, useBusy } from "../components";
 import { ago, compact, count, counted, dateTime } from "../format";
 import { Icon } from "../icons";
 import { costWords, TURN_KIND_WORDS } from "../live-model";
+import { useBlob, useTranscript } from "../runs";
+import { PLACE_LABEL } from "../setup-model";
 import { useSelect } from "../store";
 import { revealInScroller } from "../scroll";
 import { TurnFeed } from "../transcript";
@@ -35,71 +37,10 @@ interface Chosen {
 
 const sameTurn = (t: TurnRow, c: { messageId: string; swipe: number }): boolean => t.messageId === c.messageId && t.swipe === c.swipe;
 
-type Transcript = { status: "loading" } | { status: "failed"; message: string } | { status: "ready"; view: LiveView; partial: boolean };
-
-/** A stored transcript, read a page at a time until it is whole. */
-function useTranscript(chatId: string, hash: string | null): { state: Transcript | null; again(): void } {
-  const app = useApp();
-  const [state, setState] = useState<Transcript | null>(null);
-  const [tries, setTries] = useState(0);
-  useEffect(() => {
-    if (hash === null) {
-      setState(null);
-      return;
-    }
-    let live = true;
-    // What has been read so far, kept outside the read so a failure part-way shows what there is.
-    const held: { view: LiveView | null } = { view: null };
-    setState({ status: "loading" });
-    void (async () => {
-      try {
-        let from: number | null = 1;
-        while (from !== null) {
-          const page: { view: LiveView; next: number | null } = await app.client.request("lah.transcript.get", { chatId, transcript: hash, from });
-          if (!live) return;
-          const before = held.view;
-          // A page that brings nothing yet names more to read would be read for ever.
-          if (before !== null && page.view.events.length === 0 && page.next !== null) throw new Error("The transcript's next part came back empty.");
-          const view: LiveView = before === null ? page.view : { ...before, events: [...before.events, ...page.view.events], ended: page.view.ended ?? before.ended };
-          held.view = view;
-          from = page.next;
-          setState({ status: "ready", view, partial: false });
-        }
-      } catch (error) {
-        if (!live) return;
-        setState(held.view !== null ? { status: "ready", view: held.view, partial: true } : { status: "failed", message: errorWords(error) });
-      }
-    })();
-    return () => {
-      live = false;
-    };
-  }, [chatId, hash, tries]);
-  return { state, again: () => setTries((n) => n + 1) };
-}
-
-/** A stored text (a compaction's summary), read when it shows. */
-function useBlob(hash: string | null): { text: string | null; failed: string | null } {
-  const app = useApp();
-  const [state, setState] = useState<{ text: string | null; failed: string | null }>({ text: null, failed: null });
-  useEffect(() => {
-    setState({ text: null, failed: null });
-    if (hash === null) return;
-    let live = true;
-    app.client.request("lah.blob.get", { hash }).then(
-      (r) => live && setState({ text: r.text, failed: null }),
-      (e: unknown) => live && setState({ text: null, failed: errorWords(e) }),
-    );
-    return () => {
-      live = false;
-    };
-  }, [hash]);
-  return state;
-}
-
 const ROLLBACK_WORDS: Readonly<Record<Exclude<RollbackState, "available">, string>> = {
-  pending: "A rollback is asked for: the chat's next turn reads the turns it replaced again, in full.",
-  done: "Rolled back: the session reads the turns it replaced again, in full.",
-  none: "It can't be rolled back: a later compaction stands on it, or the turns it replaced are no longer kept.",
+  pending: "You asked to undo this summary: at the chat's next reply the main agent reads the notes it replaced again, in full.",
+  done: "This summary was undone: the main agent reads the notes it replaced again, in full.",
+  none: "This summary can't be undone: a later summary stands on it, or the notes it replaced are no longer kept.",
 };
 
 /** A compaction point: what it replaced, the way to its summary (where it isn't the summary's own page), and its rollback. */
@@ -110,7 +51,7 @@ function Compaction(props: { turn: TurnRow; busy: boolean; onSummary?(): void; o
     <div class="lah-compaction" data-lah-compaction={c.rollback}>
       <span class="lah-compaction-head">
         <Icon name="layers" size={14} />
-        <span>{`Compacted here: a summary took the place of ${counted(c.replaced, "earlier turn")}.`}</span>
+        <span>{`A summary was made here: it took the place of the main agent's notes of ${counted(c.replaced, "earlier reply", "earlier replies")}.`}</span>
       </span>
       {c.rollback === "available" ? null : <span>{ROLLBACK_WORDS[c.rollback]}</span>}
       <div class="lah-actions">
@@ -121,7 +62,7 @@ function Compaction(props: { turn: TurnRow; busy: boolean; onSummary?(): void; o
         ) : null}
         {c.rollback === "available" ? (
           <Button size="sm" icon="undo" busy={props.busy} onClick={props.onRollback}>
-            Roll back
+            Undo the summary
           </Button>
         ) : null}
       </div>
@@ -131,35 +72,40 @@ function Compaction(props: { turn: TurnRow; busy: boolean; onSummary?(): void; o
 
 /** The session as it stands, a sentence a line. */
 function sessionLines(s: SessionView): string[] {
-  const lines = [s.turns === 0 && !s.summary ? "The next turn starts a new session: no earlier turn is carried." : `The next turn reads ${counted(s.turns, "turn")} in full (≈${count(s.tokens)} tokens)${s.summary ? ", after a summary of the ones before" : ""}.`];
-  if (s.dropped > 0) lines.push(`${counted(s.dropped, "turn")} ${s.dropped === 1 ? "is" : "are"} off the path and not read: an earlier message changed after ${s.dropped === 1 ? "it" : "them"}.`);
-  if (s.missing > 0) lines.push(`${counted(s.missing, "stored part")} ${s.missing === 1 ? "is" : "are"} missing from the store and left out.`);
+  const lines = [s.turns === 0 && !s.summary ? "Nothing is carried yet: the next reply starts the main agent's notes." : `For the next reply the main agent reads its notes of the last ${counted(s.turns, "reply", "replies")} in full (≈${count(s.tokens)} tokens)${s.summary ? ", and a summary of the ones before" : ""}.`];
+  if (s.dropped > 0) lines.push(`Its notes of ${counted(s.dropped, "reply", "replies")} are no longer used: an earlier message of the chat was changed or swiped after ${s.dropped === 1 ? "it" : "them"}.`);
+  if (s.missing > 0) lines.push(`${counted(s.missing, "stored part")} of the notes can't be found and ${s.missing === 1 ? "is" : "are"} left out.`);
   return lines;
 }
 
-function Detail(props: { chatId: string; turn: TurnRow; kind: Chosen["kind"]; busy: boolean; onBack(): void; onRollback(): void; onKind(kind: Chosen["kind"]): void }) {
+function Detail(props: { chatId: string; turn: TurnRow; kind: Chosen["kind"]; busy: boolean; onBack(): void; onRollback(): void; onKind(kind: Chosen["kind"]): void; onChanges(): void }) {
   const { turn } = props;
-  const transcript = useTranscript(props.chatId, props.kind === "turn" ? turn.transcript : null);
+  const transcript = useTranscript(props.kind === "turn" ? turn.transcript : null);
   const summary = useBlob(props.kind === "summary" ? (turn.compaction?.summary ?? null) : null);
   return (
     <>
       <div class="lah-pane-head">
         <span class="lah-back">
-          <IconButton icon="chevron-left" label="Back to the turns" onClick={props.onBack} />
+          <IconButton icon="chevron-left" label="Back to the replies" onClick={props.onBack} />
         </span>
         <span class="lah-pane-title">
           <strong class="lah-h">{props.kind === "summary" ? `The summary made at reply #${turn.index}` : `Reply #${turn.index} · ${TURN_KIND_WORDS[turn.kind]}`}</strong>
-          <span class="lah-dim lah-small">{`${dateTime(turn.at)} · swipe ${turn.swipe + 1} · message ${turn.messageId}`}</span>
+          <span class="lah-dim lah-small">{[dateTime(turn.at), ...(turn.place !== undefined ? [PLACE_LABEL[turn.place].toLowerCase()] : []), `swipe ${turn.swipe + 1}`].join(" · ")}</span>
         </span>
+        {turn.changes > 0 ? (
+          <Button size="sm" icon="folder" onClick={props.onChanges}>
+            {`${counted(turn.changes, "file")} changed`}
+          </Button>
+        ) : null}
       </div>
       {turn.onPath ? null : (
-        <Banner tone="warn" title="Off the path">
-          An earlier message of the chat changed after this turn, so its record no longer fits the chat and the session doesn't read it. Its transcript is still here.
+        <Banner tone="warn" title="No longer used">
+          An earlier message of the chat was changed or swiped after this reply, so the main agent's notes of it no longer fit the chat and it doesn't read them. What the agents did for it is still here.
         </Banner>
       )}
       {props.kind === "summary" ? (
         <Section
-          title="What the main agent reads in place of the turns before"
+          title="What the main agent reads in place of its notes of the replies before"
           aside={summary.text !== null ? <CopyButton text={summary.text} label="Copy the summary" /> : undefined}
         >
           {summary.failed !== null ? (
@@ -177,20 +123,20 @@ function Detail(props: { chatId: string; turn: TurnRow; kind: Chosen["kind"]; bu
           <Compaction turn={turn} busy={props.busy} onRollback={props.onRollback} />
           <div class="lah-actions">
             <Button size="sm" icon="list" onClick={() => props.onKind("turn")}>
-              Show this turn's transcript
+              Show what the agents did for this reply
             </Button>
           </div>
         </Section>
       ) : turn.transcript === null ? (
-        <Empty icon="file" title="No transcript was kept">
-          This turn's record names no transcript, so only its figures are known: {turn.usage ? `${counted(turn.usage.calls, "call")}, ${count(turn.usage.in)} tokens in, ${count(turn.usage.out)} out.` : "none were recorded."}
+        <Empty icon="file" title="Its steps weren't kept">
+          This reply's record doesn't hold what the agents did, so only its figures are known: {turn.usage ? `${counted(turn.usage.calls, "call")}, ${count(turn.usage.in)} tokens in, ${count(turn.usage.out)} out.` : "none were recorded."}
         </Empty>
       ) : transcript.state === null || transcript.state.status === "loading" ? (
-        <Empty icon="hourglass">Reading the transcript…</Empty>
+        <Empty icon="hourglass">Reading what the agents did…</Empty>
       ) : transcript.state.status === "failed" ? (
         <Empty
           icon="alert"
-          title="The transcript couldn't be read"
+          title="What the agents did couldn't be read"
           action={
             <Button icon="refresh" onClick={transcript.again}>
               Try again
@@ -248,15 +194,27 @@ export function SessionsPage() {
     roll(async () => {
       if (chatId === null || target.compaction === null) return;
       const agreed = await app.host.confirm({
-        title: "Roll back this compaction?",
-        message: `From its next turn on, the chat's main agent reads the ${counted(target.compaction.replaced, "turn")} this summary replaced again, in full. That takes more tokens each turn, and the session may compact again when it passes its limit. The summary is kept.`,
-        confirm: "Roll back",
+        title: "Undo this summary?",
+        message: `From the chat's next reply on, the main agent reads its notes of the ${counted(target.compaction.replaced, "reply", "replies")} this summary replaced again, in full. That takes more tokens each reply, and the notes may be summarized again when they pass their limit. The summary is kept.`,
+        confirm: "Undo the summary",
       });
       if (!agreed) return;
       try {
         const result = await app.client.request("lah.session.rollback", { chatId, messageId: target.messageId, swipe: target.swipe });
         setList((held) => ({ ...held, session: result.session, turns: held.turns.map((t) => (sameTurn(t, result.turn) ? result.turn : t)) }));
-        app.toast(result.turn.compaction?.rollback === "done" ? "Rolled back." : "Rollback asked for: the next turn makes it.");
+        app.toast(result.turn.compaction?.rollback === "done" ? "The summary was undone." : "Asked: the chat's next reply undoes the summary.");
+      } catch (error) {
+        app.fail(error);
+      }
+    });
+  const [summarizing, askSummary] = useBusy();
+  const summarize = (): void =>
+    askSummary(async () => {
+      if (chatId === null) return;
+      try {
+        const result = await app.client.request("lah.session.summarize", { chatId });
+        setList((held) => ({ ...held, session: result.session }));
+        app.toast("Asked: the chat's next reply summarizes the notes.");
       } catch (error) {
         app.fail(error);
       }
@@ -266,35 +224,48 @@ export function SessionsPage() {
       <div class="lah-stack" data-lah-view="sessions">
         <ChatBar />
         <Empty icon="message" title="No chat is open">
-          Sessions shows the turns of the chat open in Lumiverse. Open one, or pick a chat LumiAH answers from the list above.
+          Past replies shows what the agents did for each reply of the chat open in Lumiverse, and the notes the main agent carries on. Open a chat, or pick one above.
         </Empty>
       </div>
     );
   return (
     <div class="lah-split" data-lah-view="sessions" data-pane={turn ? "detail" : "list"}>
       <div class="lah-split-list">
-        <ChatBar aside={<IconButton icon="refresh" label="Read the turns again" onClick={() => read(chatId)} />} />
+        <ChatBar aside={<IconButton icon="refresh" label="Read the list again" onClick={() => read(chatId)} />} />
         {list.session ? (
-          <Section title="The session now" id="session">
+          <Section title="What carries into the next reply" id="session">
             <div class="lah-stack" data-lah-session-now>
               {sessionLines(list.session).map((line) => (
                 <p key={line}>{line}</p>
               ))}
+              {list.session.held === true && !list.session.asked ? <p class="lah-dim">You undid a summary, so the notes stay in full for now: they are summarized again once they have grown by the margin Settings give, or when you ask.</p> : null}
+              {list.session.asked ? (
+                <p class="lah-line" data-lah-summary-asked>
+                  <Icon name="check" size={14} />
+                  <span>{`You asked for a summary ${ago(now, list.session.asked)}: the chat's next reply makes it.`}</span>
+                </p>
+              ) : list.session.turns > 0 ? (
+                <div class="lah-actions">
+                  <Button size="sm" icon="layers" busy={summarizing} onClick={summarize}>
+                    Summarize the notes at the next reply
+                  </Button>
+                </div>
+              ) : null}
               {running ? (
                 <p class="lah-line">
                   <span class="lah-pulse" aria-hidden="true" />
-                  <span>A turn is running now; it joins this list when it ends.</span>
+                  <span>A reply is being worked on now; it joins this list when it ends.</span>
                 </p>
               ) : null}
             </div>
           </Section>
         ) : null}
         {list.status === "loading" ? (
-          <Empty icon="hourglass">Reading the chat's turns…</Empty>
+          <Empty icon="hourglass">Reading the chat's past replies…</Empty>
         ) : list.status === "failed" && list.turns.length === 0 ? (
           <Empty
             icon="alert"
-            title="The turns couldn't be read"
+            title="The past replies couldn't be read"
             action={
               <Button icon="refresh" onClick={() => read(chatId)}>
                 Try again
@@ -304,24 +275,29 @@ export function SessionsPage() {
             {list.message}
           </Empty>
         ) : list.turns.length === 0 ? (
-          <Empty icon="layers" title="No turn yet">
-            Each reply LumiAH writes leaves a record on its message: what the main agent did, and what it carries on. This chat's messages hold none yet.
+          <Empty icon="layers" title="No reply yet">
+            Each reply LumiAH works on leaves a record with its message: what the agents did, and the notes the main agent carries on. This chat has none yet: send a message in a chat LumiAH answers, and its reply shows here.
           </Empty>
         ) : (
           <>
-            <p class="lah-lead lah-small">{`${counted(list.total, "turn")} recorded on this chat's messages, newest first${list.turns.length < list.total ? `; ${count(list.turns.length)} shown` : ""}.`}</p>
-            <ol class="lah-turns" aria-label="The chat's turns">
+            <p class="lah-lead lah-small">{`${counted(list.total, "reply", "replies")} LumiAH worked on, newest first${list.turns.length < list.total ? `; ${count(list.turns.length)} shown` : ""}.`}</p>
+            <ol class="lah-turns" aria-label="The chat's past replies">
               {list.turns.map((t) => (
                 <li key={`${t.messageId}:${t.swipe}`} class="lah-turnrow" data-lah-turnrow={t.turn} data-on-path={t.onPath}>
                   <button type="button" class="lah-navrow" aria-current={chosen !== null && chosen.kind === "turn" && sameTurn(t, chosen)} onClick={() => setChosen({ kind: "turn", messageId: t.messageId, swipe: t.swipe })}>
                     <span class="lah-navrow-text">
                       <span class="lah-turnrow-title">
                         <span>{`#${t.index} · ${TURN_KIND_WORDS[t.kind]}`}</span>
-                        {t.onPath ? null : <Badge tone="warn">off the path</Badge>}
-                        {t.compaction ? <Badge tone="accent">compacted</Badge> : null}
+                        {t.noPart !== undefined ? <Badge tone="warn">Lumiverse's own reply</Badge> : null}
+                        {t.onPath ? null : <Badge tone="warn">no longer used</Badge>}
+                        {t.compaction ? <Badge tone="accent">summary made</Badge> : null}
                       </span>
                       <span class="lah-turnrow-preview">{t.preview === "" ? "(an empty reply)" : t.preview}</span>
-                      <span class="lah-navrow-sub lah-num">{[ago(now, t.at), ...(t.usage ? [counted(t.usage.calls, "call"), `${compact(t.usage.in)} in`, `${compact(t.usage.out)} out`, costWords(t.usage)] : []), ...(t.transcript === null ? ["no transcript"] : [])].join(" · ")}</span>
+                      {/* LumiAH had no part in the reply: the row says why in the backend's own words, as Live does. */}
+                      {t.noPart !== undefined ? <span class="lah-navrow-sub" data-lah-nopart>{`LumiAH had no part in it. ${t.noPart.text}`}</span> : null}
+                      <span class="lah-navrow-sub lah-num">
+                        {[ago(now, t.at), ...(t.place !== undefined ? [PLACE_LABEL[t.place].toLowerCase()] : []), ...(t.usage ? [counted(t.usage.calls, "call"), `${compact(t.usage.in)} in`, `${compact(t.usage.out)} out`, costWords(t.usage)] : []), ...(t.changes > 0 ? [`${counted(t.changes, "file")} changed`] : []), ...(t.transcript === null ? ["steps not kept"] : [])].join(" · ")}
+                      </span>
                     </span>
                     <Icon name="chevron-right" size={16} class="lah-chev" />
                   </button>
@@ -342,7 +318,7 @@ export function SessionsPage() {
                   )
                 }
               >
-                {`Show earlier turns (${count(Math.max(0, list.total - list.turns.length))} more)`}
+                {`Show earlier replies (${count(Math.max(0, list.total - list.turns.length))} more)`}
               </Button>
             ) : null}
           </>
@@ -350,10 +326,20 @@ export function SessionsPage() {
       </div>
       <div class="lah-split-detail" ref={detail}>
         {turn && chosen ? (
-          <Detail key={`${chosen.kind}:${turn.messageId}:${turn.swipe}`} chatId={chatId} turn={turn} kind={chosen.kind} busy={rolling} onBack={() => setChosen(null)} onRollback={() => rollback(turn)} onKind={(kind) => setChosen({ ...chosen, kind })} />
+          <Detail
+            key={`${chosen.kind}:${turn.messageId}:${turn.swipe}`}
+            chatId={chatId}
+            turn={turn}
+            kind={chosen.kind}
+            busy={rolling}
+            onBack={() => setChosen(null)}
+            onRollback={() => rollback(turn)}
+            onKind={(kind) => setChosen({ ...chosen, kind })}
+            onChanges={() => app.nav.update((n) => ({ ...n, page: "workspace", changes: { messageId: turn.messageId, swipe: turn.swipe } }))}
+          />
         ) : (
-          <Empty icon="layers" title="Pick a turn">
-            Its transcript shows here: every agent's steps as Live showed them, with tokens, time and cost, search, filters and export.
+          <Empty icon="layers" title="Pick a reply">
+            What the agents did for it shows here, step by step as Live showed it, with what it took and cost.
           </Empty>
         )}
       </div>

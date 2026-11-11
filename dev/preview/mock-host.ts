@@ -18,6 +18,8 @@ export interface MockHost {
   openChat(chatId: string | null): void;
   /** The socket comes back, as Lumiverse says it once it has authenticated it. */
   reconnect(): void;
+  /** The user agreed to grant the extension these permissions, in the host's own confirmation. */
+  onGrant: (permissions: string[]) => void;
 }
 
 function byId<T extends HTMLElement>(id: string): T {
@@ -26,7 +28,7 @@ function byId<T extends HTMLElement>(id: string): T {
   return el as T;
 }
 
-export function createMockHost(options: { drawerOpen: boolean; chatId: string | null }): MockHost {
+export function createMockHost(options: { drawerOpen: boolean; chatId: string | null; canGrant: boolean }): MockHost {
   const backendListeners = new Set<Listener<unknown>>();
   const drawerListeners = new Set<Listener<{ open: boolean; tabId: string | null }>>();
   const eventListeners = new Map<string, Set<Listener<unknown>>>();
@@ -63,6 +65,7 @@ export function createMockHost(options: { drawerOpen: boolean; chatId: string | 
 
   const host: MockHost = {
     onSend: () => {},
+    onGrant: () => {},
     deliver(payload) {
       // A copy, as a message that crossed a socket is: the page can't share an object with the backend.
       for (const listener of backendListeners) listener(structuredClone(payload));
@@ -155,11 +158,27 @@ export function createMockHost(options: { drawerOpen: boolean; chatId: string | 
     },
     host: { descriptorVersion: 1, lumiverseVersion: "preview", capabilities: {}, extensionInstallationId: "preview" },
     getActiveChat: () => ({ chatId, characterId: null }),
+    // The profile active in the host: the made-up Deepseek one, which a chat with no connection of its own generates on.
+    connections: { getActive: () => ({ activeProfileId: "conn-deepseek", provider: "deepseek", model: "deepseek-v4-flash" }) },
     sendToBackend: (payload: unknown) => host.onSend(structuredClone(payload)),
     onBackendMessage(handler: Listener<unknown>) {
       backendListeners.add(handler);
       return () => backendListeners.delete(handler);
     },
+    // A page may ask the host to grant its extension permissions, which the host confirms with the user first; an older Lumiverse has no such request (`canGrant` false).
+    ...(options.canGrant
+      ? {
+          permissions: {
+            getGranted: async () => [],
+            async request(permissions: string[], asked?: { reason?: string }) {
+              const { confirmed } = await ui.showConfirm({ title: "Allow LumiAH these permissions?", message: `${asked?.reason ?? ""} It asks for: ${permissions.join(", ")}.`.trim(), confirmLabel: "Allow" });
+              if (!confirmed) throw new Error("The user declined.");
+              host.onGrant(permissions);
+              return permissions;
+            },
+          },
+        }
+      : {}),
     // The preview gives `setup` only what it reads of the host's context; the rest of that large type isn't made up.
   } as unknown as SpindleFrontendContext;
   return host;

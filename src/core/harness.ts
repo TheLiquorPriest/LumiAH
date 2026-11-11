@@ -1,482 +1,654 @@
-// The turn (DESIGN §2, §3): `createHarness(host, options).answer(turn, sink, signal)` answers one
-// generation that reached the loopback connection.
+// The harness (DESIGN §1): `createHarness(host, options)` gives everything the runtime calls.
 //
-// It reads the user's settings and texts, resumes the chat's session by walking its active path
-// (§5), compacts it when it has grown past its setting, and runs the main agent on the request with
-// its tools. The main agent decides its own steps: no code calls a tool or a model on its behalf.
-// When it calls `write_reply` with a brief, the writer's call is made (§3.2: Lumiverse's assembled
-// messages as they came, the brief put in, the request's own sampling parameters) and its answer
-// streams to the sink as the reply. When Settings say the main agent writes, its final answer is the
-// reply. The turn ends with its record, which the caller anchors on the reply's message.
-//
-// Every step goes to the host's trace port: each agent as it starts, each call with its tokens, time,
-// cost and exact prompt, each tool result, each stop. The main agent's steps also go to the sink as
-// progress lines, for the reply's thinking block.
+// - `answer` answers one generation that reached the loopback connection (`turn.ts`), and `side`
+//   one turn of a side session (`side.ts`). Where the core runs inside Lumiverse and Lumiverse's own
+//   generation writes the reply (§25), a turn is two calls instead: `prepare` before the reply,
+//   `complete` once it is written (or `abandon` when it never is).
+// - `jobs.run` runs a job the host was told waits (`jobs.ts`).
+// - Everything else is the user's side of it, as the page reaches it through the runtime: the
+//   workspace, guidance, the definitions, jobs, side sessions, spend, upkeep, and talking to a run
+//   that is under way. Each of those takes one plain object and resolves plain JSON, so each can be
+//   a request over the link; a refusal rejects with a `HarnessRefusal`, whose message the user reads.
 
-import { AgentRegistry, baseAgents, type ResolvedAgent } from "./agents";
+import { AgentRegistry, baseAgents } from "./agents";
+import { forgetApproval, type KeptApproval, keptApprovals } from "./approved";
+import { Areas, chatFolder } from "./areas";
 import { Blobs } from "./blobs";
-import { CompactionMemo, foldKey, foldOf, summaryOf } from "./compaction";
-import { type AgentDeps, type AgentReply, AgentTurn, startAgent } from "./loop";
-import type { AgentUsage, HarnessHost, ModelDelta, PresetBlock, ReplySink, TraceEvent, TranscriptEntry, TurnRecord, TurnRequest, TurnResult, TurnStatus } from "./ports";
+import { CompactionMemo } from "./compaction";
+import type { AgentView, SkillView, ToolView } from "./definitions";
+import { type GuidanceId, type GuidanceRead, guidanceGuard, readGuidance } from "./guidance";
+import { jobEnded } from "./job-words";
+import { Jobs } from "./jobs";
+import { DOC, docKey, ROOT_AREA } from "./paths";
+import type { FileAuthor, FileChange, JobAllowance, JobView, JobWhen, JsonObject, PreparedTurn, ReplySink, TurnRecord, TurnRequest, TurnResult, WorkspaceArea } from "./ports";
+import { isRecord } from "./ports";
 import { AgentAccounts } from "./provider";
-import { carriedOf, receiptOf } from "./receipts";
-import { requestDocument, writerMessages } from "./request";
-import { type Compaction, type ResumedSession, type SegmentStep, type SessionSegment, Sessions } from "./sessions";
-import { AGENT, defaultSettings, type Settings, settingsOf } from "./settings";
-import { TEXT, TOOL, type Texts, textsOf } from "./texts";
-import { type PastTurn, type ToolEnv, type ToolOutcome, ToolRegistry } from "./tools";
+import { RECALL_SKILLS, recallAgents } from "./recall/definitions";
+import { type RecallPage, recallPage } from "./recall/page";
+import { HarnessRefusal } from "./refusal";
+import { type HarnessOptions, readSetup, type Shared } from "./run";
+import { askCompaction, pathTurns, rollback, Sessions } from "./sessions";
+import { AGENT, type AgentSettings, agentRunSchema, defaultSettings, newAgentSettings, type Settings, type SettingsScope } from "./settings";
+import { type SideResult, Sides, type SideTurnView } from "./side";
+import { SkillRegistry } from "./skills";
+import { Spend, type SpendSummary } from "./spend";
+import type { SideRow } from "./stored";
+import { TEXT, textsOf } from "./texts";
+import { type JobRead, ToolRegistry } from "./tools";
 import { BASE_TOOLS } from "./tools/base";
-import { TurnTrace } from "./transcript";
-import { emptyUsage } from "./usage";
-import { clip, errorText, limitOf } from "./util";
-import { chatView, loreView } from "./views";
+import { abandonStored, completeStored, NO_SINK, Turn } from "./turn";
+import { Upkeep, type UpkeepSummary } from "./upkeep";
+import { errorText } from "./util";
+import { type AreaAccess, type FileRow, type FileVersion, fileChanges, type PageWorkspace, pageWorkspace, showPath, Workspace, type WorkspaceView, type WrittenFile } from "./workspace";
 
-export interface HarnessOptions {
-  /**
-   * The user's settings and texts as stored, read at the start of every turn: the core's settings
-   * object (whole or in part: the core fills in its defaults) and the user's own texts by id. So a
-   * changed setting and a replaced text take effect on the next turn.
-   */
-  settings(): Promise<{ values: unknown; texts: unknown }>;
+export type { HarnessOptions, StoredState } from "./run";
+
+/** A request of the page's about the workspace says which chat's it means: null for the user's own area alone. */
+type InChat<T> = T & { chatId: string | null };
+
+/** A tool the user approved for a chat, as the page lists it: the chat, the tool, and when they said so (null: it was kept before the time was). */
+export type ApprovalRow = KeptApproval & { chatId: string };
+
+/**
+ * Where the search vectors are kept in the store, apart for each embedding space and each owner:
+ * `recall/vectors/<space>/<chat|book>/<owner>/…` (`recall/meaning.ts`, whose stored path this is).
+ * Read here only to forget a chat's.
+ */
+const VECTORS = "recall/vectors/";
+
+/**
+ * A file an agent keeps through a tool that runs outside the core (`workspace.writeAs`): the chat
+ * (`""`: a side session about none), the file by its area and its path within it, its whole text and
+ * the version that text was based on (null: a new file), the agent it is for, and the run (`turn`)
+ * and the tool call (`callId`) it is made in, all three as the extension's tool was handed them.
+ */
+export interface AgentWrite {
+  chatId: string;
+  area: WorkspaceArea;
+  path: string;
+  text: string;
+  base: string | null;
+  by: { agentId: string; role: string };
+  turn: string;
+  callId: string;
+}
+
+/** What forgetting a chat removed: every document, its jobs' and its side sessions' among them, and how many of each of those two. */
+export interface ForgottenChat {
+  documents: number;
+  jobs: number;
+  sides: number;
+}
+
+/** An area as the page shows it: its files and limits, the agent definitions a file may be pinned for, and, for the chat's own area, the reply whose record it stands on (null: no turn has left one). */
+export interface AreaView {
+  area: WorkspaceArea;
+  files: FileRow[];
+  chars: number;
+  limits: { fileChars: number; files: number; areaChars: number; pinChars: number };
+  agents: { id: string; name: string }[];
+  basis: { messageId: string; swipe: number; index: number } | null;
+}
+
+/** A level of guidance as the page shows it: whose it is, its text and version, where its file is, and whether the page may edit it (`locked` says why not). */
+export interface GuidanceLevelView {
+  id: GuidanceId;
+  whose: string;
+  text: string;
+  path: string | null;
+  hash: string | null;
+  at: number | null;
+  by: FileAuthor | null;
+  editable: boolean;
+  locked?: string;
+}
+
+export interface GuidanceView {
+  levels: GuidanceLevelView[];
+  /** The characters Settings allow each level: what is over is cut when it is given. */
+  limit: number;
+  agentsEdit: boolean;
+}
+
+/** Every definition, with the form of what an agent runs with (a schema in the settings' dialect), what a new agent starts from, and what Settings are read against where these definitions stand (`scope`: for `checkSettings` and `settingsSchema`, so a page takes every tool and agent a run would). */
+export interface DefinitionsAnswer {
+  agents: AgentView[];
+  skills: SkillView[];
+  tools: ToolView[];
+  agentSchema: JsonObject;
+  agentDefaults: AgentSettings;
+  scope: SettingsScope;
+}
+
+export interface JobsPage {
+  jobs: JobView[];
+  /** The cursor that reads the page after this one; null on the last. */
+  next: string | null;
+  /** What jobs sent and wrote in the last 24 hours as Job tokens per day counts it (a cached re-read at its weight), and, in `sent`, with every token counted in full. */
+  today: { tokens: number; sent?: number };
+  /** The agent definitions a job may be given to. */
+  agents: { id: string; name: string }[];
+  /** The user holds every job. */
+  paused: boolean;
 }
 
 export interface Harness {
-  /** The tools an agent definition may be given: the base tools, and whatever an extension registers. */
+  /** What is written in code: the core's tools, agent definitions and skills, and whatever an extension that runs beside the core registers. A run merges them with the extension's and the user's own (§13). */
   readonly tools: ToolRegistry;
-  /** The agent definitions: the main agent, the writer and the summarizer, and whatever an extension registers. */
   readonly agents: AgentRegistry;
+  readonly skills: SkillRegistry;
   /**
    * Answers one turn. The reply streams to `sink`, which gets exactly one `done` or one `error`;
    * `signal` stops the turn. Never rejects: how the turn ended is in what it returns, with its record
    * for the caller to anchor on the reply's message.
    */
   answer(turn: TurnRequest, sink: ReplySink, signal: AbortSignal): Promise<TurnResult>;
+  /**
+   * The first half of a turn whose reply the host writes (§25, built in): the session is resumed
+   * and the main agent works, always briefing a writer, and what Lumiverse's own generation is to be
+   * sent comes back; no writer is called. `replyBy` is the moment, on the host's clock, by which this
+   * must have returned (null: none): the main agent is told how long it has, is warned near the end,
+   * and at that moment the turn hands over what it has; the agents it started are cancelled, the jobs
+   * it started stand. `signal` stops the first half. Never rejects: whatever fails, the request comes
+   * back as it came with why (`part: "none"`), so the host lets Lumiverse answer alone.
+   */
+  prepare(turn: TurnRequest, options: { replyBy: number | null }, signal: AbortSignal): Promise<PreparedTurn>;
+  /**
+   * The second half, for a turn `prepare` left pending: the text the host's generation wrote (for a
+   * continue: the part it added) and how it ended. The turn is recorded as any turn is, and its
+   * record comes back for the host to anchor on the reply's message. An empty reply gives the turn
+   * up, as `abandon` does. A turn this harness no longer holds (a restart since its hand-over, or
+   * the wait for its reply ran out) is finished from what storage kept of it, and the result and
+   * the record say so (`recovered`). Rejects (`not_found`) for a turn that was never handed over,
+   * or was recorded or given up already.
+   */
+  complete(input: { generationId: string; reply: string; finish: string }): Promise<TurnResult>;
+  /**
+   * Gives a pending turn up: its generation failed or was stopped, and no reply is coming. Nothing
+   * of the turn is kept: no record, the chat's area as it was before it, and its jobs learn that no
+   * record is coming. A pending turn nobody completes ends the same way once Settings' time for it
+   * has passed, but for what storage keeps of it, which stays until `complete` or `abandon`.
+   * Rejects (`not_found`) for a turn that was never handed over, or was recorded or given up already.
+   */
+  abandon(input: { generationId: string; reason?: string }): Promise<{ abandoned: boolean }>;
+  /** One turn of a side session (§19): `generationId` is the turn's id, which its trace bears. */
+  side(input: { session: string; generationId: string; text: string }, sink: ReplySink, signal: AbortSignal): Promise<SideResult>;
+  /** Talking to a run that is under way (§18), by its id: a turn's generation, a job, a side session's turn. A note reaches the run's first agent at its next round; a hold stops every agent of it at its next round. */
+  say(input: { run: string; text: string }): Promise<{ said: true }>;
+  pause(input: { run: string }): Promise<{ paused: boolean }>;
+  resume(input: { run: string }): Promise<{ paused: boolean }>;
+  workspace: {
+    list(input: InChat<{ area: WorkspaceArea }>): Promise<AreaView>;
+    /** A file's text as it stands, or as one of its versions held it (`version`, from `history`): the page compares two versions with two reads, and restores one by writing its text based on `file.hash`. */
+    read(input: InChat<{ area: WorkspaceArea; path: string; version?: string }>): Promise<{ file: FileRow; text: string; version: FileVersion }>;
+    write(input: InChat<{ area: WorkspaceArea; path: string; text: string; base: string | null }>): Promise<{ file: FileRow }>;
+    move(input: InChat<{ area: WorkspaceArea; from: string; to: string; base: string }>): Promise<{ file: FileRow }>;
+    delete(input: InChat<{ area: WorkspaceArea; path: string; base: string }>): Promise<{ deleted: true }>;
+    pin(input: InChat<{ area: WorkspaceArea; path: string; on: boolean; role?: string }>): Promise<{ file: FileRow }>;
+    history(input: InChat<{ area: WorkspaceArea; path: string }>): Promise<{ versions: FileVersion[] }>;
+    /** The change set of the turn recorded on a reply's shown swipe (§11): what its agents and its jobs wrote. */
+    changes(input: { chatId: string; messageId: string; swipe: number }): Promise<{ changes: (FileChange & { by: FileAuthor })[] }>;
+    /**
+     * A file an agent keeps through a tool that runs outside the core (a mounting extension's own,
+     * §21): the versioned write `workspace_write` makes, in the same areas, under the same limits and
+     * the same guard, recorded as that agent's. `turn` and `callId` are the run and the tool call it is
+     * made in, and `by` the agent, all as the extension's tool was handed them: the file is then in that
+     * turn's change set, and the call's result names it in the live view. `path` is within its area and
+     * `base` the version the text was based on (null: a new file), as `write` takes them. Refused in
+     * words as `write` is; and (`conflict`) for the chat's own area once that run is no longer under
+     * way, since that area is kept turn by turn. `learned/` and `~/` take the write after the run too.
+     */
+    writeAs(input: AgentWrite): Promise<WrittenFile>;
+  };
+  guidance: {
+    get(input: { chatId: string | null }): Promise<GuidanceView>;
+    /** Writes a level as the user: a versioned write like any other (`base`: the version it was based on, null for a level nothing was written to yet). */
+    set(input: { chatId: string | null; level: GuidanceId; text: string; base: string | null }): Promise<GuidanceView>;
+  };
+  definitions: {
+    /** Every definition as a run about `chatId` would have it (none: about no chat). */
+    get(input: { chatId?: string | null }): Promise<DefinitionsAnswer>;
+  };
+  session: {
+    /** Rolls back the summary made at a turn (§5). Refused in plain words where it would change nothing. */
+    rollback(input: { chatId: string; messageId: string; swipe: number }): Promise<{ record: TurnRecord }>;
+    /** The user asks for the chat's notes to be summarized: the next turn does it, whatever their length and whatever a rollback holds. */
+    summarize(input: { chatId: string }): Promise<{ asked: number }>;
+  };
+  jobs: {
+    list(input: { chatId: string | null; cursor: string | null; limit: number }): Promise<JobsPage>;
+    read(input: { id: string }): Promise<JobRead>;
+    /** The user starts a job (§15, §22): it belongs to the chat and to no turn. */
+    start(input: { chatId: string; agent: string; task: string; when: JobWhen; allowance?: JobAllowance }): Promise<{ job: JobView }>;
+    /** Starts a job that stopped short again, from the start, as a new job with the same agent and task. */
+    again(input: { id: string }): Promise<{ job: JobView }>;
+    cancel(input: { id: string }): Promise<{ job: JobView }>;
+    /** Grants a job that stopped at its allowance more: it carries on from its own session (§22). */
+    grant(input: { id: string; allowance: JobAllowance }): Promise<{ job: JobView }>;
+    /** Holds every job, or lets them go. */
+    hold(input: { paused: boolean }): Promise<{ paused: boolean }>;
+    /** Runs a job that waits. The host calls this, when it will, for each job it was told of (`JobsPort.queued`); nothing else runs a job. */
+    run(input: { id: string }, signal: AbortSignal): Promise<JobView>;
+    /** After a restart: what became of the jobs that waited or ran when the runtime stopped. Those that waited are the host's to run again. */
+    recover(): Promise<{ interrupted: JobView[]; paused: JobView[]; queued: JobView[] }>;
+  };
+  sides: {
+    list(input: { chatId?: string | null }): Promise<{ sides: SideRow[] }>;
+    start(input: { chatId: string | null; agent?: string }): Promise<{ side: SideRow }>;
+    turns(input: { id: string }): Promise<{ side: SideRow; turns: SideTurnView[] }>;
+    remove(input: { id: string }): Promise<{ removed: true }>;
+  };
+  spend: {
+    get(input: { days: number }): Promise<SpendSummary>;
+  };
+  upkeep: {
+    get(): Promise<UpkeepSummary>;
+    sweep(signal?: AbortSignal): Promise<UpkeepSummary>;
+  };
+  chats: {
+    /**
+     * Forgets a chat Lumiverse no longer has: everything LumiAH keeps for it, and nothing of another's.
+     * Its jobs are cancelled and go with their reports; its side sessions go; and so do its `learned/`
+     * area and every head of its own area, what the user approved for it, what they asked of its
+     * session, how its lore last stood, and its search vectors. The texts those named are left to the
+     * sweep (`upkeep.sweep`), which removes what nothing refers to any more. The answer counts what
+     * went: every document, its jobs' and its side sessions' among them, and how many of each of those
+     * two. Refused (`conflict`) while a reply or a side session's answer is being worked on in the
+     * chat: that run would write the chat's documents again behind this.
+     */
+    forget(input: { chatId: string }): Promise<ForgottenChat>;
+  };
+  /** What the user approved "for this chat" (§17), for the page to show and take back. */
+  approvals: {
+    /** The tools approved for a chat, the newest first; for every chat of the user's where `chatId` is null. */
+    kept(input: { chatId: string | null }): Promise<{ kept: ApprovalRow[] }>;
+    /** Takes a tool out of what is approved for a chat: every run that begins from then on asks about it again. The chat's approvals after. */
+    forget(input: { chatId: string; tool: string }): Promise<{ kept: ApprovalRow[] }>;
+  };
+  /** What the pages read of a chat's lore and history (§24): its lore with each entry's state, the agents' own search, the chronicle's check, and how far the story's learning has come. */
+  recall: RecallPage;
 }
 
-/** What a harness keeps across turns: the connections' accounts, the blobs read lately, and the summaries made lately. */
-interface Shared {
-  host: HarnessHost;
-  options: HarnessOptions;
-  tools: ToolRegistry;
-  agents: AgentRegistry;
-  accounts: AgentAccounts;
-  blobs: Blobs;
-  sessions: Sessions;
-  memo: CompactionMemo;
-  /** The settings of the turn read last: what the memory limits above are read from. */
-  latest: Settings;
-}
-
-export function createHarness(host: HarnessHost, options: HarnessOptions): Harness {
+export function createHarness(host: Shared["host"], options: HarnessOptions): Harness {
   const tools = new ToolRegistry();
   tools.register(...BASE_TOOLS);
   const agents = new AgentRegistry();
-  agents.register(...baseAgents());
+  // The chronicler and the two skills of lore and history (§24.7) are the core's own, like the three agents a turn can't do without.
+  agents.register(...baseAgents(), ...recallAgents());
+  const skills = new SkillRegistry();
+  skills.register(...RECALL_SKILLS);
   const blobs = new Blobs(host, () => shared.latest.keep.blobChars);
-  const shared: Shared = { host, options, tools, agents, accounts: new AgentAccounts(host), blobs, sessions: new Sessions(host, blobs), memo: new CompactionMemo(() => shared.latest.keep.summaries), latest: defaultSettings() };
-  return { tools, agents, answer: (turn, sink, signal) => new Turn(shared, turn, sink, signal).answer() };
-}
+  const workspace = new Workspace({ host, blobs, limits: () => shared.latest.workspace });
+  const shared: Shared = {
+    host,
+    options,
+    tools,
+    agents,
+    skills,
+    // The core's own, as they stand before anything is registered beside them: whatever joins the registries later is an extension's.
+    core: { agents: new Set(agents.all().map((d) => d.id)), skills: new Set(skills.all().map((s) => s.id)), tools: new Set(tools.all().map((d) => d.name)) },
+    accounts: new AgentAccounts(host),
+    blobs,
+    sessions: new Sessions(host, blobs),
+    memo: new CompactionMemo(() => shared.latest.keep.summaries),
+    workspace,
+    areas: new Areas(host, workspace, () => shared.latest.jobs.recordWaitMs),
+    spend: new Spend(host, () => shared.latest),
+    jobs: new Jobs(() => shared),
+    runs: new Map(),
+    latest: defaultSettings(),
+  };
+  const sides = new Sides(() => shared);
+  /** The turns between their two halves (§25), by generation: each waits for its reply to be written. */
+  const pending = new Map<string, Turn>();
+  /** A pending turn this harness holds, taken: whoever asks first has it. Undefined for one it doesn't hold: storage may (`completeStored`, `abandonStored`). */
+  const waiting = (generationId: unknown): Turn | undefined => {
+    const turn = typeof generationId === "string" ? pending.get(generationId) : undefined;
+    if (turn && typeof generationId === "string") pending.delete(generationId);
+    return turn;
+  };
+  const upkeep = new Upkeep({ host, blobs, keep: () => shared.latest.keep });
+  // The caps count what earlier runs of the process spent once the last day's calls are read; until then, what this one spent.
+  shared.spend.ready().catch((error: unknown) => host.log("warn", `[LumiAH] the last day's spend couldn't be read (${errorText(error)}): the caps count from now`));
 
-/** How the writer's call went: it wrote the reply, or why it didn't (`stopped`: the turn's signal ended it). */
-type Written = { ok: true } | { ok: false; reason: string; stopped: boolean };
+  /** The workspace as the user holds it on the page: every file is theirs to read and write, and what they write is recorded as theirs. */
+  const userView = async (chatId: string | null): Promise<WorkspaceView> => {
+    const areas: Record<WorkspaceArea, AreaAccess | null> = chatId === null ? { chat: null, learned: null, user: shared.areas.user() } : { chat: shared.areas.now(chatId), learned: await shared.areas.learned(chatId), user: shared.areas.user() };
+    return { author: { who: "user" }, role: AGENT.main, areas, guard: () => null };
+  };
+  const page = async (chatId: string | null): Promise<PageWorkspace> => pageWorkspace(await userView(chatId), () => shared.latest.workspace);
 
-/** How a turn stands once its agents are done: its reply written, or why not. */
-type Outcome = { status: "done" } | { status: Exclude<TurnStatus, "done">; reason: string };
+  /** The levels of guidance of a chat (none: the user's alone), read as a run's are. */
+  const levels = async (chatId: string | null): Promise<{ levels: GuidanceRead[]; view: WorkspaceView; limit: number; agentsEdit: boolean }> => {
+    const setup = await readSetup(shared, chatId ?? "");
+    const view = await userView(chatId);
+    const read = await readGuidance({ areas: view.areas, chat: setup.chat, claim: setup.claim, texts: setup.texts, pathChars: setup.settings.workspace.pathChars, log: host.log });
+    return { levels: read, view, limit: setup.settings.guidance.chars, agentsEdit: setup.settings.guidance.agentsEdit };
+  };
+  const guidanceView = (read: { levels: GuidanceRead[]; limit: number; agentsEdit: boolean }): GuidanceView => ({
+    levels: read.levels.map((level) => ({
+      id: level.id,
+      whose: level.whose,
+      text: level.text,
+      path: level.file ? showPath(level.file.area, level.file.path) : null,
+      hash: level.version,
+      at: level.at,
+      by: level.by,
+      editable: level.file !== null,
+      ...(level.file === null ? { locked: "This level is kept by the extension that answers this chat: it is edited there." } : {}),
+    })),
+    limit: read.limit,
+    agentsEdit: read.agentsEdit,
+  });
 
-/** A turn stopped by its signal, with the reason the signal gave where it gave one in words. */
-class Stopped extends Error {}
+  /** A job the user asked about, or the refusal that says there is none. */
+  const jobOf = async (id: unknown): Promise<JobRead> => {
+    const read = typeof id === "string" ? await shared.jobs.read(null, id) : null;
+    if (!read) throw new HarnessRefusal("not_found", "There is no such job.");
+    return read;
+  };
 
-/** One turn's work. */
-class Turn {
-  private readonly host: HarnessHost;
-  private settings: Settings;
-  private texts: Texts = textsOf(null);
-  private readonly startedAt: number;
-  /** The reply's text as sent to the sink so far. */
-  private reply = "";
-  private finish = "stop";
-  /** The sink was ended: nothing more goes to it. */
-  private closed = false;
-  /** The writer is at work on the reply. */
-  private writing = false;
-  /** The reply was written whole. */
-  private written = false;
-  /** Why the turn failed after part of the reply was sent: what was sent can't be taken back, so the turn can't try again. */
-  private broken: string | null = null;
-  /** The main agent's id, once it started: its tool calls are the turn's progress lines. */
-  private mainId: string | null = null;
-
-  constructor(
-    private readonly shared: Shared,
-    private readonly turn: TurnRequest,
-    private readonly sink: ReplySink,
-    private readonly signal: AbortSignal,
-  ) {
-    this.host = shared.host;
-    this.settings = shared.latest;
-    this.startedAt = this.host.clock.now();
-  }
-
-  async answer(): Promise<TurnResult> {
-    const { host, turn } = this;
+  /** A chat's kept approvals as the page lists them: the newest first, one kept before the time was last, and of two kept at once the one approved later first. */
+  const approvalRows = (chatId: string, kept: readonly KeptApproval[]): ApprovalRow[] => kept.map((k) => ({ chatId, ...k })).reverse();
+  const newestFirst = (a: ApprovalRow, b: ApprovalRow): number => (b.at ?? -1) - (a.at ?? -1);
+  /** The chat a document's path names in its second part (`chats/<chat>/…`), read back from how `docKey` wrote it; null where that part is none. */
+  const chatOf = (path: string): string | null => {
+    const key = path.split("/")[1];
+    if (key === undefined) return null;
     try {
-      const stored = await this.shared.options.settings();
-      // The schema is the registries': an extension's own tools and agent definitions are settings too.
-      this.settings = settingsOf(stored.values, { tools: this.shared.tools.names(), agents: this.shared.agents.extra() });
-      this.texts = textsOf(stored.texts);
-      this.shared.latest = this.settings;
-    } catch (error) {
-      // Running on the defaults would call models the user didn't choose: the turn says why instead.
-      // Its words are fixed: the user's texts are read with the settings, so there are none to say
-      // it in; they go to the user as the turn's error, never to a model.
-      const reason = `LumiAH couldn't read its settings (${errorText(error)}), so this turn wasn't answered. Check that the runtime is linked to the extension, then try again.`;
-      this.end(() => this.sink.error(reason, "failed"));
-      return { status: "failed", reason, record: null, reply: "", usage: emptyUsage() };
+      return decodeURIComponent(key);
+    } catch {
+      return null;
     }
-    const trace = new TurnTrace(host, { turn: turn.generationId, chatId: turn.chatId }, this.shared.blobs, this.settings.keep.prompts, (event) => this.heard(event));
-    const agents = new AgentTurn(this.settings.turn, this.startedAt, trace);
-    trace.turn = agents;
-    trace.emit({ kind: "turn_started", turn: turn.generationId, chatId: turn.chatId, generation: turn.kind, messageId: turn.target.messageId, at: this.startedAt });
-    const work = new Work();
-    let outcome: Outcome;
-    try {
-      outcome = await this.work(work, trace, { host, settings: this.settings, texts: this.texts, accounts: this.shared.accounts, turn: agents });
-    } catch (error) {
-      outcome = error instanceof Stopped || this.signal.aborted ? { status: "stopped", reason: this.text(TEXT.progress.turnStopped) } : { status: "failed", reason: errorText(error) };
-    }
-    const usage: AgentUsage = { ...agents.usage };
-    const at = host.clock.now();
-    // The reply ends first: its bookkeeping never holds the user's reply up.
-    if (outcome.status === "done") this.end(() => this.sink.done(this.finish, usage));
-    else if (outcome.status === "stopped" && this.reply !== "") this.end(() => this.sink.done("stop", usage));
-    else {
-      const { reason, status } = outcome;
-      this.progress(TEXT.progress.stopped, { reason });
-      this.end(() => this.sink.error(reason, status));
-    }
-    const reason = outcome.status === "done" ? undefined : outcome.reason;
-    trace.emit({ kind: "turn_ended", status: outcome.status, ...(reason !== undefined ? { reason } : {}), usage, at });
-    const record = await this.record(work, trace, { status: outcome.status, at, ...(reason !== undefined ? { reason } : {}) }, usage);
-    return { status: outcome.status, ...(reason !== undefined ? { reason } : {}), record, reply: this.reply, usage };
-  }
+  };
 
-  // ---------------------------------------------------------------- the work
-
-  /** The turn's agents at work: the session read (and compacted), the main agent run, the reply written. */
-  private async work(work: Work, trace: TurnTrace, deps: AgentDeps): Promise<Outcome> {
-    const { host, turn, settings, texts, shared } = this;
-    const session = await shared.sessions.resume(turn);
-    work.session = session;
-    this.live();
-    let carried: { summary: string | null; turns: readonly PastTurn[] } = { summary: session.summary, turns: session.turns };
-    const sizes = { receiptChars: settings.session.receiptChars, charsPerToken: settings.loop.charsPerToken, texts };
-    const env: ToolEnv = { host, turn, settings, texts, agent: AGENT.main, chat: chatView(host, turn.chatId, session.before, settings.tools), lore: loreView(host, turn, settings.tools), past: carried.turns };
-    if (carriedOf(carried, sizes).tokens > limitOf(settings.session.summarizeAtTokens)) {
-      const made = await this.compact(carried, env, deps);
-      if (made) {
-        work.compaction = made.landed;
-        carried = { summary: made.summary, turns: made.kept };
+  return {
+    tools,
+    agents,
+    skills,
+    answer: (turn, sink, signal) => new Turn(shared, turn, sink, signal).answer(),
+    async prepare(turn, options, signal) {
+      const replyBy = typeof options.replyBy === "number" && Number.isFinite(options.replyBy) ? options.replyBy : null;
+      const hosted = new Turn(shared, turn, NO_SINK, signal, { replyBy, lapsed: () => pending.delete(turn.generationId) });
+      const prepared = await hosted.prepare();
+      if (prepared.pending) pending.set(turn.generationId, hosted);
+      return prepared;
+    },
+    async complete(input) {
+      const turn = waiting(input.generationId);
+      if (!turn) return completeStored(shared, input);
+      if (typeof input.reply !== "string" || input.reply === "") {
+        // Nothing was written: there is no reply to hold a record, so the turn is given up.
+        const given = turn.abandon();
+        await turn.forget();
+        return { status: "stopped", reason: given.reason, record: null, reply: "", usage: given.usage };
       }
-      this.live();
-    }
-    const { history, lead, tokens } = carriedOf(carried, sizes);
-    const { refs } = session;
-    trace.emit({
-      kind: "session",
-      session: { turns: carried.turns.length, tokens, summary: carried.summary !== null, dropped: [...refs.dropped], missing: session.missing, ...(work.compaction ? { compacted: { folded: work.compaction.folded, kept: work.compaction.kept.length, summary: work.compaction.summary } } : {}), ...(refs.rolledBack !== null ? { rolledBack: { summary: refs.rolledBack } } : {}) },
-      at: host.clock.now(),
-    });
-    if (carried.turns.length === 0 && carried.summary === null) this.progress(TEXT.progress.fresh);
-    else this.progress(carried.summary !== null ? TEXT.progress.sessionSummary : TEXT.progress.session, { turns: texts.counted(carried.turns.length, TEXT.word.earlierTurn) });
-    const droppedReplies = texts.render(refs.dropped.length === 1 ? TEXT.main.replyOne : TEXT.main.replyMany, { list: refs.dropped.map((index) => `#${index}`).join(", ") });
-    if (refs.dropped.length > 0) this.progress(TEXT.progress.dropped, { replies: droppedReplies });
+      return turn.complete(input.reply, typeof input.finish === "string" ? input.finish : "");
+    },
+    async abandon(input) {
+      const turn = waiting(input.generationId);
+      if (!turn) await abandonStored(shared, input.generationId);
+      else {
+        turn.abandon(typeof input.reason === "string" ? input.reason.trim() : "");
+        await turn.forget();
+      }
+      return { abandoned: true };
+    },
+    side: (input, sink, signal) => sides.turn(input, sink, signal),
 
-    const main = this.resolved(AGENT.main);
-    const writes = settings.reply.writer === "main";
-    const blocks = await this.blocks();
-    const document = requestDocument(turn.messages, blocks, session.before, texts);
-    work.request = { messages: document.messages, last: document.last };
-    const notes = [
-      ...(refs.dropped.length > 0 ? [texts.render(TEXT.main.noteDropped, { replies: droppedReplies })] : []),
-      ...(refs.rolledBack !== null ? [texts.render(TEXT.main.noteRolledBack)] : []),
-      ...(session.missing > 0 ? [texts.render(TEXT.main.noteMissing, { count: texts.counted(session.missing, TEXT.word.part) })] : []),
-      ...(lead !== null ? [texts.render(TEXT.main.noteSummary, { summary: lead })] : []),
-      ...(session.continued ? [texts.render(TEXT.main.noteContinued, { receipt: receiptOf(session.continued.segment, settings.session.receiptChars, texts) })] : []),
-    ];
-    const kinds = { new: TEXT.main.kindNew, regenerate: TEXT.main.kindRegenerate, swipe: TEXT.main.kindSwipe, continue: TEXT.main.kindContinue } as const;
-    const message = texts.render(TEXT.main.turn, { kind: texts.render(kinds[turn.kind]), notes: notes.map((note) => `${note}\n\n`).join(""), count: texts.counted(document.messages, TEXT.word.message), request: document.text, ask: texts.render(writes ? TEXT.main.askWrites : TEXT.main.ask) });
-    // past_turn reads what the agent carries, and, on a continue, what it did for this very reply before.
-    const past = session.continued ? [...carried.turns, session.continued] : carried.turns;
-    const tools = shared.tools.build(main.tools, { ...env, past, ...(writes ? {} : { writeReply: (brief: string, ctx: { agentId: string }) => this.writeReply(brief, ctx.agentId, env, deps) }) });
-    const agent = startAgent({ role: AGENT.main, connectionId: main.connectionId, model: main.model, effort: main.effort, system: texts.render(writes ? TEXT.main.systemWrites : main.definition.instructions), prefix: [], tools, budget: main.budget, history }, deps);
-    this.mainId = agent.id;
-    const reply = await agent.send(message, this.signal);
-    work.main = agent.transcript().entries;
-    work.wrote = writes;
-    return writes ? this.ownReply(reply) : this.briefed(reply, agent.id, env, deps, work);
-  }
+    async say(input) {
+      const text = typeof input.text === "string" ? input.text.trim() : "";
+      if (text === "") throw new HarnessRefusal("bad_request", "Say something first.");
+      const run = shared.runs.get(input.run);
+      if (!run) throw new HarnessRefusal("not_found", "That run isn't under way any more, so there is nobody to tell.");
+      // Its first agent is past its rounds (the writer is writing the reply): a note kept now would reach nobody, and the user would take it for heard.
+      if (!run.say(text)) throw new HarnessRefusal("conflict", "The reply is being written now, so the agent reads no more notes this turn. Say it in the chat, or in a side session.");
+      return { said: true };
+    },
+    async pause(input) {
+      const run = shared.runs.get(input.run);
+      if (run) {
+        run.pause();
+        return { paused: true };
+      }
+      // A job that waits to run has no run to hold yet: it is marked, and begins held.
+      if (await shared.jobs.pauseWaiting(input.run)) return { paused: true };
+      throw new HarnessRefusal("not_found", "That run isn't under way any more, so there is nothing to pause.");
+    },
+    async resume(input) {
+      const run = shared.runs.get(input.run);
+      if (run) {
+        run.resume();
+        return { paused: false };
+      }
+      if (await shared.jobs.resumeWaiting(input.run)) return { paused: false };
+      throw new HarnessRefusal("not_found", "That run isn't under way any more, so there is nothing to resume.");
+    },
 
-  /** The turn's signal ended it: nothing more of it is started. */
-  private live(): void {
-    if (this.signal.aborted) throw new Stopped();
-  }
+    workspace: {
+      async list(input) {
+        const listed = await (await page(input.chatId)).list(input);
+        const setup = await readSetup(shared, input.chatId ?? "");
+        const latest = input.chatId !== null && listed.area === "chat" ? await shared.areas.latest(input.chatId) : null;
+        return { ...listed, agents: setup.definitions.agents().map((d) => ({ id: d.id, name: d.name })), basis: latest ? { messageId: latest.messageId, swipe: latest.swipeId, index: latest.index } : null };
+      },
+      read: async (input) => (await page(input.chatId)).read(input),
+      write: async (input) => ({ file: (await (await page(input.chatId)).write(input)).file }),
+      move: async (input) => (await page(input.chatId)).move(input),
+      delete: async (input) => (await page(input.chatId)).delete(input),
+      pin: async (input) => (await page(input.chatId)).pin(input),
+      history: async (input) => (await page(input.chatId)).history(input),
+      async changes(input) {
+        const turns = await pathTurns(await host.chat.path(input.chatId));
+        const turn = turns.find((t) => t.messageId === input.messageId);
+        if (!turn) throw new HarnessRefusal("not_found", "That reply has no record of LumiAH's on the chat's active path.");
+        if (turn.swipeId !== input.swipe) throw new HarnessRefusal("not_found", "The chat shows another swipe of that reply now: a turn's changes are read for the swipe the chat shows.");
+        return { changes: await shared.areas.changes(input.chatId, turns, turn) };
+      },
+      async writeAs(input) {
+        // It comes from an extension's tool, over the link where the core runs apart: nothing in it is taken on trust.
+        const asked: Readonly<Record<string, unknown>> = isRecord(input) ? input : {};
+        const by: Readonly<Record<string, unknown>> = isRecord(asked.by) ? asked.by : {};
+        const { agentId, role } = by;
+        const { turn, callId } = asked;
+        if (typeof agentId !== "string" || agentId === "" || typeof role !== "string" || role === "") throw new HarnessRefusal("bad_request", "An agent's write says whose it is: by.agentId and by.role, as the tool call that makes it was handed them.");
+        if (typeof turn !== "string" || turn === "" || typeof callId !== "string" || callId === "") throw new HarnessRefusal("bad_request", "An agent's write says which run and which tool call it is made in: turn and callId, as the tool call was handed them.");
+        const chatId = typeof asked.chatId === "string" ? asked.chatId : "";
+        const found = shared.runs.get(turn);
+        const run = found?.info.chatId === chatId ? found : undefined;
+        const noAgent = (): HarnessRefusal => new HarnessRefusal("not_found", `There is no agent "${role}" here: it may have been removed or switched off.`);
+        let view: WorkspaceView;
+        let limits: () => Settings["workspace"];
+        if (run) {
+          if (!run.resolve(role)) throw noAgent();
+          // The run's own areas and its own guard: the write lands where the agent's workspace_write would, and is refused where that would be. A job's agent writes as the job, as its own tools do.
+          view = { author: run.info.kind === "job" ? { who: "job", id: run.info.id, role } : { who: "agent", id: agentId, role }, role, areas: run.areas, guard: guidanceGuard(run.guidance, run.settings, run.texts) };
+          limits = () => run.settings.workspace;
+        } else {
+          // The chat's own area is kept turn by turn: with no turn under way to write it in, the file would be in no reply's change set, and a swipe would not take it back.
+          if (asked.area === "chat") throw new HarnessRefusal("conflict", "That run isn't under way in this chat any more, and a file in the chat's own area belongs to the turn that writes it: an agent's write there is made while its run is. learned/ and ~/ take one after.");
+          const setup = await readSetup(shared, chatId);
+          if (!setup.definitions.resolve(role, setup.settings)) throw noAgent();
+          const user = await userView(chatId === "" ? null : chatId);
+          const read = await readGuidance({ areas: user.areas, chat: setup.chat, claim: setup.claim, texts: setup.texts, pathChars: setup.settings.workspace.pathChars, log: host.log });
+          view = { author: { who: "agent", id: agentId, role }, role, areas: user.areas, guard: guidanceGuard(read, setup.settings, setup.texts) };
+          limits = () => setup.settings.workspace;
+        }
+        const written = await pageWorkspace(view, limits).write({ area: asked.area, path: asked.path, text: asked.text, base: asked.base } as Parameters<PageWorkspace["write"]>[0]);
+        if (run) fileChanges(run.info, callId, written.changes);
+        return written;
+      },
+    },
 
-  /** An agent definition as this turn runs it. The core's own are always registered. */
-  private resolved(id: string): ResolvedAgent {
-    const agent = this.shared.agents.resolve(id, this.settings);
-    if (!agent) throw new Error(`there is no agent definition "${id}"`);
-    return agent;
-  }
+    guidance: {
+      get: async (input) => guidanceView(await levels(input.chatId)),
+      async set(input) {
+        const read = await levels(input.chatId);
+        const level = read.levels.find((l) => l.id === input.level);
+        if (!level) throw new HarnessRefusal("not_found", "There is no such level of guidance here: the middle level needs a chat with a character, and the chat's needs a chat.");
+        if (!level.file) throw new HarnessRefusal("forbidden", "This level is kept by the extension that answers this chat: it is edited there.");
+        await pageWorkspace(read.view, () => shared.latest.workspace).write({ area: level.file.area, path: level.file.path, text: input.text, base: input.base });
+        return guidanceView(await levels(input.chatId));
+      },
+    },
 
-  /** The active preset's blocks, which mark the request's instructions; none when the chat has no preset, or it can't be read (the request then goes unmarked, and the log says why). */
-  private async blocks(): Promise<PresetBlock[]> {
-    const { presetId } = this.turn;
-    if (presetId === null) return [];
-    try {
-      return await this.host.preset.blocks(presetId);
-    } catch (error) {
-      this.host.log("warn", `the preset ${presetId} couldn't be read (${errorText(error)}), so the request's instructions aren't marked this turn`);
-      return [];
-    }
-  }
+    definitions: {
+      async get(input) {
+        const setup = await readSetup(shared, isRecord(input) && typeof input.chatId === "string" ? input.chatId : "");
+        const scope = setup.definitions.scope();
+        return { ...setup.definitions.view(setup.settings, setup.texts), agentSchema: agentRunSchema(scope.tools), agentDefaults: newAgentSettings(), scope };
+      },
+    },
 
-  /** The main agent wrote the reply itself: its final answer is the reply, sent whole once it is known to be the answer and not a round of tool calls. */
-  private ownReply(reply: AgentReply): Outcome {
-    if (reply.status === "answered" && reply.text.trim() !== "") {
-      this.content(reply.text);
-      this.finish = reply.finish ?? "stop";
-      this.written = true;
-      return { status: "done" };
-    }
-    if (reply.status === "cancelled") return { status: "stopped", reason: this.text(TEXT.progress.turnStopped) };
-    return { status: "failed", reason: reply.reason ?? this.text(TEXT.answer.replyEmpty) };
-  }
+    session: {
+      async rollback(input) {
+        const done = await rollback(host, input.chatId, input.messageId, input.swipe);
+        if ("refused" in done) throw new HarnessRefusal("conflict", done.refused);
+        return done;
+      },
+      summarize: (input) => askCompaction(host, input.chatId),
+    },
 
-  /** The main agent's send ended while a writer writes the reply: by `write_reply` (the reply is written, or broke off), with an answer of its own (taken as the brief), or short of one. */
-  private async briefed(reply: AgentReply, mainId: string, env: ToolEnv, deps: AgentDeps, work: Work): Promise<Outcome> {
-    if (this.written) return { status: "done" };
-    if (this.broken !== null) return { status: "failed", reason: this.broken };
-    if (reply.status === "cancelled" || this.signal.aborted) return { status: "stopped", reason: this.text(TEXT.progress.turnStopped) };
-    let brief: string | null = null;
-    let short: string | undefined;
-    if (reply.status === "answered" && reply.text.trim() !== "") {
-      // It answered without calling write_reply: as its instructions say, its answer is its brief.
-      brief = reply.text.trim();
-      work.briefed = brief;
-    } else {
-      short = reply.reason ?? this.text(TEXT.answer.replyEmpty);
-      if (this.settings.reply.withoutBrief === "fail") return { status: "failed", reason: short };
-      // The reply's thinking block says so here, and the trace in what the writer is started for.
-      this.progress(TEXT.progress.writingAlone, { reason: short });
-    }
-    const wrote = await this.write(brief, mainId, env, deps, short);
-    if (wrote.ok) return { status: "done" };
-    return wrote.stopped ? { status: "stopped", reason: this.text(TEXT.progress.turnStopped) } : { status: "failed", reason: wrote.reason };
-  }
+    jobs: {
+      async list(input) {
+        const listed = await shared.jobs.page(input);
+        const setup = await readSetup(shared, input.chatId ?? "");
+        const cap = (await shared.spend.get({ days: 1 })).caps.find((c) => c.setting.join(".") === "jobs.tokensPerDay");
+        // Whom the user may give a job: any agent but the writer, whose prompt is a chat's preset.
+        return { ...listed, today: { tokens: cap?.used ?? 0, sent: cap?.sent ?? 0 }, agents: setup.definitions.agents().flatMap((d) => (d.id === AGENT.writer ? [] : [{ id: d.id, name: d.name }])), paused: shared.jobs.held };
+      },
+      read: (input) => jobOf(input.id),
+      async start(input) {
+        if (!host.jobs) throw new HarnessRefusal("unavailable", "This runtime can't run jobs.");
+        const setup = await readSetup(shared, input.chatId);
+        // The user's own start: the job belongs to the chat and to no turn (§22).
+        const started = await shared.jobs.createJob({ chatId: input.chatId, when: input.when === "now" ? "now" : "after_reply", what: { agent: input.agent, task: input.task }, by: { who: "user" }, basis: null, ...(isRecord(input.allowance) ? { allowance: allowanceOf(input.allowance) } : {}) }, setup);
+        if ("refused" in started) throw new HarnessRefusal("invalid", started.refused);
+        return { job: started };
+      },
+      async again(input) {
+        if (!host.jobs) throw new HarnessRefusal("unavailable", "This runtime can't run jobs.");
+        const { job } = await jobOf(input.id);
+        const setup = await readSetup(shared, job.chatId);
+        // Started again by the user, it is the user's job now: it belongs to the chat, whatever the first one belonged to.
+        const started = await shared.jobs.createJob({ chatId: job.chatId, when: "now", what: { again: job.id }, by: { who: "user" }, basis: null, ...(job.allowance ? { allowance: job.allowance } : {}) }, setup);
+        if ("refused" in started) throw new HarnessRefusal("conflict", started.refused);
+        return { job: started };
+      },
+      async cancel(input) {
+        await jobOf(input.id);
+        const setup = await readSetup(shared, "");
+        const done = await shared.jobs.cancel(null, input.id, setup.texts.render(TEXT.jobs.whyCancelledByUser));
+        if (!done) throw new HarnessRefusal("not_found", "There is no such job.");
+        return { job: done.job };
+      },
+      async grant(input) {
+        if (!isRecord(input.allowance)) throw new HarnessRefusal("bad_request", "Say how much more the job may spend.");
+        return { job: await shared.jobs.grant(input.id, allowanceOf(input.allowance)) };
+      },
+      hold: async (input) => shared.jobs.hold(input.paused === true),
+      run: (input, signal) => shared.jobs.run(input, signal),
+      recover: () => shared.jobs.recover(),
+    },
 
-  // ---------------------------------------------------------------- the session's compaction
+    sides: {
+      list: (input) => sides.list(isRecord(input) ? input : {}),
+      start: (input) => sides.start(input),
+      turns: (input) => sides.turns(input),
+      remove: (input) => sides.remove(input),
+    },
 
-  /**
-   * Summarizes all but the latest turns of what the main agent carries, in one call of the
-   * summarizer's, and lands the summary. Null when there is nothing to fold or no summary stands
-   * (the call failed, or its answer was cut): the session then goes on whole, and the next turn
-   * tries again.
-   */
-  private async compact(carried: { summary: string | null; turns: readonly PastTurn[] }, env: ToolEnv, deps: AgentDeps): Promise<{ landed: Compaction; summary: string; kept: readonly PastTurn[] } | null> {
-    const { settings, texts, shared } = this;
-    const fold = foldOf(carried, { keep: settings.session.keepTurns, limit: settings.session.summaryTokens, receiptChars: settings.session.receiptChars, texts });
-    if (!fold) return null;
-    const summarizer = this.resolved(AGENT.summarizer);
-    this.progress(TEXT.progress.compacting, { turns: texts.counted(fold.folded.length, TEXT.word.turn) });
-    const key = await foldKey({ connectionId: summarizer.connectionId, model: summarizer.model, effort: summarizer.effort, callTokensOut: summarizer.budget.callTokensOut, system: fold.system, message: fold.message });
-    const result = await shared.memo.run(key, async () => {
-      const agent = startAgent({ role: AGENT.summarizer, connectionId: summarizer.connectionId, model: summarizer.model, effort: summarizer.effort, system: fold.system, prefix: [], tools: shared.tools.build(summarizer.tools, { ...env, agent: AGENT.summarizer }), budget: summarizer.budget, task: "summarize the main agent's notes" }, deps);
-      return summaryOf(await agent.send(fold.message, this.signal), texts);
-    });
-    if ("failed" in result) {
-      this.progress(TEXT.progress.notCompacted, { reason: result.failed });
-      this.host.log("warn", `the main agent's notes weren't summarized (${result.failed}); they go on whole`);
-      return null;
-    }
-    const landed = await shared.sessions.compact(result.summary, fold.kept, fold.folded.length);
-    this.progress(TEXT.progress.compacted, { folded: texts.counted(fold.folded.length, TEXT.word.turn), kept: String(fold.kept.length) });
-    return { landed, summary: result.summary, kept: fold.kept };
-  }
+    spend: { get: (input) => shared.spend.get(input) },
+    upkeep: {
+      get: async () => {
+        // The keep times a count reads are the user's as they stand now.
+        await readSetup(shared, "").catch(() => undefined);
+        return upkeep.get();
+      },
+      sweep: async (signal) => {
+        await readSetup(shared, "").catch(() => undefined);
+        return upkeep.sweep(signal ?? new AbortController().signal);
+      },
+    },
 
-  // ---------------------------------------------------------------- the writer
+    chats: {
+      async forget(input) {
+        const chatId = isRecord(input) && typeof input.chatId === "string" ? input.chatId : "";
+        if (chatId === "") throw new HarnessRefusal("bad_request", "Say which chat to forget.");
+        // A job of the chat is LumiAH's own to stop, below. A reply or a side session's answer is not: it ends first.
+        if ([...shared.runs.values()].some((run) => run.info.chatId === chatId && run.info.kind !== "job")) throw new HarnessRefusal("conflict", "A reply or a side session's answer is being worked on in that chat. Stop it or let it end, then forget the chat.");
+        const { store } = host;
+        // The words a cancelled job is given are the user's own where their texts can be read, and the shipped ones where they can't: the job goes either way.
+        const texts = await readSetup(shared, "").then(
+          (setup) => setup.texts,
+          () => textsOf(null),
+        );
+        // Each job that waits or runs is cancelled and has ended, written for the last time, before its documents go.
+        const listed = await shared.jobs.list(chatId);
+        for (const job of listed) if (!jobEnded(job)) await shared.jobs.cancel(chatId, job.id, texts.render(TEXT.jobs.whyCancelledByUser));
+        const about = (await sides.list({ chatId })).sides;
+        for (const side of about) await sides.remove({ id: side.id });
 
-  /** `write_reply`: the writer writes from the main agent's brief, and its reply ends the main agent's send. */
-  private async writeReply(brief: string, mainId: string, env: ToolEnv, deps: AgentDeps): Promise<ToolOutcome> {
-    if (this.writing || this.written || this.broken !== null) return { text: this.text(TEXT.answer.replyBusy), error: true };
-    const wrote = await this.write(brief, mainId, env, deps);
-    if (wrote.ok) return { text: this.reply, end: true };
-    // Part of the reply already reached the user: a second try would write a second reply after it, so the turn ends here, failed.
-    if (this.reply !== "") {
-      this.broken = wrote.reason;
-      return { text: this.reply, end: true };
-    }
-    return { text: this.text(TEXT.answer.replyFailed, { reason: wrote.reason }), error: true };
-  }
+        // The two lists that name every chat's jobs lose this chat's, in a step among the jobs' own writes: nothing a job was writing lands after it, and nothing is written for the chat from then on.
+        const jobs = new Set([...listed.map((job) => job.id), ...(await shared.jobs.forget(chatId))]);
 
-  /**
-   * The writer's call (DESIGN §3.2): Lumiverse's assembled messages as they came, with the brief put
-   * in (none when the main agent stopped short of one: `short` is why, which the trace tells as what
-   * the writer was started for), the request's own sampling parameters and answer room, and the
-   * tools Settings give the writer (none by default). Its answer streams to the sink as the reply.
-   */
-  private async write(brief: string | null, parent: string, env: ToolEnv, deps: AgentDeps, short?: string): Promise<Written> {
-    const { turn, settings, texts, shared } = this;
-    this.writing = true;
-    try {
-      const writer = this.resolved(AGENT.writer);
-      if (brief !== null) this.progress(TEXT.progress.writing);
-      const agent = startAgent(
-        {
-          role: AGENT.writer,
-          connectionId: writer.connectionId,
-          model: writer.model,
-          effort: writer.effort,
-          system: "",
-          prefix: [],
-          tools: shared.tools.build(writer.tools, { ...env, agent: AGENT.writer }),
-          // The request's own answer room where it names one: the preset governs the prose as it does without LumiAH.
-          budget: { ...writer.budget, callTokensOut: turn.maxTokens ?? writer.budget.callTokensOut },
-          history: writerMessages(turn.messages, brief, settings.reply, texts),
-          params: turn.params,
-          onDelta: (delta) => this.delta(delta),
-          parent,
-          task: brief !== null ? "write the reply from the brief" : `write the reply without a brief: the main agent stopped short of one (${short ?? "no reason given"})`,
-        },
-        deps,
-      );
-      const reply = await agent.run(this.signal);
-      if (reply.status !== "answered") return { ok: false, reason: reply.reason ?? texts.render(TEXT.answer.replyEmpty), stopped: reply.status === "cancelled" };
-      // A host that streams nothing still gave the answer whole: what wasn't streamed is sent now.
-      if (reply.text.startsWith(this.reply)) this.content(reply.text.slice(this.reply.length));
-      if (this.reply.trim() === "") return { ok: false, reason: texts.render(TEXT.answer.replyEmpty), stopped: false };
-      this.finish = reply.finish ?? "stop";
-      this.written = true;
-      return { ok: true };
-    } finally {
-      this.writing = false;
-    }
-  }
+        // Nothing of the chat is answered from memory or written back once its documents are gone.
+        shared.areas.forget(chatId);
+        const folder = chatFolder(chatId);
+        const paths = new Set<string>();
+        for (const id of jobs) paths.add(DOC.job(id));
+        if (store.list) {
+          for (const path of await store.list(folder)) paths.add(path);
+          const owner = `/chat/${docKey(chatId)}/`;
+          for (const path of await store.list(VECTORS)) if (path.includes(owner)) paths.add(path);
+          // A turn of the chat that waits for its reply in storage alone (its harness is gone: a restart, a wait that ran out) is kept by its generation and names its chat inside. Read as it is stored, whatever else it holds: one that is damaged goes too.
+          const waits = DOC.pending("x");
+          for (const path of await store.list(waits.slice(0, waits.indexOf("x")))) {
+            const kept = await store.read(path);
+            if (isRecord(kept) && kept.kind === "pending" && kept.chatId === chatId) paths.add(path);
+          }
+        } else {
+          // A store that can't list gives up the documents a chat's id names; the heads its turns left under their own ids, its waiting turns and its vectors can't be found there.
+          for (const path of [DOC.learned(chatId), DOC.chatArea(chatId, ROOT_AREA), DOC.approvals(chatId), DOC.session(chatId), DOC.chatJobs(chatId)]) if ((await store.read(path)) !== null) paths.add(path);
+          host.log("warn", `[LumiAH] this runtime can't list its documents, so forgetting chat ${chatId} left what its turns kept under their own ids and its search vectors`);
+        }
+        for (const path of paths) await store.remove(path);
+        return { documents: paths.size + about.length, jobs: jobs.size, sides: about.length };
+      },
+    },
 
-  // ---------------------------------------------------------------- the sink
+    approvals: {
+      async kept(input) {
+        const chatId = isRecord(input) && typeof input.chatId === "string" ? input.chatId : null;
+        if (chatId !== null) return { kept: approvalRows(chatId, await keptApprovals(host.store, chatId)).sort(newestFirst) };
+        if (!host.store.list) throw new HarnessRefusal("unavailable", "This runtime can't list its documents, so what you approved can be read for one chat at a time only.");
+        // Every chat's approvals are a document of that name in the chat's folder: where chats are kept is read from where one chat's is.
+        const sample = DOC.approvals("x");
+        const rows: ApprovalRow[] = [];
+        for (const path of await host.store.list(sample.slice(0, sample.indexOf("x")))) {
+          const of = chatOf(path);
+          if (of !== null && DOC.approvals(of) === path) rows.push(...approvalRows(of, await keptApprovals(host.store, of)));
+        }
+        return { kept: rows.sort(newestFirst) };
+      },
+      async forget(input) {
+        const asked: Readonly<Record<string, unknown>> = isRecord(input) ? input : {};
+        const { chatId, tool } = asked;
+        if (typeof chatId !== "string" || chatId === "" || typeof tool !== "string" || tool === "") throw new HarnessRefusal("bad_request", "Say which tool to forget, and for which chat.");
+        return { kept: approvalRows(chatId, await forgetApproval(host, chatId, tool)).sort(newestFirst) };
+      },
+    },
 
-  private text(id: string, vars: Readonly<Record<string, string>> = {}): string {
-    return this.texts.render(id, vars);
-  }
-
-  /** Something for the sink, unless it was ended; a sink that throws (its stream is gone) loses what it was given, never the turn. */
-  private toSink(send: () => void): void {
-    if (this.closed) return;
-    try {
-      send();
-    } catch (error) {
-      this.host.log("warn", `the reply's stream took nothing (${errorText(error)})`);
-    }
-  }
-
-  /** Ends the sink, once. */
-  private end(send: () => void): void {
-    this.toSink(send);
-    this.closed = true;
-  }
-
-  private content(text: string): void {
-    if (text === "") return;
-    this.reply += text;
-    this.toSink(() => this.sink.content(text));
-  }
-
-  /** A piece of the writer's answer as it arrives: its text is the reply's, its reasoning the reply's thinking. */
-  private delta(delta: ModelDelta): void {
-    const { reasoning } = delta;
-    if (reasoning !== undefined && reasoning !== "") this.toSink(() => this.sink.reasoning(reasoning));
-    if (delta.content !== undefined) this.content(delta.content);
-  }
-
-  /** A progress line for the reply's thinking block, while Settings write them. */
-  private progress(id: string, vars: Readonly<Record<string, string>> = {}): void {
-    const { progress, progressChars } = this.settings.reply;
-    if (progress) this.toSink(() => this.sink.progress(clip(this.text(id, vars), progressChars)));
-  }
-
-  /** Hears the turn's trace: each tool the main agent calls is a progress line, and so is each call any of the turn's agents makes again, since it holds the reply up. */
-  private heard(event: TraceEvent): void {
-    if (event.kind !== "agent_entry") return;
-    const { entry } = event;
-    if (entry.kind === "retry") this.progress(TEXT.progress.retry, { reason: entry.reason, attempt: String(entry.attempt), retries: String(entry.of) });
-    if (event.agentId !== this.mainId || entry.kind !== "answer") return;
-    for (const call of entry.calls) this.progress(TEXT.progress.call, { tool: call.name, args: JSON.stringify(call.args) });
-  }
-
-  // ---------------------------------------------------------------- the record
-
-  /**
-   * The turn's record, its bodies stored: its segment of the session and its transcript. Null when no
-   * reply text was sent (there is then no reply to anchor a record on) or the turn's session was
-   * never read; and when its bodies can't be stored, which the log says.
-   */
-  private async record(work: Work, trace: TurnTrace, ended: { status: TurnStatus; at: number; reason?: string }, usage: AgentUsage): Promise<TurnRecord | null> {
-    const { turn, settings, shared } = this;
-    const { session } = work;
-    if (this.reply === "" || !session) return null;
-    try {
-      const own = stepsOf(work, { reply: String(session.reply), chars: String(this.reply.length), texts: this.texts, stopped: ended.reason });
-      const segment: SessionSegment = { v: 1, kind: "segment", reply: session.reply, generationId: turn.generationId, turn: turn.kind, at: ended.at, request: work.request, steps: [...(session.continued?.segment.steps ?? []), ...own] };
-      const segmentHash = await shared.sessions.segment(segment);
-      const transcript = settings.keep.transcripts ? await shared.blobs.putJson(trace.transcript({ generation: turn.kind, messageId: turn.target.messageId, startedAt: this.startedAt, ended }), false) : undefined;
-      return { v: 1, generationId: turn.generationId, kind: turn.kind, at: ended.at, path: session.path, segment: segmentHash, ...(transcript !== undefined ? { transcript } : {}), ...(work.compaction ? { summary: work.compaction.summary, kept: work.compaction.kept, folded: work.compaction.folded } : {}), usage };
-    } catch (error) {
-      this.host.log("warn", `the turn's record wasn't made (${errorText(error)}): the reply stands, and the main agent's notes won't hold this turn`);
-      return null;
-    }
-  }
+    recall: recallPage({ host, setup: (chatId) => readSetup(shared, chatId), learned: (chatId) => shared.areas.learned(chatId) }),
+  };
 }
 
-/** What a turn's work leaves for its record. */
-class Work {
-  session: ResumedSession | null = null;
-  compaction: Compaction | null = null;
-  request: { messages: number; last: number | null } = { messages: 0, last: null };
-  /** The main agent's transcript, once its send ended. */
-  main: TranscriptEntry[] = [];
-  /** The main agent wrote the reply itself. */
-  wrote = false;
-  /** Its own answer, taken as the brief because it never called `write_reply`. */
-  briefed: string | null = null;
-}
-
-/**
- * The main agent's steps this turn, from its transcript: what it wrote beside its calls, each call
- * with what came back, and how it ended. The reply itself is never kept (it is in the chat):
- * `write_reply`'s result, which is the reply, is kept as a note of its length, and so is a reply the
- * main agent wrote itself. An answer taken as the brief is kept as the `write_reply` call it stood for.
- */
-function stepsOf(work: Work, input: { reply: string; chars: string; texts: Texts; stopped: string | undefined }): SegmentStep[] {
-  const { texts } = input;
-  const written = texts.render(TEXT.session.replyWritten, { chars: input.chars, reply: input.reply });
-  const results = new Map<string, Extract<TranscriptEntry, { kind: "result" }>>();
-  for (const entry of work.main) if (entry.kind === "result") results.set(entry.callId, entry);
-  const answers = work.main.filter((entry) => entry.kind === "answer");
-  const steps: SegmentStep[] = [];
-  for (const entry of work.main) {
-    if (entry.kind === "stop") steps.push({ kind: "stop", reason: entry.reason });
-    if (entry.kind !== "answer") continue;
-    const final = entry === answers.at(-1) && entry.calls.length === 0;
-    if (final && work.wrote) steps.push({ kind: "reply", chars: Number(input.chars) });
-    else if (final && work.briefed !== null) steps.push({ kind: "call", name: TOOL.writeReply, args: { brief: work.briefed }, result: written });
-    else if (entry.text.trim() !== "") steps.push({ kind: "said", text: entry.text });
-    for (const call of entry.calls) {
-      const result = results.get(call.id);
-      if (!result) continue;
-      const replied = call.name === TOOL.writeReply && !result.error;
-      steps.push({ kind: "call", name: call.name, args: call.args, result: replied ? written : result.text, ...(result.error ? { error: true as const } : {}) });
-    }
+/** An allowance as a page sent it, read: each member that is a whole number of zero or more, or null for no limit; anything else is left out. */
+function allowanceOf(raw: Readonly<Record<string, unknown>>): JobAllowance {
+  const out: JobAllowance = {};
+  for (const key of ["tokensIn", "tokensOut", "toolTurns", "wallMs"] as const) {
+    const value = raw[key];
+    if (value === null || (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)) out[key] = value;
   }
-  // A turn that ended short of its agents' own stop (its signal, a failure outside them) says so too.
-  if (input.stopped !== undefined && !steps.some((step) => step.kind === "stop")) steps.push({ kind: "stop", reason: input.stopped });
-  return steps;
+  return out;
 }

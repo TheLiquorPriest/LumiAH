@@ -1,23 +1,36 @@
-// A turn from the extension's side (DESIGN §2): the prompt interceptor tags a generation on the
-// loopback connection with a single-use tag and leaves out the messages the history cutoff hides;
-// the runtime shows the tag once and gets the turn back; and the record the turn leaves is written
-// on the reply's message once Lumiverse has saved it.
+// A turn from the extension's side (DESIGN §2, §25). The prompt interceptor sees every reply's
+// prompt and decides whose it is:
+//
+// - On a loopback connection it is a runtime's: the generation is tagged with a single-use tag and
+//   the messages the history cutoff hides are left out; the runtime shows the tag once and gets the
+//   turn back; and the record the turn leaves is written on the reply's message once Lumiverse has
+//   saved it.
+// - In a chat switched on to run built in, the turn is worked on here, before the prompt goes on
+//   (hosted.ts): this file knows the generation and where its record goes, as for a runtime's.
+// - Any other prompt is left exactly as it came.
 //
 // A generation is known from Lumiverse's own events: its start says which chat, what kind and which
 // message it writes; its end says the message it saved. The turn's id is its generation's.
+//
+// Every account's bookkeeping is its own (DESIGN §7): its verdicts, generations, turns and waiting
+// records sit in maps no other account's replies touch, and its own settings trim only them. What
+// bounds the worker over all accounts is fixed (`CEILINGS`), and past it the account that holds the
+// most gives up its oldest.
 
-import type { ActivatedLore, JsonValue, TurnKind, TurnRecord } from "../../core/ports";
+import type { ActivatedLore, JsonObject, TurnKind, TurnRecord } from "../../core/ports";
 import { recordOf } from "../../core/sessions";
 import type { Anchoring, SourceMark, TurnFacts } from "../../link/contract";
 import { TAG_PARAM, contentMark } from "../../link/contract";
-import { TRANSPORT_DEFAULTS, type TransportSettings } from "../../link/settings";
+import { CEILINGS, TRANSPORT_DEFAULTS, type TransportSettings } from "../../link/settings";
+import type { RunPlace } from "../../shared/ui";
 import type { Chats } from "./chat";
 import type { Connections } from "./connections";
 import { randomHex } from "./docs";
-import { LinkRefused, wordsOf } from "./errors";
+import { LinkRefused, wordsOf, wrongKey } from "./errors";
+import type { OpenTurns } from "./open";
 import type { RegistryStore } from "./registry";
 import type { SettingsStore } from "./settings";
-import type { BackendHost, GenerationEnded, GenerationStarted, GenerationStopped, HostGenerationType, InterceptorInput, InterceptorVerdict, PromptMessage } from "./spindle";
+import type { ActivatedInfo, BackendHost, GenerationEnded, GenerationStarted, GenerationStopped, HostGenerationType, InterceptorInput, InterceptorVerdict, PromptMessage } from "./spindle";
 
 /**
  * The interceptor's priority: Lumiverse runs the lowest first, so the largest number there is runs
@@ -38,16 +51,28 @@ interface Generation {
   type: HostGenerationType;
   targetMessageId: string | null;
   targetSwipeId: number | null;
+  /** That swipe was deleted while the generation ran: its turn's record has nowhere to go. */
+  targetGone?: true;
   at: number;
   /** Lumiverse said it ended: the message it saved (null: none), and when. */
   ended: { messageId: string | null; at: number } | null;
   stopped: boolean;
 }
 
-/** A generation LumiAH tagged, and what became of it. */
+/** Where a turn's record goes: the message, and the swipe as that message numbers it now. */
+export interface Target {
+  message: string | null;
+  swipe: number;
+  /** That swipe was deleted: the record has nowhere to go. */
+  gone: boolean;
+}
+
+/** A generation LumiAH answers, and what became of it. */
 export interface Turn {
   /** The turn's id: its generation's. */
   turn: string;
+  /** Where it runs (§25): in a runtime, which shows `tag` once to get it; or here, built in, where the tag is never sent and admits nobody. */
+  place: RunPlace;
   tag: string;
   userId: string;
   chatId: string;
@@ -56,23 +81,59 @@ export interface Turn {
   /** The persona the prompt was assembled for, where Lumiverse said: its attached world book applies to the chat. */
   personaId: string | null;
   sources: SourceMark[];
-  /** The World Info entries Lumiverse activated for the prompt. */
-  activated: { entryId: string; bookId: string | null; title: string }[];
+  /** The World Info entries Lumiverse activated for the prompt, and how each got there where it said. */
+  activated: ActivatedInfo[];
   at: number;
-  /** The runtime's request that spent the tag, and the runtime it came from; null while unspent. */
+  /** The runtime's request that spent the tag, and the runtime it came from; null while unspent, and for a turn that runs here. */
   request: string | null;
   relay: string | null;
   /** The turn as the runtime was told, once its target is known. */
   facts: Promise<Omit<TurnFacts, "settings">> | null;
+  /** Where its record goes, once it was fixed (a runtime's `begin`, or `aim` for a turn that runs here): moved down since by every swipe of that message deleted before it. */
+  target: Target | null;
+  /** The user stopped it from LumiAH's live view. */
+  stoppedHere: boolean;
 }
 
 interface Pending {
   turn: string;
   userId: string;
   chatId: string;
-  target: { message: string | null; swipe: number };
+  /** The turn's own target (`Turn.target`, the same object) while this extension holds the turn; else as the runtime said it. */
+  target: Target;
   record: TurnRecord;
+  /** What this backend keeps on the record beside the core's fields: where the turn ran, and why LumiAH had no part in the reply where it had none. */
+  ran: JsonObject;
   at: number;
+}
+
+/** Where a prompt is answered: in a runtime, here (built in), or nowhere (`false`: the prompt is none of LumiAH's). */
+type Verdict = RunPlace | false;
+
+/**
+ * One account's part of the interceptor's bookkeeping. Nothing in it is another account's: a turn
+ * is found by its account first, and what the account's own settings let go is its own.
+ */
+interface Account {
+  userId: string;
+  /**
+   * Where a prompt of a chat on a connection is answered, as last checked: `<connection> <chat>`
+   * to its verdict. A prompt known to be none of LumiAH's goes on without a wait, and a check that
+   * fails or takes too long never fails or holds up a chat that isn't known to be answered.
+   */
+  mine: Map<string, Verdict>;
+  /** The account's own wait for that check, how many verdicts and how many turns it keeps, as its settings last said; the defaults until they were first read. */
+  checkMs: number;
+  known: number;
+  held: number;
+  generations: Map<string, Generation>;
+  /** The latest generation started in each chat: how a prompt finds its generation where Lumiverse's context doesn't name it. */
+  latest: Map<string, string>;
+  byTag: Map<string, Turn>;
+  byTurn: Map<string, Turn>;
+  /** Each chat's latest turn. */
+  byChat: Map<string, Turn>;
+  pending: Map<string, Pending>;
 }
 
 export interface TurnsDeps {
@@ -80,8 +141,21 @@ export interface TurnsDeps {
   connections: Connections;
   registry: RegistryStore;
   settings: SettingsStore;
+  /** The turns something is owed to across a restart of this worker (open.ts). */
+  open: OpenTurns;
+  /** Whether a chat is switched on to run built in, from what the extension remembers alone (switch.ts). */
+  builtin(userId: string, chatId: string): Promise<boolean>;
+  /** A reply is about to go to a runtime (never a prompt preview): where that runtime isn't linked the user is told so, since nothing here answers in its place (§25). Not waited for. */
+  toRuntime?(userId: string, chatId: string): void;
+  /** The extension as its pages show it, for the words a reply that couldn't start is given. */
+  name: string;
   now(): number;
+  /** Runs `fn` once after `ms`; what it returns cancels that. */
+  later(ms: number, fn: () => void): () => void;
 }
+
+/** A built-in turn's part of the interceptor (hosted.ts): given the prompt, its turn and the places of the messages the history cutoff hides, what Lumiverse is to send. It never rejects. */
+export type HostedTurn = (input: InterceptorInput, turn: Turn, omit: number[]) => Promise<InterceptorVerdict>;
 
 /** The places of the history messages a prompt leaves out: all but the latest `count`, when only the latest are kept. */
 export function cutoff(messages: readonly PromptMessage[], history: TransportSettings["history"]): number[] {
@@ -90,22 +164,27 @@ export function cutoff(messages: readonly PromptMessage[], history: TransportSet
   return places.slice(0, Math.max(0, places.length - history.count));
 }
 
+/** A wait as its words say it: in seconds, or in milliseconds where it is under one. */
+const waitWords = (ms: number): string => (ms >= 1_000 ? `${Math.round(ms / 1_000)} s` : `${ms} ms`);
+
 export class Turns {
-  private readonly generations = new Map<string, Generation>();
-  /** The latest generation started in each chat: how a prompt finds its generation where Lumiverse's context doesn't name it. */
-  private readonly latest = new Map<string, string>();
-  private readonly byTag = new Map<string, Turn>();
-  private readonly byTurn = new Map<string, Turn>();
-  /** Each chat's latest tagged turn, by `user chat`. */
-  private readonly byChat = new Map<string, Turn>();
-  private readonly pending = new Map<string, Pending>();
+  private readonly accounts = new Map<string, Account>();
+  /** Where each generation, turn and waiting record is held, by its id: the one way to an account from an id alone (Lumiverse's events may not name the user). An id leaves it only when its own account holds nothing by it. */
+  private readonly home = new Map<string, Account>();
+  /** The generations whose account Lumiverse didn't name, until their prompt comes and says whose they are; and the latest of them in each chat. */
+  private readonly unowned = new Map<string, Generation>();
+  private readonly unownedLatest = new Map<string, string>();
+  /** What works a built-in turn before its prompt goes on (hosted.ts); null until the backend is put together. */
+  private hosted: HostedTurn | null = null;
+  /** How many swipe deletions were heard: a target read from the chat while one came is read again. */
+  private swipesDeleted = 0;
   private readonly begun: ((turn: Turn, facts: Omit<TurnFacts, "settings">) => void)[] = [];
   private readonly stopped: ((turn: Turn, why: string) => void)[] = [];
   private readonly over: ((generationId: string, chatId: string) => void)[] = [];
   private readonly answered: ((userId: string) => void)[] = [];
 
   constructor(
-    private readonly host: Pick<BackendHost, "log" | "lore">,
+    private readonly host: Pick<BackendHost, "log" | "lore" | "granted">,
     private readonly deps: TurnsDeps,
   ) {}
 
@@ -130,166 +209,512 @@ export class Turns {
   }
 
   turn(id: string): Turn | undefined {
-    return this.byTurn.get(id);
+    return this.home.get(id)?.byTurn.get(id);
   }
 
-  /** The latest turn tagged in a user's chat; none when it has had none since the extension started. */
+  /** The latest turn of a user's chat that LumiAH answered, in either place; none when it has had none since the extension started. */
   ofChat(userId: string, chatId: string): Turn | undefined {
-    return this.byChat.get(`${userId}\u0000${chatId}`);
+    return this.accounts.get(userId)?.byChat.get(chatId);
+  }
+
+  /** What works a built-in turn before its prompt goes on (hosted.ts). */
+  hostedBy(work: HostedTurn): void {
+    this.hosted = work;
+  }
+
+  // ---------------------------------------------------------------- an account's own
+
+  private of(userId: string): Account {
+    let account = this.accounts.get(userId);
+    if (account === undefined) {
+      const { checkMs, known, held } = TRANSPORT_DEFAULTS.tags;
+      account = { userId, mine: new Map(), checkMs, known, held, generations: new Map(), latest: new Map(), byTag: new Map(), byTurn: new Map(), byChat: new Map(), pending: new Map() };
+      this.accounts.set(userId, account);
+    }
+    return account;
+  }
+
+  /** A generation by its id, whoever's it is. */
+  private generation(id: string): Generation | undefined {
+    return this.home.get(id)?.generations.get(id) ?? this.unowned.get(id);
+  }
+
+  /** Something an account held by an id is gone: the id's place is forgotten once the account holds nothing by it. */
+  private let(account: Account, id: string): void {
+    if (this.home.get(id) === account && !account.generations.has(id) && !account.byTurn.has(id) && !account.pending.has(id)) this.home.delete(id);
+  }
+
+  private keep(account: Account, generation: Generation): void {
+    account.generations.set(generation.id, generation);
+    this.home.set(generation.id, account);
+  }
+
+  private dropGeneration(account: Account, id: string): void {
+    const generation = account.generations.get(id);
+    if (generation === undefined) return;
+    account.generations.delete(id);
+    if (account.latest.get(generation.chatId) === id) account.latest.delete(generation.chatId);
+    this.let(account, id);
+  }
+
+  /** A generation nobody was named for turns out to be this account's: its prompt came. */
+  private adopt(account: Account, generation: Generation): void {
+    this.unowned.delete(generation.id);
+    if (this.unownedLatest.get(generation.chatId) === generation.id) this.unownedLatest.delete(generation.chatId);
+    generation.userId = account.userId;
+    this.keep(account, generation);
+    account.latest.set(generation.chatId, generation.id);
+  }
+
+  private forget(account: Account, turn: Turn): void {
+    account.byTag.delete(turn.tag);
+    if (account.byTurn.get(turn.turn) === turn) account.byTurn.delete(turn.turn);
+    if (account.byChat.get(turn.chatId) === turn) account.byChat.delete(turn.chatId);
+    this.let(account, turn.turn);
+  }
+
+  /** Lets go of the account's oldest turns past its own "Tags remembered", and of its oldest generations past twice that: the generations are a superset of the turns (those on other connections are here too). */
+  private trim(account: Account): void {
+    while (account.byTag.size > account.held) {
+      const oldest = account.byTag.values().next().value;
+      if (oldest === undefined) break;
+      this.forget(account, oldest);
+    }
+    while (account.generations.size > account.held * 2) {
+      const oldest = account.generations.keys().next().value;
+      if (oldest === undefined) break;
+      this.dropGeneration(account, oldest);
+    }
+  }
+
+  /** Over every account: past `most`, the account that holds the most gives up its oldest, until the total fits. An account at work pays for its own numbers, never another's for them. */
+  private shed(most: number, count: (account: Account) => number, drop: (account: Account) => void): void {
+    let total = 0;
+    for (const account of this.accounts.values()) total += count(account);
+    while (total > most) {
+      let largest: Account | undefined;
+      for (const account of this.accounts.values()) if (largest === undefined || count(account) > count(largest)) largest = account;
+      if (largest === undefined || count(largest) === 0) return;
+      drop(largest);
+      total--;
+    }
+  }
+
+  /** The worker's own bounds over all accounts (`CEILINGS`): none of them is any account's setting. */
+  private bound(): void {
+    this.shed(
+      CEILINGS.turnsTotal,
+      (a) => a.byTag.size,
+      (a) => {
+        const oldest = a.byTag.values().next().value;
+        if (oldest !== undefined) this.forget(a, oldest);
+      },
+    );
+    this.shed(
+      CEILINGS.turnsTotal * 2,
+      (a) => a.generations.size,
+      (a) => this.dropGeneration(a, a.generations.keys().next().value ?? ""),
+    );
+    this.shed(
+      CEILINGS.verdictsTotal,
+      (a) => a.mine.size,
+      (a) => void a.mine.delete(a.mine.keys().next().value ?? ""),
+    );
+    this.shed(
+      CEILINGS.recordsTotal,
+      (a) => a.pending.size,
+      (a) => this.early(a),
+    );
+    while (this.unowned.size > CEILINGS.generationsUnowned) {
+      const oldest = this.unowned.values().next().value;
+      if (oldest === undefined) break;
+      this.unowned.delete(oldest.id);
+      if (this.unownedLatest.get(oldest.chatId) === oldest.id) this.unownedLatest.delete(oldest.chatId);
+    }
+  }
+
+  /** An account's oldest waiting record is written now, where its reply is, for want of room to wait. */
+  private early(account: Account): void {
+    const oldest = account.pending.values().next().value;
+    if (oldest === undefined) return;
+    account.pending.delete(oldest.turn);
+    this.let(account, oldest.turn);
+    void this.write(oldest, null);
   }
 
   // ---------------------------------------------------------------- Lumiverse's events
 
   started(event: GenerationStarted): void {
-    const held = this.generations.get(event.generationId);
+    const held = this.generation(event.generationId);
     if (held !== undefined) {
       // Said again once the reply's message is staged: what it adds is kept, nothing it leaves out is lost.
       held.targetMessageId = event.targetMessageId ?? held.targetMessageId;
       held.targetSwipeId = event.targetSwipeId ?? held.targetSwipeId;
-      held.userId = event.userId ?? held.userId;
+      if (held.userId === null && event.userId !== null) this.adopt(this.of(event.userId), held);
       return;
     }
-    this.generations.set(event.generationId, { id: event.generationId, chatId: event.chatId, userId: event.userId, type: event.type, targetMessageId: event.targetMessageId, targetSwipeId: event.targetSwipeId, at: this.deps.now(), ended: null, stopped: false });
-    this.latest.set(event.chatId, event.generationId);
+    const generation: Generation = { id: event.generationId, chatId: event.chatId, userId: event.userId, type: event.type, targetMessageId: event.targetMessageId, targetSwipeId: event.targetSwipeId, at: this.deps.now(), ended: null, stopped: false };
+    if (event.userId === null) {
+      this.unowned.set(generation.id, generation);
+      this.unownedLatest.set(generation.chatId, generation.id);
+    } else {
+      const account = this.of(event.userId);
+      this.keep(account, generation);
+      account.latest.set(generation.chatId, generation.id);
+      this.trim(account);
+    }
+    this.bound();
   }
 
   ended(event: GenerationEnded): void {
-    const generation = this.generations.get(event.generationId);
+    const generation = this.generation(event.generationId);
     const ended = { messageId: event.messageId, at: this.deps.now() };
     if (generation !== undefined) generation.ended = ended;
-    // One whose start wasn't heard (the extension started mid-generation) is kept as ended, so its turn's record, handed over later, goes on its message at once.
-    else this.generations.set(event.generationId, { id: event.generationId, chatId: event.chatId, userId: event.userId, type: "other", targetMessageId: null, targetSwipeId: null, at: ended.at, ended, stopped: false });
-    const pending = this.pending.get(event.generationId);
-    if (pending !== undefined) {
-      this.pending.delete(event.generationId);
-      void this.write(pending, event.messageId);
+    else {
+      // One whose start wasn't heard (the extension started mid-generation) is kept as ended, so its turn's record, handed over later, goes on its message at once.
+      const made: Generation = { id: event.generationId, chatId: event.chatId, userId: event.userId, type: "other", targetMessageId: null, targetSwipeId: null, at: ended.at, ended, stopped: false };
+      if (event.userId === null) this.unowned.set(made.id, made);
+      else this.keep(this.of(event.userId), made);
+      this.bound();
     }
+    this.handed(event.generationId, event.messageId);
+    void this.clear(event.generationId, event.messageId);
     for (const listener of this.over) listener(event.generationId, event.chatId);
   }
 
   stoppedBy(event: GenerationStopped): void {
-    const generation = this.generations.get(event.generationId);
+    const generation = this.generation(event.generationId);
     if (generation !== undefined) generation.stopped = true;
-    const turn = this.byTurn.get(event.generationId);
+    const turn = this.turn(event.generationId);
     if (turn !== undefined) for (const listener of this.stopped) listener(turn, "You stopped the reply in Lumiverse.");
     // Lumiverse keeps what a stopped reply had written, on the message it was writing: a record already handed over goes there.
-    const pending = this.pending.get(event.generationId);
-    if (pending !== undefined) {
-      this.pending.delete(event.generationId);
-      void this.write(pending, null);
-    }
+    this.handed(event.generationId, null);
+    void this.clear(event.generationId, null);
     for (const listener of this.over) listener(event.generationId, event.chatId);
+  }
+
+  /** A generation is over: the record that waited for it is written, on the message Lumiverse saved (`saved`), else on the one the turn targeted. */
+  private handed(generationId: string, saved: string | null): void {
+    const account = this.home.get(generationId);
+    const pending = account?.pending.get(generationId);
+    if (account === undefined || pending === undefined) return;
+    account.pending.delete(generationId);
+    this.let(account, generationId);
+    void this.write(pending, saved);
+  }
+
+  /** The user stopped a turn from LumiAH's live view: remembered, so the empty reply that may leave is taken away once its generation is over. */
+  stoppedFromLive(userId: string, turnId: string): void {
+    const turn = this.accounts.get(userId)?.byTurn.get(turnId);
+    if (turn !== undefined) turn.stoppedHere = true;
+  }
+
+  /**
+   * A swipe of a message was deleted, and the message's later swipes moved down by one. So does the
+   * place of every record still to be written on one of them: of the generations under way there,
+   * of the turns begun, and of the records waiting for their reply to be saved. One whose own swipe
+   * is the deleted one has nowhere to go: written where it was aimed, it would land on another reply.
+   */
+  swipeDeleted(chatId: string, messageId: string, deleted: number): void {
+    this.swipesDeleted++;
+    const moved = (generation: Generation): void => {
+      if (generation.chatId !== chatId || generation.targetMessageId !== messageId || generation.targetSwipeId === null || generation.targetGone) return;
+      if (generation.targetSwipeId > deleted) generation.targetSwipeId--;
+      else if (generation.targetSwipeId === deleted) generation.targetGone = true;
+    };
+    for (const generation of this.unowned.values()) moved(generation);
+    // The event names no user: the chat is looked for in every account's own.
+    for (const account of this.accounts.values()) {
+      for (const generation of account.generations.values()) moved(generation);
+      // A turn and its waiting record share one target: each is moved once.
+      const targets = new Set<Target>();
+      for (const turn of account.byTurn.values()) if (turn.chatId === chatId && turn.target !== null) targets.add(turn.target);
+      for (const pending of account.pending.values()) if (pending.chatId === chatId) targets.add(pending.target);
+      for (const target of targets) {
+        if (target.message !== messageId || target.gone) continue;
+        if (target.swipe > deleted) target.swipe--;
+        else if (target.swipe === deleted) target.gone = true;
+      }
+      for (const pending of [...account.pending.values()]) {
+        if (pending.chatId !== chatId || !pending.target.gone) continue;
+        account.pending.delete(pending.turn);
+        this.let(account, pending.turn);
+        this.host.log("warn", `[LumiAH] turn ${pending.turn.slice(0, 8)}: the swipe its reply was written on was deleted, so its record wasn't written`);
+      }
+    }
+  }
+
+  /**
+   * A generation is over. A new reply stopped from the live view before it had any text can leave
+   * its message behind, empty: Lumiverse keeps it when its Stop found thinking written, and saves it
+   * as a finished reply when the runtime couldn't make it stop the generation. That message goes.
+   * Never a regenerate's, a swipe's or a continue's, whose message was there before, and never one
+   * with text (`deleteEmpty`). `saved` is the message Lumiverse said it saved; null: the one the turn
+   * targeted. Without the permission to change a chat's messages nothing is deleted, and nothing is
+   * said of it: the pages say what that permission is for.
+   */
+  private async clear(generationId: string, saved: string | null): Promise<void> {
+    const turn = this.turn(generationId);
+    if (turn === undefined || !turn.stoppedHere || turn.kind !== "new" || !this.host.granted("chat_mutation")) return;
+    try {
+      const messageId = saved ?? (await turn.facts)?.target.message ?? null;
+      if (messageId !== null) await this.deps.chats.deleteEmpty(turn.userId, turn.chatId, messageId);
+    } catch (error) {
+      this.host.log("warn", `[LumiAH] turn ${turn.turn.slice(0, 8)}: the empty reply its stop left couldn't be deleted (${wordsOf(error)})`);
+    }
   }
 
   // ---------------------------------------------------------------- the interceptor
 
-  /** The generation a prompt belongs to: the one its context names, else the latest started in its chat that isn't tagged yet. */
-  private generationOf(input: InterceptorInput): Generation | null {
-    if (input.generationId !== null) {
-      const named = this.generations.get(input.generationId);
-      if (named !== undefined) return named;
-      // Its start wasn't heard (the extension started mid-generation): what the context says of it is enough to tag it.
-      const made: Generation = { id: input.generationId, chatId: input.chatId, userId: input.userId, type: input.type, targetMessageId: null, targetSwipeId: null, at: this.deps.now(), ended: null, stopped: false };
-      this.generations.set(made.id, made);
-      return made;
-    }
-    const id = this.latest.get(input.chatId);
-    const generation = id === undefined ? undefined : this.generations.get(id);
-    if (generation === undefined || generation.ended !== null || generation.stopped || generation.type !== input.type) return null;
-    if (generation.userId !== null && generation.userId !== input.userId) return null;
-    return this.byTurn.get(generation.id)?.request != null ? null : generation;
+  /** What may have changed which connections or chats are answered here (a runtime registered, the loopback connection was made, a chat was switched): the user's verdicts are checked again before they are used. */
+  unsure(userId: string): void {
+    this.accounts.get(userId)?.mine.clear();
   }
 
   /**
-   * The prompt interceptor (DESIGN §2 step 2). A prompt on any other connection than a loopback is
-   * left as it is. On a loopback, the messages the history cutoff hides are left out, and the
-   * generation is tagged: the tag goes into the request's body, where the runtime finds it. A prompt
-   * preview (a dry run) shows the cutoff and gets no tag, since nothing will be sent.
+   * Where a prompt is answered, as Lumiverse has the connections and the user has the switch now:
+   * in a runtime when it is on a loopback connection (its request reaches the runtime there,
+   * whatever the switch says), else here when its chat is switched on to run built in. The two are
+   * asked apart, so a chat switched on here is answered here though Lumiverse won't say what its
+   * connection is.
+   */
+  private async placeNow(input: InterceptorInput): Promise<Verdict> {
+    const { connections, chats } = this.deps;
+    const [loop, here] = await Promise.allSettled([
+      input.connectionId !== null ? connections.isLoopback(input.userId, input.connectionId) : chats.own(input.userId, input.chatId).then(async (chat) => (await connections.ofChat(input.userId, chat))?.loopback === true),
+      this.deps.builtin(input.userId, input.chatId),
+    ]);
+    if (loop.status === "fulfilled" && loop.value) return "runtime";
+    if (here.status === "fulfilled" && here.value) return "builtin";
+    if (loop.status === "rejected") throw loop.reason;
+    if (here.status === "rejected") throw here.reason;
+    return false;
+  }
+
+  /**
+   * The account's own settings for its bookkeeping, read before they are used, so that they hold
+   * from its first reply on. They are in memory after their first read; that first read is given
+   * the default wait for a check and no more, so a storage that doesn't answer holds no reply
+   * longer than the check itself may. Failing or late, what the account had stands.
+   */
+  private async tune(account: Account): Promise<TransportSettings | null> {
+    const read = this.deps.settings.transport(account.userId).then((transport) => {
+      account.checkMs = transport.tags.checkMs;
+      account.known = Math.min(transport.tags.known, CEILINGS.tagsKnown);
+      account.held = Math.min(transport.tags.held, CEILINGS.tagsHeld);
+      return transport;
+    });
+    const late = Promise.withResolvers<null>();
+    const unwait = this.deps.later(TRANSPORT_DEFAULTS.tags.checkMs, () => late.resolve(null));
+    try {
+      return await Promise.race([read, late.promise]);
+    } catch {
+      return null;
+    } finally {
+      unwait();
+      read.catch(() => undefined);
+    }
+  }
+
+  /**
+   * Where this prompt is answered. The check asks Lumiverse, which can fail (a permission revoked)
+   * or be slow. Nothing here may fail or hold up a chat that isn't LumiAH's, and nothing may cost a
+   * reply (the interceptor isn't required: a failure here leaves the prompt as it came):
+   * - known to be none of LumiAH's: it goes on at once, and the check runs behind it, for the next reply;
+   * - not known: the check is waited for, a bounded time; failing or late, the prompt goes on untouched;
+   * - known to run built in: failing or late, it is worked on here all the same;
+   * - known to be a runtime's: failing or late, the prompt is left untagged, in words Lumiverse
+   *   shows: tagged blindly, a connection that is no loopback any more would be sent the tag. The
+   *   runtime passes an untagged request on to the writer, so the reply is still written.
+   * A chat that became LumiAH's since it was last seen is so answered from its second reply on.
+   */
+  private async where(input: InterceptorInput): Promise<Verdict> {
+    const account = this.of(input.userId);
+    const key = `${input.connectionId ?? ""}\u0000${input.chatId}`;
+    const held = account.mine.get(key);
+    const began = this.deps.now();
+    const check = this.placeNow(input).then((verdict) => {
+      account.mine.delete(key);
+      account.mine.set(key, verdict);
+      for (const oldest of account.mine.keys()) {
+        if (account.mine.size <= account.known) break;
+        account.mine.delete(oldest);
+      }
+      this.bound();
+      return verdict;
+    });
+    // Whoever waits for it below hears how it went; nobody waiting is no failure of its own.
+    check.catch(() => undefined);
+    if (held === false) return false;
+    await this.tune(account);
+    const { checkMs } = account;
+    const late = Promise.withResolvers<never>();
+    const unwait = this.deps.later(Math.max(0, checkMs - (this.deps.now() - began)), () => late.reject(new Error(`Lumiverse didn't say within ${waitWords(checkMs)}`)));
+    try {
+      return await Promise.race([check, late.promise]);
+    } catch (error) {
+      if (held === undefined) {
+        this.host.log("warn", `[LumiAH] a reply's connection couldn't be checked (${wordsOf(error)}), so it was left as it is`);
+        return false;
+      }
+      if (held === "builtin") return "builtin";
+      throw new Error(`${this.deps.name} answers this chat in its runtime, and couldn't check its connection now (${wordsOf(error)}), so its agents had no part in this reply. Try again in a moment; if it keeps happening, see ${this.deps.name}'s Runtime page.`);
+    } finally {
+      unwait();
+    }
+  }
+
+  /** The generation a prompt belongs to: the one its context names, else the latest started in its chat that isn't tagged yet. Never another account's. */
+  private generationOf(input: InterceptorInput): Generation | null {
+    const account = this.of(input.userId);
+    if (input.generationId !== null) {
+      const holder = this.home.get(input.generationId);
+      if (holder !== undefined && holder !== account) return null;
+      const named = account.generations.get(input.generationId);
+      if (named !== undefined) return named;
+      const nobodys = this.unowned.get(input.generationId);
+      if (nobodys !== undefined) {
+        this.adopt(account, nobodys);
+        return nobodys;
+      }
+      // Its start wasn't heard (the extension started mid-generation): what the context says of it is enough to tag it.
+      const made: Generation = { id: input.generationId, chatId: input.chatId, userId: input.userId, type: input.type, targetMessageId: null, targetSwipeId: null, at: this.deps.now(), ended: null, stopped: false };
+      this.keep(account, made);
+      return made;
+    }
+    // The latest started in the chat, whether Lumiverse named its account or not.
+    const named = account.generations.get(account.latest.get(input.chatId) ?? "");
+    const nobodys = this.unowned.get(this.unownedLatest.get(input.chatId) ?? "");
+    const generation = named !== undefined && nobodys !== undefined ? (nobodys.at > named.at ? nobodys : named) : (named ?? nobodys);
+    if (generation === undefined || generation.ended !== null || generation.stopped || generation.type !== input.type) return null;
+    if (generation.userId === null) this.adopt(account, generation);
+    return account.byTurn.get(generation.id)?.request != null ? null : generation;
+  }
+
+  /** A generation becomes a turn of LumiAH's: known by its generation's id, by its chat and, for a runtime's, by its tag. The messages the cutoff hides are left out of what it says of the prompt's sources. */
+  private take(input: InterceptorInput, kind: TurnKind, generation: Generation, place: RunPlace, omit: readonly number[]): Turn {
+    const account = this.of(input.userId);
+    const left = new Set(omit);
+    const sources = input.messages.flatMap((m, i): SourceMark[] => {
+      if (left.has(i)) return [];
+      if (m.history && m.sourceId !== undefined && m.sourceIndex !== undefined) return [{ mark: contentMark(m.role, m.text), source: { kind: "history", messageId: m.sourceId, index: m.sourceIndex } }];
+      // A World Info entry Lumiverse put there as a message of its own (§24.1): which entry it is, the core works out from its text.
+      return m.lore ? [{ mark: contentMark(m.role, m.text), source: { kind: "lore" } }] : [];
+    });
+    const earlier = account.byTurn.get(generation.id);
+    if (earlier !== undefined) account.byTag.delete(earlier.tag);
+    const turn: Turn = { turn: generation.id, place, tag: randomHex(128), userId: input.userId, chatId: input.chatId, kind, presetId: input.presetId, personaId: input.personaId, sources, activated: input.activated, at: this.deps.now(), request: null, relay: null, facts: null, target: null, stoppedHere: false };
+    account.byTag.set(turn.tag, turn);
+    account.byTurn.set(turn.turn, turn);
+    account.byChat.set(turn.chatId, turn);
+    this.home.set(turn.turn, account);
+    this.trim(account);
+    this.bound();
+    return turn;
+  }
+
+  /**
+   * The prompt interceptor (DESIGN §2 step 2, §25). A prompt that is none of LumiAH's is left as it
+   * is. On a loopback, the messages the history cutoff hides are left out, and the generation is
+   * tagged: the tag goes into the request's body, where the runtime finds it. In a chat that runs
+   * built in, the turn is worked on here and the prompt goes on with its brief (hosted.ts). A prompt
+   * preview (a dry run) shows the cutoff and nothing else, since nothing will be sent.
    */
   async intercept(input: InterceptorInput): Promise<InterceptorVerdict> {
     const kind = KINDS[input.type];
     if (kind === undefined) return {};
-    const { connections, chats, settings } = this.deps;
-    const loopback = input.connectionId !== null ? await connections.isLoopback(input.userId, input.connectionId) : (await connections.ofChat(input.userId, await chats.own(input.userId, input.chatId)))?.loopback === true;
-    if (!loopback) return {};
-    const transport = await settings.transport(input.userId);
+    const place = await this.where(input);
+    if (place === false) return {};
+    if (place === "builtin") {
+      try {
+        return await this.here(input, kind);
+      } catch (error) {
+        // It never costs the user a reply: whatever fails before the turn begins, the prompt goes on as it came.
+        this.host.log("warn", `[LumiAH] a built-in turn couldn't begin (${wordsOf(error)}), so Lumiverse wrote this reply on its own`);
+        return {};
+      }
+    }
+    if (!input.dryRun) this.deps.toRuntime?.(input.userId, input.chatId);
+    // Without the permission to set a request's parameters the tag can't travel, so nothing is changed and the reply is the connection's own, whole. The pages say what that permission is for.
+    if (!this.host.granted("generation_parameters")) return {};
+    const transport = await this.deps.settings.transport(input.userId);
     const omit = cutoff(input.messages, transport.history);
     if (input.dryRun) return { omit };
     const generation = this.generationOf(input);
-    if (generation === null) throw new Error("LumiAH couldn't tell which generation this prompt belongs to, so the reply wasn't started. Send the message again.");
-    const left = new Set(omit);
-    const sources = input.messages.flatMap((m, i): SourceMark[] => (m.history && !left.has(i) && m.sourceId !== undefined && m.sourceIndex !== undefined ? [{ mark: contentMark(m.role, m.text), source: { kind: "history", messageId: m.sourceId, index: m.sourceIndex } }] : []));
-    const earlier = this.byTurn.get(generation.id);
-    if (earlier !== undefined) this.byTag.delete(earlier.tag);
-    const turn: Turn = { turn: generation.id, tag: randomHex(128), userId: input.userId, chatId: input.chatId, kind, presetId: input.presetId, personaId: input.personaId, sources, activated: input.activated, at: this.deps.now(), request: null, relay: null, facts: null };
-    this.byTag.set(turn.tag, turn);
-    this.byTurn.set(turn.turn, turn);
-    this.byChat.set(`${turn.userId}\u0000${turn.chatId}`, turn);
-    this.trim(transport.tags.held);
+    if (generation === null) throw new Error(`${this.deps.name} couldn't tell which generation this prompt belongs to, so its agents had no part in this reply. Send the message again.`);
+    const turn = this.take(input, kind, generation, "runtime", omit);
     return { omit, parameters: { [TAG_PARAM]: turn.tag } };
   }
 
-  /** Lets go of the oldest tags past `held`, and their generations with them. */
-  private trim(held: number): void {
-    while (this.byTag.size > held) {
-      const oldest = this.byTag.values().next().value;
-      if (oldest === undefined) return;
-      this.forget(oldest);
+  /** A prompt of a chat that runs built in: its turn is made known, and worked on before the prompt goes on. */
+  private async here(input: InterceptorInput, kind: TurnKind): Promise<InterceptorVerdict> {
+    const transport = await this.deps.settings.transport(input.userId);
+    const omit = cutoff(input.messages, transport.history);
+    if (input.dryRun) return { omit };
+    if (this.hosted === null) return {};
+    const generation = this.generationOf(input);
+    if (generation === null) {
+      this.host.log("warn", `[LumiAH] a prompt's generation couldn't be told, so Lumiverse wrote that reply on its own`);
+      return {};
     }
-    // The generations are a superset of the tagged ones (those on other connections are here too): bounded by the same number.
-    while (this.generations.size > held * 2) {
-      const oldest = this.generations.keys().next().value;
-      if (oldest === undefined) return;
-      const generation = this.generations.get(oldest);
-      this.generations.delete(oldest);
-      if (generation !== undefined && this.latest.get(generation.chatId) === oldest) this.latest.delete(generation.chatId);
-    }
+    return this.hosted(input, this.take(input, kind, generation, "builtin", omit), omit);
   }
 
-  private forget(turn: Turn): void {
-    this.byTag.delete(turn.tag);
-    if (this.byTurn.get(turn.turn) === turn) this.byTurn.delete(turn.turn);
-    const chat = `${turn.userId}\u0000${turn.chatId}`;
-    if (this.byChat.get(chat) === turn) this.byChat.delete(chat);
+  /** Fixes where a turn that runs here writes its record, as `begin` does for a runtime's: read from what Lumiverse said of its generation, else from the chat. */
+  async aim(turn: Turn): Promise<Target> {
+    turn.target ??= await this.targetOf(turn);
+    return turn.target;
   }
 
   // ---------------------------------------------------------------- the runtime's requests
 
-  /** The message and swipe a turn's reply is written to, as far as Lumiverse has said or the chat shows. */
-  private async targetOf(turn: Turn): Promise<{ message: string | null; swipe: number }> {
-    const generation = this.generations.get(turn.turn);
-    let message = generation?.targetMessageId ?? null;
-    let swipe = generation?.targetSwipeId ?? null;
-    if (message === null) {
-      // Lumiverse didn't name it. A swipe, a regenerate and a continue write the chat's last message; a new reply writes the empty message staged for it, when there is one.
-      const last = await this.deps.chats.last(turn.chatId);
-      if (last !== null && last.role === "assistant" && (turn.kind !== "new" || last.content === "")) {
-        message = last.id;
-        swipe = last.swipeId;
-      }
-    } else if (swipe === null) swipe = (await this.deps.chats.find(turn.chatId, message))?.swipeId ?? null;
-    return { message, swipe: swipe ?? 0 };
+  /**
+   * The message and swipe a turn's reply is written to, as far as Lumiverse has said or the chat
+   * shows. Read again when a swipe was deleted meanwhile: the one the chat showed may have moved.
+   */
+  private async targetOf(turn: Turn): Promise<Target> {
+    for (;;) {
+      const heard = this.swipesDeleted;
+      const generation = this.generation(turn.turn);
+      let message = generation?.targetMessageId ?? null;
+      let swipe = generation?.targetSwipeId ?? null;
+      if (message === null) {
+        // Lumiverse didn't name it. A swipe, a regenerate and a continue write the chat's last message; a new reply writes the empty message staged for it, when there is one.
+        const last = await this.deps.chats.last(turn.chatId);
+        if (last !== null && last.role === "assistant" && (turn.kind !== "new" || last.content === "")) {
+          message = last.id;
+          swipe = last.swipeId;
+        }
+      } else if (swipe === null) swipe = (await this.deps.chats.find(turn.chatId, message))?.swipeId ?? null;
+      if (this.swipesDeleted === heard) return { message, swipe: swipe ?? 0, gone: generation?.targetGone === true };
+    }
   }
 
   /**
    * `turn.begin` (DESIGN §2 step 4): the loopback key and the tag checked, the tag spent, the turn
    * answered. A tag admits one request: the same request asked again (after a reconnect) is answered
-   * as before, and any other is refused.
+   * as before, and any other is refused. A tag is looked for among the caller's own alone: another
+   * account's is no tag at all to this one.
    */
   async begin(userId: string, relay: string, key: unknown, tag: unknown, request: unknown): Promise<TurnFacts> {
-    if (typeof key !== "string" || typeof tag !== "string" || typeof request !== "string" || request === "") throw new LinkRefused("bad_request", "The turn's request is malformed: update the runtime and LumiAH to the same build.");
-    if (!(await this.deps.registry.keyIs(userId, key))) throw new LinkRefused("forbidden", "The key in the loopback connection isn't this account's loopback key. Mint a new one on LumiAH's Runtime page: your linked runtime puts it in the connection.");
+    const { name } = this.deps;
+    if (typeof key !== "string" || typeof tag !== "string" || typeof request !== "string" || request === "") throw new LinkRefused("bad_request", `The turn's request is malformed: update the runtime and ${name} to the same build.`);
+    if (!(await this.deps.registry.keyIs(userId, key))) throw wrongKey(name);
     const lifeMs = (await this.deps.settings.transport(userId)).tags.lifeMs;
     const settings = await this.deps.settings.revision(userId);
-    const turn = this.byTag.get(tag);
-    if (turn === undefined || this.deps.now() - turn.at > lifeMs) throw new LinkRefused("not_found", "LumiAH doesn't know this reply's tag: the extension started again since the reply was asked for, or the tag is too old. Send the message again.");
-    if (turn.userId !== userId) throw new LinkRefused("forbidden", "This reply's tag belongs to another account.");
+    const turn = this.accounts.get(userId)?.byTag.get(tag);
+    // A turn that runs here has a tag too, which is never sent: no request may be answered by it.
+    if (turn === undefined || turn.place !== "runtime" || this.deps.now() - turn.at > lifeMs) throw new LinkRefused("not_found", `${name} doesn't know this reply's tag: the extension started again since the reply was asked for, or the tag is too old. Send the message again.`);
     if (turn.request !== null && turn.request !== request) throw new LinkRefused("conflict", "This reply's tag was already used. A tag admits one request, so this one wasn't answered: send the message again.");
     if (turn.facts === null) {
       turn.request = request;
       turn.relay = relay;
       turn.facts = this.targetOf(turn).then((target) => {
-        const facts: Omit<TurnFacts, "settings"> = { turn: turn.turn, user: turn.userId, chat: turn.chatId, generation: turn.turn, kind: turn.kind, target, preset: turn.presetId, sources: turn.sources };
+        // Kept apart from what the runtime is told: a swipe deleted later moves this one, and the runtime's copy stays as it was said.
+        turn.target = target;
+        // The record this turn leaves is handed over when the turn ends, which may be after this worker was restarted: what says the turn began here outlives it.
+        void this.deps.open.put(userId, { turn: turn.turn, chatId: turn.chatId, place: "runtime", kind: turn.kind, target: { message: target.message, swipe: target.swipe }, at: this.deps.now() }).catch((error: unknown) => this.host.log("warn", `[LumiAH] turn ${turn.turn.slice(0, 8)} couldn't be kept across a restart (${wordsOf(error)})`));
+        const facts: Omit<TurnFacts, "settings"> = { turn: turn.turn, user: turn.userId, chat: turn.chatId, generation: turn.turn, kind: turn.kind, target: { message: target.message, swipe: target.swipe }, preset: turn.presetId, sources: turn.sources };
         for (const listener of this.begun) listener(turn, facts);
         return facts;
       });
@@ -299,30 +724,59 @@ export class Turns {
 
   /**
    * `turn.commit` (DESIGN §2 step 8): the turn's record goes on the reply's message, now when
-   * Lumiverse has saved the reply, else when it says it has.
+   * Lumiverse has saved the reply, else when it says it has. A record is taken only for a turn the
+   * backend knows began here: one this worker holds, or one the worker before it kept (open.ts).
+   * `ran` is given for a turn that ran here (hosted.ts): where it ran, and why LumiAH had no part
+   * in the reply where it had none; a runtime's record is marked as the runtime's.
    */
-  async commit(userId: string, turnId: unknown, chatId: unknown, target: unknown, rawRecord: unknown): Promise<Anchoring> {
+  async commit(userId: string, turnId: unknown, chatId: unknown, target: unknown, rawRecord: unknown, ran?: JsonObject): Promise<Anchoring> {
+    const { name, open } = this.deps;
     const record = recordOf(rawRecord);
     const where = target as { message?: unknown; swipe?: unknown } | null;
     if (typeof turnId !== "string" || typeof chatId !== "string" || record === null || where === null || typeof where !== "object" || !(where.message === null || typeof where.message === "string") || typeof where.swipe !== "number" || !Number.isSafeInteger(where.swipe) || where.swipe < 0) {
-      throw new LinkRefused("bad_request", "The turn's record is malformed: update the runtime and LumiAH to the same build.");
+      throw new LinkRefused("bad_request", `The turn's record is malformed: update the runtime and ${name} to the same build.`);
     }
     await this.deps.chats.own(userId, chatId);
-    const known = this.byTurn.get(turnId);
-    if (known !== undefined && (known.userId !== userId || known.chatId !== chatId)) throw new LinkRefused("forbidden", "That turn isn't this account's.");
-    const pending: Pending = { turn: turnId, userId, chatId, target: { message: where.message, swipe: where.swipe }, record, at: this.deps.now() };
-    const generation = this.generations.get(turnId);
+    const account = this.of(userId);
+    const known = account.byTurn.get(turnId);
+    const kept = known === undefined ? await open.get(userId, turnId) : null;
+    const place = known?.place ?? kept?.place;
+    if (place === undefined || (known?.chatId ?? kept?.chatId) !== chatId) throw new LinkRefused("not_found", `${name} knows no such turn in that chat, so its record wasn't taken: a record is kept only for a reply that began here.`);
+    if (place === "builtin" && ran === undefined) throw new LinkRefused("forbidden", "That turn ran built in: its record is the extension's own to write.");
+    // What was owed to the turn is in hand now.
+    void open.drop(userId, turnId).catch(() => undefined);
+    // The runtime says the target it was told at `begin`. Where this extension still holds the turn, its own stands: a swipe deleted since has moved it.
+    const pending: Pending = { turn: turnId, userId, chatId, target: known?.target ?? { message: where.message, swipe: where.swipe, gone: false }, record, ran: ran ?? { place: "runtime" }, at: this.deps.now() };
+    if (pending.target.gone) {
+      this.host.log("warn", `[LumiAH] turn ${turnId.slice(0, 8)}: the swipe its reply was written on was deleted, so its record wasn't written`);
+      return "never";
+    }
+    // A generation this worker doesn't know began before it started, and its end may have been said while nobody listened: the chat shows whether the reply is saved.
+    if (this.generation(turnId) === undefined && (await this.saved(pending))) return (await this.write(pending, null)) ? "now" : "never";
+    // Read after that look at the chat: the generation's end may have been said meanwhile.
+    const generation = this.generation(turnId);
     if (generation?.ended != null) return (await this.write(pending, generation.ended.messageId)) ? "now" : "never";
     if (generation?.stopped === true) return (await this.write(pending, null)) ? "now" : "never";
-    this.pending.set(turnId, pending);
-    const held = (await this.deps.settings.transport(userId)).anchors.held;
-    while (this.pending.size > held) {
-      const oldest = this.pending.values().next().value;
-      if (oldest === undefined) break;
-      this.pending.delete(oldest.turn);
-      void this.write(oldest, null);
-    }
+    account.pending.set(turnId, pending);
+    this.home.set(turnId, account);
+    // The account's own "Records waiting", and no other's: past it, its own oldest is written where its reply is now.
+    const held = Math.min((await this.deps.settings.transport(userId)).anchors.held, CEILINGS.recordsWaiting);
+    while (account.pending.size > held) this.early(account);
+    this.bound();
     return "on_save";
+  }
+
+  /**
+   * Whether the chat shows a record's reply as saved: its message shows the swipe the turn wrote, and
+   * that swipe holds text. Lumiverse leaves a new reply's, a swipe's and a regenerate's swipe empty
+   * until it saves it. A continue's held text before it began, so it tells nothing; nor does a read
+   * that fails. The record then waits as it would have.
+   */
+  private async saved(pending: Pending): Promise<boolean> {
+    const { message, swipe } = pending.target;
+    if (message === null || pending.record.kind === "continue") return false;
+    const shown = await this.deps.chats.find(pending.chatId, message).catch(() => null);
+    return shown !== null && shown.swipeId === swipe && shown.content !== "";
   }
 
   /**
@@ -332,49 +786,76 @@ export class Turns {
    * saved). False when there is no message to write it on.
    */
   private async write(pending: Pending, saved: string | null): Promise<boolean> {
-    const messageId = saved ?? pending.target.message;
+    const { target } = pending;
+    const messageId = saved ?? target.message;
+    const turn = pending.turn.slice(0, 8);
+    // Without the permission to change a chat's messages no record can be written. The pages say what that costs; it isn't logged reply after reply as something that went wrong.
+    if (!this.host.granted("chat_mutation")) return false;
     try {
       if (messageId === null) {
-        this.host.log("warn", `[LumiAH] turn ${pending.turn.slice(0, 8)}: its reply wasn't saved, so its record wasn't written`);
+        this.host.log("warn", `[LumiAH] turn ${turn}: its reply wasn't saved, so its record wasn't written`);
         return false;
       }
-      const swipe = messageId === pending.target.message ? pending.target.swipe : null;
-      const written = await this.deps.chats.anchor(pending.userId, pending.chatId, messageId, swipe, pending.record as unknown as JsonValue);
-      if (!written) this.host.log("warn", `[LumiAH] turn ${pending.turn.slice(0, 8)}: its reply's message is gone, so its record wasn't written`);
-      else for (const listener of this.answered) listener(pending.userId);
-      return written;
+      const own = messageId === target.message;
+      for (;;) {
+        if (own && target.gone) {
+          this.host.log("warn", `[LumiAH] turn ${turn}: the swipe its reply was written on was deleted, so its record wasn't written`);
+          return false;
+        }
+        const aimed = target.swipe;
+        // The core's record, with what this backend keeps beside it (`ran`): the core reads its own fields and passes over the rest.
+        const written = await this.deps.chats.anchor(pending.userId, pending.chatId, messageId, own ? () => target.swipe : null, { ...(pending.record as unknown as JsonObject), ran: pending.ran });
+        if (written) {
+          for (const listener of this.answered) listener(pending.userId);
+          return true;
+        }
+        // No place for it where it was aimed. A swipe deleted while it was being written moved the turn's own: once more, where that is now.
+        if (own && (target.gone || target.swipe !== aimed)) continue;
+        this.host.log("warn", `[LumiAH] turn ${turn}: its reply's message is gone, so its record wasn't written`);
+        return false;
+      }
     } catch (error) {
-      this.host.log("error", `[LumiAH] turn ${pending.turn.slice(0, 8)}: its record couldn't be written (${wordsOf(error)})`);
+      this.host.log("error", `[LumiAH] turn ${turn}: its record couldn't be written (${wordsOf(error)})`);
       return false;
     }
   }
 
   /** `lore.activated`: the entries Lumiverse activated for a generation, each with its text as stored. */
   async activated(userId: string, chatId: string, generationId: string): Promise<ActivatedLore[]> {
-    const turn = this.byTurn.get(generationId);
-    if (turn === undefined || turn.userId !== userId || turn.chatId !== chatId) return [];
     const out: ActivatedLore[] = [];
-    for (const a of turn.activated) {
+    for (const a of this.activatedInfo(userId, chatId, generationId)) {
       const entry = await this.host.lore.entry(a.entryId, userId).catch(() => null);
       if (entry !== null) out.push({ entryId: a.entryId, bookId: a.bookId ?? entry.bookId, title: a.title !== "" ? a.title : entry.title, content: entry.content });
     }
     return out;
   }
 
-  /** Every so often: a record whose reply was never said saved is written where it can be, and what is too old is let go. */
+  /** The entries Lumiverse activated for a generation, each as its prompt's context named it: which, of which book, and how it got there (§24.1). None for a generation LumiAH had no turn in. */
+  activatedInfo(userId: string, chatId: string, generationId: string): ActivatedInfo[] {
+    const turn = this.accounts.get(userId)?.byTurn.get(generationId);
+    return turn === undefined || turn.chatId !== chatId ? [] : turn.activated;
+  }
+
+  /** Every so often: a record whose reply was never said saved is written where it can be, and what is too old is let go, account by account and each by its own settings. */
   async tick(): Promise<void> {
     const now = this.deps.now();
-    const of = async (userId: string | null): Promise<TransportSettings> => (userId === null ? TRANSPORT_DEFAULTS : this.deps.settings.transport(userId).catch(() => TRANSPORT_DEFAULTS));
-    for (const pending of [...this.pending.values()]) {
-      if (now - pending.at <= (await of(pending.userId)).anchors.waitMs) continue;
-      this.pending.delete(pending.turn);
-      void this.write(pending, null);
+    for (const account of [...this.accounts.values()]) {
+      const transport = await this.deps.settings.transport(account.userId).catch(() => TRANSPORT_DEFAULTS);
+      for (const pending of [...account.pending.values()]) {
+        if (now - pending.at <= transport.anchors.waitMs) continue;
+        account.pending.delete(pending.turn);
+        this.let(account, pending.turn);
+        void this.write(pending, null);
+      }
+      for (const turn of [...account.byTag.values()]) if (now - turn.at > transport.tags.lifeMs && !account.pending.has(turn.turn)) this.forget(account, turn);
+      for (const [id, generation] of [...account.generations]) if (now - generation.at > transport.tags.lifeMs && !account.byTurn.has(id) && !account.pending.has(id)) this.dropGeneration(account, id);
+      // A runtime's turn whose record never came (the runtime went away for good) is owed nothing past its tag's life.
+      for (const kept of await this.deps.open.list(account.userId).catch(() => [])) if (kept.place === "runtime" && now - kept.at > transport.tags.lifeMs) await this.deps.open.drop(account.userId, kept.turn).catch(() => undefined);
     }
-    for (const turn of [...this.byTag.values()]) if (now - turn.at > (await of(turn.userId)).tags.lifeMs && !this.pending.has(turn.turn)) this.forget(turn);
-    for (const [id, generation] of [...this.generations]) {
-      if (now - generation.at <= (await of(generation.userId)).tags.lifeMs || this.byTurn.has(id) || this.pending.has(id)) continue;
-      this.generations.delete(id);
-      if (this.latest.get(generation.chatId) === id) this.latest.delete(generation.chatId);
+    for (const [id, generation] of [...this.unowned]) {
+      if (now - generation.at <= TRANSPORT_DEFAULTS.tags.lifeMs) continue;
+      this.unowned.delete(id);
+      if (this.unownedLatest.get(generation.chatId) === id) this.unownedLatest.delete(generation.chatId);
     }
   }
 }

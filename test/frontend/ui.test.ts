@@ -5,12 +5,13 @@ import { describe, expect, test } from "bun:test";
 import { finishedTurn } from "../../dev/preview/fixtures";
 import { MockBackend } from "../../dev/preview/mock-backend";
 import { sampleSettings } from "../../dev/preview/sections";
-import { chatAnswered, followDelta, followLive, followState, type LiveDelta, type LiveEvent, type LivePartial, type LiveView, startLine, UI_VERSION, type UiRequests, type UiRequestType, uiMessageOf, uiRequestOf, URL_SLOT } from "../../src/shared/ui";
+import { chatAnswered, type ChatView, citationsOf, followDelta, followLive, followState, type LiveDelta, type LiveEvent, type LivePartial, type LiveView, loreChangesOf, promptHeldOf, replyDid, startLine, type TraceEvent, type TranscriptEntry, UI_VERSION, type UiRequestType, uiMessageOf, uiRequestOf, URL_SLOT } from "../../src/shared/ui";
+import { BODIES } from "./bodies";
 
 const T0 = Date.UTC(2026, 10, 10, 9, 0, 0);
 const EVENTS = finishedTurn("chat-mara", "turn-1", T0).events;
 
-const view = (upTo: number, turn = "turn-1", partials: LivePartial[] = []): LiveView => ({ chatId: "chat-mara", turn, kind: "new", messageId: null, startedAt: T0, ended: null, events: EVENTS.slice(0, upTo), partials });
+const view = (upTo: number, turn = "turn-1", partials: LivePartial[] = []): LiveView => ({ stream: "chat-mara", chatId: "chat-mara", turn, kind: "new", messageId: null, startedAt: T0, ended: null, events: EVENTS.slice(0, upTo), partials });
 
 describe("following a live view", () => {
   test("a new turn's view takes the place of whatever the page held", () => {
@@ -146,7 +147,7 @@ describe("following the state", () => {
   const state = new MockBackend(() => {}, { scenario: "ready", turn: "none", sections: settled.sections, texts: settled.texts, delay: 0, page: 50, fail: new Set(), now: () => T0, later: () => () => {} }).state;
 
   test("the next push replaces the parts it carries, each whole", () => {
-    const next = followState(state, { rev: state.rev + 1, patch: { running: [{ chatId: "chat-mara", turn: "t", kind: "swipe", startedAt: T0 }] } });
+    const next = followState(state, { rev: state.rev + 1, patch: { running: [{ stream: "chat-mara", chatId: "chat-mara", turn: "t", kind: "swipe", startedAt: T0, paused: false }] } });
     expect(next?.rev).toBe(state.rev + 1);
     expect(next?.running).toHaveLength(1);
     expect(next?.settings).toBe(state.settings);
@@ -161,27 +162,6 @@ describe("following the state", () => {
 });
 
 describe("what the backend takes for a request", () => {
-  /** One well-formed body per request: a request added to the contract must be added here to compile. */
-  const BODIES: { [K in UiRequestType]: UiRequests[K]["body"] } = {
-    "lah.hello": {},
-    "lah.chat.get": { chatId: "chat-mara" },
-    "lah.chat.set": { chatId: "chat-mara", on: true },
-    "lah.live.open": { chatId: "chat-mara" },
-    "lah.live.events": { chatId: "chat-mara", turn: "turn-1", from: 1 },
-    "lah.live.close": { chatId: "chat-mara" },
-    "lah.turn.stop": { chatId: "chat-mara", turn: "turn-1" },
-    "lah.turns.list": { chatId: "chat-mara", cursor: null, limit: 20 },
-    "lah.transcript.get": { chatId: "chat-mara", transcript: "t".repeat(64), from: 1 },
-    "lah.prompt.get": { prompt: "p".repeat(64) },
-    "lah.blob.get": { hash: "b".repeat(64) },
-    "lah.session.rollback": { chatId: "chat-mara", messageId: "msg-1", swipe: 0 },
-    "lah.settings.set": { set: [{ path: ["core", "reply", "writer"], value: null }], reset: [[]] },
-    "lah.models.list": { connectionId: null },
-    "lah.text.set": { id: "main.system", text: "" },
-    "lah.text.reset": { id: "main.system" },
-    "lah.key": { op: "mint" },
-    "lah.relay": { op: "rotate", relay: "relay-1" },
-  };
   const envelope = (type: string, body: object, reqId: unknown = "r1"): Record<string, unknown> => ({ lah: UI_VERSION, type, reqId, ...body });
 
   test("every request of the contract, well formed, is taken", () => {
@@ -213,9 +193,42 @@ describe("what the backend takes for a request", () => {
 
   test("a request with a field missing or of the wrong kind is refused, by name", () => {
     const bad: [UiRequestType, object][] = [
+      ["lah.hello", { active: 5 }],
+      ["lah.job.start", { chatId: "chat-mara", agent: "archivist", task: "Learn the story so far.", when: "now", allowance: { tokensIn: -1 } }],
+      ["lah.job.grant", { id: "job-1" }],
+      ["lah.job.grant", { id: "job-1", allowance: { wallMs: "an hour" } }],
+      ["lah.job.resume", {}],
+      ["lah.session.summarize", {}],
       ["lah.chat.get", {}],
       ["lah.chat.set", { chatId: "chat-mara", on: "yes" }],
-      ["lah.live.events", { chatId: "chat-mara", turn: "turn-1", from: 0 }],
+      ["lah.chat.takeover", { chatId: "" }],
+      ["lah.chat.takeover", {}],
+      ["lah.live.events", { stream: "chat-mara", turn: "turn-1", from: 0 }],
+      ["lah.live.open", { chatId: "chat-mara" }],
+      ["lah.turn.say", { stream: "chat-mara", turn: "turn-1", text: "   " }],
+      ["lah.approval.answer", { id: "held-1", answer: { decision: "refuse" } }],
+      ["lah.approval.answer", { id: "held-1", decision: "once" }],
+      ["lah.approvals.kept", {}],
+      ["lah.approval.forget", { chatId: "chat-mara" }],
+      ["lah.approval.forget", { chatId: null, tool: "workspace_write" }],
+      ["lah.ws.list", { chatId: null, area: "chat" }],
+      ["lah.ws.list", { chatId: "chat-mara", area: "everything" }],
+      ["lah.ws.read", { chatId: null, area: "user", path: "a.md", version: 3 }],
+      ["lah.ws.write", { chatId: null, area: "user", path: "", text: "x", base: null }],
+      ["lah.ws.write", { chatId: null, area: "user", path: "a.md", text: "x" }],
+      ["lah.ws.move", { chatId: null, area: "user", from: "a.md", to: "b.md", base: null }],
+      ["lah.ws.pin", { chatId: null, area: "user", path: "a.md", on: true }],
+      ["lah.guidance.set", { chatId: null, level: "chat", text: "x", base: null }],
+      ["lah.agent.save", { agent: { id: "a", name: "A", description: "" } }],
+      ["lah.def.switch", { kind: "page", id: "live", off: true }],
+      ["lah.tool.approval", { name: "workspace_write", approval: "never" }],
+      ["lah.tier.approval", { tier: "write", approval: null }],
+      ["lah.jobs.set", {}],
+      ["lah.job.start", { chatId: "chat-mara", agent: "archivist", task: "", when: "now" }],
+      ["lah.job.start", { chatId: "chat-mara", agent: "archivist", task: "Tidy the notes.", when: "tomorrow" }],
+      ["lah.side.send", { session: "side-notes", text: "" }],
+      ["lah.spend.get", { days: 0 }],
+      ["lah.spend.get", { days: 30, timeZone: 60 }],
       ["lah.turns.list", { chatId: "chat-mara", cursor: null, limit: 0 }],
       ["lah.turns.list", { chatId: "chat-mara", limit: 20 }],
       ["lah.session.rollback", { chatId: "chat-mara", messageId: "msg-1", swipe: -1 }],
@@ -226,6 +239,26 @@ describe("what the backend takes for a request", () => {
       ["lah.relay", { op: "rotate" }],
       ["lah.blob.get", { hash: "x".repeat(257) }],
       ["lah.text.set", { id: "main.system" }],
+      // Where a chat runs is one of the two places, and nothing else.
+      ["lah.chat.set", { chatId: "chat-mara", on: true, place: "cloud" }],
+      ["lah.chat.set", { chatId: "chat-mara", on: true, place: null }],
+      ["lah.job.start", { chatId: "chat-mara", agent: "main", task: "Learn this story.", when: "now", story: false }],
+      // Home's read names a chat or none; the pages of a chat's lore and chronicle always name one.
+      ["lah.home.get", {}],
+      ["lah.home.get", { chatId: 7 }],
+      ["lah.lore.get", { chatId: null }],
+      ["lah.lore.entry", { chatId: "chat-mara" }],
+      ["lah.lore.search", { chatId: "chat-mara", queries: [] }],
+      ["lah.lore.search", { chatId: "chat-mara", queries: ["night key", "  "] }],
+      ["lah.lore.search", { chatId: "chat-mara", queries: "night key" }],
+      ["lah.lore.search", { chatId: "chat-mara", queries: ["night key"], limit: 0 }],
+      ["lah.lore.embed", { chatId: "chat-mara" }],
+      ["lah.lore.embed", { chatId: "chat-mara", start: "yes" }],
+      ["lah.chronicle.get", {}],
+      ["lah.chronicle.cited", { chatId: "chat-mara" }],
+      ["lah.chronicle.cited", { chatId: "chat-mara", citations: [] }],
+      ["lah.chronicle.cited", { chatId: "chat-mara", citations: ["[#38 a3f9c27e]", ""] }],
+      ["lah.story.get", { chatId: "" }],
     ];
     for (const [type, body] of bad) expect(uiRequestOf(envelope(type, body))).toEqual({ malformed: `The request ${type} is malformed.`, reqId: "r1" });
   });
@@ -255,10 +288,76 @@ describe("what a page works out for itself", () => {
     }
   });
 
-  test("a chat is answered by LumiAH while its connection is the loopback, whatever the switch last said", () => {
-    const chat = { chatId: "chat-mara", name: "Mara at the harbour", on: true, since: 1 };
-    expect(chatAnswered({ ...chat, connection: { id: "c1", name: "LumiAH loopback", loopback: true } })).toBe(true);
-    expect(chatAnswered({ ...chat, connection: { id: "c2", name: "Deepseek", loopback: false } })).toBe(false);
-    expect(chatAnswered({ ...chat, connection: null })).toBe(false);
+  test("a chat is answered where it is switched on to run built in, or generates on a loopback connection, whatever the switch last said", () => {
+    const chat = { chatId: "chat-mara", name: "Mara at the harbour", since: 1 };
+    const loopback = { id: "c1", name: "LumiAH loopback", loopback: true };
+    const own = { id: "c2", name: "Deepseek", loopback: false };
+    const answered = (over: Pick<ChatView, "on" | "place" | "connection">): boolean => chatAnswered({ ...chat, ...over });
+    // Built in, the chat keeps its own connection, and no connection at all doesn't matter.
+    expect(answered({ on: true, place: "builtin", connection: own })).toBe(true);
+    expect(answered({ on: true, place: "builtin", connection: null })).toBe(true);
+    expect(answered({ on: false, place: "builtin", connection: own })).toBe(false);
+    // In a runtime, it is answered through the loopback: off it, its replies don't reach LumiAH.
+    expect(answered({ on: true, place: "runtime", connection: loopback })).toBe(true);
+    expect(answered({ on: true, place: "runtime", connection: own })).toBe(false);
+    expect(answered({ on: true, place: "runtime", connection: null })).toBe(false);
+    expect(answered({ on: false, place: "runtime", connection: loopback })).toBe(true);
+  });
+
+  test("a chronicle line's citations are read in the order written, each with where it starts", () => {
+    const line = "- Okoro signed the ledger [#38 a3f9c27e]; Ilse holds the night key [#412 0c1d9e3a]";
+    expect(citationsOf(line)).toEqual([
+      { citation: "[#38 a3f9c27e]", index: 38, hash: "a3f9c27e", start: line.indexOf("[#38") },
+      { citation: "[#412 0c1d9e3a]", index: 412, hash: "0c1d9e3a", start: line.indexOf("[#412") },
+    ]);
+    // What only looks like one is none: a hash is eight hex characters or more, and a number is a number.
+    expect(citationsOf("- Brann keeps the day key [#40] [#x a3f9c27e] [#40 a3f9] [40 a3f9c27e]")).toEqual([]);
+    expect(citationsOf("- Joss never lies to Mara")).toEqual([]);
+  });
+
+  test("what the prompt held and the lore the writer saw are read from a trace by their shape", () => {
+    const held = { kind: "prompt_held", lore: [{ entryId: "lore-harbour-office", bookId: "book-harbour", title: "The harbour office", chars: 212, tokens: 53, why: { by: "key", key: "harbour office" }, message: 2 }], index: { listed: [], more: 4 }, history: { held: [[30, 47]], missing: [[1, 29]], stands: [{ kind: "summary", name: "Lumiverse's summary" }] }, at: T0 };
+    // Core's union names the event once its hook has landed; until then a trace carries it all the same.
+    const event = held as unknown as TraceEvent;
+    expect(promptHeldOf(event)).toMatchObject({ lore: [{ title: "The harbour office", message: 2 }], index: { more: 4 }, history: { missing: [[1, 29]] }, at: T0 });
+    expect(promptHeldOf({ kind: "turn_paused", at: T0 })).toBeNull();
+    expect(promptHeldOf({ ...held, history: null } as unknown as TraceEvent)).toBeNull();
+
+    const result: TranscriptEntry = { kind: "result", callId: "call_write_1", name: "write_reply", text: "Written.", error: false, ms: 900, at: T0 };
+    const changed = { ...result, lore: { added: [{ entryId: "lore-night-key", bookId: "book-harbour", title: "The night key", chars: 118 }], dropped: [], refused: [{ entryId: "lore-nobody", reason: "The chat's books have no such entry." }] } };
+    expect(loreChangesOf(changed as unknown as TranscriptEntry)).toEqual(changed.lore);
+    expect(loreChangesOf({ ...result, lore: { added: [], dropped: [] } } as unknown as TranscriptEntry)).toEqual({ added: [], dropped: [], refused: [] });
+    expect(loreChangesOf(result)).toBeNull();
+    expect(loreChangesOf({ kind: "note", text: "Keep it short.", at: T0 })).toBeNull();
+  });
+
+  test("what a turn came to is read from its events: the brief that was taken, the lore by title, and where the main agent stopped short", () => {
+    const of = (events: TraceEvent[]): LiveEvent[] => events.map((event, i) => ({ turn: "turn-1", chatId: "chat-mara", seq: i + 1, event }));
+    const agent = (id: string, parent?: string): TraceEvent => ({ kind: "agent_started", agent: { id, role: id.startsWith("main") ? "main" : "archivist", connectionId: null, model: null, effort: "inherit", system: "", prefix: [], history: 0, ...(parent !== undefined ? { parent } : {}), at: T0 } });
+    const entry = (agentId: string, e: TranscriptEntry): TraceEvent => ({ kind: "agent_entry", agentId, entry: e });
+    const usage = { in: 10, cachedIn: 0, out: 5, reasoningOut: 0, estimated: [] };
+    const answer = (text: string, calls: { id: string; name: string; args: Record<string, string> }[]): TranscriptEntry => ({ kind: "answer", text, calls, written: false, tools: "native", usage, model: "m", finishReason: "stop", ms: 1, at: T0 });
+    const result = (callId: string, name: string, error: boolean, lore?: object): TranscriptEntry => ({ kind: "result", callId, name, text: "", error, ms: 1, at: T0, ...(lore ? { lore } : {}) }) as TranscriptEntry;
+    const lore = { added: [{ entryId: "lore-night-key", bookId: "book-harbour", title: "The night key", chars: 118 }], dropped: [{ entryId: "lore-joss", bookId: "book-people", title: "Joss", chars: 131 }], refused: [] };
+
+    // The brief of the call that was taken, with what it did to the lore; a call that was turned down first gives way to it.
+    const taken = of([
+      agent("main-1"),
+      entry("main-1", answer("", [{ id: "w1", name: "write_reply", args: { brief: "A first try." } }])),
+      entry("main-1", result("w1", "write_reply", true)),
+      agent("archivist-1", "main-1"),
+      entry("archivist-1", answer("The ledger is in the back room.", [])),
+      entry("main-1", answer("", [{ id: "w2", name: "write_reply", args: { brief: "Ilse comes to the door. End on her question." } }])),
+      entry("main-1", result("w2", "write_reply", false, lore)),
+    ]);
+    expect(replyDid(taken)).toEqual({ brief: "Ilse comes to the door. End on her question.", lore: { added: ["The night key"], dropped: ["Joss"] }, stop: null });
+
+    // Stopped short of a brief: the stop's code and its words, and no brief though it had said something.
+    const stopped = of([agent("main-1"), entry("main-1", answer("Let me look.", [{ id: "s1", name: "chat_search", args: { query: "night key" } }])), entry("main-1", { kind: "stop", status: "failed", code: "connection", reason: "the connection has no model set", at: T0 })]);
+    expect(replyDid(stopped)).toEqual({ brief: null, lore: { added: [], dropped: [] }, stop: { code: "connection", reason: "the connection has no model set" } });
+
+    // It never called write_reply and never stopped: its last answer is what the model that writes the reply was given.
+    expect(replyDid(of([agent("main-1"), entry("main-1", answer("Joss answers plainly. Keep him dry.", []))]))).toEqual({ brief: "Joss answers plainly. Keep him dry.", lore: { added: [], dropped: [] }, stop: null });
+    expect(replyDid([])).toEqual({ brief: null, lore: { added: [], dropped: [] }, stop: null });
   });
 });

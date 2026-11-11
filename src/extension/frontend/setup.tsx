@@ -3,15 +3,17 @@
 // mounts the shell. The pages render what the backend's messages carry and send its requests; they
 // read nothing else of Lumiverse.
 //
-// An extension that bundles LumiAH's pieces into its own calls `setup` from its own entry, or
-// `mountPages` to put the pages in a root of its choosing with a channel of its own.
+// An extension that builds LumiAH into itself (DESIGN §21) calls `setup` from its own entry for a
+// tab of its own name, or `mountPages` to put the pages (all of them, or those it names) in a root
+// of its choosing with a channel of its own.
 
 import { render } from "preact";
 import type { SpindleFrontendContext } from "lumiverse-spindle-types";
 import type { FrontendToBackend } from "../../shared/ui";
-import { type App, AppContext, createApp, type PrefsStorage } from "./app";
+import { type App, AppContext, createApp, type PageId, type PrefsStorage } from "./app";
 import { createHost } from "./host";
 import { TAB_ICON_SVG } from "./icons";
+import { badgeOf, SKIP_REPLY, skippable } from "./nav-model";
 import { Shell } from "./shell";
 import { CSS } from "./styles";
 
@@ -23,13 +25,13 @@ export interface TabOptions {
   description: string;
 }
 
-export const LUMIAH_TAB: TabOptions = { id: "lumiah", title: "LumiAH", shortName: "LumiAH", description: "The agent harness: its live session, its sessions, its settings and its runtime" };
+export const LUMIAH_TAB: TabOptions = { id: "lumiah", title: "LumiAH", shortName: "LumiAH", description: "The agent harness: switch it on for a chat, watch its agents work, and see their lore, chronicle, workspace and guidance, jobs, agents, skills and tools, spend and settings" };
 
-/** Renders the pages into `root`; returns the unmount. The stylesheet (`CSS`) must be in the document. */
-export function mountPages(root: HTMLElement, app: App): () => void {
+/** Renders the pages into `root`; returns the unmount. `pages` names the pages to show (all, when left out). The stylesheet (`CSS`) must be in the document. */
+export function mountPages(root: HTMLElement, app: App, options: { pages?: readonly PageId[] } = {}): () => void {
   render(
     <AppContext.Provider value={app}>
-      <Shell />
+      <Shell {...(options.pages ? { pages: options.pages } : {})} />
     </AppContext.Provider>,
     root,
   );
@@ -52,19 +54,28 @@ export function setup(ctx: SpindleFrontendContext, tabOptions: TabOptions = LUMI
   cleanups.push(ctx.dom.addStyle(CSS));
   const app = createApp({ channel: { send: (payload: FrontendToBackend) => ctx.sendToBackend(payload), subscribe: (handler) => ctx.onBackendMessage(handler) }, host, storage: deviceStorage() });
   cleanups.push(() => app.client.dispose());
-  const tab = ctx.ui.registerDrawerTab({ id: tabOptions.id, title: tabOptions.title, shortName: tabOptions.shortName, headerTitle: tabOptions.title, description: tabOptions.description, keywords: ["agent", "harness", "live", "session", "transcript", "runtime", "loopback", "tokens", "cost"], iconSvg: TAB_ICON_SVG });
+  const tab = ctx.ui.registerDrawerTab({ id: tabOptions.id, title: tabOptions.title, shortName: tabOptions.shortName, headerTitle: tabOptions.title, description: tabOptions.description, keywords: ["agent", "harness", "home", "live", "session", "transcript", "lore", "chronicle", "workspace", "guidance", "skills", "tools", "jobs", "approval", "spend", "runtime", "tokens", "cost"], iconSvg: TAB_ICON_SVG });
   const unmount = mountPages(tab.root, app);
   cleanups.push(() => {
     unmount();
     tab.destroy();
   });
-  // The tab's badge says how many turns LumiAH is answering now, so a running turn shows with the drawer on another tab.
-  cleanups.push(
-    app.client.state.subscribe((state) => {
-      const turns = state?.running.length ?? 0;
-      tab.setBadge(turns > 0 ? String(turns) : null);
-    }),
-  );
+  // The signs outside the drawer, where a reply is waited for. The tab's badge says what waits for the user, else that LumiAH is working on the open chat's reply (nav-model's `badgeOf`).
+  const badge = (): void => tab.setBadge(badgeOf(app.client.state.get(), host.activeChat.get()));
+  cleanups.push(app.client.state.subscribe(badge), host.activeChat.subscribe(badge));
+  badge();
+  // And Lumiverse's input bar (its Extras list) offers to skip LumiAH while it prepares a built-in reply for the open chat: the one thing a user who only waits for a reply may want of it. An older Lumiverse has no such place; hidden while there is nothing to skip.
+  const register = ctx.ui.registerInputBarAction;
+  if (typeof register === "function") {
+    const action = register.call(ctx.ui, { id: "skip-reply", label: SKIP_REPLY, subtitle: "It is reading up before this reply", enabled: false });
+    const offer = (): void => action.setEnabled(skippable(app.client.state.get(), host.activeChat.get()) !== null);
+    const skip = (): void => {
+      const reply = skippable(app.client.state.get(), host.activeChat.get());
+      if (reply) void app.client.request("lah.turn.stop", { stream: reply.stream, turn: reply.turn }).catch((error: unknown) => app.fail(error));
+    };
+    cleanups.push(app.client.state.subscribe(offer), host.activeChat.subscribe(offer), action.onClick(skip), () => action.destroy());
+    offer();
+  }
   cleanups.push(host.watch(() => app.client.resync()));
   void app.client.sync();
   return () => {

@@ -14,5 +14,5 @@ export { LinkClient } from "./link";
 export type { Http, HttpReply, HttpRequest, StoredLogin } from "./lumiverse";
 export { LiveError } from "./lumiverse";
 export type { Runtime, RuntimeDeps } from "./runtime";
-export { CONNECTION_NAME, createRuntime } from "./runtime";
+export { createRuntime } from "./runtime";
 export type { Harness } from "./turn";

@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ESNext", "DOM"],
+    "types": ["bun-types"],
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    // Only inside LumiAH's own repository, where this example sits beside the package it uses.
+    // In a project of your own, delete `paths`: `lumi-ah` is then the dependency in package.json.
+    "paths": { "lumi-ah/*": ["../../src/*/index.ts"] }
+  },
+  "include": ["src"]
+}

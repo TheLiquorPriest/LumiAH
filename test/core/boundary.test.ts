@@ -14,9 +14,14 @@ function files(dir: string): string[] {
   return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => (entry.isDirectory() ? files(join(dir, entry.name)) : entry.name.endsWith(".ts") ? [join(dir, entry.name)] : []));
 }
 
-/** Every module a source file names: an `import … from` or `export … from` statement, a bare `import "…"`, and `import("…")`. */
+/**
+ * Every module a source file names: an `import … from` or `export … from` statement, a bare
+ * `import "…"`, and `import("…")`. What stands between the keyword and `from` is a list of names: it
+ * holds no quote, `=`, bracket or parenthesis, so an exported value that merely contains the word
+ * (`export const X = [v("from", "…")]`) is no import.
+ */
 function specifiers(source: string): string[] {
-  const statements = /^\s*(?:import|export)\b[^;]*?\bfrom\s*["']([^"']+)["']/gm;
+  const statements = /^\s*(?:import|export)\b[^;"'`=()[\]]*?\bfrom\s*["']([^"']+)["']/gm;
   const bare = /^\s*import\s*["']([^"']+)["']/gm;
   const dynamic = /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g;
   return [statements, bare, dynamic].flatMap((pattern) => [...source.matchAll(pattern)].map((m) => m[1] ?? ""));
@@ -33,6 +38,20 @@ describe("src/core", () => {
   test("has the files this test reads", () => {
     expect(sources.length).toBeGreaterThan(15);
     expect(sources.map((s) => s.path)).toContain("src/core/harness.ts");
+  });
+
+  test("reads every way a module is named, and takes no string for an import", () => {
+    const source = [
+      'import { a, type B } from "./a";',
+      "import type {\n  C,\n  D,\n} from './c';",
+      'export * from "../outside";',
+      'export { e } from "node:fs";',
+      'import "./bare";',
+      'const late = await import("pkg");',
+      'export const TEXTS = [v("from", "the first message to read"), v("to", "the last")];',
+      'export const said = `read from "the start"`;',
+    ].join("\n");
+    expect(specifiers(source).sort()).toEqual(["../outside", "./a", "./bare", "./c", "node:fs", "pkg"]);
   });
 
   test("imports nothing outside src/core", () => {

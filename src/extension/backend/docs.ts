@@ -22,7 +22,10 @@ const USERS_KEPT = 256;
 
 export class UserDocs<T> {
   private readonly loaded = new Map<string, Promise<T>>();
-  private writing: Promise<void> = Promise.resolve();
+  /** Each user's writes, one at a time in the order asked. A user's own queue: a slow write of one account's document holds up no other account's. */
+  private readonly writes = new KeyedQueue();
+  /** How many changes each user has under way, from the document's read to its write's end. */
+  private readonly changing = new Map<string, number>();
   /** The stored text of a user's file this build couldn't read: kept aside before the first write over it. */
   private readonly unreadable = new Map<string, string>();
 
@@ -67,37 +70,46 @@ export class UserDocs<T> {
         },
       );
       this.loaded.set(userId, loaded);
-      if (this.loaded.size > USERS_KEPT) this.loaded.delete(this.loaded.keys().next().value ?? "");
+      // Past what is kept, the ones read longest ago are let go, but never one with a change under way: read again before its write landed it would be the text from before the change, and the next change would write that over it.
+      for (const other of this.loaded.keys()) {
+        if (this.loaded.size <= USERS_KEPT) break;
+        if (!this.changing.has(other)) this.loaded.delete(other);
+      }
     }
     return loaded;
   }
 
-  /** Changes the user's document and writes it, one write at a time; rejects when it couldn't be written, and the change is then undone in memory too (the next read is from storage). */
+  /** Changes the user's document and writes it, one write at a time for that user; rejects when it couldn't be written, and the change is then undone in memory too (the next read is from storage). */
   async change<R>(userId: string, fn: (doc: T) => R): Promise<R> {
-    const doc = await this.get(userId);
-    const out = fn(doc);
-    const text = JSON.stringify(doc);
-    const write = this.writing.then(async () => {
-      const unreadable = this.unreadable.get(userId);
-      if (unreadable !== undefined) {
-        await this.host.storage.write(`${this.file}.bad`, unreadable, userId);
-        this.unreadable.delete(userId);
-      }
-      await this.host.storage.write(this.file, text, userId);
-    });
-    this.writing = write.catch(() => undefined);
+    this.changing.set(userId, (this.changing.get(userId) ?? 0) + 1);
     try {
-      await write;
-    } catch (error) {
-      this.loaded.delete(userId);
-      throw new Error(`LumiAH couldn't save ${this.file} (${error instanceof Error ? error.message : String(error)}). Try again in a moment.`);
+      const doc = await this.get(userId);
+      const out = fn(doc);
+      const text = JSON.stringify(doc);
+      try {
+        await this.writes.run(userId, async () => {
+          const unreadable = this.unreadable.get(userId);
+          if (unreadable !== undefined) {
+            await this.host.storage.write(`${this.file}.bad`, unreadable, userId);
+            this.unreadable.delete(userId);
+          }
+          await this.host.storage.write(this.file, text, userId);
+        });
+      } catch (error) {
+        this.loaded.delete(userId);
+        throw new Error(`LumiAH couldn't save ${this.file} (${error instanceof Error ? error.message : String(error)}). Try again in a moment.`);
+      }
+      return out;
+    } finally {
+      const left = (this.changing.get(userId) ?? 1) - 1;
+      if (left > 0) this.changing.set(userId, left);
+      else this.changing.delete(userId);
     }
-    return out;
   }
 
   /** Resolves once every write is done (tests). */
   settle(): Promise<void> {
-    return this.writing;
+    return this.writes.idle();
   }
 }
 
@@ -113,5 +125,10 @@ export class KeyedQueue {
       if (this.tails.get(key) === tail) this.tails.delete(key);
     });
     return run;
+  }
+
+  /** Resolves once the work asked for so far is done, under every key. */
+  async idle(): Promise<void> {
+    await Promise.all(this.tails.values());
   }
 }

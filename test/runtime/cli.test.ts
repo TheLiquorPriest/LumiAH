@@ -1,100 +1,31 @@
 // The `lumiah` command, as far as it can be run without systemd or a real disk (DESIGN §1; the
 // runtime's own guide is docs/RUNTIME.md): what it takes and refuses on its command line, the port it
-// picks, the config it writes and with which mode, and the unit it would install. The machine is a
-// fake: files in a map, programs that only record how they were run, and a made-up Lumiverse with
-// LumiAH's backend behind it, so `up` signs in and registers for real.
+// picks, the config it writes and with which mode, the unit it would install, and what it does to a
+// runtime that is already running. The machine is a fake (test/support/machine.ts): files in a map,
+// programs that only record how they were run, and a made-up Lumiverse with LumiAH's backend behind
+// it, so `up` signs in and registers for real.
 
 import { describe, expect, test } from "bun:test";
-import { AGENT, createHarness, isRecord, settingsOf } from "../../src/core/index";
-import { startBackend } from "../../src/extension/backend/backend";
-import { type OwnedEntry, type RuntimeIO, lumiah, unitText } from "../../src/runtime/cli";
-import { configOf } from "../../src/runtime/config";
+import type { AgentUsage } from "../../src/core/ports";
+import { createBackend } from "../../src/extension/backend/backend";
+import { lumiah, type RuntimeIO, unitText } from "../../src/runtime/cli";
+import { configOf, configText } from "../../src/runtime/config";
 import { FakeHost } from "../support/fake-host";
 import { FakeLumiverse } from "../support/fake-lumiverse";
-import { USER } from "../support/rig";
+import { BUN, HOME, type Machine, type MachineChange, machine as machineOn, SELF } from "../support/machine";
+import { FAST, PORT, rig, runtimeFrom, until, USER } from "../support/rig";
 
-const HOME = "/home/mara";
-const SELF = "/srv/lumiverse/extensions/lumi_ah/dist/lumiah.js";
-const BUN = "/opt/bun/bin/bun";
+/** Nothing these tests do waits on a backend's own timers, so it is given none. */
+const ENV = { now: () => Date.now(), later: () => () => undefined, build: "test-build" };
 
-interface Machine {
-  io: RuntimeIO;
-  out: string[];
-  err: string[];
-  /** Every file written or copied, with the mode it was given and its directory's. */
-  files: Map<string, { text: string; mode: number; dirMode: number | null }>;
-  /** Who owns what, where it isn't the account's own. */
-  owners: Map<string, OwnedEntry>;
-  /** The ports something else already serves on. */
-  taken: Set<number>;
-  /** Every address served on, in order. */
-  served: { hostname: string; port: number }[];
-  /** Every program run, as one line. */
-  ran: string[];
-  /** Every request made of Lumiverse, as `METHOD path`. */
-  asked: string[];
-  host: FakeHost;
-}
+/** A machine and the Lumiverse reached from it, as LumiAH's own extension sees that Lumiverse. */
+type Installed = Machine & { host: FakeHost };
 
 /** A machine with Lumiverse on it, LumiAH installed and running, and the account `mara` (uid 1000) at its terminal. */
-function machine(change: Partial<Pick<RuntimeIO, "uid" | "platform" | "env" | "bun">> = {}): Machine {
+function machine(change: MachineChange = {}): Installed {
   const host = new FakeHost();
-  const lumiverse = new FakeLumiverse(host, USER);
-  // Nothing these tests do waits on the backend's own timers, so it is given none.
-  startBackend(host, { now: () => Date.now(), later: () => () => undefined, build: "test-build" });
-  const m: Omit<Machine, "io"> = { out: [], err: [], files: new Map(), owners: new Map(), taken: new Set(), served: [], ran: [], asked: [], host };
-  const uid = change.uid === undefined ? 1000 : change.uid;
-  const io: RuntimeIO = {
-    out: (text) => void m.out.push(text),
-    err: (text) => void m.err.push(text),
-    env: change.env ?? { LUMIVERSE_PASSWORD: "a made-up password" },
-    ask: async () => null,
-    http: async (request) => {
-      const url = new URL(request.url);
-      m.asked.push(`${request.method} ${url.pathname}`);
-      // Signing in is Lumiverse's own; everything after it is the fake's routes, with the session it gave.
-      if (url.pathname === "/api/auth/sign-in/username") return { status: 200, header: () => null, text: JSON.stringify({ token: lumiverse.token }) };
-      return lumiverse.http(request);
-    },
-    openSocket: lumiverse.openSocket,
-    serve: (options) => {
-      if (m.taken.has(options.port)) throw new Error(`port ${options.port} in use`);
-      m.served.push({ hostname: options.hostname, port: options.port });
-      return { stop: () => undefined };
-    },
-    // Asked to stop at once: a foreground `up` returns as soon as it serves.
-    stopped: async () => "SIGTERM",
-    bun: change.bun === undefined ? BUN : change.bun,
-    self: SELF,
-    uid,
-    hostname: "harbour-box",
-    platform: change.platform ?? "linux",
-    home: HOME,
-    files: {
-      read: (path) => m.files.get(path)?.text ?? null,
-      write: (path, text, mode, dirMode) => void m.files.set(path, { text, mode, dirMode }),
-      copy: (from, to, mode) => void m.files.set(to, { text: `copy of ${from}`, mode, dirMode: null }),
-      exists: (path) => m.files.has(path),
-      list: (dir) => [...m.files.keys()].filter((path) => path.startsWith(`${dir}/`) && !path.slice(dir.length + 1).includes("/")).map((path) => path.slice(dir.length + 1)),
-      remove: (path) => void m.files.delete(path),
-      // Everything is the account's own, and no one else's to write, unless a test says otherwise.
-      stat: (path) => m.owners.get(path) ?? { uid: uid ?? 1000, gid: uid ?? 1000, mode: 0o755 },
-      real: (path) => path,
-    },
-    run: async (command, args) => {
-      m.ran.push([command, ...args].join(" "));
-      if (command === "id") return { code: 0, out: args.includes("-nu") && args.length === 1 ? "mara\n" : "brann\n", err: "" };
-      if (command === "loginctl" && args[0] === "show-user") return { code: 0, out: "yes\n", err: "" };
-      return { code: 0, out: "", err: "" };
-    },
-    sleep: async () => undefined,
-    now: () => Date.now(),
-    build: "test-build",
-    version: "0.0.1",
-    harness: (harnessHost, settings) => createHarness(harnessHost, { settings }),
-    writerConnection: (values) => settingsOf(isRecord(values) ? values.core : undefined).agents[AGENT.writer]?.connectionId ?? null,
-  };
-  return { ...m, io };
+  createBackend(host, ENV);
+  return { ...machineOn(new FakeLumiverse(host, USER), change), host };
 }
 
 const UP = ["up", "--url", "http://127.0.0.1:7860", "--username", "mara"];
@@ -229,6 +160,84 @@ describe("lumiah up", () => {
   });
 });
 
+describe("lumiah up --extension, for an extension that has LumiAH built in", () => {
+  const OTHER_SELF = "/srv/lumiverse/extensions/other_ext/dist/lumiah.js";
+  const OTHER_CONFIG = `${HOME}/.config/lumiah/mara-other_ext.json`;
+  const signIns = (m: Machine): number => m.asked.filter((line) => line === "POST /api/auth/sign-in/username").length;
+
+  /** LumiAH's machine with that extension installed beside it; `io` runs the extension's own copy of the runtime. */
+  function both() {
+    const m = machine();
+    const other = new FakeHost("other_ext", m.host);
+    createBackend(other, ENV, { identity: { name: "Lantern", connectionName: "Lantern loopback" } });
+    return { m, other, io: { ...m.io, self: OTHER_SELF } };
+  }
+
+  /** What LumiAH's own runtime has on the machine and in Lumiverse. */
+  const ownOf = (m: Installed) => ({
+    config: m.files.get(CONFIG)?.text,
+    unit: m.files.get(`${HOME}/.config/systemd/user/lumiah-mara.service`)?.text,
+    copy: m.files.get(`${HOME}/.local/share/lumiah/lumiah.js`)?.text,
+    registry: JSON.stringify(m.host.stored(USER, "registry.json")),
+  });
+
+  test("gives that runtime a name, a config, a port, a unit, an installed copy and a connection of its own, and leaves LumiAH's as they were", async () => {
+    const { m, other, io } = both();
+    expect(await lumiah([...UP, "--systemd"], m.io)).toBe(0);
+    const own = ownOf(m);
+
+    expect(await lumiah([...UP, "--extension", "other_ext", "--systemd"], io)).toBe(0);
+    // Nothing serves on LumiAH's port while this runs (its service is the fake's to start), and the port is still LumiAH's.
+    expect(configOf(m.files.get(OTHER_CONFIG)?.text ?? null, OTHER_CONFIG)).toMatchObject({ name: "mara-other_ext", extension: "other_ext", port: 7872 });
+    expect(m.files.get(`${HOME}/.config/systemd/user/lumiah-mara-other_ext.service`)?.text).toBe(unitText({ name: "mara-other_ext", bun: BUN, script: `${HOME}/.local/share/lumiah/other_ext/lumiah.js`, config: OTHER_CONFIG, memory: "1G" }));
+    expect(m.files.get(`${HOME}/.local/share/lumiah/other_ext/lumiah.js`)?.text).toBe(`copy of ${OTHER_SELF}`);
+    expect(m.ran.filter((line) => line.startsWith("systemctl")).slice(-3)).toEqual(["systemctl --user daemon-reload", "systemctl --user enable lumiah-mara-other_ext.service", "systemctl --user restart lumiah-mara-other_ext.service"]);
+    // It registered with that extension and no other, and goes by that extension's names.
+    expect(JSON.stringify(other.stored(USER, "registry.json"))).toContain('"name":"mara-other_ext"');
+    expect(m.out.join("\n")).toContain('Registered the runtime "mara-other_ext" with Lantern: it answers mara\'s replies.');
+    expect(m.out.join("\n")).toContain("Mint your loopback key on Lantern's Runtime page next");
+    expect(m.host.connectionList).toMatchObject([
+      { name: "LumiAH", provider: "custom", url: "http://127.0.0.1:7871/v1", model: "lumiah" },
+      { name: "Lantern loopback", provider: "custom", url: "http://127.0.0.1:7872/v1", model: "lumiah-other_ext" },
+    ]);
+    expect(ownOf(m)).toEqual(own);
+  });
+
+  test("set up again by the lines their pages show, each runtime keeps its own sign-in, name and port", async () => {
+    const { m, io } = both();
+    expect(await lumiah(UP, m.io)).toBe(0);
+    expect(await lumiah([...UP, "--extension", "other_ext"], io)).toBe(0);
+    expect(signIns(m)).toBe(2);
+
+    // The update lines name the runtime; with no name, a line means the only runtime here of its extension.
+    expect(await lumiah(["up", "--name", "mara"], m.io)).toBe(0);
+    expect(await lumiah(["up", "--name", "mara-other_ext", "--extension", "other_ext"], io)).toBe(0);
+    expect(await lumiah(["up"], m.io)).toBe(0);
+    expect(await lumiah(["up", "--extension", "other_ext"], io)).toBe(0);
+    expect(signIns(m)).toBe(2);
+    expect(configOf(m.files.get(CONFIG)?.text ?? null, CONFIG)).toMatchObject({ name: "mara", extension: "lumi_ah", port: 7871 });
+    expect(configOf(m.files.get(OTHER_CONFIG)?.text ?? null, OTHER_CONFIG)).toMatchObject({ name: "mara-other_ext", extension: "other_ext", port: 7872 });
+    expect([...m.files.keys()].sort()).toEqual([OTHER_CONFIG, CONFIG]);
+    // Each found its own connection again and made no other.
+    expect(m.host.connectionList.map((c) => c.name)).toEqual(["LumiAH", "Lantern loopback"]);
+  });
+
+  test("refuses to take the name or the port of LumiAH's own runtime, and says what to do", async () => {
+    const { m, other, io } = both();
+    expect(await lumiah(UP, m.io)).toBe(0);
+    const own = ownOf(m);
+
+    expect(await lumiah([...UP, "--name", "mara", "--extension", "other_ext"], io)).toBe(1);
+    expect(m.err.at(-1)).toBe(`There is a runtime "mara" here already, and it links to the extension lumi_ah: this line would make it other_ext's instead. Give this one a name of its own with --name, or remove that one first (lumiah down --name mara, then delete ${CONFIG}).`);
+    expect(await lumiah([...UP, "--extension", "other_ext", "--port", "7871"], io)).toBe(1);
+    expect(m.err.at(-1)).toBe(`Port 7871 on 127.0.0.1 is the runtime "mara"'s, set up here too. Pick another with --port.`);
+
+    expect(ownOf(m)).toEqual(own);
+    expect([...m.files.keys()]).toEqual([CONFIG]);
+    expect(other.stored(USER, "registry.json")).toBeNull();
+  });
+});
+
 describe("the unit lumiah installs", () => {
   test("runs the runtime's stable copy from its config, restarts it always, and caps its memory", () => {
     expect(unitText({ name: "mara", bun: BUN, script: `${HOME}/.local/share/lumiah/lumiah.js`, config: CONFIG, memory: "1G" }).split("\n")).toEqual([
@@ -254,5 +263,160 @@ describe("the unit lumiah installs", () => {
     const unit = unitText({ name: "mara", bun: "/opt/my bun/bin/bun", script: "/home/mara/.local/share/lumiah/lumiah.js", config: CONFIG, memory: "2G" });
     expect(unit).toContain('ExecStart="/opt/my bun/bin/bun" /home/mara/.local/share/lumiah/lumiah.js serve');
     expect(unit).toContain("MemoryMax=2G");
+  });
+});
+
+/** The machine's HTTP, with the runtime's own port answered by a runtime that runs in the test, as one serving there would. */
+function reaching(m: Machine, runtime: { fetch(request: Request): Promise<Response> }, port: number): RuntimeIO["http"] {
+  return async (request) => {
+    const url = new URL(request.url);
+    if (url.port !== String(port)) return m.io.http(request);
+    const response = await runtime.fetch(new Request(request.url, { method: request.method, headers: { ...request.headers, host: url.host } }));
+    const text = await response.text();
+    return { status: response.status, header: (name) => response.headers.get(name), text };
+  };
+}
+
+const USAGE: AgentUsage = { calls: 1, toolTurns: 0, in: 10, cachedIn: 0, out: 5, reasoningOut: 0, estimated: false, ms: 1 };
+
+/**
+ * A runtime set up on a machine before, running, with a reply under way: the reply waits, then asks
+ * the model for its words over the link, with the secret the runtime started with. `io` is the
+ * machine as `up` finds it: the runtime answers on its port, the reply goes on whenever `up` waits,
+ * and `order` notes when the reply ended, when the runtime was registered anew, and when its
+ * service was restarted. `linked` is whether the extension had the runtime's session to push to,
+ * each time `up` began to wait.
+ */
+async function answering() {
+  const gate = Promise.withResolvers<void>();
+  const it = await rig({
+    harness: (host) => ({
+      answer: async (_turn, sink, signal) => {
+        await gate.promise;
+        const { content } = await host.models.call({ messages: [{ role: "user", content: "Who keeps the harbour light now?" }], maxTokens: 64, connectionId: null, model: null }, signal);
+        sink.content(content);
+        sink.done("stop", USAGE);
+        return { status: "done", record: null, reply: content, usage: USAGE };
+      },
+    }),
+  });
+  const chatId = await it.setUp();
+  it.host.script = ["Okoro keeps it now."];
+  // Its config, as `up` wrote it then: the registration the runtime runs with.
+  const m = machineOn(it.lumiverse);
+  m.files.set(CONFIG, { text: configText({ name: "mara", base: it.lumiverse.base, extension: it.host.identifier, listen: "127.0.0.1", port: PORT, relay: it.registration.relay, secret: it.registration.secret, session: { username: "mara", token: it.lumiverse.token, savedAt: 0 }, tuning: FAST }), mode: 0o600, dirMode: 0o700 });
+  const order: string[] = [];
+  const linked: boolean[] = [];
+  const generating = it.generate(chatId).then((out) => {
+    order.push("the reply ended");
+    return out;
+  });
+  await until(() => it.runtime.turns.count === 1, "the reply to be under way");
+  const io: RuntimeIO = {
+    ...m.io,
+    out: (text) => {
+      if (text.startsWith("Registered the runtime")) order.push("the runtime was registered anew");
+      m.io.out(text);
+    },
+    http: reaching(m, it.runtime, PORT),
+    sleep: async () => {
+      linked.push(it.backend.relays.isLinked(USER, it.registration.relay));
+      gate.resolve();
+      await generating;
+    },
+    run: async (command, args, env) => {
+      if (command === "systemctl" && args.includes("restart")) order.push("the service was restarted");
+      return m.io.run(command, args, env);
+    },
+  };
+  const close = (): void => {
+    gate.resolve();
+    it.close();
+  };
+  return { it, m, io, order, linked, generating, close };
+}
+
+describe("lumiah up over a runtime set up before", () => {
+  test("keeps the registration a running runtime answers with: a reply under way ends as it would have, and only then is the service restarted", async () => {
+    const { it, m, io, order, linked, generating, close } = await answering();
+    try {
+      expect(await lumiah(["up", "--name", "mara", "--systemd"], io)).toBe(0);
+
+      expect(await generating).toMatchObject({ status: 200, error: null, content: "Okoro keeps it now.", finish: "stop" });
+      expect(order).toEqual(["the reply ended", "the service was restarted"]);
+      expect(m.out).toContain('The runtime "mara" keeps its registration with LumiAH: it answers mara\'s replies.');
+      expect(m.out).toContain("The running runtime has 1 request(s) under way: waiting up to 5 minutes for them to finish before restarting it.");
+      // Registering left the runtime's link as it was: while `up` waited, the extension still had its session to push to.
+      expect(linked).toEqual([true]);
+      expect(it.runtime.link.refused).toBeNull();
+      // And the service starts again with the registration the runtime ran with.
+      const config = configOf(m.files.get(CONFIG)?.text ?? null, CONFIG);
+      expect({ relay: config.relay, secret: config.secret }).toEqual(it.registration);
+    } finally {
+      close();
+    }
+  });
+
+  test("given another address for Lumiverse, where it must register anew, waits for the reply under way before it does", async () => {
+    const { it, m, io, order, generating, close } = await answering();
+    try {
+      // Another name for the same Lumiverse: the saved secret isn't shown to an address it wasn't minted at, so the registration is replaced.
+      expect(await lumiah(["up", "--name", "mara", "--url", "http://localhost:7860", "--username", "mara", "--systemd"], io)).toBe(0);
+
+      expect(await generating).toMatchObject({ status: 200, error: null, content: "Okoro keeps it now.", finish: "stop" });
+      expect(order).toEqual(["the reply ended", "the runtime was registered anew", "the service was restarted"]);
+      expect(m.out).toContain("The running runtime has 1 request(s) under way: waiting up to 5 minutes for them to finish before registering it anew.");
+      expect(configOf(m.files.get(CONFIG)?.text ?? null, CONFIG).secret).not.toBe(it.registration.secret);
+    } finally {
+      close();
+    }
+  });
+
+  test("keeps its registration while the secret it saved is still the extension's, and registers anew once it isn't", async () => {
+    const host = new FakeHost();
+    const backend = createBackend(host, ENV);
+    const m = machineOn(new FakeLumiverse(host, USER));
+    const saved = () => configOf(m.files.get(CONFIG)?.text ?? null, CONFIG);
+    expect(await lumiah(UP, m.io)).toBe(0);
+    const first = saved();
+    expect(m.out).toContain('Registered the runtime "mara" with LumiAH: it answers mara\'s replies.');
+
+    expect(await lumiah(UP, m.io)).toBe(0);
+    expect({ relay: saved().relay, secret: saved().secret }).toEqual({ relay: first.relay, secret: first.secret });
+    expect(m.out).toContain('The runtime "mara" keeps its registration with LumiAH: it answers mara\'s replies.');
+
+    // Forgotten on the Runtime page: the secret it saved speaks for no runtime any more, so there is none to keep.
+    await backend.relays.forget(USER, first.relay);
+    m.out.length = 0;
+    expect(await lumiah(UP, m.io)).toBe(0);
+    expect(saved().secret).not.toBe(first.secret);
+    expect(m.out).toContain('Registered the runtime "mara" with LumiAH: it answers mara\'s replies.');
+    expect(Object.keys((await backend.registry.read(USER)).relays)).toEqual([saved().relay]);
+  });
+});
+
+describe("lumiah status", () => {
+  test("reads a runtime that listens beyond loopback, which tells a request that shows nothing only that it is up", async () => {
+    const host = new FakeHost();
+    createBackend(host, ENV);
+    const lumiverse = new FakeLumiverse(host, USER);
+    const m = machineOn(lumiverse);
+    expect(await lumiah([...UP, "--listen", "0.0.0.0"], m.io)).toBe(0);
+    expect(m.err.join("\n")).toContain("Your loopback key and every prompt cross to it in clear http");
+    const config = configOf(m.files.get(CONFIG)?.text ?? null, CONFIG);
+    // The runtime that config starts, serving where the config says.
+    const runtime = runtimeFrom(config, lumiverse, [], { harness: m.io.harness });
+    try {
+      await runtime.link.connect();
+      m.out.length = 0;
+
+      expect(await lumiah(["status"], { ...m.io, http: reaching(m, runtime, config.port) })).toBe(0);
+
+      expect(m.out).toContain("It answers: link to LumiAH up, 0 turn(s) under way.");
+      const bare = await runtime.fetch(new Request(`http://192.0.2.7:${config.port}/healthz`, { headers: { host: `192.0.2.7:${config.port}` } }));
+      expect(await bare.json()).toEqual({ up: true });
+    } finally {
+      runtime.close();
+    }
   });
 });

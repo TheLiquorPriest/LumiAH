@@ -78,6 +78,12 @@ export const COMPONENTS_CSS = `
 .lah-caret{color:var(--lah-muted);transition:transform var(--lah-fast)}
 details[open]>summary>.lah-caret{transform:rotate(90deg)}
 .lah-disclosure-body{display:flex;flex-direction:column;gap:var(--lah-s2);padding:var(--lah-s1) 0 var(--lah-s2);min-width:0}
+/* An agent's words as prose (prose.tsx): a heading or a list it wrote looks the same on every page. Under .lah so the lists outweigh the reset that takes a list's marks away. */
+.lah-prose{display:flex;flex-direction:column;gap:var(--lah-s2);min-width:0;overflow-wrap:anywhere}
+.lah-prose-h{font-weight:600}
+.lah .lah-prose ul{list-style:disc;padding-left:1.3em;display:flex;flex-direction:column;gap:2px}
+.lah .lah-prose ol{list-style:decimal;padding-left:1.6em;display:flex;flex-direction:column;gap:2px}
+.lah-prose-code{margin:0;padding:var(--lah-s2) var(--lah-s3);border:1px solid var(--lah-hairline);border-radius:var(--lah-r);background:var(--lah-well);white-space:pre-wrap;overflow-wrap:anywhere;font-size:var(--lah-fs-sm)}
 .lah-field{display:flex;flex-direction:column;gap:var(--lah-s1);min-width:0}
 .lah-field-head{display:flex;align-items:center;justify-content:space-between;gap:var(--lah-s2);min-width:0}
 .lah-field-head>label,.lah-field-label{font-size:var(--lah-fs-sm);font-weight:500;color:var(--lah-muted);min-width:0;overflow-wrap:anywhere}
@@ -87,6 +93,7 @@ details[open]>summary>.lah-caret{transform:rotate(90deg)}
 .lah-input:focus{border-color:var(--lah-accent)}
 .lah-input:disabled{opacity:.55}
 textarea.lah-input{min-height:96px;padding:var(--lah-s2) var(--lah-s3);resize:vertical;font-family:var(--lah-mono);font-size:var(--lah-fs-sm);line-height:1.5}
+textarea.lah-input.lah-is-prose{font-family:inherit;font-size:inherit}
 select.lah-input{appearance:auto;text-overflow:ellipsis}
 .lah-input.lah-is-invalid{border-color:var(--lah-neg)}
 .lah-search{position:relative;display:flex;align-items:center;flex:1 1 0;min-width:0}
@@ -109,7 +116,8 @@ select.lah-input{appearance:auto;text-overflow:ellipsis}
 .lah-stepper{display:inline-flex;align-items:center;gap:var(--lah-s1);max-width:100%;min-width:0}
 .lah-stepper>.lah-input{flex:1 1 96px;width:96px;min-width:56px;text-align:center;font-variant-numeric:tabular-nums}
 .lah-stepper>.lah-btn{flex:0 0 var(--lah-tap);padding:0}
-.lah-toasts{position:sticky;bottom:var(--lah-s2);z-index:8;display:flex;flex-direction:column;align-items:center;gap:var(--lah-s1);pointer-events:none;margin-top:auto;padding-top:var(--lah-s2)}
+/* The notices take no room of their own and stand over the page's foot, above whatever a running turn keeps there (--lah-foot-h: the bar with Stop, a held call's card; transcript.tsx measures it), so a notice never covers a control the user may need at once. */
+.lah-toasts{position:sticky;bottom:calc(var(--lah-s2) + var(--lah-foot-h,0px));z-index:8;height:0;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:var(--lah-s1);pointer-events:none;margin-top:auto}
 .lah-toast{pointer-events:auto;display:flex;align-items:center;gap:var(--lah-s2);max-width:min(100%,520px);padding:var(--lah-s1) var(--lah-s1) var(--lah-s1) var(--lah-s3);border-radius:var(--lah-r-lg);border:1px solid var(--lah-border);background:var(--lah-bar-bg);box-shadow:var(--lah-shadow-lg);font-size:var(--lah-fs-sm)}
 .lah-toast.lah-is-error{border-color:color-mix(in srgb,var(--lah-danger) 50%,transparent);color:var(--lah-neg)}
 .lah-toast-text{flex:1;min-width:0;overflow-wrap:anywhere;color:var(--lah-fg)}

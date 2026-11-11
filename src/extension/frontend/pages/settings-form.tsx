@@ -7,9 +7,8 @@
 import { useEffect, useId, useState } from "preact/hooks";
 import type { ConnectionView, JsonValue, SettingPath } from "../../../shared/ui";
 import { Badge, Button, Check, NumberField, Seg, Select, Switch, TextArea, TextInput } from "../components";
-import { duration } from "../format";
 import { Icon } from "../icons";
-import { changedCount, type Choice, type Control, type FormNode, initialOf, isBranch, linesOf, pathKey, sameJson, valueWords, withoutRow } from "../settings-model";
+import { besideNumber, changedCount, type Choice, type Control, type FormNode, initialOf, isBranch, linesOf, pathKey, sameJson, shownNumber, storedNumber, valueWords, withoutRow } from "../settings-model";
 
 /** What a form's controls need from the page that holds it. */
 export interface FormCtx {
@@ -26,13 +25,10 @@ export interface FormCtx {
   at(path: SettingPath): JsonValue | undefined;
   /** The models a connection offers (null: the default connection); rejects where they can't be listed. */
   models(connectionId: string | null): Promise<string[]>;
-}
-
-/** A step for − and + that suits a number's size: a tenth of its magnitude, so 32,000 steps by 1,000 and 8 by 1. */
-export function niceStep(value: number, integer: boolean): number {
-  const size = Math.abs(value);
-  if (size < 10) return integer ? 1 : size < 1 ? 0.05 : 0.5;
-  return 10 ** (Math.floor(Math.log10(size)) - 1) * (size < 100 ? 10 : 1);
+  /** The tools' names, for a table with a row per tool; left out where the page doesn't know them, and a name is then typed. */
+  tools?: readonly string[];
+  /** Each setting's row also says the key it is kept under (`core.agents.main.connectionId`): off unless the user asked for the details. */
+  details?: boolean;
 }
 
 function connectionLabel(c: ConnectionView): string {
@@ -143,9 +139,71 @@ function SetControl(props: { node: FormNode; options: readonly Choice[]; ctx: Fo
         </Button>
       </div>
       {props.options.map((o, i) => (
-        <Check key={i} checked={has(o.value)} label={<code>{o.label}</code>} help={o.help ?? undefined} disabled={ctx.busy} onChange={(on) => keep((x) => (sameJson(x.value, o.value) ? on : has(x.value)))} />
+        // A value that is its own label is a name (a tool's), shown as one; a label in words is read as words.
+        <Check key={i} checked={has(o.value)} label={o.label === String(o.value) ? <code>{o.label}</code> : o.label} help={o.help ?? undefined} disabled={ctx.busy} onChange={(on) => keep((x) => (sameJson(x.value, o.value) ? on : has(x.value)))} />
       ))}
     </div>
+  );
+}
+
+/**
+ * The user's connections, each ticked or not: a setting that holds connection ids. The loopback
+ * connection isn't offered (no agent's call goes on it). An id the setting holds that is none of
+ * the user's connections (one since deleted) shows too, so what is stored is never hidden and can
+ * be taken out.
+ */
+function ConnectionsControl(props: { node: FormNode; ctx: FormCtx }) {
+  const { node, ctx } = props;
+  const held = Array.isArray(node.value) ? node.value.filter((v): v is string => typeof v === "string") : [];
+  const offered = ctx.connections.filter((x) => !x.loopback || held.includes(x.id));
+  const gone = held.filter((id) => !ctx.connections.some((x) => x.id === id));
+  const set = (id: string, on: boolean): void => ctx.save([{ path: node.path, value: on ? [...held.filter((x) => x !== id), id] : held.filter((x) => x !== id) }]);
+  return (
+    <div class="lah-set-checks" role="group" aria-label={node.label} data-lah-connections>
+      <span class="lah-set-unit">{`${held.length} of ${offered.length + gone.length} on`}</span>
+      {offered.length + gone.length === 0 ? <span class="lah-field-help">You have no connection an agent can use yet. Add one under Lumiverse's Connect.</span> : null}
+      {offered.map((x) => (
+        <Check key={x.id} checked={held.includes(x.id)} label={connectionLabel(x)} disabled={ctx.busy} onChange={(on) => set(x.id, on)} />
+      ))}
+      {gone.map((id) => (
+        <Check key={id} checked label={<code>{id}</code>} help="None of your connections has this id now: untick it to take it out." disabled={ctx.busy} onChange={(on) => set(id, on)} />
+      ))}
+    </div>
+  );
+}
+
+/**
+ * A number: typed plain in the unit it is shown in (a time in seconds or minutes, never
+ * milliseconds), with its unit beside it and, once it is long, the number grouped. A setting that
+ * may be none has that as a tick; unticked where its default is none too, the field shows empty and
+ * nothing is kept until a number is typed: a limit made up here would be saved at once, and a limit
+ * of one token stops every call.
+ */
+function NumberControl(props: { node: FormNode; control: Extract<Control, { kind: "number" }>; ctx: FormCtx }) {
+  const { node, control: c, ctx } = props;
+  const [typing, setTyping] = useState(false);
+  const kept = typeof node.value === "number" ? node.value : null;
+  const fallback = typeof node.fallback === "number" ? node.fallback : null;
+  const none = kept === null && !typing;
+  const shown = shownNumber(c, kept, fallback);
+  const beside = besideNumber(shown.value, shown.unit);
+  const set = (value: JsonValue): void => ctx.save([{ path: node.path, value }]);
+  const tick = (on: boolean): void => {
+    setTyping(!on && fallback === null);
+    if (on && kept !== null) set(null);
+    if (!on && fallback !== null) set(fallback);
+  };
+  return (
+    <>
+      {node.nullable ? <Check checked={none} label={node.none} disabled={ctx.busy} onChange={tick} /> : null}
+      {none ? null : <NumberField label={node.label} value={shown.value} integer={shown.integer} step={shown.step} disabled={ctx.busy} invalid={ctx.problems.has(pathKey(node.path))} onChange={(typed) => set(storedNumber(shown, typed))} {...(shown.min !== null ? { min: shown.min } : {})} {...(shown.max !== null ? { max: shown.max } : {})} />}
+      {!none && beside !== null ? (
+        <span class="lah-set-unit" data-lah-unit={shown.unit ?? undefined}>
+          {beside}
+        </span>
+      ) : null}
+      {kept === null && typing ? <span class="lah-field-help" style={{ flexBasis: "100%" }}>Type a number: it is kept when you leave the field.</span> : null}
+    </>
   );
 }
 
@@ -156,17 +214,8 @@ function LeafControl(props: { node: FormNode; control: Exclude<Control, { kind: 
   switch (c.kind) {
     case "boolean":
       return <Switch checked={node.value === true} label={node.value === true ? "On" : "Off"} disabled={ctx.busy} onChange={set} />;
-    case "number": {
-      const none = node.value === null;
-      const value = typeof node.value === "number" ? node.value : null;
-      return (
-        <>
-          {node.nullable ? <Check checked={none} label={node.none} disabled={ctx.busy} onChange={(on) => set(on ? null : typeof node.fallback === "number" ? node.fallback : (c.min ?? 0))} /> : null}
-          {none ? null : <NumberField label={node.label} value={value} integer={c.integer} step={c.step ?? niceStep(value ?? 0, c.integer)} disabled={ctx.busy} invalid={ctx.problems.has(pathKey(node.path))} onChange={set} {...(c.min !== null ? { min: c.min } : {})} {...(c.max !== null ? { max: c.max } : {})} />}
-          {!none && c.unit ? <span class="lah-set-unit">{c.unit === "ms" && value !== null ? `ms (${duration(value)})` : c.unit}</span> : null}
-        </>
-      );
-    }
+    case "number":
+      return <NumberControl node={node} control={c} ctx={ctx} />;
     case "choice":
       return <ChoiceControl node={node} options={c.options} ctx={ctx} />;
     case "connection": {
@@ -187,6 +236,8 @@ function LeafControl(props: { node: FormNode; control: Exclude<Control, { kind: 
     }
     case "set":
       return <SetControl node={node} options={c.options} ctx={ctx} />;
+    case "connections":
+      return <ConnectionsControl node={node} ctx={ctx} />;
     case "list":
       return (
         <>
@@ -211,7 +262,7 @@ function Leaf(props: { node: FormNode; control: Exclude<Control, { kind: "group"
   const key = pathKey(node.path);
   const problem = ctx.problems.get(key) ?? null;
   const k = props.control.kind;
-  const wide = k === "set" || k === "json" || k === "list" || (props.control.kind === "text" && props.control.multiline);
+  const wide = k === "set" || k === "connections" || k === "json" || k === "list" || (props.control.kind === "text" && props.control.multiline);
   return (
     <div class={wide ? "lah-set-row lah-is-wide" : "lah-set-row"} data-lah-setting={node.path.join(".")} data-changed={node.changed || undefined} data-lah-found={ctx.found === key || undefined}>
       <div class="lah-set-about">
@@ -220,7 +271,7 @@ function Leaf(props: { node: FormNode; control: Exclude<Control, { kind: "group"
           {node.changed ? <Badge tone="accent">changed</Badge> : null}
         </div>
         {node.help ? <p class="lah-field-help">{node.help}</p> : null}
-        <span class="lah-set-path">{node.path.join(".")}</span>
+        {ctx.details ? <span class="lah-set-path">{node.path.join(".")}</span> : null}
       </div>
       <div class="lah-set-edit">
         <div class="lah-set-control">
@@ -256,12 +307,15 @@ function AddRow(props: { node: FormNode; control: Extract<Control, { kind: "tabl
     setName("");
   };
   const free = ctx.connections.filter((x) => !taken.has(x.id));
+  const tools = c.keys === "tool" && ctx.tools ? ctx.tools.filter((t) => !taken.has(t)) : null;
   return (
     <div class="lah-set-add" data-lah-add={node.path.join(".")}>
       {c.keys === "connection" ? (
         <Select label={`A connection to add to ${node.label}`} value={name} options={[{ value: "", label: free.length === 0 ? "Every connection has a row" : "Choose a connection…" }, ...free.map((x) => ({ value: x.id, label: connectionLabel(x) }))]} disabled={ctx.busy} onChange={setName} />
+      ) : tools !== null ? (
+        <Select label={`A tool to add to ${node.label}`} value={name} options={[{ value: "", label: tools.length === 0 ? "Every tool has a row" : "Choose a tool…" }, ...tools.map((t) => ({ value: t, label: t }))]} disabled={ctx.busy} onChange={setName} />
       ) : (
-        <input class="lah-input lah-mono" aria-label={c.keys === "model" ? `A model's name to add to ${node.label}` : `A name to add to ${node.label}`} placeholder={c.keys === "model" ? "A model's name" : "A name"} value={name} autocomplete="off" spellcheck={false} disabled={ctx.busy} onInput={(event) => setName(event.currentTarget.value)} onKeyDown={(event) => event.key === "Enter" && add()} />
+        <input class="lah-input lah-mono" aria-label={c.keys === "model" ? `A model's name to add to ${node.label}` : c.keys === "tool" ? `A tool's name to add to ${node.label}` : `A name to add to ${node.label}`} placeholder={c.keys === "model" ? "A model's name" : c.keys === "tool" ? "A tool's name" : "A name"} value={name} autocomplete="off" spellcheck={false} disabled={ctx.busy} onInput={(event) => setName(event.currentTarget.value)} onKeyDown={(event) => event.key === "Enter" && add()} />
       )}
       <Button icon="plus" disabled={ctx.busy || name.trim() === "" || taken.has(name.trim())} onClick={add}>
         Add

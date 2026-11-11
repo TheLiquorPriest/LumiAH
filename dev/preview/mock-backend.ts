@@ -1,13 +1,61 @@
 // A stand-in for LumiAH's extension backend, for the preview and the frontend's tests: it answers
-// every request of `src/shared/ui.ts` and pushes the state and the live view as the real one does,
+// every request of `src/shared/ui.ts` and pushes the state and the live views as the real one does,
 // from made-up data (fixtures.ts). It keeps settings as the real one does (the user's own values put
-// whole at paths over the defaults, each section checking its own), plays a turn a step at a time so
-// the live view fills as you watch (a call's answer arriving a few words at a time while it is in
-// flight), and can be told to fail a request, so every state of every page can be reached without
-// Lumiverse.
+// whole at paths over the defaults, each section checking its own), plays a run a step at a time so
+// a live view fills as you watch (a call's answer arriving a few words at a time while it is in
+// flight, a tool call held until the user answers it, a turn paused and let go on), and can be told
+// to fail a request, so every state of every page can be reached without Lumiverse. This file holds
+// the state, the settings and the live views; each area's requests are answered by its own part
+// under mock/.
 
-import { type BackendToFrontend, chatAnswered, type ChatView, isRecord, type JsonObject, type JsonValue, type LiveEnded, type LiveEvent, type LivePartial, type LiveView, type RelayView, type SessionView, type SettingPath, type SetupStepId, type TextDef, type TurnRow, type UiErrorCode, type UiProblem, type UiRequest, type UiRequests, type UiRequestType, type UiState, uiRequestOf, UI_VERSION, URL_SLOT } from "../../src/shared/ui";
-import { CHATS, CONNECTIONS, failedTurn, fakeHash, finishedTurn, longTurn, MODELS, OTHER_CHAT, type PlayStep, playedTurn, storedTurns, SUMMARY, Trace } from "./fixtures";
+import {
+  type ApprovalView,
+  type KeptApproval,
+  type BackendToFrontend,
+  type CauseCode,
+  chatAnswered,
+  type ChatView,
+  type JobView,
+  type JsonObject,
+  type JsonValue,
+  type LastTurn,
+  type LiveEnded,
+  type LiveEvent,
+  type LivePartial,
+  type LiveView,
+  loreChangesOf,
+  type NoPart,
+  type RelayView,
+  replyDid,
+  type RunPlace,
+  isRecord,
+  isReply,
+  type SessionView,
+  type SettingPath,
+  type SetupStepId,
+  type StreamId,
+  type TextDef,
+  type TurnRow,
+  type UiProblem,
+  type UiRequest,
+  type UiRequests,
+  type UiRequestType,
+  type UiState,
+  uiRequestOf,
+  UI_VERSION,
+  URL_SLOT,
+} from "../../src/shared/ui";
+import { causeOf } from "../../src/extension/backend/cause";
+import { CHATS, CONNECTIONS, failedTurn, fakeHash, finishedTurn, handedTurn, type HeldWord, lateTurn, longTurn, MODELS, OTHER_CHAT, type PlayStep, playedHanded, playedTurn, REPLY_MS, replyDue, slowTurn, storedTurns, SUMMARY, THEIR_CHAT, Trace, workedTurn, workingTurn, WRITING_MS } from "./fixtures";
+import { chronicleMock } from "./mock/chronicle";
+import { type Handlers, hashOf, type HomeCtx, type PlayedCall, type PlayOptions, Refusal, type StoryCtx } from "./mock/ctx";
+import { defsMock } from "./mock/defs";
+import { homeMock, missingPermissions } from "./mock/home";
+import { jobsMock } from "./mock/jobs";
+import { loreMock } from "./mock/lore";
+import { spendMock } from "./mock/spend";
+import { talkMock } from "./mock/talk";
+import { workspaceMock } from "./mock/workspace";
 
 /** One section of the settings, as the real backend holds them: its key, its defaults, its schema, and what it refuses. */
 export interface MockSection {
@@ -21,8 +69,15 @@ export type Scenario = "ready" | "fresh" | "trouble";
 
 export interface MockOptions {
   scenario: Scenario;
-  /** The chat's live turn when the preview opens: a finished one, a failed one, a long one, one that starts playing at once, or none. */
-  turn: "done" | "failed" | "long" | "running" | "none";
+  /**
+   * The chat's live turn when the preview opens: a finished one, a failed one, a long one, one in
+   * which the main agent started sub-agents that wrote files (`worked`), one that starts playing at
+   * once (`running`), one that plays with sub-agents and a tool call it holds for the user's word
+   * (`working`), or none.
+   */
+  turn: "done" | "failed" | "long" | "worked" | "running" | "working" | "nopart" | "urgent" | "none";
+  /** The README's pictures (`?showcase=1`): the made-up story as it stands once it is learned to its end, so the Chronicle page opens on a whole chronicle. Left out, the story is as the scenario has it. */
+  showcase?: boolean;
   sections: MockSection[];
   texts: { defs: readonly TextDef[]; check(id: string, text: string): string | null };
   /** How long each answer takes, in ms. */
@@ -34,16 +89,8 @@ export interface MockOptions {
   now(): number;
   /** Runs `fn` after `ms`; returns the cancel. Tests pass their own so nothing waits on a clock. */
   later(fn: () => void, ms: number): () => void;
-}
-
-class Refusal extends Error {
-  constructor(
-    readonly code: UiErrorCode,
-    message: string,
-    readonly problems?: UiProblem[],
-  ) {
-    super(message);
-  }
+  /** Closes the stand-in host's drawer, as Lumiverse does when LumiAH asks it to (`lah.drawer.close`). Left out where there is no drawer to close (a test's backend): the request then answers that nothing was closed, as a Lumiverse without that call does. */
+  closeDrawer?(): void;
 }
 
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
@@ -60,14 +107,31 @@ function put(root: JsonObject, path: readonly string[], value: JsonValue): void 
 
 const within = (path: readonly string[], under: readonly string[]): boolean => under.length <= path.length && under.every((key, i) => path[i] === key);
 
+/** A run under a stream: its trace and view, the steps still to play, and how it is held. */
 interface Live {
+  stream: StreamId;
+  /** Whether it answers a generation in a chat: a reply's turn leaves a record on its chat, any other run a transcript of its own. */
+  reply: boolean;
+  chatId: string | null;
   trace: Trace;
   view: LiveView;
-  /** The steps still to play, and the cancel of what waits: the next step, and what the call in flight has yet to send. */
   steps: PlayStep[];
+  /** The cancel of what waits: the next step, and what the call in flight has yet to send. */
   cancel: (() => void) | null;
   /** What the calls in flight have sent so far. */
   partials: LivePartial[];
+  /** The user holds it: its next step waits for `resume`. */
+  paused: boolean;
+  resume: (() => void) | null;
+  /** What the user said since its last step, for its main agent's next round. */
+  notes: string[];
+  /** The call it holds for the user's word, and what answers it. */
+  held: { id: string; answer(word: HeldWord): void } | null;
+  options: PlayOptions;
+  /** Where it runs (§25), as its chat stood when it began. */
+  place: RunPlace;
+  /** For a built-in reply's turn: when its time before the reply ends. */
+  replyBy: number | null;
 }
 
 /**
@@ -90,15 +154,51 @@ const START_SERVICE = `sudo -u lumiverse /usr/local/bin/bun --cwd / /srv/lumiver
 const START_FOREGROUND = `sudo -u lumiverse /usr/local/bin/bun --cwd / /srv/lumiverse/data/extensions/lumi_ah/dist/lumiah.js up --url ${URL_SLOT}`;
 const BUILD = "4c1e9a70";
 
+/** What the page says of a reply LumiAH had no part in because the user skipped it before the brief (DESIGN §25), in the backend's own words. */
+const STOPPED_PART: NoPart = { why: "stopped", text: "You skipped LumiAH for this reply. Lumiverse wrote the reply from the prompt as it was. To stop a reply itself, use Lumiverse's own Stop." };
+
+/** And because its turn failed before the brief. */
+const FAILED_PART: NoPart = { why: "failed", text: "LumiAH's agents didn't finish. Lumiverse sent the prompt as it was, so the reply is its own." };
+
+/** How the story's built-in reply opens: Lumiverse's own generation writes it, so the stand-in has no text of it but this. */
+const BUILTIN_REPLY = "The door opened a hand's width. Ilse stood behind it with the night key already in her fist, as if she had heard the knock coming up the lane.";
+
+/** What a turn's trace counts up to for the first screen: the agents that worked, their tool calls, the lore entries added to and dropped from what the writer saw, and the jobs started. */
+function countsOf(trace: Trace): Pick<LastTurn, "agents" | "tools" | "lore" | "jobs"> {
+  const counts = { agents: 0, tools: 0, lore: { added: 0, dropped: 0 }, jobs: new Set<string>() };
+  for (const { event } of trace.events) {
+    if (event.kind === "agent_started") counts.agents += 1;
+    if (event.kind === "job") counts.jobs.add(event.job.id);
+    if (event.kind !== "agent_entry") continue;
+    if (event.entry.kind === "answer") counts.tools += event.entry.calls.length;
+    const lore = loreChangesOf(event.entry);
+    if (lore !== null) counts.lore = { added: counts.lore.added + lore.added.length, dropped: counts.lore.dropped + lore.dropped.length };
+  }
+  return { ...counts, jobs: counts.jobs.size };
+}
+
 export class MockBackend {
   state: UiState;
   private own: { path: string[]; value: JsonValue }[] = [];
   private ownTexts: Record<string, string> = {};
-  private readonly live = new Map<string, Live>();
-  private readonly watching = new Set<string>();
+  private readonly live = new Map<StreamId, Live>();
+  private readonly watching = new Set<StreamId>();
   private readonly stored = new Map<string, { row: TurnRow; trace: Trace | null }[]>();
+  /** The tools the user approved "for this chat", newest first. */
+  private approved: KeptApproval[] = [];
+  /** When the user asked for a chat's notes to be summarized at its next turn. */
+  private readonly summaryAsked = new Map<string, number>();
+  /** The transcripts kept of runs that are no reply (a job's, a side session's turn), by hash. */
+  private readonly kept = new Map<string, { trace: Trace; stream: StreamId }>();
+  private readonly texts = new Map<string, string>();
   private turns = 0;
+  /** The trace of every run played since the preview opened, in the order they began: what Spend counts beside the story's own figures. */
+  private readonly played: Trace[] = [];
   private minted = 0;
+  /** The job started as the learning of each chat's story (`lah.job.start` with `story`), by chat. */
+  private readonly story = new Map<string, string>();
+  private readonly handlers: Handlers<UiRequestType>;
+  private starting = true;
 
   constructor(
     private readonly deliver: (payload: BackendToFrontend) => void,
@@ -106,6 +206,8 @@ export class MockBackend {
   ) {
     const now = options.now();
     const ready = options.scenario !== "fresh";
+    // In the story as set up, the user once approved the archivist's writes for the open chat: the Tools page lists it, to be taken back.
+    if (options.scenario === "ready") this.approved = [{ chatId: "chat-mara", chat: "Mara at the harbour", tool: "workspace_write", at: now - 2 * 60 * 60_000 }];
     const relay = (over: Partial<RelayView>): RelayView => ({
       id: "relay-1",
       name: "mara",
@@ -133,27 +235,92 @@ export class MockBackend {
               relay({ id: "relay-2", name: "mara-old", link: "refused", seenAt: now - 90_000, unit: null, build: "1f0a6c33", update: true, problem: "This runtime speaks link version 0 and LumiAH 1: update the runtime by running its start line on LumiAH's Runtime page again.", scheduler: "unknown", session: { valid: null, endsAt: null } }),
             ]
           : [];
-    const done = (id: SetupStepId): boolean => (options.scenario === "ready" ? true : options.scenario === "trouble" ? id !== "runtime" : false);
+    const permissions = missingPermissions(options.scenario);
+    const steps: Readonly<Record<SetupStepId, boolean>> = { permissions: !permissions.some((p) => p.needed), chat: ready, reply: ready };
     this.state = {
       rev: 1,
-      runtime: { build: BUILD, link: 1, model: "lumiah", relays, start: { service: START_SERVICE, foreground: START_FOREGROUND, missing: [] }, issues: options.scenario === "trouble" ? ["LumiAH wasn't granted the generation permission, so no agent can call a model. Grant it in Lumiverse → Extensions → LumiAH."] : [] },
-      setup: { steps: (["runtime", "key", "connection", "chat", "reply"] as const).map((id) => ({ id, done: done(id) })) },
+      runtime: { build: BUILD, link: 1, model: "lumiah", relays, start: { service: START_SERVICE, foreground: START_FOREGROUND, missing: [] }, issues: [], ready: false },
+      setup: { steps: (["permissions", "chat", "reply"] as const).map((id) => ({ id, done: steps[id] })) },
       key: ready ? { set: true, print: "9f2c·41d0", at: now - 9 * 86_400_000 } : { set: false, print: null, at: null },
       chats: ready ? clone(CHATS) : [],
       running: [],
       connections: clone(ready ? CONNECTIONS : CONNECTIONS.filter((c) => !c.loopback)),
       settings: { values: {}, defaults: {}, schema: {} },
       texts: { defs: [...options.texts.defs], own: {} },
+      approvals: [],
+      jobs: { active: [], off: false, paused: false, changed: 0 },
+      notices: [],
+      defs: 0,
+      permissions,
     };
+    this.state.runtime.ready = this.readyOf(this.state);
     this.state.settings = this.settingsView();
+    // The jobs' part is made after the context it takes, so what reads its list is bound once it is there.
+    let jobsOf: (chatId: string) => JobView[] = () => [];
+    const ctx: HomeCtx & StoryCtx = {
+      now: options.now,
+      later: options.later,
+      ready,
+      scenario: options.scenario,
+      showcase: options.showcase === true,
+      state: () => this.state,
+      push: (patch) => this.push(patch),
+      blobs: {
+        put: (text) => {
+          const hash = hashOf(text);
+          this.texts.set(hash, text);
+          return hash;
+        },
+        set: (hash, text) => void this.texts.set(hash, text),
+        get: (hash) => this.texts.get(hash),
+      },
+      play: (stream, steps, play) => this.play(stream, steps, play),
+      stop: (stream, why) => this.stop(stream, why),
+      pause: (stream, on) => this.pause(stream, on),
+      settings: (set, reset) => void this.setSettings(set, reset),
+      keep: (stream, trace) => {
+        const transcript = fakeHash(`transcript:${trace.turn}`);
+        this.kept.set(transcript, { trace, stream });
+        return transcript;
+      },
+      learning: (chatId, jobId) => void this.story.set(chatId, jobId),
+      chat: (chatId) => this.chat(chatId),
+      last: (chatId) => this.last(chatId),
+      storyJob: (chatId) => jobsOf(chatId).find((j) => j.id === this.story.get(chatId)) ?? null,
+      calls: () => this.calls(),
+    };
+    const workspace = workspaceMock(ctx);
+    const chronicle = chronicleMock(ctx);
+    const jobs = jobsMock(ctx);
+    jobsOf = (chatId) => {
+      const page = jobs["lah.jobs.list"]({ lah: UI_VERSION, type: "lah.jobs.list", reqId: "story", chatId, cursor: null, limit: 1000 });
+      return page instanceof Promise ? [] : page.jobs;
+    };
+    // The chronicle's files are read as any workspace file is: its part answers for those it holds, the workspace's for the rest.
+    this.handlers = { ...this.ownHandlers(), ...workspace, ...defsMock(ctx), ...jobs, ...spendMock(ctx), ...talkMock(ctx), ...homeMock(ctx), ...loreMock(ctx), ...chronicle.handlers, "lah.ws.read": (r) => chronicle.read(r) ?? workspace["lah.ws.read"](r), "lah.ws.list": (r) => { const view = workspace["lah.ws.list"](r); return view instanceof Promise ? view.then((v) => chronicle.list(r, v)) : chronicle.list(r, view); } };
     if (ready) {
       this.stored.set("chat-mara", storedTurns(now));
-      const first = options.turn === "done" ? finishedTurn("chat-mara", "turn-0043", now - 3 * 60_000) : options.turn === "failed" ? failedTurn("chat-mara", "turn-0039", now - 26 * 60_000) : options.turn === "long" ? longTurn("chat-mara", "turn-0037", now - 44 * 60_000, 90) : null;
-      if (first) this.live.set("chat-mara", { trace: first, view: this.viewOf(first, []), steps: [], cancel: null, partials: [] });
-      const other = failedTurn("chat-brann", "turn-b-0007", now - 50 * 60_000);
-      this.live.set("chat-brann", { trace: other, view: this.viewOf(other, []), steps: [], cancel: null, partials: [] });
+      // The open chat runs built in (DESIGN §25), so its turns are built-in ones: Lumiverse writes the reply.
+      const first =
+        options.turn === "done"
+          ? handedTurn("chat-mara", "turn-0043", now - 3 * 60_000, { messageId: "msg-0043" })
+          : options.turn === "failed"
+            ? failedTurn("chat-mara", "turn-0039", now - 26 * 60_000)
+            : options.turn === "long"
+              ? longTurn("chat-mara", "turn-0037", now - 44 * 60_000, 90)
+              : options.turn === "worked"
+                ? workedTurn("chat-mara", "turn-0045", now - 2 * 60_000, "builtin")
+                : options.turn === "nopart"
+                  ? lateTurn("chat-mara", "turn-0049", now - 6 * 60_000)
+                  : null;
+      if (first) this.hold("chat-mara", first, { reply: true, chatId: "chat-mara" });
+      this.hold("chat-brann", failedTurn("chat-brann", "turn-b-0007", now - 50 * 60_000), { reply: true, chatId: "chat-brann" });
       if (options.turn === "running") options.later(() => this.startTurn("chat-mara"), 400);
+      if (options.turn === "working") options.later(() => this.startTurn("chat-mara", workingTurn("builtin")), 400);
+      // A slow main agent with forty seconds before the reply: the countdown turns urgent as you watch, then runs out.
+      if (options.turn === "urgent") options.later(() => this.play("chat-mara", slowTurn(), { reply: true, chatId: "chat-mara", replyMs: 40_000 }), 400);
     }
+    this.starting = false;
   }
 
   // ---------------------------------------------------------------- what the page sends
@@ -167,189 +334,353 @@ export class MockBackend {
     }
     const request = read.request;
     this.options.later(() => {
-      try {
-        if (this.options.fail.has(request.type)) throw new Refusal("internal", `The preview was told to fail ${request.type}.`);
-        // The handler table is keyed by the request's type, which TypeScript can't follow through the lookup.
-        const body = (this.handlers[request.type] as (r: UiRequest) => unknown)(request);
-        this.deliver({ lah: UI_VERSION, type: "lah.result", reqId: request.reqId, request: request.type, body } as BackendToFrontend);
-      } catch (error) {
+      const refuse = (error: unknown): void => {
         const refusal = error instanceof Refusal ? error : new Refusal("internal", error instanceof Error ? error.message : String(error));
         this.deliver({ lah: UI_VERSION, type: "lah.error", reqId: request.reqId, code: refusal.code, message: refusal.message, ...(refusal.problems ? { problems: refusal.problems } : {}) });
+      };
+      const answer = (body: unknown): void => this.deliver({ lah: UI_VERSION, type: "lah.result", reqId: request.reqId, request: request.type, body } as BackendToFrontend);
+      try {
+        if (this.options.fail.has(request.type)) throw new Refusal("internal", `The preview was told to fail ${request.type}.`);
+        // The handler table is keyed by the request's type, which TypeScript can't follow through the lookup. A handler may answer later (a sweep takes a while).
+        const body = (this.handlers[request.type] as (r: UiRequest) => unknown)(request);
+        if (body instanceof Promise) body.then(answer, refuse);
+        else answer(body);
+      } catch (error) {
+        refuse(error);
       }
     }, this.options.delay);
   }
 
-  private readonly handlers: { [K in UiRequestType]: (r: Extract<UiRequest, { type: K }>) => UiRequests[K]["result"] } = {
-    "lah.hello": () => this.state,
-    "lah.chat.get": (r) => ({ chat: this.chat(r.chatId) }),
-    "lah.chat.set": (r) => {
-      const loopback = this.state.connections.find((c) => c.loopback);
-      if (r.on && !loopback) throw new Refusal("unavailable", "There is no loopback connection to pin the chat to yet. Make it first: Runtime, first-time setup, step 3.");
-      const before = this.chat(r.chatId);
-      const chat: ChatView = r.on && loopback ? { ...before, on: true, since: this.options.now(), connection: { id: loopback.id, name: loopback.name, loopback: true } } : { ...before, on: false, since: null, connection: { id: "conn-deepseek", name: "Deepseek", loopback: false } };
-      const chats = this.state.chats.some((c) => c.chatId === chat.chatId) ? this.state.chats.map((c) => (c.chatId === chat.chatId ? chat : c)) : [...this.state.chats, chat];
-      this.push({ chats: chats.filter((c) => c.on || chatAnswered(c)), ...(r.on ? { setup: this.stepDone("chat") } : {}) });
-      return { chat };
-    },
-    "lah.live.open": (r) => {
-      this.watching.add(r.chatId);
-      const held = this.live.get(r.chatId);
-      if (!held) return { live: null, next: null };
-      const events = held.view.events.slice(0, this.options.page);
-      return { live: { ...held.view, events }, next: held.view.events.length > events.length ? events.length + 1 : null };
-    },
-    "lah.live.events": (r) => {
-      const held = this.live.get(r.chatId);
-      if (!held || held.view.turn !== r.turn) throw new Refusal("not_found", "That turn is no longer the chat's live turn.");
-      return this.pageOf(held.view.events, r.from);
-    },
-    "lah.live.close": (r) => {
-      this.watching.delete(r.chatId);
-      return { closed: true };
-    },
-    "lah.turn.stop": (r) => {
-      const held = this.live.get(r.chatId);
-      if (!held || held.view.turn !== r.turn || held.view.ended !== null) return { stopped: false };
-      held.cancel?.();
-      held.steps = [];
-      held.partials = [];
-      const before = held.trace.events.length;
-      for (const agentId of ["main-1", "writer-1"]) if (held.trace.events.some((e) => e.event.kind === "agent_started" && e.event.agent.id === agentId) && !held.trace.events.some((e) => e.event.kind === "agent_idle" && e.event.agentId === agentId)) held.trace.stop(agentId, "cancelled", "cancelled", "You stopped the turn.").idle(agentId);
-      held.trace.ended("stopped", "You stopped it from the live view.");
-      this.grew(r.chatId, held, before);
-      return { stopped: true };
-    },
-    "lah.turns.list": (r) => {
-      const all = this.stored.get(r.chatId) ?? [];
-      const from = r.cursor === null ? 0 : Number(r.cursor);
-      const rows = all.slice(from, from + r.limit).map((x) => x.row);
-      return { turns: rows, next: from + r.limit < all.length ? String(from + r.limit) : null, total: all.length, session: this.session(r.chatId) };
-    },
-    "lah.transcript.get": (r) => {
-      const found = [...this.stored.values()].flat().find((x) => x.row.transcript === r.transcript);
-      if (!found?.trace) throw new Refusal("not_found", "The store no longer has that transcript.");
-      const page = this.pageOf(found.trace.events, r.from);
-      return { view: { ...this.viewOf(found.trace, []), events: page.events }, next: page.next };
-    },
-    "lah.prompt.get": (r) => {
-      for (const trace of this.traces()) {
-        const prompt = trace.prompts.get(r.prompt);
-        if (prompt) return { prompt };
-      }
-      throw new Refusal("not_found", "The store no longer has that prompt.");
-    },
-    "lah.blob.get": (r) => {
-      if (r.hash === fakeHash("summary:1") || r.hash === fakeHash("summary:0")) return { text: SUMMARY };
-      for (const trace of this.traces()) {
-        const text = trace.blobs.get(r.hash);
-        if (text !== undefined) return { text };
-      }
-      throw new Refusal("not_found", "The store no longer has that text.");
-    },
-    "lah.session.rollback": (r) => {
-      const found = (this.stored.get(r.chatId) ?? []).find((x) => x.row.messageId === r.messageId && x.row.swipe === r.swipe);
-      if (!found?.row.compaction) throw new Refusal("not_found", "That turn made no compaction.");
-      if (found.row.compaction.rollback !== "available") throw new Refusal("unavailable", "That compaction can't be rolled back now.");
-      found.row = { ...found.row, compaction: { ...found.row.compaction, rollback: "pending" } };
-      return { turn: found.row, session: this.session(r.chatId) };
-    },
-    "lah.settings.set": (r) => {
-      const next = [...this.own.filter((o) => !r.reset.some((under) => within(o.path, under)) && !r.set.some((s) => within(o.path, s.path))), ...r.set.map((s) => ({ path: s.path, value: clone(s.value) }))];
-      const empty = r.set.find((s) => s.path.length === 0);
-      if (empty) throw new Refusal("invalid", "A setting needs a place.", [{ path: [], message: "A setting needs a place." }]);
-      const values = this.valuesOf(next);
-      const problems = this.options.sections.flatMap((section) => section.check(values[section.key]).map((p) => ({ path: [section.key, ...p.path], message: p.message })));
-      for (const key of Object.keys(values)) if (!this.options.sections.some((s) => s.key === key)) problems.push({ path: [key], message: "There is no such setting." });
-      if (problems.length > 0) throw new Refusal("invalid", problems.length === 1 ? `Not saved: ${problems[0]?.message ?? ""}` : `Not saved: the settings refuse ${problems.length} of these values.`, problems);
-      this.own = next;
-      const settings = this.settingsView();
-      this.push({ settings });
-      return { settings };
-    },
-    "lah.models.list": (r) => {
-      const models = MODELS[r.connectionId ?? ""];
-      if (!models) throw new Refusal("unavailable", "its provider lists no models");
-      return { models };
-    },
-    "lah.text.set": (r) => {
-      if (!this.options.texts.defs.some((d) => d.id === r.id)) throw new Refusal("not_found", `There is no text ${r.id}.`);
-      const refused = this.options.texts.check(r.id, r.text);
-      if (refused !== null) throw new Refusal("invalid", refused, [{ path: [r.id], message: refused }]);
-      this.ownTexts = { ...this.ownTexts, [r.id]: r.text };
-      return { texts: this.pushTexts() };
-    },
-    "lah.text.reset": (r) => {
-      const { [r.id]: _dropped, ...rest } = this.ownTexts;
-      this.ownTexts = rest;
-      return { texts: this.pushTexts() };
-    },
-    "lah.key": (r) => {
-      if (r.op === "forget") {
-        const view = { set: false, print: null, at: null };
-        this.push({ key: view });
-        return { key: null, view, connection: null };
-      }
-      // A key differs from the one before however fast it is asked for.
-      this.minted += 1;
-      const key = `lah_${fakeHash(`key:${this.options.now()}:${this.minted}`).slice(0, 40)}`;
-      const view = { set: true, print: `${key.slice(4, 8)}·${key.slice(8, 12)}`, at: this.options.now() };
-      const linked = this.state.runtime.relays.some((x) => x.link === "linked");
-      const connections = linked && !this.state.connections.some((c) => c.loopback) ? [CONNECTIONS[0] as (typeof CONNECTIONS)[number], ...this.state.connections] : this.state.connections;
-      const loopback = linked ? connections.find((c) => c.loopback) : undefined;
-      let setup = this.stepDone("key");
-      if (loopback) setup = { steps: setup.steps.map((s) => (s.id === "connection" ? { ...s, done: true } : s)) };
-      this.push({ key: view, connections, setup });
-      return { key, view, connection: loopback ? { id: loopback.id, name: loopback.name } : null };
-    },
-    "lah.relay": (r) => {
-      if (!this.state.runtime.relays.some((x) => x.id === r.relay)) throw new Refusal("not_found", "There is no such runtime.");
-      const runtime = r.op === "forget" ? { ...this.state.runtime, relays: this.state.runtime.relays.filter((x) => x.id !== r.relay) } : this.state.runtime;
-      if (r.op === "forget") this.push({ runtime });
-      return { runtime };
-    },
-  };
+  /** The requests this file answers itself: the state, chats, live views and what the user does to a run, sessions, settings, texts, the key and the runtime. */
+  private ownHandlers() {
+    type Own = "lah.hello" | "lah.chat.get" | "lah.chat.set" | "lah.chat.takeover" | "lah.live.open" | "lah.live.events" | "lah.live.close" | "lah.turn.stop" | "lah.turn.say" | "lah.turn.pause" | "lah.approval.answer" | "lah.approvals.kept" | "lah.approval.forget" | "lah.turns.list" | "lah.transcript.get" | "lah.prompt.get" | "lah.blob.get" | "lah.session.rollback" | "lah.session.summarize" | "lah.settings.set" | "lah.models.list" | "lah.text.set" | "lah.text.reset" | "lah.key" | "lah.relay" | "lah.drawer.close";
+    const handlers: { [K in Own]: (r: Extract<UiRequest, { type: K }>) => UiRequests[K]["result"] } = {
+      "lah.hello": () => this.state,
+      "lah.chat.get": (r) => ({ chat: this.chat(r.chatId) }),
+      "lah.chat.set": (r) => {
+        const before = this.chat(r.chatId);
+        const place = r.place ?? before.place;
+        if (r.on && this.state.permissions.some((p) => p.needed)) throw new Refusal("unavailable", "LumiAH can't answer a chat yet: Lumiverse hasn't allowed it what it needs. Allow it on Home, then switch the chat on.");
+        if (r.on && place === "runtime" && !this.state.runtime.ready) throw new Refusal("unavailable", "No runtime is ready, so this chat can't run in one yet. Set one up on the Runtime page, or run the chat built in.");
+        const loopback = this.state.connections.find((c) => c.loopback);
+        // Built in, a chat keeps its own connection; in a runtime it is pinned to the loopback, and gets its own back when it leaves.
+        const connection = r.on && place === "runtime" && loopback ? { id: loopback.id, name: loopback.name, loopback: true } : { id: "conn-deepseek", name: "Deepseek", loopback: false };
+        const chat: ChatView = { ...before, on: r.on, since: r.on ? (before.on && before.since !== null ? before.since : this.options.now()) : null, place, connection };
+        const chats = this.state.chats.some((c) => c.chatId === chat.chatId) ? this.state.chats.map((c) => (c.chatId === chat.chatId ? chat : c)) : [...this.state.chats, chat];
+        this.push({ chats: chats.filter((c) => c.on || chatAnswered(c)), ...(r.on ? { setup: this.stepDone("chat") } : {}) });
+        return { chat };
+      },
+      "lah.chat.takeover": (r) => {
+        const before = this.chat(r.chatId);
+        if (before.other === undefined) throw new Refusal("conflict", "No other extension answers this chat, so there is nothing to take over. Switch LumiAH on for it instead.");
+        // The other's mark goes, the chat gets back the connection it had, and it is switched on here, built in.
+        const { other: _mark, ...mine } = before;
+        const chat: ChatView = { ...mine, on: true, since: this.options.now(), place: "builtin", connection: { id: "conn-deepseek", name: "Deepseek", loopback: false } };
+        const chats = this.state.chats.some((c) => c.chatId === chat.chatId) ? this.state.chats.map((c) => (c.chatId === chat.chatId ? chat : c)) : [...this.state.chats, chat];
+        this.push({ chats });
+        return { chat };
+      },
+      "lah.live.open": (r) => {
+        this.watching.add(r.stream);
+        const held = this.live.get(r.stream);
+        if (!held) return { live: null, next: null };
+        const events = held.view.events.slice(0, this.options.page);
+        return { live: { ...held.view, events }, next: held.view.events.length > events.length ? events.length + 1 : null };
+      },
+      "lah.live.events": (r) => {
+        const held = this.live.get(r.stream);
+        if (!held || held.view.turn !== r.turn) throw new Refusal("not_found", "That turn is no longer the live one.");
+        return this.pageOf(held.view.events, r.from);
+      },
+      "lah.live.close": (r) => {
+        this.watching.delete(r.stream);
+        return { closed: true };
+      },
+      "lah.turn.stop": (r) => {
+        const held = this.live.get(r.stream);
+        if (!held || held.view.turn !== r.turn || held.view.ended !== null) return { stopped: false };
+        this.stop(r.stream, "You stopped it from the live view.");
+        return { stopped: true };
+      },
+      "lah.turn.say": (r) => {
+        const held = this.live.get(r.stream);
+        if (!held || held.view.turn !== r.turn || held.view.ended !== null) return { said: false };
+        held.notes.push(r.text);
+        return { said: true };
+      },
+      "lah.turn.pause": (r) => {
+        const held = this.live.get(r.stream);
+        if (!held || held.view.turn !== r.turn || held.view.ended !== null) return { paused: false };
+        this.pause(r.stream, r.on);
+        return { paused: held.paused };
+      },
+      "lah.approval.answer": (r) => {
+        const held = [...this.live.values()].find((x) => x.held?.id === r.id);
+        if (!held?.held) return { answered: false };
+        const asked = this.state.approvals.find((a) => a.id === r.id);
+        // Approved for this chat, the tool is kept as that until the user takes it back on the Tools page.
+        if (r.answer.decision === "chat" && asked && asked.chatId !== "" && !this.approved.some((k) => k.chatId === asked.chatId && k.tool === asked.tool)) this.approved = [{ chatId: asked.chatId, chat: this.chat(asked.chatId).name, tool: asked.tool, at: this.options.now() }, ...this.approved];
+        held.held.answer(r.answer);
+        return { answered: true };
+      },
+      "lah.approvals.kept": (r) => ({ kept: this.approved.filter((k) => r.chatId === null || k.chatId === r.chatId) }),
+      "lah.approval.forget": (r) => {
+        this.approved = this.approved.filter((k) => !(k.chatId === r.chatId && k.tool === r.tool));
+        return { kept: this.approved.filter((k) => k.chatId === r.chatId) };
+      },
+      "lah.turns.list": (r) => {
+        const all = this.stored.get(r.chatId) ?? [];
+        const from = r.cursor === null ? 0 : Number(r.cursor);
+        const rows = all.slice(from, from + r.limit).map((x) => x.row);
+        return { turns: rows, next: from + r.limit < all.length ? String(from + r.limit) : null, total: all.length, session: this.session(r.chatId) };
+      },
+      "lah.transcript.get": (r) => {
+        const reply = [...this.stored.values()].flat().find((x) => x.row.transcript === r.transcript);
+        const other = this.kept.get(r.transcript);
+        const trace = reply?.trace ?? other?.trace;
+        if (!trace) throw new Refusal("not_found", "The store no longer has that transcript.");
+        const page = this.pageOf(trace.events, r.from);
+        const where = reply ? { reply: true, place: reply.row.place ?? (trace.chatId === "" ? ("builtin" as const) : this.chat(trace.chatId).place) } : undefined;
+        return { view: { ...this.viewOf(other?.stream ?? trace.chatId, trace.chatId === "" ? null : trace.chatId, trace, [], where), events: page.events }, next: page.next };
+      },
+      "lah.prompt.get": (r) => {
+        for (const trace of this.traces()) {
+          const prompt = trace.prompts.get(r.prompt);
+          if (prompt) return { prompt };
+        }
+        throw new Refusal("not_found", "The store no longer has that prompt.");
+      },
+      "lah.blob.get": (r) => {
+        if (r.hash === fakeHash("summary:1") || r.hash === fakeHash("summary:0")) return { text: SUMMARY };
+        const kept = this.texts.get(r.hash);
+        if (kept !== undefined) return { text: kept };
+        for (const trace of this.traces()) {
+          const text = trace.blobs.get(r.hash);
+          if (text !== undefined) return { text };
+        }
+        throw new Refusal("not_found", "The store no longer has that text.");
+      },
+      "lah.session.rollback": (r) => {
+        const found = (this.stored.get(r.chatId) ?? []).find((x) => x.row.messageId === r.messageId && x.row.swipe === r.swipe);
+        if (!found?.row.compaction) throw new Refusal("not_found", "That turn made no compaction.");
+        if (found.row.compaction.rollback !== "available") throw new Refusal("unavailable", "That compaction can't be rolled back now.");
+        found.row = { ...found.row, compaction: { ...found.row.compaction, rollback: "pending" } };
+        return { turn: found.row, session: this.session(r.chatId) };
+      },
+      "lah.session.summarize": (r) => {
+        if (!this.stored.has(r.chatId)) throw new Refusal("not_found", "LumiAH has no session for that chat.");
+        this.summaryAsked.set(r.chatId, this.options.now());
+        return { session: this.session(r.chatId) };
+      },
+      "lah.settings.set": (r) => ({ settings: this.setSettings(r.set, r.reset) }),
+      "lah.models.list": (r) => {
+        const models = MODELS[r.connectionId ?? ""];
+        if (!models) throw new Refusal("unavailable", "its provider lists no models");
+        return { models };
+      },
+      "lah.text.set": (r) => {
+        if (!this.options.texts.defs.some((d) => d.id === r.id)) throw new Refusal("not_found", `There is no text ${r.id}.`);
+        const refused = this.options.texts.check(r.id, r.text);
+        if (refused !== null) throw new Refusal("invalid", refused, [{ path: [r.id], message: refused }]);
+        this.ownTexts = { ...this.ownTexts, [r.id]: r.text };
+        return { texts: this.pushTexts() };
+      },
+      "lah.text.reset": (r) => {
+        const { [r.id]: _dropped, ...rest } = this.ownTexts;
+        this.ownTexts = rest;
+        return { texts: this.pushTexts() };
+      },
+      "lah.key": (r) => {
+        if (r.op === "forget") {
+          const view = { set: false, print: null, at: null };
+          this.push({ key: view });
+          return { key: null, view, connection: null };
+        }
+        // A key differs from the one before however fast it is asked for.
+        this.minted += 1;
+        const key = `lah_${fakeHash(`key:${this.options.now()}:${this.minted}`).slice(0, 40)}`;
+        const view = { set: true, print: `${key.slice(4, 8)}·${key.slice(8, 12)}`, at: this.options.now() };
+        const linked = this.state.runtime.relays.some((x) => x.link === "linked");
+        const connections = linked && !this.state.connections.some((c) => c.loopback) ? [CONNECTIONS[0] as (typeof CONNECTIONS)[number], ...this.state.connections] : this.state.connections;
+        const loopback = linked ? connections.find((c) => c.loopback) : undefined;
+        this.push({ key: view, connections });
+        return { key, view, connection: loopback ? { id: loopback.id, name: loopback.name } : null };
+      },
+      "lah.relay": (r) => {
+        if (!this.state.runtime.relays.some((x) => x.id === r.relay)) throw new Refusal("not_found", "There is no such runtime.");
+        const runtime = r.op === "forget" ? { ...this.state.runtime, relays: this.state.runtime.relays.filter((x) => x.id !== r.relay) } : this.state.runtime;
+        if (r.op === "forget") this.push({ runtime });
+        return { runtime };
+      },
+      "lah.drawer.close": () => {
+        const close = this.options.closeDrawer;
+        close?.();
+        return { closed: close !== undefined };
+      },
+    };
+    return handlers;
+  }
 
   // ---------------------------------------------------------------- what the preview drives
 
-  /** A runtime links, as after the start line ran: first-time setup's first step is done. */
+  /** A runtime links, as after the start line ran: the runtime's own first step is done. */
   linkRuntime(): void {
     const now = this.options.now();
     const linked: RelayView = { id: "relay-1", name: "mara", build: BUILD, host: "harbour", url: "http://127.0.0.1:7861/v1", registeredAt: now, seenAt: now, link: "linked", problem: null, update: false, turns: 0, unit: "lumiah-mara.service", session: { valid: true, endsAt: new Date(now + 7 * 86_400_000).toISOString() }, scheduler: "excluded", lines: { update: null, login: null } };
-    this.push({ runtime: { ...this.state.runtime, relays: [linked], issues: [] }, setup: this.stepDone("runtime") });
+    this.push({ runtime: { ...this.state.runtime, relays: [linked] } });
   }
 
-  /** A reply is asked for in a chat: its turn plays a step at a time. False when the chat isn't answered, or a turn of it runs already. */
-  startTurn(chatId: string, steps: PlayStep[] = playedTurn()): boolean {
-    const before = this.live.get(chatId);
-    if (!chatAnswered(this.chat(chatId)) || (before && before.view.ended === null)) return false;
-    this.turns += 1;
-    const trace = new Trace(chatId, `turn-live-${String(this.turns).padStart(3, "0")}`, this.options.now());
-    trace.clock = this.options.now;
-    const held: Live = { trace, view: this.viewOf(trace, []), steps: [...steps], cancel: null, partials: [] };
-    this.live.set(chatId, held);
-    this.advance(chatId, held, true);
-    return true;
+  /** Lumiverse grants LumiAH permissions, as after the user agreed in its confirmation: first-time setup's first step is done once none it needs is missing. */
+  grant(ids: readonly string[]): void {
+    const permissions = this.state.permissions.filter((p) => !ids.includes(p.id));
+    this.push({ permissions, ...(permissions.some((p) => p.needed) ? {} : { setup: this.stepDone("permissions") }) });
+  }
+
+  /** Where a chat's turns run now: what the preview's own buttons read to play a turn that fits. */
+  placeOf(chatId: string): RunPlace {
+    return this.chat(chatId).place;
+  }
+
+  /** A reply is asked for in a chat: its turn plays a step at a time (`steps`; left out, a plain turn as the chat's place has it: handed to Lumiverse's own generation built in, written by LumiAH's writer in a runtime). False when the chat isn't answered (it is off, LumiAH lacks a permission, or its runtime isn't ready), or a turn of it runs already. */
+  startTurn(chatId: string, steps?: PlayStep[]): boolean {
+    const chat = this.chat(chatId);
+    if (!chatAnswered(chat) || this.state.permissions.some((p) => p.needed) || (chat.place === "runtime" && !this.state.runtime.ready)) return false;
+    return this.play(chatId, steps ?? (chat.place === "builtin" ? playedHanded() : playedTurn()), { reply: true, chatId }) !== null;
   }
 
   /** A push the page never hears: the next one leaves a gap for it to mend. */
   dropNextLive = false;
 
-  // ---------------------------------------------------------------- inside
+  // ---------------------------------------------------------------- runs
 
-  private advance(chatId: string, held: Live, first: boolean): void {
+  /** A run that is over (or was read whole) stands under its stream. */
+  private hold(stream: StreamId, trace: Trace, options: PlayOptions): Live {
+    // A chat's jobs run where its turns run; a side session about no chat runs built in.
+    const place = options.chatId === null ? "builtin" : this.chat(options.chatId).place;
+    const replyBy = options.reply && place === "builtin" ? (trace.replyBy ?? trace.startedAt + (options.replyMs ?? REPLY_MS)) : null;
+    const held: Live = { stream, reply: options.reply, chatId: options.chatId, trace, view: this.viewOf(stream, options.chatId, trace, [], { reply: options.reply, place, replyBy }), steps: [], cancel: null, partials: [], paused: false, resume: null, notes: [], held: null, options, place, replyBy };
+    this.live.set(stream, held);
+    return held;
+  }
+
+  /** Plays a run under a stream; the turn's id, or null while a run of that stream is under way. */
+  private play(stream: StreamId, steps: PlayStep[], options: PlayOptions): string | null {
+    const before = this.live.get(stream);
+    if (before && before.view.ended === null) return null;
+    this.turns += 1;
+    const trace = new Trace(options.chatId ?? "", options.turn ?? `turn-live-${String(this.turns).padStart(3, "0")}`, this.options.now());
+    trace.clock = this.options.now;
+    this.played.push(trace);
+    const held = this.hold(stream, trace, options);
+    held.steps = [...steps];
+    // A played turn's `turn_started` says when its reply is due, as core's does; and at that moment its work stops, whatever it is at.
+    trace.replyBy = held.replyBy;
+    if (held.replyBy !== null) this.options.later(() => this.due(held), held.replyBy - this.options.now());
+    this.advance(held, true);
+    return trace.turn;
+  }
+
+  /** Holds a run that is under way at its next step, or lets it go on; false when none of that stream runs. */
+  private pause(stream: StreamId, on: boolean): boolean {
+    const held = this.live.get(stream);
+    if (!held || held.view.ended !== null) return false;
+    if (held.paused === on) return true;
+    held.paused = on;
+    const before = held.trace.events.length;
+    held.trace.now = Math.max(held.trace.now, this.options.now());
+    if (on) held.trace.paused();
+    else held.trace.resumed();
+    this.grew(held, before);
+    this.push({ running: this.state.running.map((x) => (x.stream === stream && x.turn === held.view.turn ? { ...x, paused: on } : x)) });
+    if (!on) {
+      const resume = held.resume;
+      held.resume = null;
+      resume?.();
+    }
+    return true;
+  }
+
+  /** Stops a run that is under way, as the user's Stop does. */
+  private stop(stream: StreamId, why: string): boolean {
+    const held = this.live.get(stream);
+    if (!held || held.view.ended !== null) return false;
+    held.cancel?.();
+    held.steps = [];
+    held.partials = [];
+    held.resume = null;
+    if (held.held) this.release(held);
+    const before = held.trace.events.length;
+    held.trace.now = Math.max(held.trace.now, this.options.now());
+    // The words the core's own stop carries: the page says each thing once, and is shown here against what it will really get.
+    for (const agentId of held.trace.working()) held.trace.stop(agentId, "cancelled", "cancelled", "the agent was cancelled").idle(agentId);
+    // Built in, a turn stopped before its brief leaves the reply to Lumiverse alone, and its trace says so, as core's does.
+    if (held.reply && held.place === "builtin" && !held.trace.handedOver && held.trace.part === null) held.trace.unaided(STOPPED_PART, "you stopped it");
+    held.trace.ended("stopped", why);
+    this.grew(held, before);
+    return true;
+  }
+
+  /** The reply is due while a built-in turn still works: its agents stop where they are and LumiAH has no part in the reply, which Lumiverse writes from its prompt as it was; the turn is recorded once that reply is saved. A turn that has handed its brief over, or is over, is left as it is. */
+  private due(held: Live): void {
+    if (held.view.ended !== null || held.trace.handedOver || held.trace.part !== null) return;
+    held.cancel?.();
+    held.steps = [];
+    held.partials = [];
+    held.resume = null;
+    if (held.held) this.release(held);
+    const before = held.trace.events.length;
+    held.trace.now = Math.max(held.trace.now, this.options.now());
+    replyDue(held.trace);
+    this.grew(held, before);
+    held.cancel = this.options.later(() => {
+      const had = held.trace.events.length;
+      held.trace.now = Math.max(held.trace.now, this.options.now());
+      held.trace.ended("done");
+      this.grew(held, had);
+    }, WRITING_MS);
+  }
+
+  private advance(held: Live, first: boolean): void {
+    if (held.paused) {
+      held.resume = () => this.advance(held, first);
+      return;
+    }
     const step = held.steps.shift();
     if (!step) return;
     const says = step.says;
-    const waiting = says ? piecesOf(says, step.after).map((piece) => this.options.later(() => this.streamed(chatId, held, says.agentId, piece), piece.at)) : [];
+    const waiting = says ? piecesOf(says, step.after).map((piece) => this.options.later(() => this.streamed(held, says.agentId, piece), piece.at)) : [];
+    const land = (word?: HeldWord): void => {
+      const before = held.trace.events.length;
+      held.trace.now = Math.max(held.trace.now, this.options.now());
+      // What the user said since the last step reaches the main agent before its next round.
+      for (const note of held.notes.splice(0)) held.trace.note(note);
+      // The call's entry lands: it takes the place of what the call had sent.
+      if (says) held.partials = held.partials.filter((p) => p.agentId !== says.agentId);
+      step.run(held.trace, word);
+      this.grew(held, first ? -1 : before);
+      this.advance(held, false);
+    };
     waiting.push(
       this.options.later(() => {
+        const asks = step.asks;
+        if (!asks) return land();
+        // The call waits for the user's word, or for its wait to run out.
+        const now = this.options.now();
+        const approval: ApprovalView = { id: `held-${held.trace.turn}-${asks.call.id}`, stream: held.stream, turn: held.trace.turn, chatId: held.chatId ?? "", agentId: asks.agentId, role: asks.role, callId: asks.call.id, tool: asks.call.name, tier: asks.tier, args: asks.call.args, at: now, until: now + asks.wait };
         const before = held.trace.events.length;
-        held.trace.now = Math.max(held.trace.now, this.options.now());
-        // The call's entry lands: it takes the place of what the call had sent.
-        if (says) held.partials = held.partials.filter((p) => p.agentId !== says.agentId);
-        step.run(held.trace);
-        this.grew(chatId, held, first ? -1 : before);
-        this.advance(chatId, held, false);
+        held.trace.now = Math.max(held.trace.now, now);
+        held.trace.asked(asks.agentId, asks.call, asks.tier, approval.until);
+        this.grew(held, first ? -1 : before);
+        first = false;
+        const timeout = this.options.later(() => answer({ decision: "timed_out" }), asks.wait);
+        const answer = (word: HeldWord): void => {
+          timeout();
+          this.release(held);
+          land(word);
+        };
+        held.held = { id: approval.id, answer };
+        held.cancel = timeout;
+        this.push({ approvals: [...this.state.approvals, approval] });
       }, step.after),
     );
     held.cancel = () => {
@@ -357,55 +688,86 @@ export class MockBackend {
     };
   }
 
+  /** A held call is held no longer. */
+  private release(held: Live): void {
+    const id = held.held?.id;
+    held.held = null;
+    if (id !== undefined) this.push({ approvals: this.state.approvals.filter((a) => a.id !== id) });
+  }
+
   /** A call in flight sent a piece: the view holds it, and the pages watching hear what arrived, with how much had arrived before. */
-  private streamed(chatId: string, held: Live, agentId: string, piece: { reasoning?: string; text?: string }): void {
+  private streamed(held: Live, agentId: string, piece: { reasoning?: string; text?: string }): void {
     if (held.view.ended !== null) return;
     const call = held.trace.events.filter((e) => e.event.kind === "agent_entry" && e.event.agentId === agentId && e.event.entry.kind === "answer").length + 1;
     const now = this.options.now();
     const had = held.partials.find((p) => p.agentId === agentId && p.call === call) ?? { agentId, call, text: "", reasoning: "", at: now };
     held.partials = [...held.partials.filter((p) => p.agentId !== agentId), { ...had, text: had.text + (piece.text ?? ""), reasoning: had.reasoning + (piece.reasoning ?? "") }];
     held.view = { ...held.view, partials: held.partials };
-    if (!this.watching.has(chatId)) return;
+    if (!this.watching.has(held.stream)) return;
     if (this.dropNextLive) {
       this.dropNextLive = false;
       return;
     }
-    this.deliver({ lah: UI_VERSION, type: "lah.live.delta", chatId, delta: { turn: held.view.turn, agentId, call, ...(piece.text !== undefined ? { text: piece.text } : {}), ...(piece.reasoning !== undefined ? { reasoning: piece.reasoning } : {}), before: { text: had.text.length, reasoning: had.reasoning.length }, at: now } });
+    this.deliver({ lah: UI_VERSION, type: "lah.live.delta", stream: held.stream, delta: { turn: held.view.turn, agentId, call, ...(piece.text !== undefined ? { text: piece.text } : {}), ...(piece.reasoning !== undefined ? { reasoning: piece.reasoning } : {}), before: { text: had.text.length, reasoning: had.reasoning.length }, at: now } });
   }
 
   /** The trace gained events: the view follows, the pages watching hear, and the state says what runs. `before` is how many events the pages had (-1: a new turn, sent whole). */
-  private grew(chatId: string, held: Live, before: number): void {
-    const view = this.viewOf(held.trace, held.partials);
+  private grew(held: Live, before: number): void {
+    const view = this.viewOf(held.stream, held.chatId, held.trace, held.partials, held);
     held.view = view;
     held.partials = view.partials;
     const running = this.state.running.some((x) => x.turn === view.turn);
-    if (view.ended === null && !running) this.push({ running: [...this.state.running, { chatId, turn: view.turn, kind: view.kind, startedAt: view.startedAt }], runtime: this.withTurns(1) });
+    if (view.ended === null && !running) this.push({ running: [...this.state.running, { stream: held.stream, chatId: held.chatId, turn: view.turn, kind: view.kind, startedAt: view.startedAt, paused: held.paused, place: held.place, replyBy: held.replyBy }], ...(held.reply ? { runtime: this.withTurns(1) } : {}) });
     if (view.ended !== null && running) {
-      this.push({ running: this.state.running.filter((x) => x.turn !== view.turn), runtime: this.withTurns(-1), setup: view.ended.state === "done" ? this.stepDone("reply") : this.state.setup });
-      this.keep(chatId, held);
+      this.push({ running: this.state.running.filter((x) => x.turn !== view.turn), ...(held.reply ? { runtime: this.withTurns(-1), setup: view.ended.state === "done" ? this.stepDone("reply") : this.state.setup } : {}) });
+      const transcript = fakeHash(`transcript:${view.turn}`);
+      // Built in, a turn that ended without its reply leaves no record on the chat (core keeps nothing of it); its transcript is still read while the live view holds it.
+      if (held.reply && held.chatId !== null && (held.place !== "builtin" || view.ended.state === "done")) this.keep(held.chatId, held, transcript);
+      else this.kept.set(transcript, { trace: held.trace, stream: held.stream });
+      held.options.done?.({ turn: view.turn, state: view.ended.state, transcript, trace: held.trace });
     }
-    if (!this.watching.has(chatId)) return;
+    if (!this.watching.has(held.stream)) return;
     if (this.dropNextLive) {
       this.dropNextLive = false;
       return;
     }
-    this.deliver({ lah: UI_VERSION, type: "lah.live", chatId, change: before < 0 ? { view } : { turn: view.turn, events: view.events.slice(before), ended: view.ended } });
+    this.deliver({ lah: UI_VERSION, type: "lah.live", stream: held.stream, change: before < 0 ? { view } : { turn: view.turn, events: view.events.slice(before), ended: view.ended } });
   }
 
-  /** A turn that ended leaves its record: the chat's stored turns gain it, and a rollback asked for is made. */
-  private keep(chatId: string, held: Live): void {
+  /** A reply's turn that ended leaves its record: the chat's stored turns gain it, and a rollback asked for is made. */
+  private keep(chatId: string, held: Live, transcript: string): void {
     const all = (this.stored.get(chatId) ?? []).map((x) => (x.row.compaction?.rollback === "pending" ? { ...x, row: { ...x.row, compaction: { ...x.row.compaction, rollback: "done" as const } } } : x));
     const index = (all[0]?.row.index ?? 1) + 2;
-    const said = held.trace.events.flatMap((e) => (e.event.kind === "agent_entry" && e.event.agentId === "writer-1" && e.event.entry.kind === "answer" ? [e.event.entry.text] : []))[0] ?? "";
-    const row: TurnRow = { turn: held.view.turn, messageId: `msg-${String(index).padStart(4, "0")}`, index, swipe: 0, at: held.view.startedAt, kind: held.view.kind, onPath: true, preview: said.slice(0, 96), transcript: fakeHash(`transcript:${held.view.turn}`), compaction: null, usage: held.trace.tally };
+    const said = held.trace.events.flatMap((e) => (e.event.kind === "agent_entry" && e.event.agentId === "writer-1" && e.event.entry.kind === "answer" ? [e.event.entry.text] : []))[0] ?? (held.place === "builtin" ? BUILTIN_REPLY : "");
+    const row: TurnRow = { turn: held.view.turn, messageId: `msg-${String(index).padStart(4, "0")}`, index, swipe: 0, at: held.view.startedAt, kind: isReply(held.view.kind) ? held.view.kind : "new", onPath: true, preview: said.slice(0, 96), transcript, compaction: null, usage: held.trace.tally, changes: held.trace.changed(), place: held.place, ...(held.view.ended?.noPart !== undefined ? { noPart: held.view.ended.noPart } : {}) };
     this.stored.set(chatId, [{ row, trace: held.trace }, ...all]);
   }
 
-  private viewOf(trace: Trace, partials: LivePartial[]): LiveView {
+  /** A run's view from its trace. `where` says where it ran and whether it answers a generation: a built-in reply's turn that ended without its reply says LumiAH had no part in the one Lumiverse wrote. */
+  private viewOf(stream: StreamId, chatId: string | null, trace: Trace, partials: LivePartial[], where?: { reply: boolean; place: RunPlace; replyBy?: number | null }): LiveView {
     const started = trace.events.find((e) => e.event.kind === "turn_started")?.event;
     const last = trace.events.at(-1)?.event;
-    const ended: LiveEnded | null = last?.kind === "turn_ended" ? { state: last.status, at: last.at, ...(last.reason !== undefined ? { reason: last.reason } : {}) } : null;
-    return { chatId: trace.chatId, turn: trace.turn, kind: started?.kind === "turn_started" ? started.generation : "new", messageId: started?.kind === "turn_started" ? started.messageId : null, startedAt: trace.startedAt, ended, events: [...trace.events], partials: ended !== null ? [] : partials };
+    // Built in, a reply's turn that ended without handing its brief over had no part in the reply Lumiverse wrote: the trace says why where it knows (its time ran out, the user stopped it); else it failed.
+    const noPart = where?.reply === true && where.place === "builtin" && last?.kind === "turn_ended" ? (trace.part ?? (last.status !== "done" && !trace.handedOver ? (last.status === "stopped" ? STOPPED_PART : FAILED_PART) : null)) : null;
+    // Why, as the code a page acts on: the user's skip and the time are the backend's own to say; the rest is read from the trace with the real backend's reader, so the preview names the cause the extension would.
+    const failed = last?.kind === "turn_ended" && last.status === "failed";
+    const cause: CauseCode | null = noPart === STOPPED_PART ? "skipped" : noPart?.why === "time" ? "time" : noPart !== null || (where?.reply === true && failed) ? causeOf(trace.events) : null;
+    const ended: LiveEnded | null = last?.kind === "turn_ended" ? { state: last.status, at: last.at, ...(last.reason !== undefined ? { reason: last.reason } : {}), ...(noPart !== null ? { noPart } : {}), ...(cause !== null ? { cause } : {}) } : null;
+    return { stream, chatId, turn: trace.turn, kind: started?.kind === "turn_started" ? started.generation : "new", messageId: started?.kind === "turn_started" ? started.messageId : null, startedAt: trace.startedAt, ended, events: [...trace.events], partials: ended !== null ? [] : partials, ...(where ? { place: where.place, replyBy: where.replyBy ?? null } : {}) };
+  }
+
+  /** A chat's latest turn as the first screen reads it: the run its live view holds, else the newest of its stored turns. */
+  private last(chatId: string): LastTurn | null {
+    const held = this.live.get(chatId);
+    if (held?.reply === true) {
+      const view = held.view;
+      return { turn: view.turn, kind: isReply(view.kind) ? view.kind : "new", messageId: view.messageId, startedAt: view.startedAt, ended: view.ended, place: held.place, replyBy: held.replyBy, usage: held.trace.tally, ...countsOf(held.trace), changes: held.trace.changed(), transcript: view.ended !== null ? fakeHash(`transcript:${view.turn}`) : null, did: replyDid(held.trace.events) };
+    }
+    const stored = this.stored.get(chatId)?.[0];
+    if (!stored) return null;
+    const { row, trace } = stored;
+    const counts = trace ? countsOf(trace) : { agents: 0, tools: 0, lore: { added: 0, dropped: 0 }, jobs: 0 };
+    return { turn: row.turn, kind: row.kind, messageId: row.messageId, startedAt: row.at, ended: { state: "done", at: row.at + (row.usage?.ms ?? 0), ...(row.noPart !== undefined ? { noPart: row.noPart } : {}) }, place: row.place ?? this.chat(chatId).place, replyBy: null, usage: row.usage, ...counts, changes: row.changes, transcript: row.transcript, ...(trace ? { did: replyDid(trace.events) } : {}) };
   }
 
   private pageOf(events: readonly LiveEvent[], from: number): { events: LiveEvent[]; next: number | null } {
@@ -415,11 +777,41 @@ export class MockBackend {
   }
 
   private traces(): Trace[] {
-    return [...[...this.live.values()].map((x) => x.trace), ...[...this.stored.values()].flat().flatMap((x) => (x.trace ? [x.trace] : []))];
+    return [...[...this.live.values()].map((x) => x.trace), ...[...this.stored.values()].flat().flatMap((x) => (x.trace ? [x.trace] : [])), ...[...this.kept.values()].map((x) => x.trace)];
   }
 
+  /** Every model call of the runs played since the preview opened, oldest first. An agent on the user's default connection is counted under the first connection that isn't the loopback, which is the story's default. */
+  private calls(): PlayedCall[] {
+    const usual = this.state.connections.find((c) => !c.loopback)?.id ?? "";
+    const out: PlayedCall[] = [];
+    for (const trace of this.played) {
+      const agents = new Map<string, { role: string; connectionId: string | null }>();
+      for (const { event } of trace.events) {
+        if (event.kind === "agent_started") agents.set(event.agent.id, event.agent);
+        else if (event.kind === "agent_entry" && event.entry.kind === "answer") {
+          const agent = agents.get(event.agentId);
+          out.push({ at: event.entry.at, chatId: trace.chatId === "" ? null : trace.chatId, agent: agent?.role ?? "main", connection: agent?.connectionId ?? usual, model: event.entry.model, usage: event.entry.usage });
+        }
+      }
+    }
+    return out.sort((a, b) => a.at - b.at);
+  }
+
+  // ---------------------------------------------------------------- inside
+
+  /** A chat as the backend has it: as the state lists it, else as Lumiverse knows it (its name, switched off, on its own connection). */
   private chat(chatId: string): ChatView {
-    return this.state.chats.find((c) => c.chatId === chatId) ?? (chatId === OTHER_CHAT.chatId ? OTHER_CHAT : { chatId, name: null, on: false, since: null, connection: { id: "conn-deepseek", name: "Deepseek", loopback: false } });
+    const listed = this.state.chats.find((c) => c.chatId === chatId);
+    if (listed) return listed;
+    // Another extension answers this one, until it is taken over (it is then among the chats listed).
+    if (chatId === THEIR_CHAT.chatId) return { ...THEIR_CHAT };
+    const name = [...CHATS, OTHER_CHAT].find((c) => c.chatId === chatId)?.name ?? null;
+    return { chatId, name, on: false, since: null, place: "builtin", connection: { id: "conn-deepseek", name: "Deepseek", loopback: false } };
+  }
+
+  /** Whether a runtime is there to choose: one linked, the key minted, the loopback connection made. */
+  private readyOf(state: Pick<UiState, "runtime" | "key" | "connections">): boolean {
+    return state.runtime.relays.some((r) => r.link === "linked") && state.key.set && state.connections.some((c) => c.loopback);
   }
 
   private session(chatId: string): SessionView {
@@ -428,7 +820,7 @@ export class MockBackend {
     const onPath = all.filter((x) => x.row.onPath);
     const summary = !rolled && onPath.some((x) => x.row.compaction !== null);
     const since = summary ? onPath.findIndex((x) => x.row.compaction !== null) + 1 : onPath.length;
-    return { turns: since, tokens: since * 1390, summary, dropped: all.length - onPath.length, missing: 0 };
+    return { turns: since, tokens: since * 1390, summary, dropped: all.length - onPath.length, missing: 0, asked: this.summaryAsked.get(chatId) ?? null, held: rolled };
   }
 
   private stepDone(id: SetupStepId): UiState["setup"] {
@@ -437,6 +829,21 @@ export class MockBackend {
 
   private withTurns(by: number): UiState["runtime"] {
     return { ...this.state.runtime, relays: this.state.runtime.relays.map((r, i) => (i === 0 ? { ...r, turns: Math.max(0, r.turns + by) } : r)) };
+  }
+
+  /** Changes settings as `lah.settings.set` does: all of them are kept or, when a section refuses one, none. */
+  private setSettings(set: readonly { path: SettingPath; value: JsonValue }[], reset: readonly SettingPath[]): UiState["settings"] {
+    const next = [...this.own.filter((o) => !reset.some((under) => within(o.path, under)) && !set.some((s) => within(o.path, s.path))), ...set.map((s) => ({ path: s.path, value: clone(s.value) }))];
+    const empty = set.find((s) => s.path.length === 0);
+    if (empty) throw new Refusal("invalid", "A setting needs a place.", [{ path: [], message: "A setting needs a place." }]);
+    const values = this.valuesOf(next);
+    const problems = this.options.sections.flatMap((section) => section.check(values[section.key]).map((p) => ({ path: [section.key, ...p.path], message: p.message })));
+    for (const key of Object.keys(values)) if (!this.options.sections.some((s) => s.key === key)) problems.push({ path: [key], message: "There is no such setting." });
+    if (problems.length > 0) throw new Refusal("invalid", problems.length === 1 ? `Not saved: ${problems[0]?.message ?? ""}` : `Not saved: the settings refuse ${problems.length} of these values.`, problems);
+    this.own = next;
+    const settings = this.settingsView();
+    this.push({ settings });
+    return settings;
   }
 
   private valuesOf(own: readonly { path: string[]; value: JsonValue }[]): JsonObject {
@@ -463,8 +870,16 @@ export class MockBackend {
     return texts;
   }
 
-  /** The state changed: its parts that did go to the page under the next revision. */
-  private push(patch: Partial<Omit<UiState, "rev">>): void {
+  /** The state changed: its parts that did go to the page under the next revision. Whether a runtime is there to choose follows from the parts it rests on, so it is worked out again here. */
+  private push(change: Partial<Omit<UiState, "rev">>): void {
+    const next = { ...this.state, ...change };
+    const ready = this.readyOf(next);
+    const patch = ready === next.runtime.ready ? change : { ...change, runtime: { ...next.runtime, ready } };
+    // What a part of the story sets while the backend is being made is the state it starts with (revision 1), not a change to tell a page of: none has said hello yet.
+    if (this.starting) {
+      this.state = { ...this.state, ...patch };
+      return;
+    }
     this.state = { ...this.state, ...patch, rev: this.state.rev + 1 };
     this.deliver({ lah: UI_VERSION, type: "lah.state", rev: this.state.rev, patch });
   }

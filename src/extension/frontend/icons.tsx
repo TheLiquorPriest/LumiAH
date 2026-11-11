@@ -41,7 +41,27 @@ export type IconName =
   | "list"
   | "plus"
   | "upload"
-  | "table";
+  | "table"
+  | "send"
+  | "pause"
+  | "play"
+  | "folder"
+  | "pin"
+  | "history"
+  | "book"
+  | "coins"
+  | "database"
+  | "shield"
+  | "bell"
+  | "power"
+  | "arrow-right"
+  | "eye"
+  | "more"
+  | "compare"
+  | "agent"
+  | "plug"
+  | "home"
+  | "scroll";
 
 /** A path's `d`; a stroked circle; a filled dot (the only fill the set allows); a rounded rect. */
 type IconShape = string | readonly ["c", number, number, number] | readonly ["dot", number, number, number] | readonly ["r", number, number, number, number, number];
@@ -86,6 +106,26 @@ const ICONS: Readonly<Record<IconName, readonly IconShape[]>> = {
   plus: ["M12 5v14M5 12h14"],
   upload: ["M12 15V4", "M7.5 8.5L12 4l4.5 4.5", "M4.5 19.5h15"],
   table: [["r", 3.5, 4.5, 17, 15, 2], "M3.5 9.5h17M3.5 14.5h17M9.5 9.5v10"],
+  send: ["M4 12l16-7.5-6.5 16-3-6.5Z", "M10.5 14l4.5-4.5"],
+  pause: [["r", 6.5, 5, 4, 14, 1], ["r", 13.5, 5, 4, 14, 1]],
+  play: ["M7.5 5l11.5 7-11.5 7Z"],
+  folder: ["M3.5 7a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z"],
+  pin: ["M9 4h6l-1 6 3 3.5H7L10 10Z", "M12 13.5V20"],
+  history: ["M4 12a8 8 0 1 0 2.6-5.9", "M4 4.5V9h4.5", "M12 8v4.5l3 2"],
+  book: ["M5 5.5a2 2 0 0 1 2-2h12v15H7a2 2 0 0 0-2 2Z", "M5 20.5v-15", "M9 8h6"],
+  coins: [["c", 12, 12, 8.5], "M12 7v10", "M14.75 9.25H10.9a1.4 1.4 0 0 0 0 2.75h2.2a1.4 1.4 0 0 1 0 2.75H9.25"],
+  database: ["M4.5 7c0-1.7 3.4-3 7.5-3s7.5 1.3 7.5 3-3.4 3-7.5 3-7.5-1.3-7.5-3Z", "M4.5 7v5c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3V7", "M4.5 12v5c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3v-5"],
+  shield: ["M12 3.5l7 2.5v5.5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6Z", "M9 12l2.2 2.2L15 10.4"],
+  bell: ["M6 16.5V11a6 6 0 0 1 12 0v5.5l1.5 2h-15Z", "M10 20.5a2 2 0 0 0 4 0"],
+  power: ["M12 3.5v8", "M7 6.5a7 7 0 1 0 10 0"],
+  "arrow-right": ["M5 12h14", "M13.5 6.5L19 12l-5.5 5.5"],
+  eye: ["M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12Z", ["c", 12, 12, 2.75]],
+  more: [["dot", 6, 12, 1.4], ["dot", 12, 12, 1.4], ["dot", 18, 12, 1.4]],
+  compare: ["M7 20V4", "M3.5 7.5L7 4l3.5 3.5", "M17 4v16", "M13.5 16.5L17 20l3.5-3.5"],
+  agent: [["r", 5, 8, 14, 11, 3], "M12 4v4", ["dot", 9.5, 13, 1.1], ["dot", 14.5, 13, 1.1], "M9.5 16.5h5"],
+  plug: ["M9 3.5v5M15 3.5v5", "M6.5 8.5h11v3a5.5 5.5 0 0 1-11 0Z", "M12 17v3.5"],
+  home: ["M3.5 11.5L12 4l8.5 7.5", "M6 9.75V19.5h12V9.75", "M10 19.5v-5.5h4v5.5"],
+  scroll: ["M8 4.5h9.5a2 2 0 0 1 2 2V8H16", "M16 6.5v11a2 2 0 0 1-2 2H6.5a2 2 0 0 1-2-2V16H12v1.5a2 2 0 0 0 2 2", "M8 4.5a2 2 0 0 0-2 2V16", "M9 9h4M9 12.5h4"],
 };
 
 function shape(spec: IconShape, key: number) {

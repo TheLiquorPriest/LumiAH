@@ -1,16 +1,19 @@
-// Runtime (DESIGN §8): whether a runtime is linked and which build it is; first-time setup, a step
-// at a time; each runtime registered, with what it said of itself and the line that mends what is
-// wrong; the lines that start one; the loopback key; the loopback connection; and which chats LumiAH
-// answers. One column on a phone, two where there is room.
+// Runtime (DESIGN §25): LumiAH runs built in by default and needs no runtime, so this page first
+// says what a runtime is and when one is worth having, and lists the chats LumiAH answers with
+// where each runs. A runtime's own parts (its three steps, each runtime registered with what it
+// said of itself and the line that mends what is wrong, the lines that start one, the loopback
+// key, the loopback connection) show to someone who asks for one, or already has one. One column
+// on a phone, two where there is room. What stands where is decided in setup-model.ts.
 
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
-import { chatAnswered, type ChatView, type LinkState, type RelayView, type SchedulerView, type SetupStepId, startLine, type UiState } from "../../../shared/ui";
+import { type ChatView, type LinkState, type RelayView, type SchedulerView, startLine, type UiState } from "../../../shared/ui";
 import { useApp } from "../app";
 import { chatLabel, useChatView } from "../chat";
-import { Badge, Banner, Button, CopyLine, Disclosure, Section, Switch, type Tone, useBusy } from "../components";
+import { Badge, Banner, Button, CopyLine, Disclosure, Section, type Tone, useBusy } from "../components";
 import { ago, counted, dateTime } from "../format";
-import { Icon } from "../icons";
+import { PLACE_ABOUT, PLACE_LABEL, runtimeBegun, type RuntimeStepId, runtimeSteps, runtimeTrouble } from "../setup-model";
+import { ChatSwitch, Step } from "../setup-parts";
 import { useSelect } from "../store";
 
 const LINK_TONE: Readonly<Record<LinkState, Tone>> = { linked: "pos", quiet: "warn", refused: "neg", down: "neutral" };
@@ -85,40 +88,6 @@ function Relay(props: { relay: RelayView; build: string; now: number; busy: bool
   );
 }
 
-/** A chat and the switch that says whether LumiAH answers it. */
-function ChatRow(props: { chat: ChatView; open: boolean; busy: boolean; onSwitch(on: boolean): void; onLive(): void }) {
-  const { chat } = props;
-  const answered = chatAnswered(chat);
-  const on = chat.connection ? chat.connection.name : "no connection LumiAH can see";
-  const words = answered ? (chat.on ? `LumiAH answers it: it is pinned to ${on}${chat.since !== null ? ` since ${dateTime(chat.since)}` : ""}.` : `LumiAH answers it: it generates on ${on}, a loopback connection, though LumiAH didn't pin it there.`) : chat.on ? null : `LumiAH doesn't answer it: it generates on ${on}.`;
-  return (
-    <div class="lah-chatrow" data-lah-chat={chat.chatId} data-answered={answered}>
-      <Switch checked={chat.on} disabled={props.busy} label={<strong>{`${chatLabel(chat)}${props.open ? " (the open chat)" : ""}`}</strong>} help={chat.on ? "On: pinned to the loopback connection" : "Off"} onChange={props.onSwitch} />
-      {words !== null ? <span class="lah-chatrow-sub">{words}</span> : null}
-      {chat.on && !answered ? (
-        <Banner tone="warn" title="Switched on, but off the loopback">
-          {`It generates on ${on}, which isn't the loopback, so its replies don't reach LumiAH. Switch it off and on again to pin it back.`}
-        </Banner>
-      ) : null}
-      {answered ? (
-        <div class="lah-actions">
-          <Button size="sm" variant="ghost" icon="pulse" onClick={props.onLive}>
-            Show it in Live
-          </Button>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
-const STEP_TITLE: Readonly<Record<SetupStepId, string>> = {
-  runtime: "Start a runtime beside Lumiverse",
-  key: "Mint your loopback key",
-  connection: "Have the loopback connection",
-  chat: "Switch LumiAH on for a chat",
-  reply: "Get a reply",
-};
-
 /** The steps a manual loopback connection takes: what goes in each field of Lumiverse's connection form. */
 function ConnectionSteps(props: { state: UiState }) {
   const url = props.state.runtime.relays.find((r) => r.url !== null)?.url ?? null;
@@ -139,21 +108,26 @@ export function RuntimePage() {
   const app = useApp();
   const state = useSelect(app.client.state, (s) => s);
   const active = useSelect(app.host.activeChat, (c) => c);
-  const asked = useChatView(active);
-  // The key just minted, shown this once where it was asked for: in the setup's step, or on the key's own card.
+  const read = useChatView(active);
+  // The key just minted, shown this once where it was asked for: in the runtime's step, or on the key's own card.
   const [minted, setMinted] = useState<{ key: string; connection: { id: string; name: string } | null; from: "step" | "card" } | null>(null);
   const [switched, setSwitched] = useState<ChatView | null>(null);
+  // Someone with no runtime asked for one: its steps and parts show from then on.
+  const [asked, setAsked] = useState(false);
   const [busy, run] = useBusy();
   if (state === null) return null;
   const now = app.now();
-  const { runtime, setup, key } = state;
+  const { runtime, key } = state;
   const linked = runtime.relays.filter((r) => r.link === "linked");
   const loopbacks = state.connections.filter((c) => c.loopback);
   // The open chat as last switched here, until the state or the next read of it says the same.
-  const open = active === null ? null : (state.chats.find((c) => c.chatId === active) ?? (switched !== null && switched.chatId === active ? switched : asked));
+  const open = active === null ? null : (state.chats.find((c) => c.chatId === active) ?? (switched !== null && switched.chatId === active ? switched : read));
   const others = state.chats.filter((c) => c.chatId !== active);
-  const firstTodo = setup.steps.find((s) => !s.done)?.id ?? null;
-  const allDone = firstTodo === null;
+  const begun = runtimeBegun(state);
+  const shown = begun || asked;
+  const steps = runtimeSteps(state);
+  const stepsDone = steps.every((s) => s.at === "done");
+  const trouble = runtimeTrouble(state);
 
   const mint = (from: "step" | "card"): void =>
     run(async () => {
@@ -171,7 +145,7 @@ export function RuntimePage() {
     });
   const forgetKey = (): void =>
     run(async () => {
-      const agreed = await app.host.confirm({ title: "Forget your loopback key?", message: "The loopback connection stops working until you mint a key again, so LumiAH answers no chat.", confirm: "Forget the key", danger: true });
+      const agreed = await app.host.confirm({ title: "Forget your loopback key?", message: "The loopback connection stops working until you mint a key again, so no chat can run in the runtime. Chats that run built in go on.", confirm: "Forget the key", danger: true });
       if (!agreed) return;
       try {
         const result = await app.client.request("lah.key", { op: "forget" });
@@ -197,17 +171,7 @@ export function RuntimePage() {
         app.fail(error);
       }
     });
-  const switchChat = (chat: { chatId: string }, on: boolean): void =>
-    run(async () => {
-      try {
-        const result = await app.client.request("lah.chat.set", { chatId: chat.chatId, on });
-        setSwitched(result.chat);
-        app.toast(on ? `LumiAH answers ${chatLabel(result.chat)} from its next reply.` : `${chatLabel(result.chat)} is back on ${result.chat.connection?.name ?? "its own connection"}.`);
-      } catch (error) {
-        app.fail(error);
-      }
-    });
-  const showLive = (chatId: string): void => app.nav.set({ page: "live", chatId: chatId === active ? null : chatId });
+  const showLive = (chatId: string): void => app.nav.update((n) => ({ ...n, page: "live", chatId: chatId === active ? null : chatId }));
 
   const startLines = (
     <>
@@ -239,19 +203,19 @@ export function RuntimePage() {
       </div>
     </div>
   ) : null;
-  const stepBody = (id: SetupStepId): ComponentChildren => {
+  const stepBody = (id: RuntimeStepId): ComponentChildren => {
     switch (id) {
-      case "runtime":
+      case "start":
         return (
           <>
-            <p class="lah-lead">The runtime is a small process on the machine Lumiverse runs on. It serves the loopback connection and runs the agents.</p>
+            <p class="lah-lead">The runtime is a small program on the machine Lumiverse runs on. It runs the agents there, with no limit on how long a turn takes.</p>
             {startLines}
           </>
         );
       case "key":
         return (
           <>
-            <p class="lah-lead">The key proves a reply request comes from your Lumiverse. {linked.length > 0 ? "Your linked runtime puts it in the loopback connection for you, making that connection when there is none." : "No runtime is linked yet, so you would paste it into the connection yourself: do step 1 first and nothing needs pasting."}</p>
+            <p class="lah-lead">The loopback key proves a request for a reply comes from your Lumiverse. {linked.length > 0 ? "Your linked runtime puts it where it belongs, so there is nothing to paste." : "No runtime is linked yet, so you would paste it yourself: do step 1 first and nothing needs pasting."}</p>
             <div class="lah-actions">
               <Button variant="primary" icon="key" busy={busy} onClick={() => mint("step")}>
                 {key.set ? "Rotate the key" : "Mint the key"}
@@ -263,130 +227,143 @@ export function RuntimePage() {
       case "connection":
         return (
           <>
-            <p class="lah-lead">{linked.length > 0 ? "Minting the key in step 2 makes it. Lumiverse can't make a connection for an extension, so the runtime does it as you. Or make it by hand:" : "A connection of yours that points at the runtime. With a runtime linked, minting the key makes it; by hand:"}</p>
+            <p class="lah-lead">The loopback connection is a connection of yours in Lumiverse that points at the runtime: a chat that runs in the runtime generates on it. {linked.length > 0 ? "Minting the key in step 2 makes it. Or make it by hand:" : "With a runtime linked, minting the key makes it. By hand:"}</p>
             <ConnectionSteps state={state} />
-          </>
-        );
-      case "chat":
-        return (
-          <>
-            <p class="lah-lead">LumiAH answers a chat whose connection is the loopback. Switching it on pins the chat to that connection; switching it off gives the chat back the connection it had.</p>
-            {open ? <ChatRow chat={open} open busy={busy} onSwitch={(on) => switchChat(open, on)} onLive={() => showLive(open.chatId)} /> : <p class="lah-lead">{active === null ? "Open a chat in Lumiverse, and its switch shows here." : "Reading the open chat…"}</p>}
-          </>
-        );
-      case "reply":
-        return (
-          <>
-            <p class="lah-lead">Send a message in that chat. The main agent works, the reply streams into the chat, and Live shows every step as it happens.</p>
-            <div class="lah-actions">
-              <Button icon="pulse" onClick={() => app.nav.update((n) => ({ ...n, page: "live" }))}>
-                Open Live
-              </Button>
-            </div>
           </>
         );
     }
   };
-  const steps = (
-    <ol class="lah-steps" data-lah-setup>
-      {setup.steps.map((s, i) => {
-        const at = s.done ? "done" : s.id === firstTodo ? "now" : "todo";
-        return (
-          <li key={s.id} class="lah-step" data-lah-step={s.id} data-state={at}>
-            <span class="lah-step-mark" aria-hidden="true">
-              {s.done ? <Icon name="check" size={16} /> : i + 1}
-            </span>
-            <div class="lah-step-body">
-              <span class="lah-step-title">
-                {STEP_TITLE[s.id]} <span class="lah-sr">{s.done ? "(done)" : at === "now" ? "(next)" : "(to do)"}</span>
-              </span>
-              {at === "now" ? stepBody(s.id) : null}
-              {at === "done" && s.id === "key" && minted?.from === "step" ? mintedNote : null}
-            </div>
-          </li>
-        );
-      })}
+  const stepList = (
+    <ol class="lah-steps" data-lah-setup="runtime">
+      {steps.map((s, i) => (
+        <Step key={s.id} id={s.id} number={i + 1} at={s.at} title={s.title}>
+          {s.at === "now" ? stepBody(s.id) : null}
+          {s.at === "done" && s.id === "key" && minted?.from === "step" ? mintedNote : null}
+        </Step>
+      ))}
     </ol>
+  );
+  const chatRow = (chat: ChatView, isOpen: boolean): ComponentChildren => (
+    <div key={chat.chatId} class="lah-chatrow">
+      <ChatSwitch chat={chat} open={isOpen} title={isOpen ? `${chatLabel(chat)} (the open chat)` : chatLabel(chat)} onChanged={setSwitched}>
+        {chat.on ? (
+          <div class="lah-actions">
+            <Button variant="ghost" icon="pulse" onClick={() => showLive(chat.chatId)}>
+              Show it in Live
+            </Button>
+          </div>
+        ) : null}
+      </ChatSwitch>
+    </div>
   );
 
   return (
-    <div class="lah-runtime" data-lah-view="runtime">
+    <div class="lah-runtime" data-lah-view="runtime" data-lah-runtime={stepsDone ? "ready" : shown ? "begun" : "none"}>
       <div class="lah-runtime-col lah-runtime-wide">
         {runtime.issues.map((issue) => (
-          <Banner key={issue} tone="neg" title="LumiAH can't answer">
+          <Banner key={issue} tone="neg" title="LumiAH can't work as it should">
             {issue}
           </Banner>
         ))}
-        {linked.length > 0 ? (
-          <Banner tone="pos" title={linked.length === 1 ? `Linked to ${linked[0]?.name ?? "a runtime"}` : `Linked to ${linked.length} runtimes`}>
-            {`LumiAH build ${runtime.build}, link version ${runtime.link}.${linked.some((r) => r.update) ? " A runtime's build differs: its update line is below." : ""}`}
+        {!shown ? (
+          <Banner
+            tone="info"
+            title="You don't need a runtime"
+            actions={
+              <Button icon="link" onClick={() => setAsked(true)}>
+                Set up a runtime
+              </Button>
+            }
+          >
+            LumiAH runs built in: it works inside Lumiverse before each reply, with nothing to install. A runtime is a program you start beside Lumiverse, on the machine it runs on. It is worth having for turns that need longer than Lumiverse allows before a reply; with one, the main agent can also write the reply itself. You choose it chat by chat.
+          </Banner>
+        ) : trouble !== null ? (
+          <Banner tone="warn" title="Your runtime isn't ready">
+            {`${trouble} Each runtime below says what it needs. Chats that run built in go on as they are.`}
+          </Banner>
+        ) : runtime.ready ? (
+          <Banner tone="pos" title={linked.length === 1 ? `A runtime is ready: ${linked[0]?.name ?? "linked"}` : `${linked.length} runtimes are ready`}>
+            {`Choose Runtime for a chat below to run it there; every other chat stays built in. LumiAH build ${runtime.build}, link version ${runtime.link}.${linked.some((r) => r.update) ? " A runtime's build differs: its update line is below." : ""}`}
           </Banner>
         ) : (
-          <Banner tone="warn" title="No runtime is linked">
-            {runtime.relays.length === 0 ? "None has registered, so LumiAH answers no chat yet. Start one with the line under first-time setup." : "Every runtime registered has gone quiet or was refused, so LumiAH answers no chat. Each says what it needs below."} {`LumiAH build ${runtime.build}, link version ${runtime.link}.`}
+          <Banner tone="info" title="Setting up a runtime">
+            {`Three steps, below. Until they are done every chat runs built in, which needs none of this. LumiAH build ${runtime.build}, link version ${runtime.link}.`}
           </Banner>
         )}
       </div>
       <div class="lah-runtime-col">
-        <Section title="First-time setup" flush id="setup">
-          {allDone ? (
-            <div style={{ padding: "0 var(--lah-s3)" }}>
-              <Disclosure summary="Done: a runtime is linked, the key and the connection are there, and a chat has been answered">{steps}</Disclosure>
-            </div>
-          ) : (
-            steps
-          )}
-        </Section>
-        <Section title="Runtimes" flush id="runtimes">
-          {runtime.relays.length === 0 ? (
-            <p class="lah-lead" style={{ padding: "var(--lah-s3)" }}>
-              None has registered yet.
-            </p>
-          ) : (
-            runtime.relays.map((r) => <Relay key={r.id} relay={r} build={runtime.build} now={now} busy={busy} onRotate={() => relay("rotate", r)} onForget={() => relay("forget", r)} />)
-          )}
-        </Section>
-        {firstTodo === "runtime" ? null : (
-          <Section title="Start another, or start it again" id="start">
-            <Disclosure summary="The lines that start a runtime for this server">{startLines}</Disclosure>
+        {shown && !stepsDone ? (
+          <Section title="Set up a runtime" flush id="setup">
+            {stepList}
           </Section>
-        )}
-      </div>
-      <div class="lah-runtime-col">
-        <Section title="Your loopback key" id="key">
-          <p data-lah-key={key.set ? "set" : "none"}>{key.set ? `Fingerprint ${key.print ?? "unknown"}${key.at !== null ? `, made ${dateTime(key.at)}` : ""}.` : "No key yet."}</p>
-          <p class="lah-lead lah-small">The key proves a reply request comes from your Lumiverse. LumiAH keeps only its fingerprint, never the key.</p>
-          <div class="lah-actions">
-            <Button variant={key.set ? "secondary" : "primary"} icon="key" busy={busy} onClick={() => mint("card")}>
-              {key.set ? "Rotate the key" : "Mint the key"}
-            </Button>
-            {key.set ? (
-              <Button variant="danger" icon="trash" disabled={busy} onClick={forgetKey}>
-                Forget it
-              </Button>
-            ) : null}
-          </div>
-          {minted?.from === "card" ? mintedNote : null}
-        </Section>
-        <Section title="The loopback connection" id="connection">
-          <p data-lah-loopbacks={loopbacks.length}>{loopbacks.length === 0 ? "None of your connections is the loopback yet." : `LumiAH takes ${loopbacks.map((c) => c.name).join(", ")} as the loopback.`}</p>
-          <p class="lah-lead lah-small">A chat on it is answered by LumiAH. The agents themselves run on the connections named in Settings, never on the loopback: a call there would come back to the runtime.</p>
-          <Disclosure summary="Make it by hand" defaultOpen={loopbacks.length === 0 && linked.length === 0 && firstTodo !== "connection"}>
-            <ConnectionSteps state={state} />
-          </Disclosure>
-        </Section>
-        <Section title="Chats LumiAH answers" flush id="chats">
-          {open ? <ChatRow chat={open} open busy={busy} onSwitch={(on) => switchChat(open, on)} onLive={() => showLive(open.chatId)} /> : null}
-          {others.map((c) => (
-            <ChatRow key={c.chatId} chat={c} open={false} busy={busy} onSwitch={(on) => switchChat(c, on)} onLive={() => showLive(c.chatId)} />
-          ))}
+        ) : null}
+        <Section title="Which chats LumiAH answers" flush id="chats">
+          <ul class="lah-facts lah-runtime-places" data-lah-places>
+            <li>
+              <span>
+                <strong>{PLACE_LABEL.builtin}.</strong> {PLACE_ABOUT.builtin}
+              </span>
+            </li>
+            <li>
+              <span>
+                <strong>{PLACE_LABEL.runtime}.</strong> {PLACE_ABOUT.runtime}
+              </span>
+            </li>
+          </ul>
+          {open ? chatRow(open, true) : null}
+          {others.map((c) => chatRow(c, false))}
           {open === null && others.length === 0 ? (
             <p class="lah-lead" style={{ padding: "var(--lah-s3)" }}>
-              {active === null ? "No chat is switched on. Open a chat in Lumiverse, and its switch shows here." : "Reading the open chat…"}
+              {active === null ? "No chat is switched on. Open a chat in Lumiverse, and its switch shows here and on Home." : "Reading the open chat…"}
             </p>
           ) : null}
         </Section>
       </div>
+      {shown ? (
+        <div class="lah-runtime-col">
+          <Section title="Runtimes" flush id="runtimes">
+            {runtime.relays.length === 0 ? (
+              <p class="lah-lead" style={{ padding: "var(--lah-s3)" }}>
+                None has registered yet. One shows here once its start line has run.
+              </p>
+            ) : (
+              runtime.relays.map((r) => <Relay key={r.id} relay={r} build={runtime.build} now={now} busy={busy} onRotate={() => relay("rotate", r)} onForget={() => relay("forget", r)} />)
+            )}
+          </Section>
+          {steps[0]?.at === "now" ? null : (
+            <Section title="Start another, or start it again" id="start">
+              <Disclosure summary="The lines that start a runtime for this server">{startLines}</Disclosure>
+            </Section>
+          )}
+          <Section title="Your loopback key" id="key">
+            <p data-lah-key={key.set ? "set" : "none"}>{key.set ? `Fingerprint ${key.print ?? "unknown"}${key.at !== null ? `, made ${dateTime(key.at)}` : ""}.` : "No key yet."}</p>
+            <p class="lah-lead lah-small">The key proves a request for a reply comes from your Lumiverse. LumiAH keeps only its fingerprint, never the key.</p>
+            <div class="lah-actions">
+              <Button variant={key.set ? "secondary" : "primary"} icon="key" busy={busy} onClick={() => mint("card")}>
+                {key.set ? "Rotate the key" : "Mint the key"}
+              </Button>
+              {key.set ? (
+                <Button variant="danger" icon="trash" disabled={busy} onClick={forgetKey}>
+                  Forget it
+                </Button>
+              ) : null}
+            </div>
+            {minted?.from === "card" ? mintedNote : null}
+          </Section>
+          <Section title="The loopback connection" id="connection">
+            <p data-lah-loopbacks={loopbacks.length}>{loopbacks.length === 0 ? "None of your connections is the loopback yet." : `LumiAH takes ${loopbacks.map((c) => c.name).join(", ")} as the loopback.`}</p>
+            <p class="lah-lead lah-small">A chat that runs in the runtime generates on it. The agents themselves run on the connections named in Settings, never on the loopback: a call there would come back to the runtime.</p>
+            <Disclosure summary="Make it by hand" defaultOpen={loopbacks.length === 0 && linked.length === 0 && steps.find((s) => s.id === "connection")?.at !== "now"}>
+              <ConnectionSteps state={state} />
+            </Disclosure>
+          </Section>
+          {stepsDone ? (
+            <Section title="Set up a runtime" id="setup">
+              <Disclosure summary="Done: a runtime is linked, and the key and the connection are there">{stepList}</Disclosure>
+            </Section>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

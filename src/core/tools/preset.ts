@@ -3,19 +3,23 @@
 // the preset's author wrote, those switched off among them.
 
 import type { JsonObject, PresetBlock } from "../ports";
-import { TEXT, TOOL } from "../texts";
+import { FAMILY, TEXT, TOOL } from "../texts";
 import type { ToolDefinition, ToolEnv, ToolOutcome } from "../tools";
 import { clip, textArg } from "../util";
-import { fitted, listPage, pagerOf, readCursor, textPage } from "./paging";
+import { fitted, listPage, pagerOf, readCursor, saidBack, textPage } from "./paging";
 
 const presetInstructions: ToolDefinition = {
   name: TOOL.presetInstructions,
+  family: FAMILY.preset,
+  tier: "read",
   build(env: ToolEnv) {
-    const { texts } = env;
+    // A preset is a generation's: a job's run and a side session's turn answer none.
+    const { texts, turn } = env;
+    if (!turn) return null;
     const p = pagerOf(env, TOOL.presetInstructions);
     // Read once per turn, the first time the tool is called.
     let read: Promise<PresetBlock[]> | undefined;
-    const instructions = (): Promise<PresetBlock[]> => (read ??= env.turn.presetId === null ? Promise.resolve([]) : env.host.preset.blocks(env.turn.presetId).then((blocks) => blocks.filter((b) => b.kind === "instruction")));
+    const instructions = (): Promise<PresetBlock[]> => (read ??= turn.presetId === null ? Promise.resolve([]) : env.host.preset.blocks(turn.presetId).then((blocks) => blocks.filter((b) => b.kind === "instruction")));
     const off = (b: PresetBlock): string => (b.enabled ? "" : texts.render(TEXT.answer.presetOff));
     return {
       name: TOOL.presetInstructions,
@@ -39,7 +43,7 @@ const presetInstructions: ToolDefinition = {
           });
         }
         const block = blocks.find((b) => b.id === wanted) ?? blocks.find((b) => b.name.trim().toLowerCase() === wanted.toLowerCase());
-        if (!block) return { text: fitted(p, blocks.map((b) => `“${b.name}” [${b.id}]`).join(", "), (list) => texts.render(TEXT.answer.presetNoBlock, { block: wanted, blocks: list })), error: true };
+        if (!block) return { text: fitted(p, blocks.map((b) => `“${b.name}” [${b.id}]`).join(", "), (list) => saidBack(p, wanted, (said) => texts.render(TEXT.answer.presetNoBlock, { block: said, blocks: list }))), error: true };
         return textPage(p, {
           text: block.content,
           from: cursor.at,

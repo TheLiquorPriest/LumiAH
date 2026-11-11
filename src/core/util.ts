@@ -80,3 +80,13 @@ export function parseJson(text: string): unknown {
     return undefined;
   }
 }
+
+/**
+ * Why whoever stopped a run stopped it, where they said: the message of the error they ended its
+ * signal with. Null for a bare stop (an `abort()` with no reason, whose reason is the platform's
+ * own "aborted" error and says nothing).
+ */
+export function stopWords(signal: AbortSignal): string | null {
+  const { reason } = signal;
+  return reason instanceof Error && reason.name !== "AbortError" && reason.message !== "" ? reason.message : null;
+}

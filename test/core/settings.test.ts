@@ -48,7 +48,7 @@ describe("the schema and the defaults", () => {
     const s = defaultSettings();
     expect(Object.keys(s.agents.main!.budget).sort()).toEqual(["callMs", "callTokensIn", "callTokensOut", "callTools", "concurrency", "revisions", "tokensIn", "tokensOut", "toolTurns", "wallMs"]);
     expect(Object.keys(s.turn).sort()).toEqual(["tokensIn", "tokensOut", "toolTurns", "wallMs"]);
-    expect(s.loop).toEqual({ repeats: 3, clipChars: 6000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000 });
+    expect(s.loop).toEqual({ repeats: 3, clipChars: 6000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000, answerFloor: 256, warnRounds: 2 });
     // Retries can be switched off, and a wait is never longer than a timer can hold.
     expect(checkSettings({ loop: { retries: 0, retryWaitMs: 0 } })).toEqual([]);
     expect(checkSettings({ loop: { retries: -1, retryWaitMs: 3_000_000_000 } }).map((p) => p.path.join("."))).toEqual(["loop.retries", "loop.retryWaitMs"]);
@@ -58,6 +58,41 @@ describe("the schema and the defaults", () => {
     expect(settingsOf({ trace: { deltaMs: 500 } }).trace.deltaMs).toBe(500);
     expect(s.tools.pageChars).toBeLessThan(s.loop.clipChars);
     expect(s.reply).toMatchObject({ writer: "writer", withoutBrief: "write" });
+  });
+
+  test("every limit of the workspace, guidance, delegation, jobs, approval, spend and upkeep is a setting with a default", () => {
+    const s = defaultSettings();
+    // Agents pin in the chat's own areas alone: pinning in the user's area, which every chat reads, is the user's unless they give it away.
+    expect(s.workspace).toEqual({ fileChars: 200_000, files: 400, areaChars: 4_000_000, pathChars: 200, versions: 10, pinChars: 12_000, agentsPinUser: false });
+    expect(s.guidance).toEqual({ chars: 8000, agentsEdit: false });
+    expect(s.skills).toEqual({ listChars: 4000 });
+    // Two deep: the main agent delegates, and so does a job it starts (the job's agent stands at 1); whoever those hand a task to stands at 2 and hands nothing on.
+    expect(s.delegation).toEqual({ depth: 2, atOnce: 3, perRun: 12, grant: "own", fileChars: 12_000 });
+    // A job's sub-agents have no count of their own, since its allowance bounds them.
+    expect(s.jobs).toEqual({ enabled: true, atOnce: 1, perRun: 3, budget: { tokensIn: 600_000, tokensOut: 60_000, toolTurns: 60, wallMs: 900_000 }, tokensPerDay: 3_000_000, taskChars: 4000, openingChars: 600, recordWaitMs: 120_000, chain: true, delegations: null });
+    expect(settingsOf({ jobs: { delegations: 4 } }).jobs.delegations).toBe(4);
+    // No tier waits for the user's word as it ships: a tool that acts outside LumiAH is one they set up and switched on. Asking first is theirs to choose, by tier or by tool.
+    expect(s.approval).toEqual({ tiers: { read: "allow", write: "allow", external: "allow" }, tools: {}, waitMs: 300_000 });
+    // The main agent holds the tools the user adds (an extension's, a switched-on MCP server's) under one name; no other agent does, and no agent holds a built-in that acts outside LumiAH unless the user gives it.
+    expect(s.agents.main?.tools.at(-1)).toBe("@added");
+    expect(Object.entries(s.agents).filter(([, agent]) => agent.tools.includes("@added")).map(([id]) => id)).toEqual(["main"]);
+    expect(Object.values(s.agents).flatMap((agent) => agent.tools).filter((name) => name === "web_search")).toEqual([]);
+    expect(checkSettings({ agents: { summarizer: { tools: ["chat_read", "@added"] } } })).toEqual([]);
+    // No cap on a day's spend as it ships; a prompt token read again from a provider's cache counts as a tenth of one against every limit on prompt tokens, and the user may set any share from none to all.
+    expect(s.spend).toEqual({ tokensPerDay: null, costPerDay: null, cachedWeight: 0.1 });
+    expect(settingsOf({ spend: { cachedWeight: 1 } }).spend.cachedWeight).toBe(1);
+    expect(checkSettings({ spend: { cachedWeight: 0 } })).toEqual([]);
+    expect(checkSettings({ spend: { cachedWeight: 1.5 } }).map((p) => [p.path.join("."), p.message])).toEqual([["spend.cachedWeight", "It must be at most 1."]]);
+    expect(s.extension).toEqual({ waitMs: 10_000 });
+    expect(s.keep).toMatchObject({ promptDays: 30, transcriptDays: 90, spanDays: null, graceHours: 24 });
+    // A receipt keeps as much of a call's arguments as of its result.
+    expect(s.session).toMatchObject({ rollbackMarginTokens: 8000, receiptChars: 600, receiptArgChars: 600 });
+    // Each agent says how its tools are offered, and the summarizer holds read tools only.
+    expect(s.agents.main?.toolCalls).toBe("auto");
+    expect(s.agents.summarizer?.tools).toEqual(["chat_search", "chat_grep", "chat_read", "book_outline", "book_read", "lore_search", "lore_read", "workspace_list", "workspace_read", "workspace_grep"]);
+    // A tool's own rule stands over its tier's, by the tool's name.
+    expect(settingsOf({ approval: { tools: { workspace_delete: "ask" } } }).approval.tools).toEqual({ workspace_delete: "ask" });
+    expect(checkSettings({ approval: { tiers: { read: "sometimes" } }, jobs: { atOnce: 0 }, delegation: { grant: "all" } }).map((p) => p.path.join("."))).toEqual(["delegation.grant", "jobs.atOnce", "approval.tiers.read"]);
   });
 });
 
@@ -98,7 +133,7 @@ describe("the user's own values", () => {
 
   test("a table takes rows by name: a throttle per connection, a price per model", () => {
     const s = settingsOf({ connections: { atOnce: 2, throttles: { "conn-1": { requestsPerMinute: 30 }, "conn-2": { tokensPerMinute: -5 } } }, prices: { "model-a": { in: 3, out: 15 } } });
-    expect(s.connections).toEqual({ atOnce: 2, throttles: { "conn-1": { requestsPerMinute: 30, tokensPerMinute: null, atOnce: null }, "conn-2": { requestsPerMinute: null, tokensPerMinute: null, atOnce: null } } });
+    expect(s.connections).toEqual({ atOnce: 2, toolRefusalMinutes: 60, throttles: { "conn-1": { requestsPerMinute: 30, tokensPerMinute: null, atOnce: null }, "conn-2": { requestsPerMinute: null, tokensPerMinute: null, atOnce: null } } });
     expect(s.prices).toEqual({ "model-a": { in: 3, cachedIn: 0, out: 15 } });
     expect(checkSettings({ connections: { throttles: { "conn-2": { tokensPerMinute: -5 } } } })).toEqual([{ path: ["connections", "throttles", "conn-2", "tokensPerMinute"], message: "It must be at least 1." }]);
   });

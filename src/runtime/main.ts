@@ -13,6 +13,7 @@ import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import pkg from "../../package.json";
 import { AGENT, createHarness, settingsOf } from "../core/index";
+import { EXTENSION_IDENTIFIER } from "../link/contract";
 import { isRecord } from "../link/json";
 import type { RuntimeIO } from "./cli";
 import { lumiah } from "./cli";
@@ -164,9 +165,10 @@ const io: RuntimeIO = {
     return promise;
   },
   now: Date.now,
+  extension: EXTENSION_IDENTIFIER,
   build: BUILD,
   version: pkg.version,
-  harness: (host, settings) => createHarness(host, { settings }),
+  harness: (host, settings, extension) => createHarness(host, { settings, extension }),
   // The writer's connection is the writer agent's own setting, in the core's section of the settings.
   writerConnection: (values) => settingsOf(isRecord(values) ? values.core : undefined).agents[AGENT.writer]?.connectionId ?? null,
 };

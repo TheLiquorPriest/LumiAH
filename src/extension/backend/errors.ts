@@ -26,6 +26,11 @@ export class UiRefused extends Error {
   }
 }
 
+/** A completion request whose key isn't the user's loopback key, refused in words that send them to the right page: `name` is the extension as its pages show it, which is LumiAH's own or that of the extension LumiAH is built into. */
+export function wrongKey(name: string): LinkRefused {
+  return new LinkRefused("forbidden", `The key in the loopback connection isn't this account's loopback key. Mint a new one on ${name}'s Runtime page: your linked runtime puts it in the connection.`);
+}
+
 /** A failure's own words. */
 export function wordsOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);

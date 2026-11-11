@@ -3,19 +3,26 @@
 // relay secret, handed to what serves it, and answered by its id with exactly one result or one
 // error. Frames that aren't the link's are left for the pages' messages (ui.ts).
 
+import type { ApprovalAsk, JobView, JsonObject, JsonValue, RemoteToolCall } from "../../core/ports";
 import type { LinkErrorCode, LinkErrorFrame, LinkFrame, LinkRequestType, LinkRequests, LinkResultFrame, OpenStream } from "../../link/contract";
-import { LINK, LINK_VERSION, MODEL_ID, STREAM_ID } from "../../link/contract";
+import { LINK, LINK_VERSION, STREAM_ID, loopbackModel } from "../../link/contract";
 import { isLinkFrame, noticeOf, requestOf } from "../../link/frames";
 import { isRecord } from "../../link/json";
-import { PartJoiner, needsParts, partOf, splitFrame } from "../../link/parts";
-import { TRANSPORT_DEFAULTS } from "../../link/settings";
+import { type Joined, PartJoiner, needsParts, partOf, splitFrame } from "../../link/parts";
+import { CEILINGS, TRANSPORT_DEFAULTS, type TransportSettings } from "../../link/settings";
+import { type Approvals, holdCall } from "./approvals";
+import type { Asks } from "./asks";
 import type { Chats } from "./chat";
 import type { Connections } from "./connections";
 import { randomHex } from "./docs";
-import { LinkRefused, wordsOf } from "./errors";
+import { LinkRefused, wordsOf, wrongKey } from "./errors";
+import { type BackendExtension, callExtension, offerOf, type RemoteTools } from "./extension";
+import type { BackendIdentity } from "./identity";
+import type { JobsBoard } from "./jobs";
 import type { LiveBuffer } from "./live";
 import type { Models } from "./models";
 import type { Lore, Presets, Storage } from "./reads";
+import type { Recall } from "./recall";
 import type { RegistryStore } from "./registry";
 import type { Caller, Relays } from "./relays";
 import type { SettingsStore } from "./settings";
@@ -34,14 +41,24 @@ export interface ServerDeps {
   storage: Storage;
   lore: Lore;
   presets: Presets;
+  /** What the lore and history tools read of Lumiverse, and a chat's book (DESIGN §23, §24). */
+  recall: Recall;
   connections: Connections;
   live: LiveBuffer;
+  tools: RemoteTools;
+  approvals: Approvals;
+  asks: Asks;
+  jobs: JobsBoard;
+  /** What the extension LumiAH is built into supplies to the core; absent for LumiAH on its own. */
+  extension: BackendExtension | undefined;
   /** What became of a `connection` push (`setup.connection`). */
   connectionMade(userId: string, ref: string, connection: { id: string; name: string } | null, problem: string | null): void;
   now(): number;
   /** Runs `fn` once after `ms`. */
   later(ms: number, fn: () => void): () => void;
   build: string;
+  /** Who this backend is: what a runtime is told of it on hello, and the name its refusals send the user to. */
+  identity: BackendIdentity;
 }
 
 type Fields = Record<string, unknown>;
@@ -57,6 +74,32 @@ const whole = (v: unknown, what: string): number => {
   return v;
 };
 
+const short = (v: unknown): v is string => typeof v === "string" && v !== "";
+
+/** A call of a tool that runs here, as the core named it. */
+function toolCallOf(raw: unknown): RemoteToolCall {
+  if (!isRecord(raw) || !short(raw.name) || !isRecord(raw.args) || !short(raw.turn) || typeof raw.chatId !== "string" || !short(raw.agentId) || typeof raw.role !== "string" || !short(raw.callId) || !short(raw.kind) || typeof raw.main !== "boolean" || !Array.isArray(raw.above) || !raw.above.every((over) => isRecord(over) && short(over.agentId) && typeof over.role === "string")) {
+    throw new LinkRefused("bad_request", "The tool call is malformed: update the runtime and LumiAH to the same build.");
+  }
+  return { name: raw.name, args: raw.args as JsonObject, turn: raw.turn, chatId: raw.chatId, agentId: raw.agentId, role: raw.role, callId: raw.callId, kind: raw.kind as RemoteToolCall["kind"], main: raw.main, above: (raw.above as { agentId: string; role: string }[]).map(({ agentId, role }) => ({ agentId, role })) };
+}
+
+/** A tool call held for the user's word, as the core asks it. */
+function approvalAskOf(raw: unknown): ApprovalAsk {
+  if (!isRecord(raw) || !short(raw.turn) || typeof raw.chatId !== "string" || !short(raw.agentId) || typeof raw.role !== "string" || !short(raw.callId) || !short(raw.tool) || !(raw.tier === "read" || raw.tier === "write" || raw.tier === "external") || !isRecord(raw.args) || typeof raw.at !== "number" || !(raw.until === null || typeof raw.until === "number")) {
+    throw new LinkRefused("bad_request", "The held call is malformed: update the runtime and LumiAH to the same build.");
+  }
+  return { turn: raw.turn, chatId: raw.chatId, agentId: raw.agentId, role: raw.role, callId: raw.callId, tool: raw.tool, tier: raw.tier, args: raw.args as JsonObject, at: raw.at, until: raw.until };
+}
+
+/** A job as the core says it: the fields the pages and the notices read are checked, the rest is the core's. */
+function jobOf(raw: unknown): JobView {
+  if (!isRecord(raw) || !short(raw.id) || !short(raw.chatId) || typeof raw.agent !== "string" || typeof raw.task !== "string" || typeof raw.state !== "string" || typeof raw.createdAt !== "number") {
+    throw new LinkRefused("bad_request", "The job is malformed: update the runtime and LumiAH to the same build.");
+  }
+  return raw as unknown as JobView;
+}
+
 const streamId = (v: unknown): string => {
   if (typeof v !== "string" || !STREAM_ID.test(v)) throw new LinkRefused("bad_request", "A stream is named by 32 hex characters: update the runtime and LumiAH to the same build.");
   return v;
@@ -69,11 +112,25 @@ function openOf(v: unknown): OpenStream[] {
   return v.flatMap((o): OpenStream[] => (isRecord(o) && typeof o.stream === "string" && typeof o.seq === "number" && Number.isSafeInteger(o.seq) && o.seq >= 0 ? [{ stream: o.stream, seq: o.seq }] : []));
 }
 
+/** What to do about a frame the joiner refused, by the limit it passed: each is a setting of the link's, but the bound all accounts share, which is nobody's to raise. */
+function joinAdvice(over: Extract<Joined, { refused: string }>["over"], name: string): string {
+  const setting = (title: string): string => `"${title}" (${name} → Settings → Transport → Link)`;
+  if (over === "shared") return "Send this one again in a moment.";
+  if (over === "frame") return `Raise ${setting("Largest frame joined")} to send one that large.`;
+  return `Those frames are this account's own: send this one again once they are done, or raise ${setting(over === "frames" ? "Frames joined at once" : "Characters held while joining")}.`;
+}
+
 export class LinkServer {
-  /** The parts of the frames each session is sending, by session. */
+  /**
+   * The frames each account's sessions are sending in parts, by account. One joiner takes them all,
+   * each session's apart, so what an account may have under way is counted over its sessions
+   * together: parts are joined before any secret is checked, a session's id is the client's to
+   * choose and Lumiverse lets an account open any number of sockets, so a limit that held for each
+   * session alone would bound nothing. An account with nothing under way has no joiner.
+   */
   private readonly joiners = new Map<string, PartJoiner>();
-  /** The joining limits each user's settings give, as last read: a joiner asks without waiting. */
-  private readonly limits = new Map<string, { maxUnits: number; staleMs: number }>();
+  /** The link's settings of each user, as last read: a joiner asks for its limits without waiting. */
+  private readonly limits = new Map<string, TransportSettings["link"]>();
 
   constructor(
     private readonly host: Pick<BackendHost, "frontend" | "log">,
@@ -112,10 +169,31 @@ export class LinkServer {
     this.host.frontend.send(frame, userId, session);
   }
 
-  /** A session went away: the frames it was sending in parts are let go. */
+  /** A session went away: the frames it was sending in parts are let go. Whose it was isn't said, so every account that has frames under way is asked. */
   sessionClosed(session: string): void {
-    this.joiners.get(session)?.clear();
-    this.joiners.delete(session);
+    for (const [userId, joiner] of this.joiners) {
+      joiner.clear(session);
+      if (joiner.waiting === 0) this.joiners.delete(userId);
+    }
+  }
+
+  /**
+   * Every so often: the frames whose parts stopped coming are let go, for every account. A joiner
+   * looks only when a part arrives, so a session that sends nothing more would keep its half-sent
+   * frames until it closed.
+   */
+  sweep(): void {
+    const now = this.deps.now();
+    for (const [userId, joiner] of this.joiners) {
+      joiner.purge(now);
+      if (joiner.waiting === 0) this.joiners.delete(userId);
+    }
+  }
+
+  /** What an account's sessions are sending in parts now: how many frames, and how many characters of them are held. */
+  joining(userId: string): { frames: number; units: number } {
+    const joiner = this.joiners.get(userId);
+    return { frames: joiner?.waiting ?? 0, units: joiner?.held ?? 0 };
   }
 
   /**
@@ -127,20 +205,29 @@ export class LinkServer {
     let raw: unknown = payload;
     const part = partOf(payload);
     if (part !== null) {
-      const key = session ?? `user:${userId}`;
-      let joiner = this.joiners.get(key);
+      if (!this.limits.has(userId)) this.limits.set(userId, (await this.deps.settings.transport(userId)).link);
+      // Nothing waits from here to `take`, so the joiner found or made is the one the account has when the part goes in.
+      let joiner = this.joiners.get(userId);
       if (joiner === undefined) {
-        joiner = new PartJoiner(() => this.limits.get(userId) ?? { maxUnits: TRANSPORT_DEFAULTS.link.joinMaxUnits, staleMs: TRANSPORT_DEFAULTS.link.partStaleMs });
-        this.joiners.set(key, joiner);
+        joiner = new PartJoiner(() => {
+          const link = this.limits.get(userId) ?? TRANSPORT_DEFAULTS.link;
+          // The account's settings bound it as far as the ceilings, whatever they say; and what every other account has under way bounds it too, so all of them together stay within the worker's own totals.
+          const shared = { frames: CEILINGS.joinFramesTotal, units: CEILINGS.joinHeldUnitsTotal };
+          for (const [other, theirs] of this.joiners) {
+            if (other === userId) continue;
+            shared.frames -= theirs.waiting;
+            shared.units -= theirs.held;
+          }
+          return { maxUnits: Math.min(link.joinMaxUnits, CEILINGS.joinMaxUnits), staleMs: Math.min(link.partStaleMs, CEILINGS.partStaleMs), maxFrames: Math.min(link.joinFrames, CEILINGS.joinFrames), maxHeldUnits: Math.min(link.joinHeldUnits, CEILINGS.joinHeldUnits), shared };
+        });
+        this.joiners.set(userId, joiner);
       }
-      if (!this.limits.has(userId)) {
-        const { link } = await this.deps.settings.transport(userId);
-        this.limits.set(userId, { maxUnits: link.joinMaxUnits, staleMs: link.partStaleMs });
-      }
-      const joined = joiner.take(part, this.deps.now());
+      const joined = joiner.take(part, this.deps.now(), session ?? "");
+      if (joiner.waiting === 0) this.joiners.delete(userId);
       if ("waiting" in joined) return true;
       if ("refused" in joined) {
-        this.refuse(joined.id, userId, session, "too_large", joined.refused);
+        // Past the bound all accounts share nothing of the sender's is too large: the extension has no room just now.
+        this.refuse(joined.id, userId, session, joined.over === "shared" ? "unavailable" : "too_large", `${joined.refused} ${joinAdvice(joined.over, this.deps.identity.name)}`);
         return true;
       }
       try {
@@ -192,15 +279,15 @@ export class LinkServer {
     switch (type) {
       case "hello": {
         await d.relays.hello(caller, r);
-        return { relay, version: LINK_VERSION, build: d.build, lost: d.streams.resume(userId, relay, openOf(r.open)), settings: await d.settings.revision(userId) };
+        return { relay, version: LINK_VERSION, build: d.build, lost: d.streams.resume(userId, relay, openOf(r.open)), settings: await d.settings.revision(userId), extension: offerOf(d.extension), backend: { name: d.identity.name, connection: d.identity.connectionName } };
       }
       case "ping": {
         await d.relays.ping(caller, r);
         return { lost: d.streams.missing(userId, relay, strings(r.streams)) };
       }
       case "models": {
-        if (typeof r.key !== "string" || !(await d.registry.keyIs(userId, r.key))) throw new LinkRefused("forbidden", "The key in the loopback connection isn't this account's loopback key. Mint a new one on LumiAH's Runtime page: your linked runtime puts it in the connection.");
-        return { models: [{ id: MODEL_ID }] };
+        if (typeof r.key !== "string" || !(await d.registry.keyIs(userId, r.key))) throw wrongKey(d.identity.name);
+        return { models: [{ id: loopbackModel(d.identity.identifier) }] };
       }
       case "turn.begin":
         return d.turns.begin(userId, relay, r.key, r.tag, r.request);
@@ -219,7 +306,7 @@ export class LinkServer {
       case "settings.get":
         return d.settings.snapshot(userId);
       case "trace.push":
-        return { taken: await d.live.push(userId, Array.isArray(r.records) ? r.records : []) };
+        return { taken: await d.live.push(userId, relay, Array.isArray(r.records) ? r.records : []) };
       case "setup.connection": {
         const made = isRecord(r.connection) && typeof r.connection.id === "string" && typeof r.connection.name === "string" ? { id: r.connection.id, name: r.connection.name } : null;
         d.connectionMade(userId, text(r.ref, "connection request"), made, typeof r.problem === "string" ? r.problem : null);
@@ -260,6 +347,74 @@ export class LinkServer {
         return { connections: await d.connections.list(userId) };
       case "connections.get":
         return { profile: await d.connections.profile(userId, typeof r.connection === "string" && r.connection !== "" ? r.connection : null) };
+      // A runtime's frame names whatever chat it likes, and any account can register a runtime: a chat is the caller's own before a tool or the extension LumiAH is built into hears of it (`""`: no chat).
+      case "tools.list":
+        return { tools: await d.tools.list(userId, typeof r.chat === "string" && r.chat !== "" ? (await d.chats.own(userId, r.chat)).id : "") };
+      case "tool.call": {
+        const stream = streamId(r.stream);
+        const call = toolCallOf(r.call);
+        if (call.chatId !== "") await d.chats.own(userId, call.chatId);
+        // Asked again for a stream already open (after a reconnect), the call under way is the answer.
+        const writer = d.streams.open(userId, relay, stream, call.turn, (await d.settings.transport(userId)).streams);
+        if (writer !== null) {
+          void d.tools.call(userId, call, writer.signal).then(
+            (out) => writer.value(out.error === true ? { text: out.text, error: true } : { text: out.text }),
+            (error: unknown) => writer.error(wordsOf(error), writer.signal.aborted ? "cancelled" : "tool_failed"),
+          );
+        }
+        return { accepted: true };
+      }
+      case "approval.ask": {
+        const stream = streamId(r.stream);
+        const ask = approvalAskOf(r.ask);
+        if (ask.chatId !== "") await d.chats.own(userId, ask.chatId);
+        const writer = d.streams.open(userId, relay, stream, ask.turn, (await d.settings.transport(userId)).streams);
+        if (writer !== null) {
+          void holdCall(d, userId, ask, writer.signal).then(
+            // The user's word crosses as it was given: the runtime's core reads it, and fails closed on anything that is no approval.
+            (answer) => writer.value(answer as unknown as JsonValue),
+            (error: unknown) => writer.error(wordsOf(error), "cancelled"),
+          );
+        }
+        return { accepted: true };
+      }
+      case "extension.call":
+        return callExtension(d.extension, r.member, r.arg, userId, d.chats);
+      case "blob.list":
+        return d.storage.blobs(userId, r.cursor);
+      case "blob.remove":
+        await d.storage.removeBlobs(userId, r.hashes);
+        return { removed: true };
+      case "doc.list":
+        return { paths: await d.storage.docs(userId, r.prefix) };
+      case "chat.info":
+        return { chat: await d.chats.info(userId, text(r.chat, "chat")) };
+      case "chat.anchors":
+        return d.chats.anchors(userId, typeof r.cursor === "string" && r.cursor !== "" ? r.cursor : null);
+      case "job.changed":
+        await d.jobs.took(userId, jobOf(r.job), relay);
+        return { taken: true };
+      case "ask.answer":
+        d.asks.answered(userId, relay, r.ask, r.value, r.refusal);
+        return { taken: true };
+      // The recall ports' reads and the book's, each checked and served where the ports are (recall.ts).
+      case "recall.lore.read":
+      case "recall.lore.activated":
+      case "recall.chat.messages":
+      case "recall.embedder":
+      case "recall.embed":
+      case "recall.memory.enabled":
+      case "recall.memory.search":
+      case "recall.memory.entity":
+      case "recall.memory.entities":
+      case "recall.memory.arcs":
+      case "recall.databanks.list":
+      case "recall.databanks.documents":
+      case "recall.databanks.content":
+      case "recall.web.enabled":
+      case "recall.web.search":
+      case "book.read":
+        return d.recall.serve(userId, type, r);
       default:
         throw new LinkRefused("bad_request", `There is no link request ${String(type)}.`);
     }
