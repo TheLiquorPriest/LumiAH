@@ -500,6 +500,8 @@ class Agent implements AgentHandle {
     let finish: string | undefined;
     // How many times the call under way was made again: a call that answers starts the count afresh.
     let retried = 0;
+    // The room of the call made again after one its room cut while it was all thinking; null for a call's own.
+    let room: number | null = null;
     for (;;) {
       // The user holds the run: nothing of this agent's goes on until they let it go.
       if (turn?.paused) {
@@ -521,7 +523,7 @@ class Agent implements AgentHandle {
       const cap = turn?.limits?.({ estimate: prepared.estimate, model: prepared.model, always: this.spec.uncapped === true }) ?? null;
       if (cap instanceof AgentStop) return this.end(used, cap, said, finish);
       const outLeft = Math.min(limitOf(budget.tokensOut) - this.total.out, turn ? limitOf(turn.budget.tokensOut) - turn.usage.out : Number.POSITIVE_INFINITY);
-      const request = requestOf(this.callSpec, prepared, Math.min(budget.callTokensOut, outLeft), settings);
+      const request = requestOf(this.callSpec, prepared, Math.min(room ?? budget.callTokensOut, outLeft), settings);
       // Kept while the call is made, so keeping it never holds the call up; a prompt that can't be kept is left off the record.
       const kept = turn?.trace?.prompt(this.id, request).catch(() => undefined) ?? Promise.resolve(undefined);
       const scope = this.scope(signal, true);
@@ -583,6 +585,15 @@ class Agent implements AgentHandle {
         ...(prompt !== undefined ? { prompt } : {}),
       });
       this.spec.onCall?.({ text: reply.text, calls: reply.calls.length });
+      // Its room cut it before it gave anything usable (no text, no whole tool call): it was all thinking. That call counted against every budget as it was; it is made again once with more room, the model told to think briefly and act. Cut so again, it ends as a cut answer does.
+      if (cutShort(reply.finishReason) && reply.text.trim() === "" && reply.calls.length === 0 && room === null) {
+        room = Math.min(Math.ceil(request.maxTokens * settings.loop.cutRoomFactor), settings.loop.cutRoomTokens);
+        const told = this.text(TEXT.runtime.cutThinking);
+        this.tell(told);
+        this.record({ kind: "notice", text: told, at: this.now() });
+        continue;
+      }
+      room = null;
       if (reply.calls.length === 0) {
         this.answered = true;
         this.conversation.push({ role: "assistant", content: reply.text });

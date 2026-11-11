@@ -48,7 +48,7 @@ describe("the schema and the defaults", () => {
     const s = defaultSettings();
     expect(Object.keys(s.agents.main!.budget).sort()).toEqual(["callMs", "callTokensIn", "callTokensOut", "callTools", "concurrency", "revisions", "tokensIn", "tokensOut", "toolTurns", "wallMs"]);
     expect(Object.keys(s.turn).sort()).toEqual(["tokensIn", "tokensOut", "toolTurns", "wallMs"]);
-    expect(s.loop).toEqual({ repeats: 3, clipChars: 6000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000, answerFloor: 256, warnRounds: 2 });
+    expect(s.loop).toEqual({ repeats: 3, clipChars: 6000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000, answerFloor: 256, warnRounds: 2, cutRoomFactor: 2, cutRoomTokens: 64_000 });
     // Retries can be switched off, and a wait is never longer than a timer can hold.
     expect(checkSettings({ loop: { retries: 0, retryWaitMs: 0 } })).toEqual([]);
     expect(checkSettings({ loop: { retries: -1, retryWaitMs: 3_000_000_000 } }).map((p) => p.path.join("."))).toEqual(["loop.retries", "loop.retryWaitMs"]);

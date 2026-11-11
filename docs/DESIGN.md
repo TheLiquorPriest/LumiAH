@@ -75,6 +75,7 @@ In a runtime the reply may be written by the agents themselves, with no writer. 
 - a loop detector for the same call made on the same state, with the same result, several times running; the same call written more than once in one answer is run once, and of one answer's calls that would end the agent's work (`write_reply`) only the first is run;
 - no call of a round begun once the turn was stopped or its time ran out;
 - clipping of long tool results, with the whole kept for `scratch_read`;
+- one more go for a call its answer room cut while it was all thinking (no text and no whole tool call came of it): the call is made again once, with its room times *More room after a cut answer* (`loop.cutRoomFactor`, 2) up to *Most room after a cut answer* (`loop.cutRoomTokens`, 64,000), and the model is told in one editable line (`runtime.cut_thinking`) to think briefly and act. The first call counts against every budget and shows in the live view as cut; the second shows as the same step again. Cut so again, it ends as a cut answer does (a job fails in words that say so). An answer cut after it wrote text or a whole tool call is handled as any cut answer is;
 - reasoning carried across tool calls where the provider needs it;
 - cache breakpoints on a stable prefix;
 - request and token throttles per connection.

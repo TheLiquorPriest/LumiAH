@@ -30,6 +30,7 @@ export { FAMILY, SCRATCH_READ, type TextDef, type TextVar, TOOL } from "./text-d
 export const TEXT = {
   runtime: {
     scratchRead: "runtime.scratch_read",
+    cutThinking: "runtime.cut_thinking",
     scratchHandle: "runtime.scratch_read.handle",
     scratchOffset: "runtime.scratch_read.offset",
     scratchLength: "runtime.scratch_read.length",
@@ -246,6 +247,7 @@ const ANSWERS = GROUP.answers;
 const PROGRESS = GROUP.progress;
 
 const RUNTIME_TEXTS: TextDef[] = [
+  { id: TEXT.runtime.cutThinking, group: RUNTIME, label: "An answer that ran out while thinking", note: "Told to an agent whose last answer ran out of room while its model was still thinking, before it wrote anything or called a tool, as the same call is made again with more room.", text: "[Your last answer ran out of room while you were still thinking, so nothing came of it. Think briefly, then act: call a tool or answer.]", vars: [] },
   { id: TEXT.runtime.scratchRead, group: RUNTIME, label: "scratch_read: what it does", note: "The description of the built-in tool that reads the rest of a clipped tool result.", text: "Read more of a tool result that came back clipped. Give the scratch handle the clipped result names and where to start; you get the next part.", vars: [] },
   { id: TEXT.runtime.scratchHandle, group: RUNTIME, label: "scratch_read: handle", note: "The description of scratch_read's handle argument.", text: "The scratch handle the clipped result names, such as s1.", vars: [] },
   { id: TEXT.runtime.scratchOffset, group: RUNTIME, label: "scratch_read: offset", note: "The description of scratch_read's offset argument.", text: "The character to start from; 0 is the start.", vars: [] },

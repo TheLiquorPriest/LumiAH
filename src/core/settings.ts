@@ -128,6 +128,10 @@ export interface Settings {
     answerFloor: number;
     /** An agent is told when it has this many rounds of tool calls left; 0 for never. */
     warnRounds: number;
+    /** A call its answer room cut before it gave anything usable (all of it thinking) is made again once, with its room times this. */
+    cutRoomFactor: number;
+    /** The most answer room that second go has, in tokens. */
+    cutRoomTokens: number;
   };
   cache: {
     /** Explicit cache breakpoints, where the provider takes them. */
@@ -381,7 +385,8 @@ export function defaultSettings(): Settings {
     // No turn-wide limit: each agent's own limits stand.
     turn: { tokensIn: null, tokensOut: null, toolTurns: null, wallMs: null },
     // An answer of fewer tokens than the floor is cut before it says anything; two rounds' warning is one to finish reading and one to answer.
-    loop: { repeats: 3, clipChars: 6000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000, answerFloor: 256, warnRounds: 2 },
+    // An answer cut while it was all thinking gets one more go with twice the room: enough for a strong reasoning model that thought at length, at most 64,000 tokens so one call never runs away.
+    loop: { repeats: 3, clipChars: 6000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000, answerFloor: 256, warnRounds: 2, cutRoomFactor: 2, cutRoomTokens: 64_000 },
     cache: { breakpoints: true, key: "" },
     // An hour is long enough not to pay for a refused call on every turn, and short enough that a connection whose model changed gets its native tools back.
     connections: { atOnce: null, throttles: {}, toolRefusalMinutes: 60 },
@@ -601,6 +606,8 @@ export const SETTINGS_SCHEMA: JsonObject = {
         retryWaitMs: whole("Wait before a retry", "How long to wait before a failed call is made again. The agent's and the turn's time limits still run while it waits.", 0, "ms", TIMER_MAX_MS),
         answerFloor: whole("Least answer room", "A call isn't made with less room for its answer than this. An agent whose answer tokens (its own, or its turn's) are that close to spent stops and says so, instead of writing an answer that would be cut.", 1, "tokens"),
         warnRounds: whole("Rounds left warning", "An agent is told when it has this many rounds of tool calls left, so it can finish with what it has. 0 for never.", 0, "rounds"),
+        cutRoomFactor: whole("More room after a cut answer", "When a model's answer runs out of room while it is still thinking, before it writes anything or calls a tool, the call is made once more with its room times this, and the model is told to think briefly and act. 1 gives it the same room.", 1, "times"),
+        cutRoomTokens: whole("Most room after a cut answer", "The most answer room that second go may have.", 1, "tokens"),
       },
     },
     cache: {

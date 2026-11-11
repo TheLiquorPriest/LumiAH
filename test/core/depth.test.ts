@@ -387,7 +387,8 @@ describe("a job run again, what a job is told, and an answer cut while it though
     const r = rig(
       lines({
         author: [{ toolCalls: [call("job_start", { agent: "voice", task: "Digest the beat.", as: "mara", lane: "soon", due: "next_turn" }), call("reply_write", { text: "Mara nods." })] }, "Done.", { toolCalls: [call("reply_write", { text: "Mara shrugs." })] }, "Done."],
-        voice: [{ content: "", reasoning: "Mara turns the morning over and over.", finishReason: "length" }, "Digested: the boat went out at dawn."],
+        // Cut while thinking twice: once, and once more on the second go with more room.
+        voice: [{ content: "", reasoning: "Mara turns the morning over and over.", finishReason: "length" }, { content: "", reasoning: "And over again.", finishReason: "length" }, "Digested: the boat went out at dawn."],
       }),
     );
     const { request } = await runTurn(r.host, r.harness, CHAT);
@@ -397,7 +398,7 @@ describe("a job run again, what a job is told, and an answer cut while it though
     const { job } = await r.harness.jobs.again({ id: failed.id });
     expect(job).toMatchObject({ again: failed.id, basis: request.generationId, by: { who: "agent", role: "author" }, as: "mara", lane: "soon", due: "next_turn", task: "Digest the beat." });
     expect((await r.harness.jobs.run({ id: job.id }, never)).state).toBe("done");
-    const told = r.callsOf(VOICE)[1]?.messages.find((m) => m.role === "user")?.content ?? "";
+    const told = r.callsOf(VOICE)[2]?.messages.find((m) => m.role === "user")?.content ?? "";
     expect(told).toContain(renderDefault(TEXT.jobs.task, { task: "Digest the beat." }));
     expect(told).toContain(renderDefault(TEXT.jobs.againNote, { why: renderDefault(TEXT.jobs.whyCutThinking) }));
     expect(told).not.toContain("write your plan");
@@ -416,6 +417,39 @@ describe("a job run again, what a job is told, and an answer cut while it though
     expect(told).toContain("You are running as a job the user started");
     expect(told).toContain("Think over what Mara saw.");
     for (const promise of ["write your plan", "learned/", "in files"]) expect(told).not.toContain(promise);
+  });
+
+  /** A job of the user's whose agent can call job_list, answered from `voice` in turn; its calls and what became of it. */
+  async function cutRun(voiceLines: Answer[]) {
+    const r = rig(lines({ voice: voiceLines }));
+    const { job } = await r.harness.jobs.start({ chatId: CHAT, agent: "voice", task: "Think over what Mara saw.", when: "now" });
+    const ended = await r.harness.jobs.run({ id: job.id }, never);
+    return { ended, calls: r.callsOf(VOICE) };
+  }
+  const thinking: Answer = { content: "", reasoning: "Mara turns the morning over and over.", finishReason: "length" };
+  const notice = renderDefault(TEXT.runtime.cutThinking);
+
+  test("a call its room cut while it was all thinking is made again once, with twice the room, and the model told to think briefly and act", async () => {
+    const { ended, calls } = await cutRun([thinking, "She saw the boat leave at dawn."]);
+    expect(ended).toMatchObject({ state: "done", opening: "She saw the boat leave at dawn.", usage: { calls: 2 } });
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.maxTokens).toBe(Math.min((calls[0]?.maxTokens ?? 0) * 2, 64_000));
+    expect(JSON.stringify(calls[1]?.messages.at(-1))).toContain(notice.slice(1, 40));
+  });
+
+  test("cut so again on the second go, the job fails in words that say so, with no third call", async () => {
+    const { ended, calls } = await cutRun([thinking, thinking, "Never reached."]);
+    expect(ended).toMatchObject({ state: "failed", reason: renderDefault(TEXT.jobs.whyCutThinking), usage: { calls: 2 } });
+    expect(calls).toHaveLength(2);
+  });
+
+  test("an answer cut after it made a whole tool call is handled as before: the call runs, with no second go and no more room", async () => {
+    const { ended, calls } = await cutRun([{ toolCalls: [call("job_list", {})], finishReason: "length" }, "Nothing else is running."]);
+    expect(ended.state).toBe("done");
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.maxTokens).toBe(calls[0]?.maxTokens);
+    expect(JSON.stringify(calls[1]?.messages)).not.toContain(notice.slice(1, 40));
+    expect(calls[1]?.messages.at(-1)?.parts?.some((part) => part.type === "tool_result")).toBe(true);
   });
 });
 
