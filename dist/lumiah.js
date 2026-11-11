@@ -357,6 +357,7 @@ var TOOL = {
   presetInstructions: "preset_instructions",
   pastTurn: "past_turn",
   writeReply: "write_reply",
+  replyWrite: "reply_write",
   workspaceList: "workspace_list",
   workspaceRead: "workspace_read",
   workspaceGrep: "workspace_grep",
@@ -484,7 +485,7 @@ var MAIN_TOOLS = [
   ADDED_TOOLS
 ];
 var SUMMARIZER_TOOLS = [TOOL.chatSearch, TOOL.chatGrep, TOOL.chatRead, TOOL.bookOutline, TOOL.bookRead, TOOL.loreSearch, TOOL.loreRead, TOOL.workspaceList, TOOL.workspaceRead, TOOL.workspaceGrep];
-var CORE_TOOLS = [...MAIN_TOOLS, TOOL.webSearch, ...Object.values(FAMILY).map((family) => `@${family}`)];
+var CORE_TOOLS = [...MAIN_TOOLS, TOOL.webSearch, TOOL.replyWrite, ...Object.values(FAMILY).map((family) => `@${family}`)];
 function defaultSettings() {
   const unlimited = { callTokensIn: null, callMs: null, callTools: null, tokensIn: null, tokensOut: null, wallMs: null };
   return {
@@ -507,8 +508,8 @@ function defaultSettings() {
     workspace: { fileChars: 200000, files: 400, areaChars: 4000000, pathChars: 200, versions: 10, pinChars: 12000, agentsPinUser: false },
     guidance: { chars: 8000, agentsEdit: false },
     skills: { listChars: 4000 },
-    delegation: { depth: 2, atOnce: 3, perRun: 12, grant: "own", fileChars: 12000 },
-    jobs: { enabled: true, atOnce: 1, perRun: 3, budget: { tokensIn: 600000, tokensOut: 60000, toolTurns: 60, wallMs: 900000 }, tokensPerDay: 3000000, taskChars: 4000, openingChars: 600, recordWaitMs: 120000, chain: true, delegations: null },
+    delegation: { depth: 2, atOnce: 3, perRun: 12, grant: "own", fileChars: 12000, asChars: 200, replyHoldChars: 200 },
+    jobs: { enabled: true, atOnce: 1, perRun: 3, budget: { tokensIn: 600000, tokensOut: 60000, toolTurns: 60, wallMs: 900000 }, tokensPerDay: 3000000, taskChars: 4000, openingChars: 600, recordWaitMs: 120000, chain: true, delegations: null, dueWaitMs: 60000 },
     approval: { tiers: { read: "allow", write: "allow", external: "allow" }, tools: {}, waitMs: 300000 },
     spend: { tokensPerDay: null, costPerDay: null, cachedWeight: 0.1 },
     extension: { waitMs: 1e4 },
@@ -533,6 +534,9 @@ var EFFORTS = [
   ["xhigh", "Extra high"],
   ["max", "Maximum"]
 ];
+function isEffort(value) {
+  return EFFORTS.some(([effort]) => effort === value);
+}
 var TOOL_CALLS = [
   ["auto", "Native, else as text", "Native tool calls where the connection takes them. Once it refuses them, the tools are described in the prompt and the model writes its calls; native calls are tried again after a time (Connections)."],
   ["native", "Native only", "Always native tool calls. A connection that refuses them fails the call."],
@@ -806,7 +810,9 @@ var SETTINGS_SCHEMA = {
           ["own", "No more than its starter holds", "A tool the agent that starts it doesn't have is left out, so delegating, or starting a job, never reaches further than the agent could itself."],
           ["definition", "Whatever its definition names", "Its definition alone decides."]
         ]),
-        fileChars: whole2("Files given with a task", "The most characters of the files a task names that are given with it. Past it the rest are named, with how to read them.", 0, "characters")
+        fileChars: whole2("Files given with a task", "The most characters of the files a task names that are given with it. Past it the rest are named, with how to read them.", 0, "characters"),
+        asChars: whole2("Instance name length", "The most characters of as in delegate and job_start: which one of the many an agent stands for, such as a character. A longer one is refused.", 1, "characters"),
+        replyHoldChars: whole2("Hold before a handed-on reply streams", "When an agent hands the reply to another (to_reply in delegate), each of that agent's answers is held until it is this long or ends without a tool call, then it streams. So the line or two it writes before a tool call is never sent; what streamed is never taken back. 0 streams everything at once.", 0, "characters")
       }
     },
     jobs: {
@@ -833,7 +839,8 @@ var SETTINGS_SCHEMA = {
         openingChars: whole2("Report opening", "How much of a finished job's report the main agent is told at its next turn, and the Jobs page lists. job_read reads the whole.", 40, "characters"),
         recordWaitMs: whole2("Wait for a turn to be saved", "A job that ends just as its turn does waits this long for Lumiverse to save that turn's reply before it takes the turn as gone from the chat.", 0, "ms", TIMER_MAX_MS),
         chain: flag2("Jobs may start jobs", "A job's own agents are offered job_start. A job so started may spend no more than is left of the one that started it, and what it spends counts against that one's allowance too. Off: only the agents of a turn or a side session, and you, start jobs."),
-        delegations: limit("Delegations per job", "The most sub-agents the agents of one job may start in all. None: no limit of its own, since what a job may spend bounds it. Sub-agents per turn bounds a turn's.", "agents")
+        delegations: limit("Delegations per job", "The most sub-agents the agents of one job may start in all. None: no limit of its own, since what a job may spend bounds it. Sub-agents per turn bounds a turn's.", "agents"),
+        dueWaitMs: whole2("Wait for jobs due", "How long a turn waits at its start for the jobs started as due by it (due in job_start). The main agent is told of any still running.", 0, "ms", TIMER_MAX_MS)
       }
     },
     approval: {
@@ -1012,6 +1019,9 @@ var AGENTS_TEXT = {
   task: "agents.task",
   taskFiles: "agents.task.files",
   taskRequest: "agents.task.request",
+  taskNewest: "agents.task.newest",
+  asLong: "agents.as_long",
+  noReply: "agents.delegate.no_reply",
   file: "agents.file",
   fileNamed: "agents.file.named",
   pinned: "agents.pinned",
@@ -1082,6 +1092,8 @@ The agents you can delegate to:
   { id: toolArgId(TOOL.delegate, "agent"), group: GROUP.tools, label: "delegate: agent", note: "The description of delegate's agent argument.", text: "The agent's id, from the list above.", vars: [] },
   { id: toolArgId(TOOL.delegate, "task"), group: GROUP.tools, label: "delegate: task", note: "The description of delegate's task argument.", text: "What it is to do and what you want back, in full. It knows nothing you don't write here.", vars: [] },
   { id: toolArgId(TOOL.delegate, "files"), group: GROUP.tools, label: "delegate: files", note: "The description of delegate's files argument.", text: "Workspace files to give it with the task, by path. Leave it out for none.", vars: [] },
+  { id: toolArgId(TOOL.delegate, "as"), group: GROUP.tools, label: "delegate: as", note: "The description of delegate's as argument, offered where an extension builds LumiAH in.", text: "Which one this agent is to be, where its kind stands for many (a character's id, for one): what it may read and the model it runs on follow from it. Leave it out for none.", vars: [] },
+  { id: toolArgId(TOOL.delegate, "to_reply"), group: GROUP.tools, label: "delegate: to_reply", note: "The description of delegate's to_reply argument, offered to an agent that may write the reply itself.", text: "true: its answer is part of the reply, streaming to the user as it is written, after what was released before; this call's result is that answer too. Leave it out for an answer only you read.", vars: [] },
   ...toolTexts(TOOL.agentMessage, "Send a follow-up to an agent you delegated to this turn. It goes on from where it left off, with everything it had read, and its answer is this tool's result.", {
     handle: "The handle that agent's answer named, such as agent_1a2b3c4d.",
     text: "What you want of it now."
@@ -1098,6 +1110,11 @@ Files given with this task:
 For reference, the request this turn answers ({{count}}), as Lumiverse assembled it:
 
 {{request}}`, vars: [v("count", 'how many messages it holds, with the word: "14 messages"'), v("request", "the request, as the main agent reads it", true)] },
+  { id: AGENTS_TEXT.taskNewest, group: AGENTS, label: "The newest message with a task", note: "Follows a delegated task for an agent whose definition is given the request, in a chat whose extension shows its agents only the user's newest message.", text: `
+
+For reference, the user's newest message:
+
+{{request}}`, vars: [v("request", "the user's newest message, as the main agent reads it", true)] },
   { id: AGENTS_TEXT.file, group: AGENTS, label: "A file in context", note: "One workspace file put in an agent's context whole: given with a task, or pinned.", text: `[{{path}}: {{chars}} characters, version {{version}}]
 {{text}}`, vars: [v("path", "the file's path", true), v("chars", "its length"), v("version", "its version, which a write or an edit of it names"), v("text", "its text", true)] },
   { id: AGENTS_TEXT.fileNamed, group: AGENTS, label: "A file named, not included", note: "Stands for a file that didn't fit the room its setting gives (Files given with a task, Pinned files in context).", text: "[{{path}}: {{chars}} characters, not included here. workspace_read reads it.]", vars: [v("path", "the file's path", true), v("chars", "its length")] },
@@ -1112,6 +1129,8 @@ agent_message with this handle has it go on, if it still may; or go on without i
   { id: AGENTS_TEXT.noAgent, group: ANSWERS, label: "delegate: no such agent", note: "delegate's answer to an id that names no agent it may delegate to.", text: "There's no agent {{agent}} to delegate to. You can delegate to: {{agents}}.", vars: [v("agent", "the id asked for"), v("agents", "the ids there are", true)] },
   { id: AGENTS_TEXT.tooMany, group: ANSWERS, label: "delegate: too many sub-agents", note: "delegate's answer once the turn has started every sub-agent Sub-agents per turn allows.", text: "Not started: this turn has started the {{limit}} it may (Sub-agents per turn). Ask one you already have with agent_message, or do it yourself.", vars: [v("limit", 'Sub-agents per turn, with the word: "3 sub-agents"', true)] },
   { id: AGENTS_TEXT.noFile, group: ANSWERS, label: "delegate: no such file", note: "delegate's answer to a file that isn't in the workspace.", text: "Not started: there's no workspace file {{path}}. workspace_list shows what there is. Call delegate again with the right path, or without it.", vars: [v("path", "the path asked for", true)] },
+  { id: AGENTS_TEXT.asLong, group: ANSWERS, label: "delegate and job_start: as too long", note: "The answer of delegate and job_start to an as past Instance name length.", text: "Not started: as is {{chars}} characters, and it may be {{limit}} at most (Instance name length). Give the short id.", vars: [v("chars", "its length"), v("limit", "Instance name length", true)] },
+  { id: AGENTS_TEXT.noReply, group: ANSWERS, label: "delegate: to_reply without the reply", note: "delegate's answer to to_reply from an agent that doesn't write the reply.", text: "Not started: you don't write this reply, so you can't hand it on. Call delegate without to_reply.", vars: [] },
   { id: AGENTS_TEXT.noHandle, group: ANSWERS, label: "agent_message: no such handle", note: "agent_message's answer to a handle that names none of this turn's agents it started.", text: "There's no agent with the handle {{handle}} among those you started this turn. Your handles: {{handles}}.", vars: [v("handle", "the handle asked for"), v("handles", "the handles there are", true)] },
   { id: AGENTS_TEXT.noHandles, group: ANSWERS, label: "agent_message: nobody to message", note: "agent_message's answer when the agent has delegated to nobody this turn.", text: "You haven't delegated to anyone this turn, so there is nobody to message. delegate starts an agent.", vars: [] },
   { id: AGENTS_TEXT.stoppedSaid, group: ANSWERS, label: "delegate: what a stopped agent had written", note: "Fills {{said}} for an agent that stopped after it had written something.", text: " It had last written: {{text}}", vars: [v("text", "what it had last written", true)] },
@@ -1264,6 +1283,7 @@ var HOSTED_TEXTS = [
 var JOBS_TEXT = {
   task: "jobs.task",
   objective: "jobs.objective",
+  objectiveChat: "jobs.objective.chat",
   resumed: "jobs.resumed",
   resumedPlan: "jobs.resumed.plan",
   allowance: "jobs.allowance",
@@ -1284,6 +1304,10 @@ var JOBS_TEXT = {
   newsMore: "jobs.news.more",
   newsRest: "jobs.news.rest",
   newsNoReport: "jobs.news.no_report",
+  dueRunning: "jobs.due.running",
+  dueLine: "jobs.due.line",
+  dueAs: "jobs.due.as",
+  whyRuntimeOnly: "jobs.why.runtime_only",
   started: "jobs.started",
   whenNow: "jobs.when.now",
   whenAfter: "jobs.when.after_reply",
@@ -1357,6 +1381,24 @@ var JOBS_TEXTS = [
 `),
     vars: [v("task", "the objective, as the user wrote it", true), v("allowance", "what the job may spend, as Its allowance writes it", true), v("plan", "the plan file's path", true)]
   },
+  {
+    id: JOBS_TEXT.objectiveChat,
+    group: JOBS,
+    label: "A long objective that may change the chat's own area",
+    note: "The first message of a job the user started that may write the chat's own area (an extension starts such a job to prepare a story): the objective in their words, what the job may spend, and the plan it is asked for before it works.",
+    text: [
+      `You are running as a job the user started: work that is too long for a reply and ends in none. Nobody reads along, there is no writer to brief and no reply to write: write_reply isn't yours here. The user's objective, in their words:
+
+{{task}}`,
+      "{{allowance}} Everything you and the agents and jobs you start spend counts against it, and when it runs out you are stopped where you stand. So keep what you learn in files as you go, never only in your head.",
+      "Before you work, write your plan to {{plan}}: what you will do with this allowance, where you will read closely, where a summary is enough, and what you will leave out. A smaller allowance means a narrower plan. Keep the plan true as you go: mark what is done, and change it when you change course. Whoever carries this job on, you among them, starts from that file.",
+      "You may write the chat's own area (/), as it stands at the chat's latest reply, and learned/ (kept with this chat whatever path its story takes) and ~/ (the user's own, shared by all their chats). Keep a plain list of what you have not verified beside what you have.",
+      "When you are done, answer with your report: what you did, what you found, where it is, and what is left."
+    ].join(`
+
+`),
+    vars: [v("task", "the objective, as the user wrote it", true), v("allowance", "what the job may spend, as Its allowance writes it", true), v("plan", "the plan file's path", true)]
+  },
   { id: JOBS_TEXT.resumed, group: JOBS, label: "A job carried on", note: "What a job's agent is sent when the job is carried on from its own session: the user granted it more after its allowance ran out, or resumed it after a restart had found it paused.", text: "This job was stopped and is carried on now, from where you left it. {{allowance}}{{plan}} Then go on.", vars: [v("allowance", "what is left of what the job may spend, as Its allowance writes it", true), v("plan", "where its plan is, as A job carried on: its plan writes it; nothing for a job that was asked for none")] },
   { id: JOBS_TEXT.resumedPlan, group: JOBS, label: "A job carried on: its plan", note: "Fills {{plan}} for a job that was asked to keep a plan: one the user started.", text: " Read your plan ({{plan}}) and your files first: they say what is done and what is left.", vars: [v("plan", "the plan file's path", true)] },
   { id: JOBS_TEXT.allowance, group: JOBS, label: "Its allowance", note: "How a job's agent is told what the job may still spend.", text: "What this job may still spend: {{parts}}.", vars: [v("parts", "each limit, as the four texts below write them, or that there is none", true)] },
@@ -1394,6 +1436,10 @@ When you are done, answer with your report: what you did, what you found, and wh
   { id: JOBS_TEXT.newsMore, group: JOBS, label: "Jobs that ended: a report's opening", note: "Fills {{report}} for a job that left a report.", text: " Its report opens: {{opening}}{{more}}", vars: [v("opening", "how the report opens, ending in \u2026 where there is more of it", true), v("more", "how to read the rest, when there is more")] },
   { id: JOBS_TEXT.newsRest, group: JOBS, label: "Jobs that ended: the rest of a report", note: "Fills {{more}} for a report longer than its opening. The opening already ends in \u2026 there, so this adds none.", text: " (job_read with job {{id}} reads the whole.)", vars: [v("id", "the job's id", true)] },
   { id: JOBS_TEXT.newsNoReport, group: JOBS, label: "Jobs that ended: no report", note: "Fills {{report}} for a job that left none.", text: " {{reason}}", vars: [v("reason", "why it ended as it did", true)] },
+  { id: JOBS_TEXT.dueRunning, group: JOBS, label: "Jobs due that still run", note: "Leads the main agent's turn with the jobs started as due by this turn that hadn't ended when it stopped waiting for them (Wait for jobs due).", text: `Jobs due by this turn that haven't ended yet (their work isn't in; job_read reads one once it ends):
+{{jobs}}`, vars: [v("jobs", "each job, as Jobs due: one job writes it", true)] },
+  { id: JOBS_TEXT.dueLine, group: JOBS, label: "Jobs due: one job", note: "One job in Jobs due that still run.", text: "- {{id}} ({{agent}}{{as}}): {{state}}.", vars: [v("id", "the job's id", true), v("agent", "the agent it runs as"), v("as", "which one it stands for, as Jobs due: for whom writes it; nothing where the job names none"), v("state", "where it stands")] },
+  { id: JOBS_TEXT.dueAs, group: JOBS, label: "Jobs due: for whom", note: "Fills {{as}} for a job started with as.", text: " for {{as}}", vars: [v("as", "which one the job's agent stands for", true)] },
   {
     id: toolId(TOOL.jobStart),
     group: GROUP.tools,
@@ -1408,6 +1454,9 @@ The agents a job can run as:
   { id: toolArgId(TOOL.jobStart, "task"), group: GROUP.tools, label: "job_start: task", note: "The description of job_start's task argument.", text: "What it is to do and what its report should say, in full. It knows nothing you don't write here; put long material in a workspace file and name the file.", vars: [] },
   { id: toolArgId(TOOL.jobStart, "when"), group: GROUP.tools, label: "job_start: when", note: "The description of job_start's when argument.", text: "after_reply (the default): it starts once this turn's reply is written. now: it starts at once and runs beside this turn.", vars: [] },
   { id: toolArgId(TOOL.jobStart, "again"), group: GROUP.tools, label: "job_start: again", note: "The description of job_start's again argument.", text: "The id of a job that was interrupted, failed or was cancelled, to start it again with the same agent and task. Give it in place of agent and task.", vars: [] },
+  { id: toolArgId(TOOL.jobStart, "as"), group: GROUP.tools, label: "job_start: as", note: "The description of job_start's as argument, offered where an extension builds LumiAH in.", text: "Which one the job's agent is to be, where its kind stands for many (a character's id, for one). Leave it out for none.", vars: [] },
+  { id: toolArgId(TOOL.jobStart, "lane"), group: GROUP.tools, label: "job_start: lane", note: "The description of job_start's lane argument, offered where an extension builds LumiAH in.", text: "soon: it goes before every waiting job that isn't. later (the default): it waits its turn behind those.", vars: [] },
+  { id: toolArgId(TOOL.jobStart, "due"), group: GROUP.tools, label: "job_start: due", note: "The description of job_start's due argument, offered where an extension builds LumiAH in.", text: "next_turn: the next turn waits for it at its start, for a while, and is told if it still runs. Leave it out for work no turn waits on.", vars: [] },
   ...toolTexts(TOOL.jobList, "List this chat's jobs, the latest first: each with its id, its agent, where it stands and how its report opens.", { cursor: CURSOR_ARG }),
   ...toolTexts(TOOL.jobRead, "Read one job: its task, where it stands, what it spent, and its report in full.", { job: "The job's id.", cursor: CURSOR_ARG }),
   ...toolTexts(TOOL.jobCancel, "Cancel a job that is waiting or running. What it already wrote to the workspace stays.", { job: "The job's id." }),
@@ -1446,6 +1495,7 @@ It has no report.`, vars: [v("head", "the heading, as job_read: a job writes it"
   state(JOBS_TEXT.state.off_path, "off the path", "stopped: off the chat's path"),
   state(JOBS_TEXT.state.spent, "stopped at its allowance", "stopped at its allowance"),
   state(JOBS_TEXT.spentDay, "stopped at a day's limit", "stopped at a day's limit, with nothing lost"),
+  { id: JOBS_TEXT.whyRuntimeOnly, group: JOBS, label: "Why: the chat plays only in a runtime", note: "Why a job, or a side session's turn, didn't run inside Lumiverse: the extension that answers the chat says it plays only in a runtime.", text: "this chat plays only in a runtime, so its work runs only there; start the runtime and run it again", vars: [] },
   state(JOBS_TEXT.state.paused, "paused, with no run under way", "paused by the user"),
   state(JOBS_TEXT.paused, "paused", "running, paused by the user"),
   { id: JOBS_TEXT.whyCancelledByAgent, group: JOBS, label: "Why: cancelled by an agent", note: "A job's reason when an agent's job_cancel ended it.", text: "the {{role}} agent cancelled it", vars: [v("role", "the definition of the agent that cancelled it", true)] },
@@ -2488,7 +2538,10 @@ var TEXT = {
     replyMany: "main.turn.reply_many",
     directed: "main.turn.directed",
     direction: "main.turn.directed.direction",
-    noDirection: "main.turn.directed.none"
+    noDirection: "main.turn.directed.none",
+    turnNewest: "main.turn.newest",
+    noNewest: "main.turn.newest.none",
+    askReleases: "main.turn.ask.releases"
   },
   request: {
     message: "request.message",
@@ -2557,7 +2610,14 @@ var TEXT = {
     replyBusy: "tool.answer.reply_busy",
     replyFailed: "tool.answer.reply_failed",
     replyNoBrief: "tool.answer.reply_no_brief",
-    replyEmpty: "tool.answer.reply_empty"
+    replyEmpty: "tool.answer.reply_empty",
+    replyReleased: "tool.answer.reply_released",
+    released: "tool.answer.released",
+    releaseBuiltIn: "tool.answer.release_built_in",
+    releaseWriter: "tool.answer.release_writer",
+    releaseHeld: "tool.answer.release_held",
+    releaseUnchecked: "tool.answer.release_unchecked",
+    releaseEnded: "tool.answer.release_ended"
   },
   progress: {
     session: "progress.session",
@@ -2576,7 +2636,9 @@ var TEXT = {
     recordFailed: "progress.record_failed",
     retry: "progress.retry",
     stopped: "progress.stopped",
-    turnStopped: "progress.turn_stopped"
+    turnStopped: "progress.turn_stopped",
+    dueWait: "progress.due_wait",
+    nothingReleased: "progress.nothing_released"
   },
   word: {
     message: "word.message",
@@ -2790,7 +2852,23 @@ The direction for this reply:
 {{text}}`, vars: [v("text", "the user's newest message", true)] },
   { id: TEXT.main.noDirection, group: MAIN, label: "No direction for this reply", note: "Fills {{direction}} where the chat ends with a reply, or with a message the user hid, so the user gave no direction for this one.", text: `
 
-The user gave no direction for this reply: carry the story on from where it stands.`, vars: [] }
+The user gave no direction for this reply: carry the story on from where it stands.`, vars: [] },
+  {
+    id: TEXT.main.turnNewest,
+    group: MAIN,
+    label: "A turn's message, with only the newest message",
+    note: "What the main agent is sent each turn in a chat whose extension shows it only the user's newest message, not the whole request Lumiverse assembled.",
+    text: `{{kind}}
+
+{{notes}}The user's newest message:
+
+{{message}}
+
+{{ask}}`,
+    vars: [v("kind", "why a reply is needed, in the words above", true), v("notes", "what changed about its notes since its last turn, each ending in a blank line; nothing when there is none of it. Required: a summary of its notes reaches the agent only here when no later turn follows it", true), v("message", "the user's newest message, framed as a message of the request is, or that there is none", true), v("ask", "what to do, in the words above", true)]
+  },
+  { id: TEXT.main.noNewest, group: MAIN, label: "No newest message", note: "Fills {{message}} where the request holds no message from the user.", text: "The request holds no message from the user: carry the story on from where it stands.", vars: [] },
+  { id: TEXT.main.askReleases, group: MAIN, label: "What to do: release the reply", note: "Fills {{ask}} in a chat whose reply is only what its agents release: no writer writes it.", text: "Work out what this reply needs, then release it with reply_write, a passage at a time, or hand it to an agent with delegate and to_reply. Nothing else reaches the user.", vars: [] }
 ];
 var REQUEST_TEXTS = [
   { id: TEXT.request.message, group: REQUEST, label: "A message", note: "One message of the request that isn't a preset instruction.", text: `[{{n}}] {{role}}{{from}}
@@ -2857,7 +2935,8 @@ The turns to fold into it, oldest first:
 var TOOL_TEXTS = [
   ...toolTexts(TOOL.presetInstructions, "List the active preset's instruction blocks in order, those switched off marked: what the preset's author tells the model, as written in the preset, before Lumiverse fills in its macros. Give block to read one whole.", { block: "A block's id or name, to read that block whole.", cursor: CURSOR_ARG }),
   ...toolTexts(TOOL.pastTurn, "Read or search an earlier turn of yours in full: every tool call you made with what came back, and your brief, where your notes keep only a receipt. Without arguments it lists your turns. Give reply to list that turn's steps; add step to read one whole; give grep to find the lines that hold some text, in that turn or, without reply, in your latest turns.", { reply: "The reply's number in the chat, as your receipts name it (reply #12).", step: "Which of the turn's steps to read whole, by its number in the turn's list.", grep: "Text to find, in any letter case: every line that holds it, with its reply, step and line.", cursor: CURSOR_ARG }),
-  ...toolTexts(TOOL.writeReply, "Hand the writer your brief and have it write the reply, which goes to the user. This ends your turn: call it once, when you have what the reply needs, and call nothing else beside it.", { brief: "What the writer needs that the prompt doesn't already give it: facts to keep straight, lore that bears on this moment, the thread to pick up. Short and specific; no prose for the reply itself." })
+  ...toolTexts(TOOL.writeReply, "Hand the writer your brief and have it write the reply, which goes to the user. This ends your turn: call it once, when you have what the reply needs, and call nothing else beside it.", { brief: "What the writer needs that the prompt doesn't already give it: facts to keep straight, lore that bears on this moment, the thread to pick up. Short and specific; no prose for the reply itself." }),
+  ...toolTexts(TOOL.replyWrite, "Release a passage of the reply: it streams to the user at once, after what was released before. Call it again for the next passage; the reply is everything released, in order. Released text can't be taken back. Your turn ends when you answer.", { text: "The passage, exactly as the user should read it." })
 ];
 var ANSWER_TEXTS = [
   { id: TEXT.answer.more, group: ANSWERS6, label: "There is more", note: "Ends a tool's answer that has more to give.", text: '[There is more: call {{tool}} again with the same arguments and cursor "{{cursor}}".]', vars: [v("tool", "the tool"), v("cursor", "where the next page starts", true)] },
@@ -2894,7 +2973,14 @@ Its steps, in full as they were; read one whole with step:`, vars: [v("told", "w
   { id: TEXT.answer.replyBusy, group: ANSWERS6, label: "write_reply: already writing", note: "write_reply's answer to a second call while the writer is at work on the first.", text: "The writer is already writing this reply from your other write_reply call. Call write_reply once.", vars: [] },
   { id: TEXT.answer.replyFailed, group: ANSWERS6, label: "write_reply: the writer failed", note: "write_reply's answer when the writer's call failed before any of the reply was sent.", text: "The writer couldn't write the reply: {{reason}}. Nothing was sent to the user. Call write_reply again to try once more.", vars: [v("reason", "why", true)] },
   { id: TEXT.answer.replyNoBrief, group: ANSWERS6, label: "write_reply: no brief", note: "write_reply's answer to a call without a brief.", text: "write_reply needs brief: what the writer needs that the prompt doesn't already give it. When the prompt holds everything, say that in a line. Call write_reply again with brief.", vars: [] },
-  { id: TEXT.answer.replyEmpty, group: ANSWERS6, label: "write_reply: an empty reply", note: "Fills {{reason}} in The writer failed, and the turn's error, when the writer's model answered with nothing.", text: "its model answered with nothing", vars: [] }
+  { id: TEXT.answer.replyEmpty, group: ANSWERS6, label: "write_reply: an empty reply", note: "Fills {{reason}} in The writer failed, and the turn's error, when the writer's model answered with nothing.", text: "its model answered with nothing", vars: [] },
+  { id: TEXT.answer.replyReleased, group: ANSWERS6, label: "write_reply: the reply was released already", note: "write_reply's answer once part of the reply was released with reply_write: no writer writes after it.", text: "Not handed to the writer: you released part of this reply with reply_write, so the reply is yours to finish. Go on with reply_write, or end your turn.", vars: [] },
+  { id: TEXT.answer.released, group: ANSWERS6, label: "reply_write: released", note: "reply_write's answer once its passage reached the user.", text: "Released: {{chars}} characters reached the user. The reply holds {{total}} characters now. Release the next passage, or end your turn.", vars: [v("chars", "the passage's length", true), v("total", "the reply's length so far")] },
+  { id: TEXT.answer.releaseBuiltIn, group: ANSWERS6, label: "reply_write: built in", note: "The answer of reply_write, and of delegate with to_reply, in a chat that runs inside Lumiverse: there Lumiverse's own generation writes the reply.", text: "Not released: this chat runs inside Lumiverse, which writes the reply itself, so no agent can release it here. Brief the writer with write_reply instead.", vars: [] },
+  { id: TEXT.answer.releaseWriter, group: ANSWERS6, label: "reply_write: the writer has the reply", note: "The answer of reply_write, and of delegate with to_reply, once the writer is writing the reply or has written it.", text: "Not released: the writer is writing this reply, or has written it, so nothing more can go into it.", vars: [] },
+  { id: TEXT.answer.releaseHeld, group: ANSWERS6, label: "reply_write: another agent's answer is streaming", note: "The answer of reply_write, and of delegate with to_reply, while a sub-agent's answer streams into the reply.", text: "Not released: another agent's answer is streaming into the reply now. Wait for that call to end, then release yours.", vars: [] },
+  { id: TEXT.answer.releaseUnchecked, group: ANSWERS6, label: "reply_write: the extension didn't say", note: "reply_write's answer when the extension that checks each passage gave no word on it in time, or gave one that isn't a word: nothing goes out unchecked.", text: "Not released: the check on each passage didn't answer, so nothing was sent. Try again.", vars: [] },
+  { id: TEXT.answer.releaseEnded, group: ANSWERS6, label: "reply_write: the reply has ended", note: "The answer of reply_write, and of delegate with to_reply, once the turn's reply has ended or the turn was stopped.", text: "Not released: this reply has ended.", vars: [] }
 ];
 var PROGRESS_TEXTS = [
   { id: TEXT.progress.session, group: PROGRESS, label: "Notes carried", note: "The first line a turn writes into the reply's thinking block: what the main agent carries from earlier turns.", text: "LumiAH: the main agent carries its notes from {{turns}}.", vars: [v("turns", 'how many earlier turns, with the word: "4 earlier turns"', true)] },
@@ -2913,7 +2999,9 @@ var PROGRESS_TEXTS = [
   { id: TEXT.progress.recordFailed, group: PROGRESS, label: "A turn's notes not stored", note: "A line when a turn's notes couldn't be stored, and what the live view says of it: the reply stands, and the main agent won't remember the turn.", text: "This turn's notes couldn't be stored ({{error}}): the reply stands, but the main agent won't remember this turn.", vars: [v("error", "why", true)] },
   { id: TEXT.progress.retry, group: PROGRESS, label: "Trying a call again", note: "A line each time a model call that failed in passing is made again, whichever of the turn's agents made it.", text: "A model call failed ({{reason}}); trying again, {{attempt}} of {{retries}}\u2026", vars: [v("reason", "the failure, in the provider's own words", true), v("attempt", "which try this is"), v("retries", "how many Settings allow")] },
   { id: TEXT.progress.stopped, group: PROGRESS, label: "Stopped", note: "A line when the turn ends without a reply.", text: "No reply: {{reason}}.", vars: [v("reason", "why", true)] },
-  { id: TEXT.progress.turnStopped, group: PROGRESS, label: "Why: the turn was stopped", note: "The reason a turn gives when it was stopped before its agents could say why.", text: "the turn was stopped", vars: [] }
+  { id: TEXT.progress.turnStopped, group: PROGRESS, label: "Why: the turn was stopped", note: "The reason a turn gives when it was stopped before its agents could say why.", text: "the turn was stopped", vars: [] },
+  { id: TEXT.progress.dueWait, group: PROGRESS, label: "Waiting for jobs due", note: "A line when a turn waits at its start for the jobs started as due by it.", text: "Waiting for {{jobs}} due by this turn\u2026", vars: [v("jobs", 'how many, with the word: "2 jobs"', true)] },
+  { id: TEXT.progress.nothingReleased, group: PROGRESS, label: "Why: nothing was released", note: "Why a turn failed in a chat whose reply is only what its agents release, when they released none of it. No writer writes in their place there.", text: "the agents ended without releasing any of the reply, and in this chat no writer writes it in their place", vars: [] }
 ];
 var WORD_TEXTS = [
   word(TEXT.word.message, "message", "messages"),
@@ -4045,8 +4133,14 @@ class Areas {
   }
   at(chatId, record) {
     if (record === null)
-      return this.workspace.area("chat", DOC.chatArea(chatId, ROOT_AREA));
+      return this.workspace.area("chat", DOC.chatArea(chatId, ROOT_AREA), () => this.originRoot(chatId, new Set([chatId])));
     return this.workspace.area("chat", DOC.chatArea(chatId, record.generationId), async () => record.workspace ?? null);
+  }
+  async originRoot(chatId, seen) {
+    const from = (await this.host.chat.info?.(chatId))?.branchedFrom ?? null;
+    if (from === null || seen.has(from))
+      return null;
+    return this.workspace.area("chat", DOC.chatArea(from, ROOT_AREA), () => this.originRoot(from, new Set([...seen, from]))).headHash();
   }
   openTurn(chatId, generationId, basis) {
     const under = this.at(chatId, basis);
@@ -4080,6 +4174,12 @@ class Areas {
   }
   async latest(chatId) {
     return (await this.standing(chatId)).at(-1) ?? null;
+  }
+  async newest(chatId) {
+    const path = await this.host.chat.path(chatId);
+    const standing = (await pathTurns(path)).filter((turn) => turn.onPath);
+    const latest = standing.at(-1) ?? null;
+    return latest !== null && latest.at === path.length - 1 ? { latest, base: standing.at(-2) ?? null } : { latest };
   }
   forget(chatId) {
     this.open.delete(chatId);
@@ -4126,6 +4226,10 @@ class LiveArea {
     const turn = await this.areas.current(this.chatId, turns);
     if (turn)
       return { area: turn.area, also: this.who.basis === turn.generationId ? null : turn.under };
+    if (this.who.throughSwipe) {
+      const { latest, base } = await this.areas.newest(this.chatId);
+      return { area: this.areas.at(this.chatId, latest?.record ?? null), also: base === undefined ? null : this.areas.at(this.chatId, base?.record ?? null) };
+    }
     return { area: this.areas.at(this.chatId, (await turns()).at(-1)?.record ?? null), also: null };
   }
   async change(make) {
@@ -5034,7 +5138,7 @@ class Agent {
       this.tools.set(SCRATCH_READ, this.scratchRead());
     this.offered = [...this.tools.values()].map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
     this.offeredTokens = toolTokens(this.offered, settings.loop.charsPerToken);
-    deps.turn?.trace?.start({ id: this.id, role: spec.role, connectionId: spec.connectionId, model: spec.model, effort: spec.effort, system: spec.system, prefix: [...spec.prefix], history: this.conversation.length, ...spec.parent !== undefined ? { parent: spec.parent } : {}, ...spec.task !== undefined ? { task: spec.task } : {}, at: this.now() });
+    deps.turn?.trace?.start({ id: this.id, role: spec.role, connectionId: spec.connectionId, model: spec.model, effort: spec.effort, system: spec.system, prefix: [...spec.prefix], history: this.conversation.length, ...spec.parent !== undefined ? { parent: spec.parent } : {}, ...spec.task !== undefined ? { task: spec.task } : {}, ...spec.as !== undefined ? { as: spec.as } : {}, at: this.now() });
   }
   now() {
     return this.deps.host.clock.now();
@@ -5209,6 +5313,7 @@ class Agent {
         at: this.now(),
         ...prompt !== undefined ? { prompt } : {}
       });
+      this.spec.onCall?.({ text: reply.text, calls: reply.calls.length });
       if (reply.calls.length === 0) {
         this.answered = true;
         this.conversation.push({ role: "assistant", content: reply.text });
@@ -5492,7 +5597,7 @@ ${this.text(TEXT.runtime.budget, { rounds: this.deps.texts.counted(rounds, TEXT.
         else {
           state2 = tool.state?.() ?? null;
           begun = true;
-          outcome = await this.raced(tool.run(call.args, { signal, agentId: this.id, role: this.spec.role, callId: call.id }), signal);
+          outcome = await this.raced(tool.run(call.args, { signal, agentId: this.id, role: this.spec.role, callId: call.id, ...this.spec.as !== undefined ? { as: this.spec.as } : {} }), signal);
         }
       } catch (error2) {
         const stopped = signal.aborted ? this.why(error2, signal) : null;
@@ -5842,25 +5947,30 @@ class Gate {
   get queued() {
     return this.waiting.length;
   }
-  enter(signal) {
+  enter(signal, soon = false) {
     if (signal.aborted)
       return Promise.reject(signal.reason);
     if (this.busy < this.limit() && this.waiting.length === 0)
       return Promise.resolve(this.take());
     const { promise, resolve, reject } = Promise.withResolvers();
     const entry = {
+      soon,
       go: () => {
         signal.removeEventListener("abort", entry.stop);
         resolve(this.take());
       },
       stop: () => {
-        const at = this.waiting.indexOf(entry);
-        if (at >= 0)
-          this.waiting.splice(at, 1);
+        const at2 = this.waiting.indexOf(entry);
+        if (at2 >= 0)
+          this.waiting.splice(at2, 1);
         reject(signal.reason);
       }
     };
-    this.waiting.push(entry);
+    const at = soon ? this.waiting.findIndex((w) => !w.soon) : -1;
+    if (at >= 0)
+      this.waiting.splice(at, 0, entry);
+    else
+      this.waiting.push(entry);
     signal.addEventListener("abort", entry.stop, { once: true });
     return promise;
   }
@@ -6524,7 +6634,7 @@ function remoteDefinition(tool, host) {
         tier: tool.tier,
         async run(args, ctx) {
           const { main = false, above = [] } = env.standing ?? {};
-          const answer = await port.call({ name: tool.name, args, turn: env.run.id, chatId: env.run.chatId, agentId: ctx.agentId, role: ctx.role, callId: ctx.callId, kind: env.run.kind, main, above: above.map(({ agentId, role }) => ({ agentId, role })) }, ctx.signal);
+          const answer = await port.call({ name: tool.name, args, turn: env.run.id, chatId: env.run.chatId, agentId: ctx.agentId, role: ctx.role, callId: ctx.callId, kind: env.run.kind, main, above: above.map(({ agentId, role, as }) => ({ agentId, role, ...as !== undefined ? { as } : {} })), ...ctx.as !== undefined ? { as: ctx.as } : {} }, ctx.signal);
           const files = takeChanges(env.run, ctx.callId);
           const changed = files.length > 0 ? { files } : {};
           if (!isRecord(answer) || typeof answer.text !== "string")
@@ -6692,6 +6802,37 @@ function resolveSettings(definition, settings) {
 }
 
 // src/core/delegation.ts
+class ReplyHold {
+  reply;
+  hold;
+  seen = "";
+  sent = 0;
+  released = "";
+  constructor(reply, hold) {
+    this.reply = reply;
+    this.hold = hold;
+  }
+  delta(delta) {
+    if (delta.content === undefined || delta.content === "")
+      return;
+    this.seen += delta.content;
+    if (this.seen.length >= this.hold)
+      this.out(this.seen.slice(this.sent));
+  }
+  call(answer) {
+    if (answer.calls === 0)
+      this.out((answer.text.startsWith(this.seen) ? answer.text : this.seen).slice(this.sent));
+    this.seen = "";
+    this.sent = 0;
+  }
+  out(text2) {
+    if (text2 === "")
+      return;
+    this.sent += text2.length;
+    if (this.reply.stream(text2))
+      this.released += text2;
+  }
+}
 var choiceOf = (d) => ({ id: d.id, name: d.name, description: d.description });
 
 class Delegator {
@@ -6709,6 +6850,8 @@ class Delegator {
       return;
     return {
       agents: () => run.definitions.workers(from.definition).map(choiceOf),
+      offersAs: run.shared.options.extension !== undefined,
+      toReply: from.reply !== undefined,
       start: (input, ctx) => this.start(from, input, ctx),
       message: (input, ctx) => this.message(input, ctx)
     };
@@ -6725,6 +6868,14 @@ class Delegator {
     const resolved = workers.some((d) => d.id === input.agent) ? run.resolve(input.agent) : undefined;
     if (!resolved)
       return run.refusal(TEXT.agents.noAgent, { agent: clip(input.agent, settings.tools.lineChars), agents: workers.map((d) => d.id).join(", ") });
+    if (input.as !== undefined && input.as.length > settings.delegation.asChars)
+      return run.refusal(TEXT.agents.asLong, { chars: String(input.as.length), limit: String(settings.delegation.asChars) });
+    const reply = input.toReply === true ? from.reply : undefined;
+    if (input.toReply === true && !reply)
+      return run.refusal(TEXT.agents.noReply);
+    const shut = reply?.refused() ?? null;
+    if (shut !== null)
+      return { text: shut, error: true };
     let room = settings.delegation.fileChars;
     const files = [];
     for (const raw of input.files) {
@@ -6748,11 +6899,16 @@ class Delegator {
     try {
       const leave = await this.gate.enter(ctx.signal);
       try {
+        const hold = reply ? new ReplyHold(reply, settings.delegation.replyHoldChars) : null;
         const { agent, lead } = await run.agent(resolved, {
           depth: from.depth + 1,
           parent: ctx.agentId,
           task: clip(input.task, settings.reply.progressChars),
-          ...(resolved.definition.grant ?? settings.delegation.grant) === "own" ? { grant: from.held } : {}
+          ...(resolved.definition.grant ?? settings.delegation.grant) === "own" ? { grant: from.held } : {},
+          ...input.as !== undefined ? { as: input.as } : {},
+          standing: "sub",
+          by: run.ref(ctx.agentId) ?? { agentId: ctx.agentId, role: ctx.role },
+          ...hold ? { onDelta: (delta) => hold.delta(delta), onCall: (answer) => hold.call(answer), replying: true } : {}
         });
         this.started.set(agent.id, { agent, definition: resolved.definition.id, owner: ctx.agentId });
         began = true;
@@ -6762,11 +6918,23 @@ class Delegator {
           files: files.length > 0 ? texts.render(TEXT.agents.taskFiles, { files: files.join(`
 
 `) }) : "",
-          request: resolved.definition.given === "request" && request ? texts.render(TEXT.agents.taskRequest, { count: request.count, request: request.text }) : ""
+          request: resolved.definition.given === "request" && request ? request.newest ? texts.render(TEXT.agents.taskNewest, { request: request.text }) : texts.render(TEXT.agents.taskRequest, { count: request.count, request: request.text }) : ""
         });
-        return this.answered(resolved.definition.id, agent.id, await agent.send(lead === "" ? task : `${lead}
+        const sent = lead === "" ? task : `${lead}
 
-${task}`, ctx.signal));
+${task}`;
+        if (!reply || !hold)
+          return this.answered(resolved.definition.id, agent.id, await agent.send(sent, ctx.signal));
+        const late = reply.refused();
+        if (late !== null)
+          return { text: late, error: true };
+        const letGo = reply.hold(run.ref(agent.id) ?? { agentId: agent.id, role: resolved.definition.id, ...input.as !== undefined ? { as: input.as } : {} });
+        try {
+          const answer = await agent.send(sent, ctx.signal);
+          return this.answered(resolved.definition.id, agent.id, hold.released === "" ? answer : { ...answer, text: hold.released });
+        } finally {
+          letGo(hold.released);
+        }
       } finally {
         leave();
       }
@@ -8815,7 +8983,10 @@ function claimOf(raw) {
     ...typeof raw.mainAgent === "string" ? { mainAgent: raw.mainAgent } : {},
     ...guidance && typeof guidance.path === "string" ? { guidance: { name: guidance.name, path: guidance.path } } : guidance && typeof guidance.text === "string" ? { guidance: { name: guidance.name, text: guidance.text } } : {},
     ...Array.isArray(raw.withdraw) ? { withdraw: raw.withdraw.filter((name) => typeof name === "string") } : {},
-    ...Object.keys(story).length > 0 ? { story } : {}
+    ...Object.keys(story).length > 0 ? { story } : {},
+    ...raw.place === "runtime" ? { place: "runtime" } : {},
+    ...raw.request === "whole" || raw.request === "newest" ? { request: raw.request } : {},
+    ...raw.reply === "released" ? { reply: "released" } : {}
   };
 }
 async function readSetup(shared, chatId, userId = shared.options.userId ?? "") {
@@ -8880,6 +9051,7 @@ class Run {
   wrote = [];
   request = null;
   guidance = [];
+  reply = null;
   equipment = null;
   book = null;
   recall = null;
@@ -9041,7 +9213,10 @@ class Run {
     const { definition } = resolved;
     const view = { author: { who: "agent", id: "", role: definition.id }, role: definition.id, areas: equipment.areas, guard: this.guard };
     const held = new Set;
-    const delegation = how.toolless ? undefined : this.delegator.for({ definition: definition.id, depth: how.depth, held, view });
+    const names = how.toolless ? [] : this.definitions.names(resolved.tools).filter((name) => !how.grant || how.grant.has(name));
+    const sourced = this.definitions.sourced(definition.id);
+    const reply = !how.toolless && !how.replying && this.reply !== null && (how.main === true || sourced?.source === "extension" || sourced?.over === "extension") ? this.reply : null;
+    const delegation = how.toolless ? undefined : this.delegator.for({ definition: definition.id, depth: how.depth, held, view, ...reply !== null && names.includes(TOOL.replyWrite) ? { reply } : {} });
     const jobs = how.toolless ? undefined : this.jobTools({ held, depth: how.depth });
     const skills = this.definitions.skills();
     const above = how.parent !== undefined ? this.lines.get(how.parent) ?? [] : [];
@@ -9059,13 +9234,13 @@ class Run {
       lore: equipment.lore,
       past: how.past ?? equipment.past,
       ...how.writeReply ? { writeReply: how.writeReply } : {},
+      ...reply !== null ? { reply } : {},
       workspace: view,
       skills,
       ...delegation ? { delegation } : {},
       ...jobs ? { jobs } : {},
       ...this.book ? { book: this.book } : {}
     };
-    const names = how.toolless ? [] : this.definitions.names(resolved.tools).filter((name) => !how.grant || how.grant.has(name));
     const tools = this.definitions.build(names, env);
     for (const tool of tools)
       held.add(tool.name);
@@ -9073,11 +9248,12 @@ class Run {
     const system = [own, how.about ?? "", !how.plain && held.has(TOOL.skillLoad) ? this.skillList() : ""].filter((part) => part !== "").join(`
 
 `);
+    const chosen = shared.options.extension?.agentModel ? await this.modelOf({ definition: definition.id, as: how.as ?? null, standing: how.standing ?? (info.kind === "job" ? "job" : "turn"), by: how.by ?? null }) : {};
     const agent = startAgent({
       role: definition.id,
-      connectionId: resolved.connectionId ?? this.ownConnection,
-      model: resolved.model,
-      effort: resolved.effort,
+      connectionId: chosen.connectionId ?? resolved.connectionId ?? this.ownConnection,
+      model: chosen.model ?? (chosen.connectionId !== undefined ? null : resolved.model),
+      effort: chosen.effort ?? resolved.effort,
       system,
       prefix: how.plain ? [] : this.prefix,
       tools,
@@ -9086,15 +9262,32 @@ class Run {
       ...how.history ? { history: how.history } : {},
       ...how.params ? { params: how.params } : {},
       ...how.onDelta ? { onDelta: how.onDelta } : {},
+      ...how.onCall ? { onCall: how.onCall } : {},
       ...how.uncapped ? { uncapped: true } : {},
       ...how.parent !== undefined ? { parent: how.parent } : {},
       ...how.task !== undefined ? { task: how.task } : {},
+      ...how.as !== undefined ? { as: how.as } : {},
       ...how.notes ? { notes: () => this.said.splice(0) } : {},
       ...how.notices ? { notices: how.notices } : {}
     }, this.deps);
     view.author = info.kind === "job" ? { who: "job", id: info.id, role: definition.id } : { who: "agent", id: agent.id, role: definition.id };
-    this.lines.set(agent.id, [...above, { agentId: agent.id, role: definition.id }]);
+    this.lines.set(agent.id, [...above, { agentId: agent.id, role: definition.id, ...how.as !== undefined ? { as: how.as } : {} }]);
     return { agent, lead: how.plain ? "" : await this.pinned(view), view };
+  }
+  ref(agentId) {
+    return this.lines.get(agentId)?.at(-1);
+  }
+  async modelOf(ask) {
+    const { shared, settings, info } = this;
+    const extension = shared.options.extension;
+    const answer = await askExtension(shared, "agent's model", settings.extension.waitMs, extension?.agentModel ? () => extension.agentModel?.({ userId: this.userId, chatId: info.chatId, turn: info.id, kind: info.kind, ...ask }) ?? Promise.resolve(null) : undefined, null);
+    if (!isRecord(answer))
+      return {};
+    return {
+      ...typeof answer.connectionId === "string" && answer.connectionId !== "" ? { connectionId: answer.connectionId } : {},
+      ...typeof answer.model === "string" && answer.model !== "" ? { model: answer.model } : {},
+      ...isEffort(answer.effort) ? { effort: answer.effort } : {}
+    };
   }
   skillList() {
     const { texts } = this;
@@ -9149,6 +9342,7 @@ class Run {
       return;
     const { basis } = this.equipped();
     const tools = {
+      offersAs: shared.options.extension !== undefined,
       agents: () => this.definitions.workers().map(choiceOf2),
       list: () => shared.jobs.list(info.chatId),
       read: (id) => shared.jobs.read(info.chatId, id),
@@ -9159,11 +9353,11 @@ class Run {
       tools.start = async (input, ctx) => {
         if (this.jobs.length + starting >= limitOf(settings.jobs.perRun))
           return { refused: texts.render(TEXT.jobs.tooMany, { limit: texts.counted(settings.jobs.perRun ?? 0, TEXT.jobs.word) }) };
-        const { when, ...what } = input;
+        const { when, as, lane, due, ...what } = input;
         starting++;
         let started;
         try {
-          started = await shared.jobs.createJob({ chatId: info.chatId, when, what, by: { who: "agent", id: ctx.agentId, role: ctx.role }, basis, starter: { held: [...starter.held], depth: starter.depth }, ...info.kind === "job" ? { parent: { id: info.id, left: this.left() } } : {} }, this);
+          started = await shared.jobs.createJob({ chatId: info.chatId, when, what, by: { who: "agent", id: ctx.agentId, role: ctx.role }, basis, starter: { held: [...starter.held], depth: starter.depth }, ...as !== undefined ? { as } : {}, ...lane !== undefined ? { lane } : {}, ...due !== undefined ? { due } : {}, ...info.kind === "job" ? { parent: { id: info.id, left: this.left() } } : {} }, this);
           if (!("refused" in started))
             this.jobs.push({ id: started.id, agent: started.agent, state: started.state });
         } finally {
@@ -9228,6 +9422,7 @@ class Jobs {
   ended = new Map;
   holding = false;
   forgotten = new Set;
+  watchers = new Set;
   constructor(shared) {
     this.shared = shared;
   }
@@ -9299,6 +9494,8 @@ class Jobs {
     } catch (error) {
       this.host.log("warn", `[LumiAH] the host took no word of job ${doc.job.id} (${errorText(error)})`);
     }
+    for (const watch of [...this.watchers])
+      watch();
     return doc.job;
   }
   async list(chatId) {
@@ -9306,6 +9503,32 @@ class Jobs {
   }
   async open(chatId) {
     return this.some((await this.index(chatId)).filter((entry) => entry.ended === undefined).map((entry) => entry.id).reverse());
+  }
+  async awaitDue(chatId, basis, ms, signal) {
+    const until = this.host.clock.now() + ms;
+    for (;; ) {
+      const due = (await this.open(chatId)).filter((job) => job.due === "next_turn" && job.basis === basis && (job.state === "queued" || job.state === "running") && job.paused !== true);
+      const left = until - this.host.clock.now();
+      if (due.length === 0 || left <= 0 || signal.aborted)
+        return due;
+      await this.changedWithin(left, signal);
+    }
+  }
+  changedWithin(ms, signal) {
+    const { promise, resolve } = Promise.withResolvers();
+    const over = new AbortController;
+    const done = () => {
+      this.watchers.delete(done);
+      signal.removeEventListener("abort", done);
+      over.abort();
+      resolve();
+    };
+    this.watchers.add(done);
+    signal.addEventListener("abort", done, { once: true });
+    this.host.clock.sleep(ms, over.signal).then(done, () => {
+      return;
+    });
+    return promise;
   }
   async page(input) {
     const from = input.cursor === null ? 0 : Number(input.cursor);
@@ -9359,6 +9582,7 @@ class Jobs {
     let agent;
     let task;
     let again;
+    let kept = {};
     if ("again" in input.what) {
       const old = await this.doc(input.what.again);
       if (!old || old.job.chatId !== input.chatId)
@@ -9368,8 +9592,12 @@ class Jobs {
       agent = old.job.agent;
       task = old.task;
       again = old.job.id;
+      kept = { ...old.job.as !== undefined ? { as: old.job.as } : {}, ...old.job.area !== undefined ? { area: old.job.area } : {}, ...old.job.plan !== undefined ? { plan: old.job.plan } : {} };
     } else
       ({ agent, task } = input.what);
+    const as = input.as ?? kept.as;
+    const area2 = input.by.who === "user" ? input.area ?? kept.area : undefined;
+    const plan = input.by.who === "user" ? input.plan ?? kept.plan : undefined;
     const may = input.by.who === "user" ? definitions.agents().filter((d) => d.id !== AGENT.writer) : definitions.workers();
     if (!may.some((d) => d.id === agent))
       return { refused: texts.render(TEXT.jobs.noAgent, { agent: clip(agent, lineChars), agents: may.map((d) => d.id).join(", ") }) };
@@ -9394,6 +9622,11 @@ class Jobs {
       by: input.by,
       basis: input.basis,
       ...again !== undefined ? { again } : {},
+      ...as !== undefined ? { as } : {},
+      ...input.lane !== undefined ? { lane: input.lane } : {},
+      ...input.due !== undefined ? { due: input.due } : {},
+      ...area2 !== undefined ? { area: area2 } : {},
+      ...plan !== undefined ? { plan } : {},
       ...input.parent ? { parent: input.parent.id } : {},
       ...allowance ? { allowance } : {},
       createdAt: this.host.clock.now(),
@@ -9527,6 +9760,21 @@ class Jobs {
     if (!await host.chat.anchor(job.chatId, turn.messageId, turn.swipeId, record))
       host.log("warn", `[LumiAH] job ${job.id} couldn't be listed on its turn's record: the reply is gone`);
   }
+  anchorNewest(chatId) {
+    return this.write(async () => {
+      const { host, areas } = this.shared();
+      const { latest, base } = await areas.newest(chatId);
+      for (const turn of [latest, base ?? null]) {
+        if (turn === null)
+          continue;
+        const head = await areas.at(chatId, turn.record).headHash();
+        if (head === null || head === (turn.record.workspace ?? null))
+          continue;
+        if (!await host.chat.anchor(chatId, turn.messageId, turn.swipeId, { ...turn.record, workspace: head }))
+          host.log("warn", "[LumiAH] a change to the chat's area couldn't be put on a reply's record: the reply is gone");
+      }
+    });
+  }
   async charge(parent, spent) {
     const run = this.live.get(parent)?.run;
     if (run) {
@@ -9568,7 +9816,7 @@ class Jobs {
       return waiting.job;
     let leave;
     try {
-      leave = await this.gate.enter(signal);
+      leave = await this.gate.enter(signal, waiting.job.lane === "soon");
     } catch {
       return live.cancelled !== null ? this.stopped(waiting, { state: "cancelled", reason: live.cancelled }) : waiting.job;
     }
@@ -9582,6 +9830,8 @@ class Jobs {
       const { settings, texts } = setup;
       if (!settings.jobs.enabled)
         return await this.stopped(doc, { state: "cancelled", reason: texts.render(TEXT.jobs.whyOff) });
+      if (setup.claim?.place === "runtime" && shared.options.place === "builtin")
+        return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyRuntimeOnly) });
       const resolved = setup.definitions.resolve(doc.job.agent, settings);
       if (!resolved)
         return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyGone, { agent: doc.job.agent }) });
@@ -9628,7 +9878,7 @@ class Jobs {
         const equipment = {
           chat: chatView(host, job.chatId, await host.chat.path(job.chatId), settings.tools),
           lore: loreView(host, { chatId: job.chatId, generationId: job.id }, settings.tools),
-          areas: job.basis === null ? { chat: areas.now(job.chatId, { gate: async () => texts.render(TEXT.jobs.noChatArea) }), learned, user: areas.user() } : { chat: areas.now(job.chatId, { basis: job.basis, gate: onPath }), learned: gated(learned, onPath), user: gated(areas.user(), onPath) },
+          areas: job.basis === null ? { chat: job.area === "chat" ? areas.now(job.chatId, { throughSwipe: true }) : areas.now(job.chatId, { gate: async () => texts.render(TEXT.jobs.noChatArea) }), learned, user: areas.user() } : { chat: areas.now(job.chatId, { basis: job.basis, gate: onPath }), learned: gated(learned, onPath), user: gated(areas.user(), onPath) },
           past: [],
           basis: job.basis
         };
@@ -9638,7 +9888,7 @@ class Jobs {
         await save();
         const history = session !== undefined ? sessionOf(await shared.blobs.getJson(session)) : null;
         const grant = held !== undefined && (resolved.definition.grant ?? settings.delegation.grant) === "own" ? { grant: new Set(held) } : {};
-        const { agent, lead } = await run.agent(resolved, { depth: depth ?? 0, task: job.task, notes: true, main: true, ...grant, ...history ? { history } : {} });
+        const { agent, lead } = await run.agent(resolved, { depth: depth ?? 0, task: job.task, notes: true, main: true, ...grant, ...history ? { history } : {}, ...job.as !== undefined ? { as: job.as } : {}, standing: "job", by: job.by.who === "user" ? "user" : { agentId: job.by.id, role: job.by.role } });
         const keep = async () => {
           session = await shared.blobs.putJson(agent.messages(), false);
         };
@@ -9650,9 +9900,9 @@ class Jobs {
             return save();
           }).catch((error) => host.log("warn", `[LumiAH] job ${job.id}'s session couldn't be kept (${errorText(error)})`));
         };
-        const plan = job.by.who === "user" ? planPath(job.id) : null;
+        const plan = job.by.who === "user" ? job.plan ?? planPath(job.id) : null;
         const allowance = allowanceText(run.left(), texts);
-        const message = history ? texts.render(TEXT.jobs.resumed, { allowance, plan: plan === null ? "" : texts.render(TEXT.jobs.resumedPlan, { plan }) }) : plan !== null ? texts.render(TEXT.jobs.objective, { task: doc.task, allowance, plan }) : texts.render(TEXT.jobs.task, { task: doc.task });
+        const message = history ? texts.render(TEXT.jobs.resumed, { allowance, plan: plan === null ? "" : texts.render(TEXT.jobs.resumedPlan, { plan }) }) : plan !== null ? texts.render(job.area === "chat" ? TEXT.jobs.objectiveChat : TEXT.jobs.objective, { task: doc.task, allowance, plan }) : texts.render(TEXT.jobs.task, { task: doc.task });
         const reply = await agent.send(lead === "" ? message : `${lead}
 
 ${message}`, signal);
@@ -9723,6 +9973,8 @@ ${message}`, signal);
         host.log("warn", `[LumiAH] job ${job.id} ended (${state2}) and couldn't be written (${errorText(error)})`);
       }
       this.listOn(job);
+      if (job.area === "chat")
+        await this.anchorNewest(job.chatId).catch((error) => host.log("warn", `[LumiAH] what job ${job.id} wrote to the chat's area couldn't be put on the records it went beside (${errorText(error)}): a branch cut there won't have it`));
       const extension = shared.options.extension;
       run.hook("answer to a run ending", extension?.runEnded ? () => extension.runEnded?.({ userId: run.userId, chatId: job.chatId, turn: job.id, kind: "job", status: ended.status, ...reason !== undefined ? { reason } : {}, reply: "", record: null, usage }) ?? Promise.resolve() : undefined);
       return job;
@@ -11250,6 +11502,11 @@ class Sides {
         return { status: "failed", reason: reason2, reply: "", usage: emptyUsage(), turn: null };
       }
       const { settings, texts } = setup;
+      if (setup.claim?.place === "runtime" && shared.options.place === "builtin") {
+        const reason2 = texts.render(TEXT.jobs.whyRuntimeOnly);
+        sink.error(reason2, "failed");
+        return { status: "failed", reason: reason2, reply: "", usage: emptyUsage(), turn: null };
+      }
       const run = new Run(shared, setup, { info: { id: input.generationId, kind: "side", chatId: doc.chatId }, budget: settings.turn, startedAt, messageId: null, side: doc.id });
       let status = "failed";
       let reason;
@@ -11726,7 +11983,9 @@ var delegate = {
         properties: {
           agent: { type: "string", enum: choices.map((c) => c.id), description: texts.render(TEXT.toolArg(TOOL.delegate, "agent")) },
           task: { type: "string", description: texts.render(TEXT.toolArg(TOOL.delegate, "task")) },
-          files: { type: "array", items: { type: "string" }, description: texts.render(TEXT.toolArg(TOOL.delegate, "files")) }
+          files: { type: "array", items: { type: "string" }, description: texts.render(TEXT.toolArg(TOOL.delegate, "files")) },
+          ...delegation.offersAs ? { as: { type: "string", description: texts.render(TEXT.toolArg(TOOL.delegate, "as")) } } : {},
+          ...delegation.toReply ? { to_reply: { type: "boolean", description: texts.render(TEXT.toolArg(TOOL.delegate, "to_reply")) } } : {}
         },
         required: ["agent", "task"]
       },
@@ -11738,7 +11997,11 @@ var delegate = {
         const task = textArg(args.task);
         if (task === null)
           return needs(p, "task");
-        return delegation.start({ agent, task, files: pathsOf(args.files) }, ctx);
+        const as = delegation.offersAs && args.as !== undefined && args.as !== null ? textArg(args.as) : undefined;
+        if (as === null)
+          return needs(p, "as");
+        const toReply = args.to_reply === true || args.to_reply === "true";
+        return delegation.start({ agent, task, files: pathsOf(args.files), ...as !== undefined ? { as } : {}, ...toReply ? { toReply: true } : {} }, ctx);
       }
     };
   }
@@ -12988,6 +13251,16 @@ function whenOf(raw) {
     return "after_reply";
   return raw === "now" || raw === "after_reply" ? raw : null;
 }
+function laneOf(raw) {
+  if (raw === undefined || raw === null || raw === "")
+    return;
+  return raw === "soon" || raw === "later" ? raw : null;
+}
+function dueOf(raw) {
+  if (raw === undefined || raw === null || raw === "")
+    return;
+  return raw === "next_turn" ? raw : null;
+}
 var jobStart = {
   name: TOOL.jobStart,
   family: FAMILY.jobs,
@@ -12996,7 +13269,7 @@ var jobStart = {
     const { texts, jobs } = env;
     const start = jobs?.start?.bind(jobs);
     const choices = jobs?.agents() ?? [];
-    if (!start || choices.length === 0)
+    if (!jobs || !start || choices.length === 0)
       return null;
     const p = pagerOf(env, TOOL.jobStart);
     return {
@@ -13009,7 +13282,12 @@ var jobStart = {
           agent: { type: "string", enum: choices.map((c) => c.id), description: texts.render(TEXT.toolArg(TOOL.jobStart, "agent")) },
           task: { type: "string", description: texts.render(TEXT.toolArg(TOOL.jobStart, "task")) },
           when: { type: "string", enum: ["after_reply", "now"], description: texts.render(TEXT.toolArg(TOOL.jobStart, "when")) },
-          again: { type: "string", description: texts.render(TEXT.toolArg(TOOL.jobStart, "again")) }
+          again: { type: "string", description: texts.render(TEXT.toolArg(TOOL.jobStart, "again")) },
+          ...jobs.offersAs ? {
+            as: { type: "string", description: texts.render(TEXT.toolArg(TOOL.jobStart, "as")) },
+            lane: { type: "string", enum: ["soon", "later"], description: texts.render(TEXT.toolArg(TOOL.jobStart, "lane")) },
+            due: { type: "string", enum: ["next_turn"], description: texts.render(TEXT.toolArg(TOOL.jobStart, "due")) }
+          } : {}
         }
       },
       async run(args, ctx) {
@@ -13022,7 +13300,20 @@ var jobStart = {
         const task = textArg(args.task);
         if (again === null && (agent === null || task === null))
           return { text: texts.render(TEXT.jobs.noTask), error: true };
-        const started = await start(again !== null ? { again, when } : { agent: agent ?? "", task: task ?? "", when }, ctx);
+        const offered = jobs.offersAs;
+        const as = offered && args.as !== undefined && args.as !== null ? textArg(args.as) : undefined;
+        if (as === null)
+          return needs(p, "as");
+        if (as !== undefined && as.length > env.settings.delegation.asChars)
+          return { text: texts.render(TEXT.agents.asLong, { chars: String(as.length), limit: String(env.settings.delegation.asChars) }), error: true };
+        const lane = offered ? laneOf(args.lane) : undefined;
+        if (lane === null)
+          return needs(p, "lane");
+        const due = offered ? dueOf(args.due) : undefined;
+        if (due === null)
+          return needs(p, "due");
+        const extra = { ...as !== undefined ? { as } : {}, ...lane !== undefined ? { lane } : {}, ...due !== undefined ? { due } : {} };
+        const started = await start(again !== null ? { again, when, ...extra } : { agent: agent ?? "", task: task ?? "", when, ...extra }, ctx);
         if ("refused" in started)
           return { text: clip(started.refused, p.pageChars), error: true };
         return { text: texts.render(TEXT.jobs.started, { id: started.id, agent: started.agent, when: texts.render(when === "now" ? TEXT.jobs.whenNow : TEXT.jobs.whenAfter) }) };
@@ -14863,7 +15154,34 @@ var writeReply = {
     };
   }
 };
-var REPLY_TOOLS = [writeReply];
+var replyWrite = {
+  name: TOOL.replyWrite,
+  family: FAMILY.reply,
+  tier: "read",
+  build(env) {
+    const { texts, reply } = env;
+    if (!reply)
+      return null;
+    const p = pagerOf(env, TOOL.replyWrite);
+    return {
+      name: TOOL.replyWrite,
+      description: texts.render(TEXT.tool(TOOL.replyWrite)),
+      state: () => reply.length(),
+      parameters: { type: "object", properties: { text: { type: "string", description: texts.render(TEXT.toolArg(TOOL.replyWrite, "text")) } }, required: ["text"] },
+      async run(args, ctx) {
+        ctx.signal.throwIfAborted();
+        const text2 = typeof args.text === "string" && args.text.trim() !== "" ? args.text : null;
+        if (text2 === null)
+          return needs(p, "text");
+        const refused2 = await reply.write(text2, ctx);
+        if (refused2 !== null)
+          return { text: refused2, error: true };
+        return { text: texts.render(TEXT.answer.released, { chars: String(text2.length), total: String(reply.length()) }) };
+      }
+    };
+  }
+};
+var REPLY_TOOLS = [writeReply, replyWrite];
 
 // src/core/tools/base.ts
 var BASE_TOOLS = [...CHAT_TOOLS, ...BOOK_TOOLS, ...LORE_TOOLS, ...PRESET_TOOLS, ...PAST_TOOLS, ...REPLY_TOOLS, ...WORKSPACE_TOOLS, ...SKILL_TOOLS, ...AGENT_TOOLS, ...JOB_TOOLS, ...CHRONICLE_TOOLS, ...MEMORY_TOOLS, ...DATABANK_TOOLS, ...WEB_TOOLS];
@@ -15019,6 +15337,9 @@ class Turn {
   pending = null;
   waited = new AbortController;
   warned = false;
+  streamed = false;
+  holder = false;
+  releasing = Promise.resolve();
   constructor(shared, turn, sink, stop, hosted = null) {
     this.shared = shared;
     this.turn = turn;
@@ -15044,6 +15365,7 @@ class Turn {
     this.settings = setup.settings;
     this.texts = setup.texts;
     const run = new Run(shared, setup, { info: { id: turn.generationId, kind: turn.kind, chatId: turn.chatId }, budget: this.settings.turn, startedAt: this.startedAt, messageId: turn.target.messageId, turn, heard: (event) => this.heard(event) });
+    run.reply = this.replyStream(run, false);
     const work = new Work;
     return this.conclude(work, run, await this.outcome(work, run, unread));
   }
@@ -15052,6 +15374,10 @@ class Turn {
     if (failed === null) {
       try {
         const main = await this.runMain(work, run);
+        if (this.streamed)
+          return this.released();
+        if (run.claim?.reply === "released")
+          return main.reply.status === "cancelled" || this.signal.aborted ? { status: "stopped", reason: this.stoppedWhy() } : { status: "failed", reason: this.text(TEXT.progress.nothingReleased) };
         return main.writes ? this.ownReply(main.reply) : await this.briefed(main.reply, main.id, run, work);
       } catch (error) {
         if (error instanceof Stopped || this.signal.aborted)
@@ -15108,8 +15434,11 @@ class Turn {
     }
     this.settings = setup.settings;
     this.texts = setup.texts;
+    if (setup.claim?.place === "runtime")
+      return asCame(this.text(TEXT.jobs.whyRuntimeOnly));
     const replyBy = this.hosted?.replyBy ?? null;
     const run = new Run(shared, setup, { info: { id: turn.generationId, kind: turn.kind, chatId: turn.chatId }, budget: this.settings.turn, startedAt: this.startedAt, messageId: turn.target.messageId, turn, ...replyBy !== null ? { replyBy } : {} });
+    run.reply = this.replyStream(run, true);
     const work = new Work;
     const timer = new AbortController;
     const late = () => this.due.abort(new AgentStop("reply_time", { id: TEXT.hosted.stop }));
@@ -15325,6 +15654,7 @@ class Turn {
       this.live();
     }
     const { history, lead, tokens } = carriedOf(carried, sizes);
+    const dueNote = await this.dueJobs(session);
     const before = session.records.at(-1);
     work.heard = host.clock.now();
     const news = await shared.jobs.news(turn.chatId, session.records, before ? before.heard ?? before.began ?? before.at : 0).catch((error) => {
@@ -15357,10 +15687,14 @@ class Turn {
     const writes2 = this.mainWrites();
     const blocks = await this.blocks();
     const kept = settings.jobs.enabled && host.jobs !== undefined && chronicleRefusal(run.definitions, shared.options.extension?.name ?? null) === null;
-    const told = run.recall ? await recallTold(run.recall, { path: session.before, blocks, writes: writes2, learned: run.areas.learned, jobs: kept ? () => shared.jobs.open(turn.chatId) : null, emit: (event) => run.trace.emit(event), log: host.log, now: host.clock.now() }) : undefined;
+    const newestOnly = run.claim?.request === "newest";
+    const releasedOnly = this.hosted === null && run.claim?.reply === "released";
+    const told = run.recall && !newestOnly ? await recallTold(run.recall, { path: session.before, blocks, writes: writes2, learned: run.areas.learned, jobs: kept ? () => shared.jobs.open(turn.chatId) : null, emit: (event) => run.trace.emit(event), log: host.log, now: host.clock.now() }) : undefined;
     const document = requestDocument(turn.messages, blocks, session.before, texts, told);
     work.request = { messages: document.messages, last: document.last };
-    run.request = { count: texts.counted(document.messages, TEXT.word.message), text: document.text };
+    const latest = newestOnly ? turn.messages.findLast((m) => m.role === "user" && m.source?.kind === "history") ?? turn.messages.findLast((m) => m.role === "user") ?? null : null;
+    const newest = latest ? requestDocument([latest], blocks, session.before, texts).text : texts.render(TEXT.main.noNewest);
+    run.request = newestOnly ? { count: texts.counted(latest ? 1 : 0, TEXT.word.message), text: newest, newest: true } : { count: texts.counted(document.messages, TEXT.word.message), text: document.text };
     const jobs = jobNews(news, texts);
     const directed = await directedNote({
       source: run.story.source,
@@ -15382,12 +15716,15 @@ class Turn {
       ...lead !== null ? [texts.render(TEXT.main.noteSummary, { summary: lead })] : [],
       ...session.continued ? [texts.render(TEXT.main.noteContinued, { receipt: receiptOf(session.continued.segment, settings.session, texts) })] : [],
       ...jobs !== null ? [jobs] : [],
+      ...dueNote !== null ? [dueNote] : [],
       ...directed !== null ? [directed] : []
     ];
     const kinds = { new: TEXT.main.kindNew, regenerate: TEXT.main.kindRegenerate, swipe: TEXT.main.kindSwipe, continue: TEXT.main.kindContinue };
-    const asked = texts.render(TEXT.main.turn, { kind: texts.render(kinds[turn.kind]), notes: notes.map((note) => `${note}
+    const ask3 = texts.render(releasedOnly ? TEXT.main.askReleases : writes2 ? TEXT.main.askWrites : TEXT.main.ask);
+    const noted = notes.map((note) => `${note}
 
-`).join(""), count: run.request.count, request: document.text, ask: texts.render(writes2 ? TEXT.main.askWrites : TEXT.main.ask) });
+`).join("");
+    const asked = newestOnly ? texts.render(TEXT.main.turnNewest, { kind: texts.render(kinds[turn.kind]), notes: noted, message: newest, ask: ask3 }) : texts.render(TEXT.main.turn, { kind: texts.render(kinds[turn.kind]), notes: noted, count: run.request.count, request: document.text, ask: ask3 });
     const replyBy = this.hosted?.replyBy ?? null;
     const message = replyBy === null ? asked : `${asked}
 
@@ -15398,7 +15735,7 @@ ${texts.render(TEXT.hosted.replyBy, { seconds: String(Math.max(0, Math.round((re
       notes: true,
       main: true,
       ...writes2 && main.definition.text === TEXT.main.system ? { system: texts.render(TEXT.main.systemWrites) } : {},
-      ...writes2 ? {} : { writeReply: this.hosted ? async (brief) => this.handBrief(brief, run) : (brief, ctx) => this.writeReply(brief, ctx.agentId, run) },
+      ...writes2 || releasedOnly ? {} : { writeReply: this.hosted ? async (brief) => this.handBrief(brief, run) : (brief, ctx) => this.writeReply(brief, ctx.agentId, run) },
       ...this.hosted ? { notices: () => this.soon() } : {}
     });
     this.mainId = agent.id;
@@ -15471,6 +15808,12 @@ ${message}`, this.signal);
   async unbriefed(reason, work, run) {
     if (this.signal.aborted)
       return { status: "stopped", reason: this.stoppedWhy() };
+    if (this.streamed) {
+      this.host.log("warn", `[LumiAH] the turn's work failed after part of its reply was released (${reason}): what was released stands`);
+      return this.released();
+    }
+    if (this.hosted === null && run.claim?.reply === "released")
+      return { status: "failed", reason };
     if (this.written) {
       this.host.log("warn", `[LumiAH] the turn's work failed after its reply was written (${reason}): the reply stands`);
       return { status: "done" };
@@ -15522,6 +15865,10 @@ ${message}`, this.signal);
     }
   }
   async writeReply(brief, mainId, run) {
+    if (this.streamed)
+      return { text: this.text(TEXT.answer.replyReleased), error: true };
+    if (this.holder)
+      return { text: this.text(TEXT.answer.releaseHeld), error: true };
     if (this.writing || this.written || this.broken !== null)
       return { text: this.text(TEXT.answer.replyBusy), error: true };
     this.progress(TEXT.progress.writing);
@@ -15603,8 +15950,109 @@ ${message}`, this.signal);
     this.toSink(send);
     this.closed = true;
   }
+  replyStream(run, builtIn) {
+    const shut = () => {
+      if (builtIn)
+        return this.text(TEXT.answer.releaseBuiltIn);
+      if (this.closed || this.signal.aborted)
+        return this.text(TEXT.answer.releaseEnded);
+      if (this.writing || this.written || this.broken !== null)
+        return this.text(TEXT.answer.releaseWriter);
+      if (this.holder)
+        return this.text(TEXT.answer.releaseHeld);
+      return null;
+    };
+    return {
+      refused: shut,
+      write: (text2, ctx) => {
+        const next = this.releasing.then(() => this.release(text2, ctx, run, shut));
+        this.releasing = next.catch(() => {
+          return;
+        });
+        return next;
+      },
+      hold: (agent) => {
+        this.holder = true;
+        let given2 = false;
+        return (released) => {
+          if (given2)
+            return;
+          given2 = true;
+          this.holder = false;
+          if (released !== "")
+            this.tellReleased(run, agent, released);
+        };
+      },
+      stream: (text2) => this.streamOut(text2),
+      length: () => this.reply.length
+    };
+  }
+  async release(text2, ctx, run, shut) {
+    const first = shut();
+    if (first !== null)
+      return first;
+    const { turn, shared } = this;
+    const agent = run.ref(ctx.agentId) ?? { agentId: ctx.agentId, role: ctx.role, ...ctx.as !== undefined ? { as: ctx.as } : {} };
+    const extension = shared.options.extension;
+    if (extension?.releasing) {
+      const lost = {};
+      const verdict = await askExtension(shared, "word on a passage of the reply", this.extensionWait(), () => extension.releasing?.({ userId: run.userId, chatId: turn.chatId, turn: turn.generationId, agent, text: text2 }) ?? Promise.resolve(null), lost);
+      if (verdict === lost)
+        return this.text(TEXT.answer.releaseUnchecked);
+      if (verdict !== null && verdict !== undefined)
+        return isRecord(verdict) && typeof verdict.refused === "string" && verdict.refused.trim() !== "" ? clip(verdict.refused, this.settings.tools.pageChars) : this.text(TEXT.answer.releaseUnchecked);
+      const late = shut();
+      if (late !== null)
+        return late;
+    }
+    if (!this.streamOut(text2))
+      return this.text(TEXT.answer.releaseEnded);
+    this.tellReleased(run, agent, text2);
+    return null;
+  }
+  streamOut(text2) {
+    if (text2 === "" || this.closed || this.signal.aborted)
+      return false;
+    this.streamed = true;
+    this.content(text2);
+    return true;
+  }
+  tellReleased(run, agent, text2) {
+    const { turn } = this;
+    const extension = this.shared.options.extension;
+    run.hook("answer to a passage released", extension?.released ? () => extension.released?.({ userId: run.userId, chatId: turn.chatId, turn: turn.generationId, agent, text: text2 }) ?? Promise.resolve() : undefined);
+  }
+  released() {
+    if (this.signal.aborted)
+      return { status: "stopped", reason: this.stoppedWhy() };
+    this.written = true;
+    this.finish = "stop";
+    return { status: "done" };
+  }
+  async dueJobs(session) {
+    const { host, turn, settings, texts, shared } = this;
+    const basis = (session.own ?? session.records.at(-1))?.generationId;
+    if (basis === undefined || !settings.jobs.enabled || !host.jobs)
+      return null;
+    let still;
+    try {
+      const due = await shared.jobs.awaitDue(turn.chatId, basis, 0, this.signal);
+      if (due.length === 0)
+        return null;
+      this.progress(TEXT.progress.dueWait, { jobs: texts.counted(due.length, TEXT.jobs.word) });
+      still = await shared.jobs.awaitDue(turn.chatId, basis, settings.jobs.dueWaitMs, this.signal);
+    } catch (error) {
+      host.log("warn", `[LumiAH] the jobs due by this turn couldn't be read (${errorText(error)}): the main agent isn't told of them`);
+      return null;
+    }
+    this.live();
+    if (still.length === 0)
+      return null;
+    return texts.render(TEXT.jobs.dueRunning, { jobs: still.map((job) => texts.render(TEXT.jobs.dueLine, { id: job.id, agent: job.agent, as: job.as !== undefined ? texts.render(TEXT.jobs.dueAs, { as: job.as }) : "", state: jobState(job, texts) })).join(`
+`) });
+  }
   content(text2) {
-    if (text2 === "")
+    if (text2 === "" || this.signal.aborted)
       return;
     this.reply += text2;
     this.toSink(() => this.sink.content(text2));
@@ -15630,7 +16078,8 @@ ${message}`, this.signal);
     if (event.agentId !== this.mainId || entry.kind !== "answer")
       return;
     for (const call of entry.calls)
-      this.progress(TEXT.progress.call, { tool: call.name, args: JSON.stringify(call.args) });
+      if (call.name !== TOOL.replyWrite)
+        this.progress(TEXT.progress.call, { tool: call.name, args: JSON.stringify(call.args) });
   }
   async segment(work, run, ended) {
     const { turn, shared } = this;
@@ -16180,10 +16629,15 @@ function createHarness(host, options) {
   const upkeep = new Upkeep({ host, blobs, keep: () => shared.latest.keep });
   shared.spend.ready().catch((error) => host.log("warn", `[LumiAH] the last day's spend couldn't be read (${errorText(error)}): the caps count from now`));
   const userView = async (chatId) => {
-    const areas = chatId === null ? { chat: null, learned: null, user: shared.areas.user() } : { chat: shared.areas.now(chatId), learned: await shared.areas.learned(chatId), user: shared.areas.user() };
+    const areas = chatId === null ? { chat: null, learned: null, user: shared.areas.user() } : { chat: shared.areas.now(chatId, { throughSwipe: true }), learned: await shared.areas.learned(chatId), user: shared.areas.user() };
     return { author: { who: "user" }, role: AGENT.main, areas, guard: () => null };
   };
   const page = async (chatId) => pageWorkspace(await userView(chatId), () => shared.latest.workspace);
+  const kept = async (input, done) => {
+    if (input.chatId !== null && input.area === "chat")
+      await shared.jobs.anchorNewest(input.chatId).catch((error) => host.log("warn", `[LumiAH] a change to the chat's area couldn't be put on the reply's record (${errorText(error)}): a branch cut there won't have it`));
+    return done;
+  };
   const levels = async (chatId) => {
     const setup = await readSetup(shared, chatId ?? "");
     const view = await userView(chatId);
@@ -16211,7 +16665,7 @@ function createHarness(host, options) {
       throw new HarnessRefusal("not_found", "There is no such job.");
     return read2;
   };
-  const approvalRows = (chatId, kept) => kept.map((k) => ({ chatId, ...k })).reverse();
+  const approvalRows = (chatId, kept2) => kept2.map((k) => ({ chatId, ...k })).reverse();
   const newestFirst = (a, b) => (b.at ?? -1) - (a.at ?? -1);
   const chatOf2 = (path) => {
     const key = path.split("/")[1];
@@ -16297,10 +16751,10 @@ function createHarness(host, options) {
         return { ...listed2, agents: setup.definitions.agents().map((d) => ({ id: d.id, name: d.name })), basis: latest ? { messageId: latest.messageId, swipe: latest.swipeId, index: latest.index } : null };
       },
       read: async (input) => (await page(input.chatId)).read(input),
-      write: async (input) => ({ file: (await (await page(input.chatId)).write(input)).file }),
-      move: async (input) => (await page(input.chatId)).move(input),
-      delete: async (input) => (await page(input.chatId)).delete(input),
-      pin: async (input) => (await page(input.chatId)).pin(input),
+      write: async (input) => kept(input, { file: (await (await page(input.chatId)).write(input)).file }),
+      move: async (input) => kept(input, await (await page(input.chatId)).move(input)),
+      delete: async (input) => kept(input, await (await page(input.chatId)).delete(input)),
+      pin: async (input) => kept(input, await (await page(input.chatId)).pin(input)),
       history: async (input) => (await page(input.chatId)).history(input),
       async changes(input) {
         const turns = await pathTurns(await host.chat.path(input.chatId));
@@ -16389,7 +16843,10 @@ function createHarness(host, options) {
         if (!host.jobs)
           throw new HarnessRefusal("unavailable", "This runtime can't run jobs.");
         const setup = await readSetup(shared, input.chatId);
-        const started = await shared.jobs.createJob({ chatId: input.chatId, when: input.when === "now" ? "now" : "after_reply", what: { agent: input.agent, task: input.task }, by: { who: "user" }, basis: null, ...isRecord(input.allowance) ? { allowance: allowanceOf(input.allowance) } : {} }, setup);
+        const plan = typeof input.plan === "string" && input.plan.trim() !== "" ? input.plan.trim() : null;
+        if (plan !== null && plan.length > setup.settings.workspace.pathChars)
+          throw new HarnessRefusal("invalid", `The plan's path is ${plan.length} characters, and a path may be ${setup.settings.workspace.pathChars} at most (Path length).`);
+        const started = await shared.jobs.createJob({ chatId: input.chatId, when: input.when === "now" ? "now" : "after_reply", what: { agent: input.agent, task: input.task }, by: { who: "user" }, basis: null, ...isRecord(input.allowance) ? { allowance: allowanceOf(input.allowance) } : {}, ...input.area === "chat" ? { area: "chat" } : {}, ...plan !== null ? { plan } : {} }, setup);
         if ("refused" in started)
           throw new HarnessRefusal("invalid", started.refused);
         return { job: started };
@@ -16473,8 +16930,8 @@ function createHarness(host, options) {
               paths.add(path);
           const waits = DOC.pending("x");
           for (const path of await store.list(waits.slice(0, waits.indexOf("x")))) {
-            const kept = await store.read(path);
-            if (isRecord(kept) && kept.kind === "pending" && kept.chatId === chatId)
+            const kept2 = await store.read(path);
+            if (isRecord(kept2) && kept2.kind === "pending" && kept2.chatId === chatId)
               paths.add(path);
           }
         } else {
@@ -16558,7 +17015,7 @@ var FRAME_LIMIT = 4 * 1024 * 1024;
 function terminal(chunk) {
   return chunk.kind === "done" || chunk.kind === "value" || chunk.kind === "error";
 }
-var EXTENSION_MEMBERS = ["definitions", "claim", "writerRequest", "runBegan", "replyWritten", "runEnded"];
+var EXTENSION_MEMBERS = ["definitions", "claim", "writerRequest", "runBegan", "agentModel", "releasing", "released", "replyWritten", "runEnded"];
 var OWN_BACKEND = { name: "LumiAH", connection: "LumiAH" };
 function versionWords(runtime, extension, name = "LumiAH") {
   if (runtime < extension)
@@ -17673,7 +18130,7 @@ function stoppedWords(why, detail) {
   const said2 = detail?.replace(/\s+/g, " ").trim().slice(0, 200) ?? "";
   return `LumiAH stopped with an error${said2 !== "" ? ` (${said2})` : ""}, so this reply ended here. Lumiverse doesn't restart it by itself: restart it in Lumiverse's Extensions tab, then press Retry.`;
 }
-var NO_FALLBACK = "Nothing answers this chat in the runtime's place: once the runtime links again, send your message again, or set the chat to Built in on LumiAH's Home, which needs no runtime.";
+var NO_FALLBACK = "Nothing answers this chat in the runtime's place: once the runtime links again, send your message again.";
 function refusedReply(link) {
   if (link.refused === null)
     return null;
@@ -17847,7 +18304,7 @@ class LinkClient {
       answer = await this.ask("hello", { secret: this.options.secret(), version: LINK_VERSION, build: this.options.build, report: this.report(), open: this.handlers?.open() ?? [] });
     } catch (error) {
       if (error instanceof LinkError && error.code === "forbidden")
-        this.refuse(`LumiAH refused this runtime (${error.message}) Register it again with its start line on LumiAH's Runtime page.`, true);
+        this.refuse(this.unknownWords(error.message), true);
       else if (error instanceof LinkError && error.code === "version")
         this.refuse(error.message, true);
       else if (error instanceof LinkError && error.code === "bad_request")
@@ -17881,6 +18338,10 @@ class LinkClient {
     this.refusedThere = there;
     this.options.log(why);
     this.conn.close();
+  }
+  unknownWords(said2) {
+    const { name } = linkedBackendOf(this.hello?.backend);
+    return `${name} refused this runtime (${said2}) Register it again with its start line on ${name}'s Runtime page.`;
   }
   push(data) {
     this.heard();
@@ -17942,7 +18403,7 @@ class LinkClient {
         this.handlers?.lost(answer.lost);
     }).catch((error) => {
       if (error instanceof LinkError && error.code === "forbidden")
-        this.refuse(`LumiAH refused this runtime (${error.message}) Register it again with its start line on LumiAH's Runtime page.`, true);
+        this.refuse(this.unknownWords(error.message), true);
     }).finally(() => {
       this.pinging = false;
     });
@@ -19283,14 +19744,18 @@ function linkExtension(deps) {
     const answer = await asked(deps, "extension.call", { member, arg: arg2 });
     return answer.supplied ? answer.value : undefined;
   }
-  async function tell(member, arg2) {
+  async function once2(member, arg2) {
     if (!has(member))
       return;
     try {
-      await deps.link.request("extension.call", { member, arg: arg2 }, deps.tuning().lostMs);
+      const answer = await deps.link.request("extension.call", { member, arg: arg2 }, deps.tuning().lostMs);
+      return answer.supplied ? answer.value : undefined;
     } catch (error) {
       throw new Error(problemOf(error).message, { cause: error });
     }
+  }
+  async function tell(member, arg2) {
+    await once2(member, arg2);
   }
   const json2 = (value) => value;
   return {
@@ -19306,7 +19771,16 @@ function linkExtension(deps) {
       return isRecord2(value) ? value : null;
     },
     writerRequest: async (request) => messagesOf(await read2("writerRequest", json2(request))),
+    agentModel: async (ask3) => {
+      const value = await read2("agentModel", json2(ask3));
+      return isRecord2(value) ? value : null;
+    },
     runBegan: (run) => tell("runBegan", json2(run)),
+    releasing: async (release) => {
+      const value = await once2("releasing", json2(release));
+      return isRecord2(value) && typeof value.refused === "string" ? { refused: value.refused } : null;
+    },
+    released: (release) => tell("released", json2(release)),
     replyWritten: (reply) => tell("replyWritten", json2(reply)),
     runEnded: (run) => tell("runEnded", json2(run))
   };
@@ -19584,10 +20058,14 @@ class Turns {
         params: samplingOf(request.body),
         maxTokens: maxTokensOf(request.body)
       };
+      const out = (piece) => {
+        if (!stop.signal.aborted)
+          answer.piece(piece, this.env.now());
+      };
       const sink = {
-        progress: (text3) => answer.piece({ kind: "progress", text: text3 }, this.env.now()),
-        reasoning: (text3) => answer.piece({ kind: "reasoning", text: text3 }, this.env.now()),
-        content: (text3) => answer.piece({ kind: "content", text: text3 }, this.env.now()),
+        progress: (text3) => out({ kind: "progress", text: text3 }),
+        reasoning: (text3) => out({ kind: "reasoning", text: text3 }),
+        content: (text3) => out({ kind: "content", text: text3 }),
         done: (finish, usage) => {
           const piece = { kind: "finish", finish: finish === "" ? "stop" : finish, usage: usageJson(usage, facts.turn) };
           if (stoppedByUser())
@@ -20521,7 +20999,7 @@ async function up(a, io) {
   if (!MEMORY.test(memory))
     throw new UsageError(`--memory is "${memory}": give a size as systemd reads one, such as 768M or 2G.`);
   if (systemd && io.platform !== "linux")
-    throw new Error(`--systemd installs a systemd service, and this is ${io.platform}. Run the runtime in the foreground instead (leave out --systemd), under your own service manager.`);
+    throw new Error(`--systemd installs a systemd service, and this is ${io.platform}. Leave out --systemd: the runtime then runs in the foreground, and ${io.platform === "darwin" ? "launchd" : io.platform === "win32" ? "Task Scheduler" : "your system's service manager"} keeps it running (LumiAH's docs/RUNTIME.md, "Keep it running", has the steps).`);
   if (systemd && io.uid === 0)
     throw new Error("--systemd installs a service of your own account, and root's account has none on most systems. Run the runtime as the account Lumiverse runs as (sudo -u <account> \u2026): it needs no more rights than that.");
   if (systemd && inContainer(io))
@@ -20731,7 +21209,7 @@ async function status(a, io) {
     const active = await io.run("systemctl", [...ctl.args, "is-active", place.unitName], ctl.env);
     io.out(`Service ${place.unitName}: ${active.out.trim() || "unknown"}.`);
   } else
-    io.out("No service: it runs only while `lumiah up` or `lumiah serve` does.");
+    io.out("No systemd unit here: it runs while `lumiah up` or `lumiah serve` runs, or under the service you made for it (launchd on macOS, Task Scheduler on Windows).");
   let healthy = false;
   try {
     const body = await healthOf(config, io);
@@ -20775,7 +21253,7 @@ if (process.versions.bun === undefined) {
 `);
   process.exit(1);
 }
-var BUILD = "47378473";
+var BUILD = "2d685011";
 var http = async (request) => {
   const response = await fetch(request.url, { method: request.method, headers: request.headers, ...request.body !== undefined ? { body: request.body } : {}, redirect: "manual" });
   const text3 = await response.text();
@@ -20923,7 +21401,7 @@ var io = {
   extension: EXTENSION_IDENTIFIER,
   build: BUILD,
   version: package_default.version,
-  harness: (host, settings, extension) => createHarness(host, { settings, extension }),
+  harness: (host, settings, extension) => createHarness(host, { settings, extension, place: "runtime" }),
   writerConnection: (values) => settingsOf(isRecord2(values) ? values.core : undefined).agents[AGENT.writer]?.connectionId ?? null
 };
 process.exitCode = await lumiah(process.argv.slice(2), io);
