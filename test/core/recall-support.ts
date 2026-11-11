@@ -207,7 +207,7 @@ export interface Rig {
 export async function toolRig(
   host: RecallHost,
   definitions: readonly ToolDefinition[],
-  options: { chatId?: string; settings?: (s: Settings) => void; texts?: Record<string, string>; turn?: Partial<TurnRequest> | null; kind?: RunKind; runId?: string; writeReply?: ToolEnv["writeReply"]; book?: Book; ready?: boolean } = {},
+  options: { chatId?: string; settings?: (s: Settings) => void; texts?: Record<string, string>; turn?: Partial<TurnRequest> | null; kind?: RunKind; runId?: string; writeReply?: ToolEnv["writeReply"]; book?: Book; ready?: boolean; story?: ToolEnv["story"] } = {},
 ): Promise<Rig> {
   const chatId = options.chatId ?? CHAT;
   const settings = defaultSettings();
@@ -230,6 +230,8 @@ export async function toolRig(
     run: { id: options.runId ?? turn?.generationId ?? "job-now", kind: options.kind ?? (turn ? "new" : "job"), chatId },
     ...(turn ? { turn } : {}),
     settings,
+    // What counts as the story: as the test says, else as Settings say it where Lumiverse says nothing of its Sovereign Hand.
+    story: options.story ?? { hidden: settings.story.hidden, from: settings.story.from === "replies" ? "replies" : "everyone", newest: settings.story.newest },
     texts: new Texts(options.texts ?? {}),
     agent: "main",
     depth: 0,

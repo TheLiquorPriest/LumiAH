@@ -29,6 +29,7 @@ import type { Models } from "./models";
 import type { Lore, Presets, Storage } from "./reads";
 import type { SettingsStore } from "./settings";
 import type { BackendHost } from "./spindle";
+import type { ChatSwitch } from "./switch";
 
 /** The jobs that wait or run here, built in: the core's own document of them names a runtime's. */
 const RUNNING_HERE = "jobs/running.builtin.json";
@@ -43,6 +44,8 @@ export interface BuiltinDeps {
   settings: SettingsStore;
   storage: Storage;
   chats: Chats;
+  /** A chat's own choice of what counts as its story, and whether Lumiverse's Sovereign Hand is on for it, as the core reads them with the chat (§24.4). */
+  chatSwitch: Pick<ChatSwitch, "info">;
   lore: Lore;
   presets: Presets;
   connections: Connections;
@@ -168,7 +171,7 @@ export class Builtin {
         messages: (chatId, from, to) => deps.chats.messages(userId, chatId, from, to),
         anchor: (chatId, messageId, swipeId, record) => deps.chats.anchor(userId, chatId, messageId, swipeId, record),
         info: async (chatId) => {
-          const info = await deps.chats.info(userId, chatId);
+          const info = await deps.chatSwitch.info(userId, chatId);
           if (info === null) return null;
           // The connection the chat generates on is its agents' where they name none; a loopback is none an agent may call.
           const on = await deps.connections.ofChat(userId, await deps.chats.own(userId, chatId));

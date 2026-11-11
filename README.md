@@ -48,6 +48,8 @@ Search several questions at once, ranked across titles, keys and text (`lore_sea
 
 Every message an agent is shown carries a citation, so what it tells your model can be traced back. The chat is never sent to a model whole.
 
+**What counts as the story** is yours to say, in Settings and for one chat at Home: whether the messages you hid from the prompt are left out (they are, unless you say otherwise), and whether your own messages are part of the story or only directions to it. With only the model's replies, the agent is told your newest message as the direction for this reply. What the agents read, search, learn and embed follows it. An extension that answers a chat may set it there, and Home says so.
+
 It also reads what Lumiverse already keeps for you, where you grant it: the Memory Cortex, your databanks, and web search with your own provider.
 
 ### A chronicle that checks itself
@@ -182,7 +184,8 @@ The tests run on Bun, one file at a time: `bun test test/core/loop.test.ts`. `de
 - **A reply starts later.** The agent works first. Live shows how long it may take at most, and "Skip LumiAH for this reply" hands the prompt on as it was.
 - **LumiAH can't stop a reply that is being written.** Lumiverse lets an extension that works on a prompt hand it back or fail the reply, and nothing else. Lumiverse's own Stop does stop it, at any point.
 - **The runtime has no fallback.** That is why built in is the default.
-- **A message you hid from the prompt in Lumiverse can still be read by the agents' history tools.**
+- **Messages you hide from the prompt in Lumiverse are left out of what the agents read.** Before, the agents' history tools still read them. To have them read again, set "Hidden messages" to "Read them" in Settings, or for one chat at Home.
+- **Lumiverse's Sovereign Hand switch can't be followed yet.** Lumiverse doesn't tell extensions whether it is on, so "As Lumiverse" counts everyone's messages. To have only the model's replies count, choose "Replies only" in Settings, or for one chat at Home.
 - **It is new.** It is covered by about 1,800 tests and was read by two independent reviewers, whose serious findings were fixed. It has run live on one small model on a test instance. It has not yet had months of play, and the fixes have not had a second review.
 
 ## Credits

@@ -530,10 +530,10 @@ describe("the pinned chronicle", () => {
     expect(await pinned(rig, chat)).toBe("");
   });
 
-  test("it needs no more of the chat than its hashes and its last message", async () => {
+  test("it needs no more of the chat than its hashes and the messages that are its story", async () => {
     const { rig, chat, m } = await runOver(harbour());
     await put(rig, "facts.md", `- The brass key opens the strongbox. ${citeDoc(m(3))}\n`);
-    const hashes = { hashes: () => chat.hashes(), last: { index: m(11).index } };
+    const hashes = { hashes: () => chat.hashes(), story: () => chat.story() };
     expect(await pinnedChronicle({ learned: learnedOf(rig), chat: hashes, settings: rig.settings, texts: rig.env.texts, jobs: "none", writes: false })).toBe(await pinned(rig, chat));
     expect(checkChronicle(await readChronicle(learnedOf(rig)), hashes).failures).toEqual([]);
   });

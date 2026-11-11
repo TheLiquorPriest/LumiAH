@@ -21,12 +21,18 @@
 // extension pinned it, which a mark says for this reason.
 //
 // The runtime way has no fallback (§25): a chat set to run in a runtime that isn't linked fails
-// its replies until the runtime is back or the user sets the chat to run built in. The chat's
-// view says so (`away`), so a page can offer that one tap.
+// its replies until the runtime is back or the user sets the chat to run built in. The chat's view
+// says so (`away`), so a page can offer that one tap.
+//
+// The chat's own choice of what counts as its story (§24.4) is kept beside its other choices, while
+// the chat is off too. The core reads it with the chat (`info`), and the pages see it with what
+// stands over it and under it (`story`).
 
-import type { JsonValue } from "../../core/ports";
+import type { ClaimAsk } from "../../core/extension";
+import type { ChatInfo, JsonValue } from "../../core/ports";
+import { type StorySetting, storyHolds, storyWordOf } from "../../core/story";
 import { isRecord } from "../../link/json";
-import type { ChatView, RunPlace } from "../../shared/ui";
+import type { ChatStoryView, ChatView, RunPlace } from "../../shared/ui";
 import type { Chats } from "./chat";
 import type { ChatConnection, Connections } from "./connections";
 import { UserDocs } from "./docs";
@@ -59,6 +65,8 @@ interface Stored {
   on: Record<string, Switched>;
   /** The chats that ran in a runtime when they were last switched off: switched on again with no place named, each runs there again. A chat that isn't here runs built in. */
   ran: Record<string, true>;
+  /** Each chat's own choice of what counts as its story, by the chat's id; a chat that isn't here follows Settings. Absent from what an earlier build stored. */
+  story: Record<string, Partial<StorySetting>>;
 }
 
 function storedOf(raw: unknown): Stored | null {
@@ -70,7 +78,14 @@ function storedOf(raw: unknown): Stored | null {
   }
   const ran: Record<string, true> = {};
   if (isRecord(raw.ran)) for (const chatId of Object.keys(raw.ran)) ran[chatId] = true;
-  return { v: 1, on, ran };
+  const story: Record<string, Partial<StorySetting>> = {};
+  if (isRecord(raw.story)) {
+    for (const [chatId, chosen] of Object.entries(raw.story)) {
+      const word = storyWordOf(chosen);
+      if (Object.keys(word).length > 0) story[chatId] = word;
+    }
+  }
+  return { v: 1, on, ran, story };
 }
 
 export interface SwitchDeps {
@@ -85,6 +100,10 @@ export interface SwitchDeps {
   /** Who this backend is: its identifier keys its mark on a chat, and its name is what another backend's pages call it. */
   identity: Pick<BackendIdentity, "identifier" | "name">;
   now(): number;
+  /** The user's own setting of what counts as the story (Settings), which a chat's choice stands over. */
+  storySetting(userId: string): Promise<StorySetting>;
+  /** What the extension that answers a chat says of its story: its name, and the members it sets; null where it sets none, or there is no such extension. */
+  claimed(ask: ClaimAsk, userId: string): Promise<{ by: string; story: Partial<StorySetting> } | null>;
 }
 
 export class ChatSwitch {
@@ -95,7 +114,7 @@ export class ChatSwitch {
     private readonly host: Pick<BackendHost, "chats" | "storage" | "log">,
     private readonly deps: SwitchDeps,
   ) {
-    this.docs = new UserDocs<Stored>(host, "chats.json", storedOf, () => ({ v: 1, on: {}, ran: {} }));
+    this.docs = new UserDocs<Stored>(host, "chats.json", storedOf, () => ({ v: 1, on: {}, ran: {}, story: {} }));
     this.markKey = `${MARK}${deps.identity.identifier}`;
   }
 
@@ -159,6 +178,51 @@ export class ChatSwitch {
   /** `lah.chat.get`: a chat as the pages show it. */
   async view(userId: string, chatId: string): Promise<ChatView> {
     return this.viewOf(userId, await this.deps.chats.own(userId, chatId));
+  }
+
+  /** The user's own choice of what counts as a chat's story; empty where they made none. */
+  async storyChoice(userId: string, chatId: string): Promise<Partial<StorySetting>> {
+    const chosen = (await this.docs.get(userId)).story[chatId];
+    return chosen === undefined ? {} : { ...chosen };
+  }
+
+  /** `chat.info` as the core reads it (§24.4): the chat itself, with the user's own choice of what counts as its story and whether Lumiverse's Sovereign Hand is on for it; null when the user has no such chat. */
+  async info(userId: string, chatId: string): Promise<ChatInfo | null> {
+    const info = await this.deps.chats.info(userId, chatId);
+    if (info === null) return null;
+    const [chosen, sovereignHand] = await Promise.all([this.storyChoice(userId, chatId), this.host.chats.sovereignHand(chatId, userId)]);
+    return { ...info, ...(Object.keys(chosen).length > 0 ? { story: chosen } : {}), sovereignHand };
+  }
+
+  /** What a claim on a chat is asked with, read here (never as a runtime described it): the chat, and what counts as its story without the extension's word; null when the user has no such chat. */
+  async claimAsk(userId: string, chatId: string, setting?: StorySetting): Promise<ClaimAsk | null> {
+    const chat = await this.info(userId, chatId);
+    if (chat === null) return null;
+    const sovereignHand = chat.sovereignHand ?? null;
+    const below = storyHolds({ chat: chat.story ?? null, user: setting ?? (await this.deps.storySetting(userId)), sovereignHand });
+    return { userId, chatId: chat.id, chat, story: below.source, sovereignHand };
+  }
+
+  /** `lah.chat.story.get`: what counts as a chat's story, as the pages show it. */
+  async story(userId: string, chatId: string): Promise<ChatStoryView> {
+    await this.deps.chats.own(userId, chatId);
+    const setting = await this.deps.storySetting(userId);
+    const ask = await this.claimAsk(userId, chatId, setting);
+    if (ask === null) throw new LinkRefused("not_found", "There is no such chat in this account.");
+    const chosen = ask.chat.story ?? {};
+    const claimed = await this.deps.claimed(ask, userId);
+    return { chatId, chosen, setting, claimed, sovereignHand: ask.sovereignHand, holds: storyHolds({ claim: claimed?.story ?? null, chat: chosen, user: setting, sovereignHand: ask.sovereignHand }) };
+  }
+
+  /** `lah.chat.story.set`: the chat's own choice, whole (each member left out follows Settings), kept while the chat is off too. */
+  async setStory(userId: string, chatId: string, story: Partial<StorySetting>): Promise<ChatStoryView> {
+    await this.deps.chats.own(userId, chatId);
+    const chosen = storyWordOf(story);
+    await this.docs.change(userId, (doc) => {
+      if (Object.keys(chosen).length === 0) delete doc.story[chatId];
+      else doc.story[chatId] = chosen;
+    });
+    return this.story(userId, chatId);
   }
 
   /**
@@ -284,6 +348,7 @@ export class ChatSwitch {
         for (const chatId of gone) {
           delete doc.on[chatId];
           delete doc.ran[chatId];
+          delete doc.story[chatId];
         }
       });
     }

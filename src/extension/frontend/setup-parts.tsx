@@ -5,7 +5,7 @@
 
 import type { ComponentChildren } from "preact";
 import { useEffect, useState } from "preact/hooks";
-import type { ChatView, PermissionNeed, RunPlace } from "../../shared/ui";
+import type { ChatStoryView, ChatView, PermissionNeed, RunPlace, StorySetting } from "../../shared/ui";
 import { useApp } from "./app";
 import { chatLabel } from "./chat";
 import { Banner, Button, Disclosure, Seg, type SegOption, Switch, useBusy } from "./components";
@@ -13,6 +13,7 @@ import { counted } from "./format";
 import { Icon, type IconName } from "./icons";
 import { asksWords, chatStanding, grantReason, neededPermissions, PLACE_ABOUT, PLACE_LABEL, type StepAt } from "./setup-model";
 import { useSelect } from "./store";
+import { storyChosen, storyRows, storySummary, storyWhy } from "./story-model";
 
 const PLACES: readonly SegOption<RunPlace>[] = [
   { value: "builtin", label: PLACE_LABEL.builtin },
@@ -178,9 +179,12 @@ export function ChatSwitch(props: { chat: ChatView; open: boolean; title?: strin
         </div>
       ) : null}
       {chat.on && props.fold === true ? (
-        <Disclosure class="lah-chatswitch-place" summary={`Where it runs: ${PLACE_LABEL[chat.place].toLowerCase()}`} defaultOpen={asked}>
-          {places}
-        </Disclosure>
+        <>
+          <Disclosure class="lah-chatswitch-place" summary={`Where it runs: ${PLACE_LABEL[chat.place].toLowerCase()}`} defaultOpen={asked}>
+            {places}
+          </Disclosure>
+          <ChatStory chatId={chat.chatId} />
+        </>
       ) : chat.on ? (
         <div class="lah-chatswitch-place">
           <span class="lah-field-label">Where it runs</span>
@@ -189,6 +193,57 @@ export function ChatSwitch(props: { chat: ChatView; open: boolean; title?: strin
       ) : null}
       {props.children}
     </div>
+  );
+}
+
+/**
+ * What counts as a chat's story (DESIGN §24.4), folded under a line that says whose messages it is:
+ * what holds and why, then the chat's own choice of each member over Settings'. A member the
+ * extension that answers the chat sets is shown as its, with no choice.
+ */
+function ChatStory(props: { chatId: string }) {
+  const app = useApp();
+  const [busy, run] = useBusy();
+  const [view, setView] = useState<ChatStoryView | null>(null);
+  useEffect(() => {
+    let current = true;
+    app.client.request("lah.chat.story.get", { chatId: props.chatId }).then(
+      (result) => current && setView(result.story),
+      (error: unknown) => current && app.fail(error),
+    );
+    return () => {
+      current = false;
+    };
+  }, [props.chatId]);
+  if (view === null || view.chatId !== props.chatId) return null;
+  const choose = (member: keyof StorySetting, value: string): void =>
+    run(async () => {
+      try {
+        setView((await app.client.request("lah.chat.story.set", { chatId: view.chatId, story: storyChosen(view, member, value) })).story);
+        app.toast("Saved for this chat. It holds from its next reply.");
+      } catch (error) {
+        app.fail(error);
+      }
+    });
+  return (
+    <Disclosure class="lah-chatswitch-story" summary={storySummary(view)}>
+      <p class="lah-field-help" data-lah-story-why>
+        {storyWhy(view)}
+      </p>
+      {storyRows(view).map((row) => (
+        <div key={row.member} class="lah-chatswitch-story-row" data-lah-story-member={row.member}>
+          <span class="lah-field-label">{row.label}</span>
+          {row.claimed !== null ? (
+            <p class="lah-field-help" data-lah-story-claimed>
+              {row.claimed}
+            </p>
+          ) : (
+            <Seg value={row.value} options={row.options} label={row.label} disabled={busy} onChange={(value) => choose(row.member, value)} />
+          )}
+          {row.help !== "" ? <p class="lah-field-help">{row.help}</p> : null}
+        </div>
+      ))}
+    </Disclosure>
   );
 }
 

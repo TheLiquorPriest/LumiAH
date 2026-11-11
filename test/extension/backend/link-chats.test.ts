@@ -31,8 +31,8 @@ function lantern() {
       heard.push(`definitions ${chatId} for ${userId}`);
       return {};
     },
-    claim: async (chat, userId) => {
-      heard.push(`claim ${chat.id} "${chat.name}" for ${userId}`);
+    claim: async (ask, userId) => {
+      heard.push(`claim ${ask.chat.id} "${ask.chat.name}" for ${userId}`);
       return null;
     },
     writerRequest: async (request, userId) => {

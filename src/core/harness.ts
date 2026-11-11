@@ -23,7 +23,7 @@ import { DOC, docKey, ROOT_AREA } from "./paths";
 import type { FileAuthor, FileChange, JobAllowance, JobView, JobWhen, JsonObject, PreparedTurn, ReplySink, TurnRecord, TurnRequest, TurnResult, WorkspaceArea } from "./ports";
 import { isRecord } from "./ports";
 import { AgentAccounts } from "./provider";
-import { RECALL_SKILLS, recallAgents } from "./recall/definitions";
+import { chronicleRefusal, RECALL_SKILLS, recallAgents } from "./recall/definitions";
 import { type RecallPage, recallPage } from "./recall/page";
 import { HarnessRefusal } from "./refusal";
 import { type HarnessOptions, readSetup, type Shared } from "./run";
@@ -639,7 +639,14 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
       },
     },
 
-    recall: recallPage({ host, setup: (chatId) => readSetup(shared, chatId), learned: (chatId) => shared.areas.learned(chatId) }),
+    recall: recallPage({
+      host,
+      setup: async (chatId) => {
+        const setup = await readSetup(shared, chatId);
+        return { ...setup, story: setup.story.source, chronicle: chronicleRefusal(setup.definitions, shared.options.extension?.name ?? null) };
+      },
+      learned: (chatId) => shared.areas.learned(chatId),
+    }),
   };
 }
 

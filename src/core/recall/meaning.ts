@@ -658,7 +658,10 @@ export class Meaning {
               lacks.set(text.hash, text.text);
             }
           }
-          if (start) this.queue(state, lacking);
+          if (start) {
+            this.unqueue(state, group);
+            this.queue(state, lacking);
+          }
         });
         this.trim(settings);
         if (start) this.start();
@@ -703,6 +706,7 @@ export class Meaning {
         if (!this.fits(space, kept)) lacking.push(text);
         else if (kept.q.length > 0 && (!keep || keep(text.key))) have.push({ text, state, kept });
       }
+      this.unqueue(state, group);
       this.queue(state, lacking);
     });
     this.start();
@@ -980,6 +984,15 @@ export class Meaning {
       const id = `${state.who}\n${text.hash}`;
       if (state.ready(text.hash) && !this.waiting.has(id)) this.waiting.set(id, { owner: state.owner, who: state.who, hash: text.hash, text: text.text });
     }
+  }
+
+  /**
+   * An owner's waiting texts that its group no longer holds wait no more: a message the story leaves
+   * out now (§24.4), or one that changed, is never embedded for it. Asked wherever a group is queued.
+   */
+  private unqueue(state: Owned, group: MeaningGroup): void {
+    const now = new Set(group.texts.map((text) => text.hash));
+    for (const [id, item] of this.waiting) if (item.who === state.who && !now.has(item.hash)) this.waiting.delete(id);
   }
 
   /** Whether a text waits that the day's cap still allows, as far as the count is known. A text of a call the loop let go waits for the next ask, not for the loop. */

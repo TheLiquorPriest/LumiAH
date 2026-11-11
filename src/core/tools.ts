@@ -14,6 +14,7 @@ import type { LexicalIndex } from "./lexical";
 import type { SessionSegment } from "./sessions";
 import type { Settings } from "./settings";
 import type { Skill } from "./skills";
+import type { StorySource } from "./story";
 import type { Texts } from "./texts";
 import type { WorkspaceView } from "./workspace";
 
@@ -170,6 +171,8 @@ export interface ToolEnv {
   /** Where the agent stands in its run: whether it is the run's main agent, and the agents over it, from the main agent down to the one that started it. Absent where the tools are built outside a run's own start (a test's): no main agent, and nobody above. */
   standing?: { main: boolean; above: readonly AgentRef[] };
   chat: ChatView;
+  /** What counts as the chat's story (§24.4): the chat tools read only those messages. */
+  story: StorySource;
   lore: LoreView;
   /** The main agent's earlier turns on the path this run reads, oldest first. */
   past: readonly PastTurn[];

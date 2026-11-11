@@ -14,6 +14,7 @@
 
 import type { RecallPorts } from "./recall/ports";
 import type { LoreChange, PromptHeld } from "./recall/shapes";
+import type { StorySetting } from "./story";
 
 // ---------------------------------------------------------------- JSON
 
@@ -286,7 +287,7 @@ export interface PathMessage {
   chars: number;
   hash: string;
   anchor: JsonValue | null;
-  /** The user hid it from the prompt, so Lumiverse leaves it out of what it sends: the history tools leave it out too, unless Settings include such messages (§24.4). Absent: it is shown. */
+  /** The user hid it from the prompt, so Lumiverse leaves it out of what it sends: what counts as the story leaves it out too, unless the user says such messages are read (§24.4). Absent: it is shown. */
   hidden?: boolean;
 }
 
@@ -308,6 +309,11 @@ export interface ChatMessage {
  * runs inside Lumiverse (DESIGN §25), the connection the chat generates on: an agent of the chat's
  * jobs and side sessions that has no connection set uses it. A runtime's host leaves it out: there
  * the chat generates on the loopback, which no agent may call.
+ *
+ * What decides the chat's story beside the user's setting (§24.4): the user's own choice for this
+ * chat (`story`, each member given stands over their setting; absent: none), and whether Lumiverse's
+ * Sovereign Hand is on for the user in this chat (`sovereignHand`; null or absent where Lumiverse
+ * doesn't tell extensions).
  */
 export interface ChatInfo {
   id: string;
@@ -316,6 +322,8 @@ export interface ChatInfo {
   characterName: string | null;
   branchedFrom: string | null;
   connectionId?: string | null;
+  story?: Partial<StorySetting>;
+  sovereignHand?: boolean | null;
 }
 
 /** A record LumiAH holds on one swipe of a message, wherever it is: the swipe shown or another, on the active path or off it. */

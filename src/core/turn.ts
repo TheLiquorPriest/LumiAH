@@ -25,8 +25,9 @@ import { mergeDefinitions } from "./definitions";
 import { jobNews } from "./job-words";
 import { type AgentReply, cutShort } from "./loop";
 import { DOC } from "./paths";
-import { type AgentUsage, type HarnessHost, type JobView, type JsonObject, type ModelDelta, modelMessages, type PreparedTurn, type PresetBlock, type RecordJob, type ReplySink, type RequestMessage, type TraceEvent, type TranscriptEntry, type TurnRecord, type TurnRequest, type TurnResult, type TurnStatus } from "./ports";
+import { type AgentUsage, type HarnessHost, type JobView, type JsonObject, type ModelDelta, modelMessages, type PathMessage, type PreparedTurn, type PresetBlock, type RecordJob, type ReplySink, type RequestMessage, type TraceEvent, type TranscriptEntry, type TurnRecord, type TurnRequest, type TurnResult, type TurnStatus } from "./ports";
 import { AgentStop } from "./provider";
+import { chronicleRefusal } from "./recall/definitions";
 import { recallTold } from "./recall/turn";
 import { writerLore } from "./recall/writer";
 import { carriedOf, receiptOf } from "./receipts";
@@ -35,6 +36,7 @@ import { briefedRequest, requestDocument, sentMessage } from "./request";
 import { askExtension, readSetup, Run, type Setup, type Shared } from "./run";
 import { type Compaction, compactionAsked, compactionDue, type PendingTurn, pendingOf, type ResumedSession, type SegmentStep, type SessionSegment, segmentOf } from "./sessions";
 import { AGENT, type Settings, settingsOf } from "./settings";
+import { leftOutWhy, type StorySource, storyHolds } from "./story";
 import { TEXT, TOOL, type Texts, textsOf } from "./texts";
 import type { PastTurn, ToolCtx, ToolOutcome } from "./tools";
 import { emptyUsage } from "./usage";
@@ -532,11 +534,27 @@ export class Turn {
     const writes = this.mainWrites();
     const blocks = await this.blocks();
     // What the prompt holds of the lore and of the chat (§24.1) and the top of the chat's chronicle (§24.7) follow the request's messages.
-    const told = run.recall ? await recallTold(run.recall, { path: session.before, blocks, writes, learned: run.areas.learned, jobs: settings.jobs.enabled && host.jobs !== undefined ? () => shared.jobs.open(turn.chatId) : null, emit: (event) => run.trace.emit(event), log: host.log, now: host.clock.now() }) : undefined;
+    // Upkeep is offered only where LumiAH's own agents keep the chronicle: in a chat whose extension puts an agent of its own in the chronicler's place, a job started for it would start that agent.
+    const kept = settings.jobs.enabled && host.jobs !== undefined && chronicleRefusal(run.definitions, shared.options.extension?.name ?? null) === null;
+    const told = run.recall ? await recallTold(run.recall, { path: session.before, blocks, writes, learned: run.areas.learned, jobs: kept ? () => shared.jobs.open(turn.chatId) : null, emit: (event) => run.trace.emit(event), log: host.log, now: host.clock.now() }) : undefined;
     const document = requestDocument(turn.messages, blocks, session.before, texts, told);
     work.request = { messages: document.messages, last: document.last };
     run.request = { count: texts.counted(document.messages, TEXT.word.message), text: document.text };
     const jobs = jobNews(news, texts);
+    // Where only the model's replies are the story, the user's messages are directions: the main agent is told so, and given this reply's, read from the chat itself.
+    const directed = await directedNote({
+      source: run.story.source,
+      before: session.before,
+      texts,
+      read: async (message) => {
+        try {
+          return (await host.chat.messages(turn.chatId, message.index, message.index + 1)).find((m) => m.id === message.id)?.content ?? null;
+        } catch (error) {
+          host.log("warn", `[LumiAH] the user's newest message couldn't be read (${errorText(error)}): the main agent is told the story is directed, without this reply's direction`);
+          return null;
+        }
+      },
+    });
     const notes = [
       ...(refs.fresh.length > 0 ? [texts.render(TEXT.main.noteDropped, { replies: droppedReplies })] : []),
       ...(refs.rolledBack !== null ? [texts.render(TEXT.main.noteRolledBack)] : []),
@@ -544,6 +562,7 @@ export class Turn {
       ...(lead !== null ? [texts.render(TEXT.main.noteSummary, { summary: lead })] : []),
       ...(session.continued ? [texts.render(TEXT.main.noteContinued, { receipt: receiptOf(session.continued.segment, settings.session, texts) })] : []),
       ...(jobs !== null ? [jobs] : []),
+      ...(directed !== null ? [directed] : []),
     ];
     const kinds = { new: TEXT.main.kindNew, regenerate: TEXT.main.kindRegenerate, swipe: TEXT.main.kindSwipe, continue: TEXT.main.kindContinue } as const;
     const asked = texts.render(TEXT.main.turn, { kind: texts.render(kinds[turn.kind]), notes: notes.map((note) => `${note}\n\n`).join(""), count: run.request.count, request: document.text, ask: texts.render(writes ? TEXT.main.askWrites : TEXT.main.ask) });
@@ -1057,6 +1076,28 @@ export async function completeStored(shared: Shared, input: { generationId: unkn
 }
 
 /**
+ * What the main agent's opening note says of the story where only the model's replies are (§3.1):
+ * that the user directs it from outside, and, with `newest` "directive", the direction for this
+ * reply, read from the chat itself (Lumiverse may have left it out of the prompt). The direction is
+ * the user's message the turn's path ends with: a path that ends with a reply has none for this
+ * reply, and a message the story leaves out as hidden gives none either. `read` gives a message's
+ * text; null where it couldn't be read, and the note then goes without it. Null where everyone's
+ * messages are the story: the note is as it always was.
+ */
+export async function directedNote(input: { source: StorySource; before: readonly PathMessage[]; read(message: PathMessage): Promise<string | null>; texts: Texts }): Promise<string | null> {
+  const { source, before, texts } = input;
+  if (source.from !== "replies") return null;
+  let direction = "";
+  if (source.newest === "directive") {
+    const last = before.at(-1);
+    const given = last !== undefined && last.role === "user" && leftOutWhy(last, source) !== "hidden" ? await input.read(last) : "";
+    if (given === null) direction = "";
+    else direction = given.trim() === "" ? texts.render(TEXT.main.noDirection) : texts.render(TEXT.main.direction, { text: given });
+  }
+  return texts.render(TEXT.main.directed, { direction });
+}
+
+/**
  * What a turn works with when the user's settings can't be read: Settings and texts as shipped and
  * the definitions written in code, with nothing of the user's, the extension's or the chat's. Only
  * the writer runs on it (`Turn.answer`).
@@ -1066,5 +1107,5 @@ function shippedSetup(shared: Shared, userId: string): Setup {
   const settings = settingsOf(null, definitions.scope());
   // Whether prompts and transcripts are kept is the user's to say, and what they said can't be read: nothing they may have switched off is kept for this turn.
   settings.keep = { ...settings.keep, prompts: false, transcripts: false };
-  return { userId, settings, texts: textsOf(null), definitions, chat: null, claim: null };
+  return { userId, settings, texts: textsOf(null), definitions, chat: null, claim: null, story: storyHolds({ user: settings.story, sovereignHand: null }) };
 }

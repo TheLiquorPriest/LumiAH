@@ -1,19 +1,26 @@
-// A chat's messages as §24 reads them (DESIGN §24.4, §24.6): every message of the active path with
-// its text, when it was sent and the hash a citation of it carries, indexed for search. One corpus
-// is kept for a chat between turns. A run brings it up to date from the chat's path, which names
-// every message's hash without its text: only a message that is new, or whose text changed, is read
-// from the host and indexed again, so a turn in a chat of thousands of messages reads a handful.
+// A chat's messages as §24 reads them (DESIGN §24.4, §24.6): every message of the active path that
+// counts as the story, with its text, when it was sent and the hash a citation of it carries,
+// indexed for search. One corpus is kept for a chat between turns. A run brings it up to date from
+// the chat's path, which names every message's hash without its text: only a message that is new,
+// or whose text changed, is read from the host and indexed again, so a turn in a chat of thousands
+// of messages reads a handful.
 //
 // Each run reads the chat as its own path has it (`ChatRun`): the messages before the reply for a
 // turn, all of them for a job. The index is shared; a run's searches keep to its own messages. A
 // message is kept under the hash of the text that was read, not the one the path promised: where
 // the chat changed between the two, the run reads the message as it stands now, and no citation
 // ever names words other than the ones it is printed with.
+//
+// What the story leaves out (`StorySource`: a message the user hid, the user's own messages where
+// only the model's replies are the story) is never kept, indexed or given to a tool: a run holds of
+// it only its number, why it is left out, and the hash the path gives, which a citation of it is
+// checked against, since a citation names a message of the chat.
 
 import { textHash } from "../hash";
 import { LexicalIndex } from "../lexical";
 import type { ChatRole, HarnessHost, PathMessage } from "../ports";
 import { isRecord } from "../ports";
+import { type LeftOutWhy, leftOutWhy, type StorySource } from "../story";
 import { citeOf } from "./cite";
 
 /** A chat message as the history tools read it. */
@@ -50,7 +57,16 @@ export function speakersOf(docs: readonly ChatDoc[]): [who: string, messages: nu
   return [...counts].sort((a, b) => b[1] - a[1]);
 }
 
-/** The chat as one run reads it: its messages, oldest first, and the index its searches use. */
+/** A message the story leaves out, as a run holds it: why, and the hash of its text as the chat's path gives it. */
+export interface LeftOut {
+  why: LeftOutWhy;
+  hash: string;
+}
+
+/** How many messages the story leaves out, by why. */
+export type LeftCount = Record<LeftOutWhy, number>;
+
+/** The chat as one run reads it: the messages that count as the story, oldest first, the index its searches use, and the numbers of those the story leaves out. */
 export class ChatRun {
   private readonly byNumber: Map<number, ChatDoc>;
   private readonly docs: Map<string, ChatDoc>;
@@ -59,14 +75,28 @@ export class ChatRun {
     readonly messages: readonly ChatDoc[],
     /** The chat's index, by message id: it may hold messages that aren't this run's, so a search passes `has` as what to keep. */
     readonly index: LexicalIndex<string>,
+    /** The messages of the run's path the story leaves out, by their numbers. */
+    private readonly left: ReadonlyMap<number, LeftOut>,
   ) {
     this.byNumber = new Map(messages.map((m) => [m.index, m]));
     this.docs = new Map(messages.map((m) => [m.id, m]));
   }
 
-  /** The message with a number; undefined where the run's chat has none there. */
+  /** The message with a number; undefined where the run's story has none there (the chat has none, or the story leaves it out: `leftAt` says which). */
   at(index: number): ChatDoc | undefined {
     return this.byNumber.get(index);
+  }
+
+  /** Why the story leaves out the message with a number; undefined for one it holds, and for a number the chat has no message at. */
+  leftAt(index: number): LeftOutWhy | undefined {
+    return this.left.get(index)?.why;
+  }
+
+  /** How many messages with numbers from `from` to `to` (both included) the story leaves out, by why. */
+  leftIn(from: number, to: number): LeftCount {
+    const count: LeftCount = { hidden: 0, direction: 0 };
+    for (const [index, { why }] of this.left) if (index >= from && index <= to) count[why]++;
+    return count;
   }
 
   /**
@@ -92,7 +122,7 @@ export class ChatRun {
     return this.docs.get(id);
   }
 
-  /** The run's first and last message; undefined for a chat with none. */
+  /** The run's first and last message of the story; undefined where it has none. */
   get first(): ChatDoc | undefined {
     return this.messages[0];
   }
@@ -101,18 +131,32 @@ export class ChatRun {
     return this.messages.at(-1);
   }
 
-  /** Each message's hash by its number: what a citation is checked against. */
+  /** Each message's hash by its number, those the story leaves out among them: what a citation is checked against, since it names a message of the chat. */
   hashes(): Map<number, string> {
-    return new Map(this.messages.map((m) => [m.index, m.hash]));
+    const out = new Map(this.messages.map((m) => [m.index, m.hash]));
+    for (const [index, { hash }] of this.left) out.set(index, hash);
+    return out;
+  }
+
+  /** The numbers of the messages that count as the story, ascending. */
+  story(): number[] {
+    return this.messages.map((m) => m.index);
   }
 }
 
-/** The runs of consecutive numbers among `indices` (sorted), none longer than `most`: what is read from the host in one request each. */
-function runsOf(indices: readonly number[], most: number): [from: number, to: number][] {
+/**
+ * The runs of numbers among `indices` (sorted), none longer than `most`: what is read from the host in
+ * one request each. Numbers part only where something is between them that `passes` doesn't let a
+ * read go over: a message the story leaves out is passed over in the batch it falls in, so a chat whose
+ * story is every other message isn't read one message a request.
+ */
+function runsOf(indices: readonly number[], most: number, passes: (index: number) => boolean): [from: number, to: number][] {
   const runs: [number, number][] = [];
   for (const index of indices) {
     const last = runs.at(-1);
-    if (last && index === last[1] && index - last[0] < most) last[1] = index + 1;
+    let joins = last !== undefined && index - last[0] < most;
+    for (let between = last?.[1] ?? index; joins && between < index; between++) joins = passes(between);
+    if (last && joins) last[1] = index + 1;
     else runs.push([index, index + 1]);
   }
   return runs;
@@ -135,15 +179,16 @@ export class ChatCorpus {
 
   /**
    * The chat as a run reads it, brought up to date once for each run. `path` is the run's own: the
-   * messages it may read, each with its hash. A read that fails is tried again by the next call.
+   * messages it may read, each with its hash; `story` says which of them count as the story. A read
+   * that fails is tried again by the next call.
    */
-  sync(run: string, path: readonly PathMessage[], sizes: { pieceChars: number; chatBatch: number }): Promise<ChatRun> {
+  sync(run: string, path: readonly PathMessage[], sizes: { pieceChars: number; chatBatch: number }, story: StorySource): Promise<ChatRun> {
     if (this.last?.run === run) return this.last.done;
     const before = this.last?.done.then(
       () => undefined,
       () => undefined,
     );
-    const done = (before ?? Promise.resolve()).then(() => this.read(path, sizes));
+    const done = (before ?? Promise.resolve()).then(() => this.read(path, sizes, story));
     const held = { run, done };
     this.last = held;
     done.catch(() => {
@@ -157,16 +202,24 @@ export class ChatCorpus {
     return port ? port.messages(this.chatId, from, to) : this.host.chat.messages(this.chatId, from, to);
   }
 
-  private async read(path: readonly PathMessage[], sizes: { pieceChars: number; chatBatch: number }): Promise<ChatRun> {
+  private async read(path: readonly PathMessage[], sizes: { pieceChars: number; chatBatch: number }, story: StorySource): Promise<ChatRun> {
     if (sizes.pieceChars !== this.pieceChars) {
       // Search piece changed: every message is cut anew.
       this.pieceChars = sizes.pieceChars;
       this.index = new LexicalIndex<string>(sizes.pieceChars);
       this.docs = new Map();
     }
-    const wanted = new Map(path.map((m) => [m.id, m]));
-    const stale = path.filter((m) => this.docs.get(m.id)?.hash !== m.hash).map((m) => m.index);
-    for (const [from, to] of runsOf(stale, Math.max(1, sizes.chatBatch))) {
+    // What the story leaves out is never kept, indexed or given: a read that spans it passes over it, and the run holds its number, why, and the hash the path gives.
+    const left = new Map<number, LeftOut>();
+    const kept: PathMessage[] = [];
+    for (const m of path) {
+      const why = leftOutWhy(m, story);
+      if (why === null) kept.push(m);
+      else left.set(m.index, { why, hash: m.hash });
+    }
+    const wanted = new Map(kept.map((m) => [m.id, m]));
+    const stale = kept.filter((m) => this.docs.get(m.id)?.hash !== m.hash).map((m) => m.index);
+    for (const [from, to] of runsOf(stale, Math.max(1, sizes.chatBatch), (index) => left.has(index))) {
       const read = await this.texts(from, to);
       const given: { m: PathMessage; text: string; at: number | null }[] = [];
       for (const raw of Array.isArray(read) ? read : []) {
@@ -186,7 +239,7 @@ export class ChatCorpus {
         this.indexed++;
       });
     }
-    // A message that left the chat leaves the index. One past this path's end may be another run's (the reply a turn is writing, which a job reads): it stays.
+    // A message that left the chat, or the story, leaves the index. One past this path's end may be another run's (the reply a turn is writing, which a job reads): it stays.
     const end = path.at(-1)?.index ?? -1;
     for (const [id, doc] of this.docs) {
       if (wanted.has(id) || doc.index > end) continue;
@@ -194,7 +247,7 @@ export class ChatCorpus {
       this.index.remove(id);
     }
     const messages: ChatDoc[] = [];
-    for (const m of path) {
+    for (const m of kept) {
       const doc = this.docs.get(m.id);
       // One whose text the host didn't give isn't the run's to read. One that changed since the path was read is read as it stands, under the hash of its own words.
       if (!doc) continue;
@@ -203,6 +256,6 @@ export class ChatCorpus {
       if (placed !== doc) this.docs.set(m.id, placed);
       messages.push(placed);
     }
-    return new ChatRun(messages, this.index);
+    return new ChatRun(messages, this.index, left);
   }
 }

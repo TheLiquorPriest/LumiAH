@@ -339,7 +339,7 @@ describe("what an extension that LumiAH is built into supplies", () => {
     const extension: BackendExtension = {
       name: "harbour_ext",
       definitions: async () => ({ skills: [{ id: "tide_reading", name: "Reading a tide table", description: "How to read the harbour's tide tables.", body: "Find the day, then the harbour." }] }),
-      claim: async (chat, userId) => (chat.name === "Harbour light" ? { mainAgent: `harbour_main_for_${userId}` } : null),
+      claim: async (ask, userId) => (ask.chat.name === "Harbour light" ? { mainAgent: `harbour_main_for_${userId}` } : null),
       runBegan: async (run, userId) => void hooks.push(`${run.kind} ${run.turn} for ${userId}`),
     };
     const { it, chatId } = await start(s, { extension });
@@ -349,13 +349,15 @@ describe("what an extension that LumiAH is built into supplies", () => {
 
     // The runtime's harness names no user in what it asks (a runtime serves one): the backend hands each member the user the runtime registered for.
     expect(await supplied.definitions?.({ userId: "", chatId: null })).toEqual({ skills: [{ id: "tide_reading", name: "Reading a tide table", description: "How to read the harbour's tide tables.", body: "Find the day, then the harbour." }] });
-    expect(await supplied.claim?.({ userId: "", chatId, chat: { id: chatId, name: "Harbour light", characterId: null, characterName: null, branchedFrom: null } })).toEqual({ mainAgent: `harbour_main_for_${USER}` });
+    // What the claim is asked with is read by the backend, never taken as the ask described it: the chat as Lumiverse has it, and what counts as its story.
+    const story = { hidden: "leave_out", from: "everyone", newest: "directive" } as const;
+    expect(await supplied.claim?.({ userId: "", chatId, chat: { id: chatId, name: "Harbour light", characterId: null, characterName: null, branchedFrom: null }, story, sovereignHand: null })).toEqual({ mainAgent: `harbour_main_for_${USER}` });
     // A chat it doesn't claim is the user's own all the same, read as Lumiverse has it; one that is no chat of theirs never reaches the member.
     const elsewhere = it.host.addChat(USER, "Elsewhere");
-    expect(await supplied.claim?.({ userId: "", chatId: elsewhere.id, chat: { id: elsewhere.id, name: "Harbour light", characterId: null, characterName: null, branchedFrom: null } })).toBeNull();
-    expect(await supplied.claim?.({ userId: "", chatId: "chat-none", chat: { id: "chat-none", name: "Harbour light", characterId: null, characterName: null, branchedFrom: null } }).catch((error: unknown) => String(error))).toContain("There is no such chat in this account.");
+    expect(await supplied.claim?.({ userId: "", chatId: elsewhere.id, chat: { id: elsewhere.id, name: "Harbour light", characterId: null, characterName: null, branchedFrom: null }, story, sovereignHand: null })).toBeNull();
+    expect(await supplied.claim?.({ userId: "", chatId: "chat-none", chat: { id: "chat-none", name: "Harbour light", characterId: null, characterName: null, branchedFrom: null }, story, sovereignHand: null }).catch((error: unknown) => String(error))).toContain("There is no such chat in this account.");
     // A user an ask names is not taken at its word.
-    await supplied.runBegan?.({ userId: "user-joss", chatId, turn: "turn-9", kind: "new" });
+    await supplied.runBegan?.({ userId: "user-joss", chatId, turn: "turn-9", kind: "new", story });
     expect(hooks).toEqual([`new turn-9 for ${USER}`]);
     // What it doesn't supply is never asked for: the core is told so at once.
     const before = it.host.sent.length;

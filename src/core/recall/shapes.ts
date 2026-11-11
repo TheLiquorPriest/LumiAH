@@ -229,7 +229,7 @@ export interface StoryEstimate {
 export interface StoryStatus {
   /** The plan of the learning, as agents write its path (`learned/chronicle/plan.md`), once the file is there; null before. */
   plan: string | null;
-  /** How many messages the chat has. */
+  /** How many messages the chat has that count as the story (§24.4): those it leaves out are nothing to learn. */
   messages: number;
   /** How many of them the chronicle's outline spans. */
   covered: number;
@@ -237,4 +237,6 @@ export interface StoryStatus {
   estimate: StoryEstimate;
   /** What the page fills in before the user starts one: the objective's words (a text the user can replace) and the agent definition that does it. */
   suggested: { task: string; agent: string };
+  /** Why the story can't be learned in this chat, in plain words: LumiAH's own agents don't keep its chronicle (`chronicleRefusal`). Null where it can. */
+  refused: string | null;
 }

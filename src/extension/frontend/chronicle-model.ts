@@ -444,12 +444,13 @@ export function carryOnGrant(job: Pick<JobView, "allowance" | "usage" | "workedM
 
 /**
  * How the card for learning the story stands: nothing can be started here (`off`: LumiAH isn't
- * switched on for the chat; `empty`: the chat has no message), Learn this story is the thing to do
- * (`offer`), the chronicle spans the chat (`whole`), or a job is at it or was: it waits, runs,
- * stopped at a limit (`spent`: its own budget, or a day's), is held with no run (`paused`), ended
- * badly (`ended`) or is done.
+ * switched on for the chat; `empty`: the chat has no message; `refused`: LumiAH's own agents don't
+ * keep its chronicle, and the core said why), Learn this story is the thing to do (`offer`), the
+ * chronicle spans the chat (`whole`), or a job is at it or was: it waits, runs, stopped at a limit
+ * (`spent`: its own budget, or a day's), is held with no run (`paused`), ended badly (`ended`) or is
+ * done.
  */
-export type StoryState = "off" | "empty" | "offer" | "whole" | "waiting" | "running" | "spent" | "paused" | "ended" | "done";
+export type StoryState = "off" | "empty" | "refused" | "offer" | "whole" | "waiting" | "running" | "spent" | "paused" | "ended" | "done";
 
 export interface StoryCard {
   state: StoryState;
@@ -498,6 +499,9 @@ export function storyCard(input: StoryInput): StoryCard {
   const job = storyJobOf(story, input.active);
   const behind = progress.behind > 0;
   const estimate = behind ? estimateWords(story.estimate) : "";
+  const plain = { job: null, badge: null, estimate: "", reason: null, progress, actions: NO_ACTIONS, live: false };
+  // An agent of an extension's stands in the chronicler's place, or LumiAH's is switched off: nothing is started or carried on here, and why is said. A job already under way is still shown, so it can be stopped.
+  if (story.refused !== null && (job === null || (job.state !== "queued" && job.state !== "running"))) return { ...plain, state: "refused", title: "LumiAH doesn't learn this story", text: story.refused, learn: false };
   const ofJob = (state: StoryState, title: string, of: JobView, more: Partial<StoryCard> = {}): StoryCard => ({
     state,
     job: of,
@@ -537,7 +541,6 @@ export function storyCard(input: StoryInput): StoryCard {
         break;
     }
   }
-  const plain = { job: null, badge: null, estimate: "", reason: null, progress, actions: NO_ACTIONS, live: false };
   if (!behind) {
     if (story.messages <= 0 && !has) return { ...plain, state: "empty", title: "This chat has no chronicle yet", text: "It has no messages yet, so there is no story to learn. Once the story starts, an agent writes its chronicle as it goes.", learn: false };
     return { ...plain, state: "whole", title: "The chronicle is up to date", text: "", learn: false };

@@ -71,6 +71,8 @@ export interface StoredMessage {
   swipes: string[];
   swipeId: number;
   anchors: Record<number, JsonValue>;
+  /** Hidden from the prompt by the user, as Lumiverse lets them hide a message. */
+  hidden?: boolean;
 }
 
 /** A chat's LumiBooks book as a test gives it: its entries, and the message hashes it kept (none unless the test says: LumiBooks' own book for a chat keeps none). */
@@ -227,7 +229,7 @@ export class MemoryHost implements HarnessHost {
   }
 
   readonly chat = {
-    path: async (chatId: string): Promise<PathMessage[]> => Promise.all((this.chats.get(chatId) ?? []).map(async (m, index) => ({ id: m.id, index, role: m.role, name: m.name, swipeId: m.swipeId, chars: this.shown(m).length, hash: await textHash(this.shown(m)), anchor: this.anchorOf(m, m.swipeId) }))),
+    path: async (chatId: string): Promise<PathMessage[]> => Promise.all((this.chats.get(chatId) ?? []).map(async (m, index) => ({ id: m.id, index, role: m.role, name: m.name, swipeId: m.swipeId, chars: this.shown(m).length, hash: await textHash(this.shown(m)), anchor: this.anchorOf(m, m.swipeId), ...(m.hidden ? { hidden: true } : {}) }))),
     messages: async (chatId: string, from: number, to: number): Promise<ChatMessage[]> => {
       this.messageReads++;
       return (this.chats.get(chatId) ?? []).flatMap((m, index) => (index >= from && index < to ? [{ id: m.id, index, role: m.role, name: m.name, swipeId: m.swipeId, content: this.shown(m) }] : []));
@@ -241,7 +243,7 @@ export class MemoryHost implements HarnessHost {
     info: async (chatId: string): Promise<ChatInfo | null> => {
       const known = this.infos.get(chatId);
       if (!known && !this.chats.has(chatId)) return null;
-      return { id: chatId, name: known?.name ?? chatId, characterId: known?.characterId ?? null, characterName: known?.characterName ?? null, branchedFrom: known?.branchedFrom ?? null, ...(known?.connectionId !== undefined ? { connectionId: known.connectionId } : {}) };
+      return { id: chatId, name: known?.name ?? chatId, characterId: known?.characterId ?? null, characterName: known?.characterName ?? null, branchedFrom: known?.branchedFrom ?? null, ...(known?.connectionId !== undefined ? { connectionId: known.connectionId } : {}), ...(known?.story !== undefined ? { story: known.story } : {}), ...(known?.sovereignHand !== undefined ? { sovereignHand: known.sovereignHand } : {}) };
     },
     anchors: async (cursor?: string): Promise<{ anchors: StoredAnchor[]; next: string | null }> => {
       const all: StoredAnchor[] = [];

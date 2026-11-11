@@ -11,6 +11,7 @@
 import type { JsonObject, JsonValue, ModelEffort, ToolTier } from "./ports";
 import { isRecord } from "./ports";
 import { defaultRecallSettings, RECALL_SETTINGS_SCHEMA, type RecallSettings } from "./recall/settings";
+import { STORY_DEFAULTS, type StorySetting } from "./story";
 import { FAMILY, TOOL } from "./text-def";
 import { hasOwn, type Limit, TIMER_MAX_MS } from "./util";
 
@@ -103,6 +104,8 @@ export interface Settings {
     /** Where Lumiverse's own generation writes the reply (§25): how long a turn waits for its reply to be written before it is given up, in milliseconds; null: as long as it takes. */
     pendingMs: Limit;
   };
+  /** What counts as a chat's story (§24.4): the user's setting, which a chat's own choice and the claiming extension's word stand over. */
+  story: StorySetting;
   /** Each agent definition's settings, by its id. */
   agents: Record<string, AgentSettings>;
   turn: TurnBudget;
@@ -359,6 +362,8 @@ export function defaultSettings(): Settings {
     // A separate writer writes, so the user's preset governs the prose as it does without LumiAH: for the same reason the writer isn't given the agents' guidance unless the user says so.
     // Built in, Lumiverse waits five minutes at most for an extension before a reply: a minute's warning leaves the main agent a round to brief in. A reply that hasn't been written ten minutes after the hand-over isn't coming.
     reply: { writer: "writer", briefAt: "before_last_user", briefRole: "system", withoutBrief: "write", progress: true, progressChars: 160, writerGuidance: false, warnMs: 60_000, pendingMs: 600_000 },
+    // A message the user hid from the prompt was hidden for a reason; whose messages are the story is Lumiverse's Sovereign Hand's to say until the user says otherwise.
+    story: { ...STORY_DEFAULTS },
     agents: {
       // Room in each answer for a reasoning model's thinking and a brief; enough rounds to look things up without wandering.
       [AGENT.main]: { connectionId: null, model: null, effort: "inherit", tools: [...MAIN_TOOLS], toolCalls: "auto", budget: { ...unlimited, callTokensOut: 16_000, toolTurns: 24, revisions: 2, concurrency: 4 } },
@@ -536,6 +541,26 @@ export const SETTINGS_SCHEMA: JsonObject = {
         writerGuidance: flag("Give the writer your guidance", "Put the guidance your agents are given (yours, the character's, the chat's) beside the brief in the writer's prompt. Off, the writer is sent the prompt as Lumiverse assembled it with the brief alone, and the main agent carries into the brief what of your guidance bears on the prose."),
         warnMs: { ...limit("Warn before the reply is due", "Where Lumiverse's own generation writes the reply, it waits only so long for LumiAH. This long before that time is up, the main agent is told to brief the writer with what it has.", "ms", 0), "x-none": "No warning" },
         pendingMs: { ...limit("Give up a reply that isn't written", "Where Lumiverse's own generation writes the reply: how long a turn waits for that reply before it is given up, with no record of it kept.", "ms"), "x-none": "As long as it takes" },
+      },
+    },
+    story: {
+      title: "What counts as the story",
+      description: "Which of a chat's messages the agents read as its story. A chat can choose otherwise on Home, and an extension that answers a chat may set it there.",
+      type: "object",
+      properties: {
+        hidden: choice("Messages you hid", "Messages you hid from the prompt in Lumiverse.", [
+          ["leave_out", "Leave out", "The agents never read them, and their answers say how many were left out."],
+          ["include", "Read them", "The agents read them like any other message."],
+        ]),
+        from: choice("Whose messages", "Whose messages are the story.", [
+          ["lumiverse", "As Lumiverse", "Only the model's replies while Sovereign Hand is on in Lumiverse, everyone's while it is off. Where Lumiverse doesn't say, everyone's."],
+          ["everyone", "Everyone's", "Your messages and the model's replies."],
+          ["replies", "Replies only", "Only the model's replies. Your messages are directions to the model, not part of the story."],
+        ]),
+        newest: choice("Your newest message", "With only the model's replies: what the main agent is given of your newest message.", [
+          ["directive", "As direction", "It is given to the main agent as the direction for the reply."],
+          ["leave_out", "Leave out", "It isn't given: your preset already carries it."],
+        ]),
       },
     },
     agents: agentsSchema(CORE_SCOPE),

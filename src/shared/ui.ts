@@ -41,6 +41,7 @@ import { type AgentStopCode, type AgentUsage, type ApprovalAnswer, type Approval
 import { citationsIn } from "../core/recall/cite";
 import type { ChronicleCheck, CitedMessage, EmbedStatus, HeldWhy, LoreChange, LoreChanged, LoreHitView, LoreListing, LoreRow, LoreSearchView, PromptHeld, StoryStatus } from "../core/recall/shapes";
 import type { Skill } from "../core/skills";
+import { type StoryHolds, type StorySetting, STORY_MEMBERS, storyValue } from "../core/story";
 import { TOOL } from "../core/text-def";
 
 // The trace is core's: the live view renders the events core's agents trace, as core shapes them.
@@ -419,6 +420,25 @@ export interface ChatView {
 /** Whether a reply in the chat reaches LumiAH now: it is switched on to run built in, or it generates on a loopback connection (which a runtime serves). */
 export function chatAnswered(chat: ChatView): boolean {
   return (chat.on && chat.place === "builtin") || chat.connection?.loopback === true;
+}
+
+export type { StoryHolds, StorySetting, StorySource, StoryWord } from "../core/story";
+export { STORY_MEMBERS, storyWordOf } from "../core/story";
+
+/**
+ * What counts as a chat's story (§24.4), as the pages show it: the chat's own choice (each member
+ * left out follows Settings), Settings' choice, the word of the extension that answers the chat (its
+ * name and the members it set; null where it set none: the page shows those as set by it, not to be
+ * changed here), what Lumiverse says of its Sovereign Hand (null: it doesn't tell extensions), and
+ * what holds, member by member, with whose word settled each.
+ */
+export interface ChatStoryView {
+  chatId: string;
+  chosen: Partial<StorySetting>;
+  setting: StorySetting;
+  claimed: { by: string; story: Partial<StorySetting> } | null;
+  sovereignHand: boolean | null;
+  holds: StoryHolds;
 }
 
 /** A run under way: a reply LumiAH is answering, a job, or a side session's turn. `paused`: the user holds its agents at their next round (§18). */
@@ -1141,6 +1161,10 @@ export interface UiRequests {
   "lah.chat.set": { body: { chatId: string; on: boolean; place?: RunPlace }; result: { chat: ChatView } };
   /** Takes over a chat that bears another backend's mark (`ChatView.other`): that mark is removed, the chat gets back the connection it had, and it is switched on here, built in. */
   "lah.chat.takeover": { body: { chatId: string }; result: { chat: ChatView } };
+  /** What counts as a chat's story (§24.4): the chat's own choice, Settings', the word of the extension that answers it, what Lumiverse says of Sovereign Hand, and what holds. */
+  "lah.chat.story.get": { body: { chatId: string }; result: { story: ChatStoryView } };
+  /** The chat's own choice, whole: each member given stands over Settings for this chat, each left out follows them. A member the extension that answers the chat set is its to set: the chat's choice of it is kept, and doesn't hold while the extension's word does. */
+  "lah.chat.story.set": { body: { chatId: string; story: Partial<StorySetting> }; result: { story: ChatStoryView } };
   /** Opens a live view (`StreamId`): its latest turn, or null when it has had none since the extension started; from then on the page hears `lah.live` and `lah.live.delta` for it. */
   "lah.live.open": { body: { stream: StreamId }; result: { live: LiveView | null; next: number | null } };
   /** A turn's events from `from` on, while it is the stream's live turn. */
@@ -1383,6 +1407,8 @@ const BODY: { [K in UiRequestType]: (r: Fields) => boolean } = {
   "lah.chat.get": (r) => isId(r.chatId),
   "lah.chat.set": (r) => isId(r.chatId) && typeof r.on === "boolean" && (r.place === undefined || isPlace(r.place)),
   "lah.chat.takeover": (r) => isId(r.chatId),
+  "lah.chat.story.get": (r) => isId(r.chatId),
+  "lah.chat.story.set": (r) => isId(r.chatId) && isRecord(r.story) && Object.entries(r.story).every(([member, value]) => STORY_MEMBERS.includes(member as keyof StorySetting) && storyValue(member as keyof StorySetting, value)),
   "lah.live.open": (r) => isId(r.stream),
   "lah.live.events": (r) => isId(r.stream) && isId(r.turn) && isSeq(r.from),
   "lah.live.close": (r) => isId(r.stream),

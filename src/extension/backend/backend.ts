@@ -3,7 +3,8 @@
 // anchors, the live buffer and the pages' requests, over one host (spindle.ts in Lumiverse, a fake
 // in the tests).
 
-import { checkSettings, defaultSettings, SETTINGS_SCHEMA, type SettingsScope } from "../../core/settings";
+import { checkSettings, defaultSettings, SETTINGS_SCHEMA, type SettingsScope, settingsOf } from "../../core/settings";
+import { storyWordOf } from "../../core/story";
 import { checkText, TEXT_DEFS } from "../../core/texts";
 import type { JsonObject } from "../../core/ports";
 import { LINK, loopbackModel, runtimeBase, sameBase } from "../../link/contract";
@@ -243,7 +244,28 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
   const live = new LiveBuffer(host, { now, transport: (userId) => settings.transport(userId), linkGoneFor: (userId, relay) => relays.goneFor(userId, relay), missing: () => permissions().some((need) => need.needed) });
   const models = new Models(host, { connections, streams, settings, registry, name });
   const keys = new Keys(host, { registry, relays, settings, connectionName: identity.connectionName, now, later });
-  const chatSwitch = new ChatSwitch(host, { chats, connections, runtimeReady: (userId) => relays.ready(userId), runtimeLinked: async (userId, chatId) => (await runtimeOf(userId, chatId)) !== null, blocked, identity, now });
+  const chatSwitch = new ChatSwitch(host, {
+    chats,
+    connections,
+    runtimeReady: (userId) => relays.ready(userId),
+    runtimeLinked: async (userId, chatId) => (await runtimeOf(userId, chatId)) !== null,
+    blocked,
+    identity,
+    now,
+    storySetting: async (userId) => settingsOf((await settings.values(userId))[CORE_KEY]).story,
+    // What the page shows as the extension's word is what its claim says: a claim that fails or says nothing of the story leaves the chat's and the user's to stand.
+    claimed: async (ask, userId) => {
+      const extension = options.extension;
+      if (extension?.claim === undefined) return null;
+      try {
+        const story = storyWordOf((await extension.claim(ask, userId))?.story);
+        return Object.keys(story).length > 0 ? { by: extension.name, story } : null;
+      } catch (error) {
+        warn(`${extension.name} gave no answer for chat ${ask.chatId}, so its word on the story isn't shown`)(error);
+        return null;
+      }
+    },
+  });
   made.chatSwitch = chatSwitch;
   const sessions = new SessionsPage({ chats, storage, settings, now });
   const approvals = new Approvals({ id: () => randomHex(64) });
@@ -256,6 +278,7 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     settings,
     storage,
     chats,
+    chatSwitch,
     lore,
     presets,
     connections,
@@ -329,6 +352,7 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     models,
     turns,
     chats,
+    chatSwitch,
     storage,
     lore,
     presets,

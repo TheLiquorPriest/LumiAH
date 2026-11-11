@@ -230,7 +230,7 @@ const job = (over: Partial<JobView> = {}): JobView => ({ id: "job-story", chatId
 /** What learning all of Brann's chat is expected to take, and what is left of it once the winter is learned. */
 const WHOLE: StoryEstimate = { messages: 2412, chars: 2_170_800, stretches: 41, promptTokens: 1_200_000, cachedTokens: 800_000, writtenTokens: 60_000, weighedTokens: 480_000, toolTurns: 130, usd: 1.9 };
 const REST: StoryEstimate = { messages: 1112, chars: 1_000_800, stretches: 19, promptTokens: 500_000, cachedTokens: 333_000, writtenTokens: 30_000, weighedTokens: 200_000, toolTurns: 60, usd: 0.8 };
-const story = (over: Partial<StoryView> = {}): StoryView => ({ job: null, plan: null, messages: 2412, covered: 0, suggested: { task: "Learn this story from its start.", agent: "archivist" }, estimate: WHOLE, ...over });
+const story = (over: Partial<StoryView> = {}): StoryView => ({ job: null, plan: null, messages: 2412, covered: 0, suggested: { task: "Learn this story from its start.", agent: "archivist" }, estimate: WHOLE, refused: null, ...over });
 const card = (of: Partial<StoryView>, more: Partial<Parameters<typeof storyCard>[0]> = {}) => storyCard({ story: story(of), active: [], held: new Set(), switches: { off: false, paused: false }, has: false, on: true, ...more });
 
 describe("how far the chronicle has come", () => {
@@ -438,5 +438,15 @@ describe("what Learn this story starts", () => {
     const name = (id: string): string => agents.find((a) => a.id === id)?.name ?? `${id.charAt(0).toUpperCase()}${id.slice(1)}`;
     expect(agentChoices("archivist", agents, name)).toEqual([{ value: "archivist", label: "Archivist" }, { value: "main", label: "Main agent" }, { value: "writer", label: "Writer" }]);
     expect(agentChoices("chronicler", [], name)).toEqual([{ value: "chronicler", label: "Chronicler" }]);
+  });
+});
+
+describe("a story LumiAH's own agents don't keep", () => {
+  test("nothing can be started or carried on, and the card says why in the core's words", () => {
+    const refused = "Tide keeper gives this chat an agent of its own in place of LumiAH's chronicler, so LumiAH keeps no chronicle for it and doesn't learn its story.";
+    expect(card({ refused })).toMatchObject({ state: "refused", text: refused, learn: false, actions: { again: false, carryOn: false, grant: false, resume: false } });
+    // A learning that ended before: not carried on or started again here either.
+    expect(card({ refused, job: job({ state: "done" }) })).toMatchObject({ state: "refused", learn: false });
+    expect(card({ refused, job: job({ state: "spent" }) })).toMatchObject({ state: "refused", learn: false, actions: { carryOn: false, grant: false } });
   });
 });

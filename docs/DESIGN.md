@@ -42,7 +42,8 @@ LumiAH answers only generations that reach the loopback connection. A chat on an
 One continuous session per chat. It decides its own steps: there are no stages, and no code calls a tool or a model on its behalf. Each turn it is given:
 - its instructions (an editable text) and the guidance files that apply;
 - what it carries from earlier turns: the last compaction summary, and a receipt for each turn since;
-- the request: the messages Lumiverse assembled, as a document it reads, with the preset's instruction blocks marked as the instructions the reply must achieve.
+- the request: the messages Lumiverse assembled, as a document it reads, with the preset's instruction blocks marked as the instructions the reply must achieve;
+- where only the model's replies are the story (§24.4): that the user directs the story from outside it, and, where the setting gives it, the user's newest message as the direction for this reply, read from the chat itself.
 
 It works with tools until it has what the reply needs, then calls `write_reply` with a brief.
 
@@ -387,6 +388,21 @@ The level of detail a moment needs slides: a line of summary is enough for most 
 - `web_search`: the user's own web search provider, where they have set one up. Its tier is external (§17).
 
 A tool that rests on something the user hasn't set up is not offered.
+
+**What counts as the story.** Not every message of a chat is story. The user may hide a message from the prompt in Lumiverse. With Lumiverse's Sovereign Hand, the user's own messages are directions to the model, not events in the story. Three choices say what the agents read as the story:
+- **Hidden messages:** left out (the default), or read like any other.
+- **Whose messages:** everyone's, only the model's replies, or as Lumiverse's Sovereign Hand says (the default): only the replies while it is on. Lumiverse doesn't tell extensions yet whether it is on (no part of Spindle reads the user's settings, and `{{loomSovHandActive}}` resolved by an extension always says no), so the adapter's `chats.sovereignHand` answers null, and following Lumiverse counts everyone's messages. The pages say so.
+- **The newest message,** where only the replies are the story: given to the main agent as the direction for this reply (the default), or left out too.
+
+The user sets them in Settings. A chat may choose otherwise, member by member, kept beside its switch. An extension that answers the chat may set any of them in its claim (`ChatClaim.story`), and is asked with what holds below its word (`ClaimAsk.story`, `ClaimAsk.sovereignHand`). The strongest word holds: the claim's, then the chat's own, then the user's. Each run resolves it once, and its hooks are told what holds (`RunBegan.story`).
+
+What the story leaves out, the agents never see:
+- The history tools neither list, search, match nor return a message left out. Each says in one short line how many it left out and why. The other messages keep their numbers.
+- The chronicle's readers and Learn this story read only the story; a message left out is nothing to learn, and counts in no figure on the page. A citation still checks against the whole chat, but a chronicle line whose cited messages are all left out is not given to the main agent.
+- Search by meaning never embeds a message left out.
+- The request Lumiverse assembled is shown to the main agent as it is: it is the preset's.
+
+The chronicle is kept and learned by LumiAH's own chronicler and story reader (§24.7). In a chat where an extension puts an agent of its own under either name, or where the user switched one off, LumiAH offers no upkeep and refuses Learn this story, saying why.
 
 ### 24.5 Search by meaning
 Where the user has an embedding connection and the setting allows, LumiAH keeps a vector for each lore entry and each chat message, in the user's storage by the text's hash, so an unchanged text is never embedded twice. New text is embedded in the background under a daily cap. `lore_search` and `chat_search` merge matches by meaning with matches by word. Without an embedding connection, search is by word and says so. The page shows how much is embedded and what it cost.

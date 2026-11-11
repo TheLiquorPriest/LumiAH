@@ -389,6 +389,11 @@ export class Ui {
         this.touch(userId, "chats", "setup");
         return { chat };
       }
+      case "lah.chat.story.get":
+        return { story: await d.switch.story(userId, r.chatId) };
+      // The core reads the chat's choice with the chat at each run's start: nothing to push.
+      case "lah.chat.story.set":
+        return { story: await d.switch.setStory(userId, r.chatId, r.story) };
       case "lah.live.open":
         return d.live.open(userId, r.stream, session);
       case "lah.live.events": {

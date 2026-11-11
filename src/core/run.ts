@@ -30,6 +30,7 @@ import type { Sessions } from "./sessions";
 import { type AgentBudget, type Settings, settingsOf, type TurnBudget } from "./settings";
 import type { SkillRegistry } from "./skills";
 import type { Spend } from "./spend";
+import { type StoryHolds, storyHolds, storyWordOf } from "./story";
 import { TEXT, TOOL, type Texts, textDef, textsOf } from "./texts";
 import type { AgentTool, ChatView, DelegateChoice, JobStarted, JobTools, LoreView, PastTurn, RunInfo, ToolEnv, ToolOutcome, ToolRegistry } from "./tools";
 import { TurnTrace } from "./transcript";
@@ -138,16 +139,18 @@ async function remoteTools(host: Pick<HarnessHost, "tools" | "log">, chatId: str
 function claimOf(raw: unknown): ChatClaim | null {
   if (!isRecord(raw)) return null;
   const guidance = isRecord(raw.guidance) && typeof raw.guidance.name === "string" ? raw.guidance : null;
+  const story = storyWordOf(raw.story);
   return {
     ...(typeof raw.mainAgent === "string" ? { mainAgent: raw.mainAgent } : {}),
     ...(guidance && typeof guidance.path === "string" ? { guidance: { name: guidance.name as string, path: guidance.path } } : guidance && typeof guidance.text === "string" ? { guidance: { name: guidance.name as string, text: guidance.text } } : {}),
     ...(Array.isArray(raw.withdraw) ? { withdraw: raw.withdraw.filter((name): name is string => typeof name === "string") } : {}),
+    ...(Object.keys(story).length > 0 ? { story } : {}),
   };
 }
 
 // ---------------------------------------------------------------- what a run reads when it starts
 
-/** What a run works with: whose it is, the user's settings and texts as they stand, the definitions merged from their three sources, the run's chat, and what the extension supplies for it. */
+/** What a run works with: whose it is, the user's settings and texts as they stand, the definitions merged from their three sources, the run's chat, what the extension supplies for it, and what counts as the chat's story (§24.4). */
 export interface Setup {
   userId: string;
   settings: Settings;
@@ -155,6 +158,7 @@ export interface Setup {
   definitions: Definitions;
   chat: ChatInfo | null;
   claim: ChatClaim | null;
+  story: StoryHolds;
 }
 
 /**
@@ -166,20 +170,25 @@ export async function readSetup(shared: Shared, chatId: string, userId: string =
   const { host, options } = shared;
   const stored = await options.settings();
   const extension = options.extension;
-  // How long the extension is waited for is a setting too, so it is read before anything is asked of it.
-  const { waitMs } = settingsOf(stored.values).extension;
+  // How long the extension is waited for is a setting too, so it is read before anything is asked of it; and so is the user's word on the story, which the claim is told.
+  const early = settingsOf(stored.values);
+  const { waitMs } = early.extension;
   let chat: ChatInfo | null = null;
   if (chatId !== "") {
     try {
       chat = (await host.chat.info?.(chatId)) ?? null;
     } catch (error) {
-      host.log("warn", `[LumiAH] the chat ${chatId} couldn't be read (${errorText(error)}): this run has no character's guidance`);
+      host.log("warn", `[LumiAH] the chat ${chatId} couldn't be read (${errorText(error)}): this run has no character's guidance, and no choice of the chat's own on what counts as its story`);
     }
   }
   const asked: ChatInfo = chat ?? { id: chatId, name: "", characterId: null, characterName: null, branchedFrom: null };
+  // What counts as the story without the extension's word: the chat's own choice over the user's setting, Lumiverse's Sovereign Hand where they follow it. What the host says of either is outside data.
+  const chosen = storyWordOf(chat?.story);
+  const sovereignHand = typeof chat?.sovereignHand === "boolean" ? chat.sovereignHand : null;
+  const below = storyHolds({ chat: chosen, user: early.story, sovereignHand });
   const [own, claimed, remote] = await Promise.all([
     askExtension<unknown>(shared, "definitions", waitMs, extension?.definitions ? () => extension.definitions?.({ userId, chatId: chatId === "" ? null : chatId }) ?? Promise.resolve({}) : undefined, {}),
-    chatId === "" ? null : askExtension<unknown>(shared, "answer for the chat", waitMs, extension?.claim ? () => extension.claim?.({ userId, chatId, chat: asked }) ?? Promise.resolve(null) : undefined, null),
+    chatId === "" ? null : askExtension<unknown>(shared, "answer for the chat", waitMs, extension?.claim ? () => extension.claim?.({ userId, chatId, chat: asked, story: below.source, sovereignHand }) ?? Promise.resolve(null) : undefined, null),
     remoteTools(host, chatId),
   ]);
   const supplied = isRecord(own) ? own : {};
@@ -197,7 +206,8 @@ export async function readSetup(shared: Shared, chatId: string, userId: string =
   );
   const settings = settingsOf(stored.values, definitions.scope());
   shared.latest = settings;
-  return { userId, settings, texts: textsOf(stored.texts), definitions, chat, claim };
+  const story = claim?.story ? storyHolds({ claim: claim.story, chat: chosen, user: early.story, sovereignHand }) : below;
+  return { userId, settings, texts: textsOf(stored.texts), definitions, chat, claim, story };
 }
 
 /** An agent definition's instructions as they are sent: the user's text for a definition that names one of the core's, else its own. */
@@ -290,6 +300,8 @@ export class Run {
   readonly definitions: Definitions;
   readonly chat: ChatInfo | null;
   readonly claim: ChatClaim | null;
+  /** What counts as the chat's story for this run (§24.4): every agent of it reads the chat as this says. */
+  readonly story: StoryHolds;
   readonly startedAt: number;
   readonly trace: TurnTrace;
   readonly agents: AgentTurn;
@@ -335,6 +347,7 @@ export class Run {
     this.definitions = setup.definitions;
     this.chat = setup.chat;
     this.claim = setup.claim;
+    this.story = setup.story;
     this.startedAt = start.startedAt;
     this.trace = new TurnTrace(host, { turn: this.info.id, chatId: this.info.chatId }, shared.blobs, this.settings.keep.prompts, (event) => this.hear(event));
     // Work carried on counts what it spent before: its time as if it had started that much earlier, its tokens and rounds as already used.
@@ -399,12 +412,12 @@ export class Run {
     this.guidance = guidance;
     this.book = book;
     // What the user has set up of what the lore and history tools rest on (§24) is read before any tool is built.
-    this.recall = recallOf({ host: shared.host, run: this.info, ...(this.start.turn ? { turn: this.start.turn } : {}), settings, texts, chat: equipment.chat, ...(book ? { book } : {}) });
+    this.recall = recallOf({ host: shared.host, run: this.info, ...(this.start.turn ? { turn: this.start.turn } : {}), settings, texts, chat: equipment.chat, story: this.story.source, ...(book ? { book } : {}) });
     await this.recall.ready();
     this.prefix = guidancePrefix(guidance, settings, texts);
     this.guard = guidanceGuard(guidance, settings, texts);
     const extension = shared.options.extension;
-    await askExtension(shared, "answer to a run beginning", settings.extension.waitMs, extension?.runBegan ? () => extension.runBegan?.({ userId: this.userId, chatId: this.info.chatId, turn: this.info.id, kind: this.info.kind }) ?? Promise.resolve() : undefined, undefined);
+    await askExtension(shared, "answer to a run beginning", settings.extension.waitMs, extension?.runBegan ? () => extension.runBegan?.({ userId: this.userId, chatId: this.info.chatId, turn: this.info.id, kind: this.info.kind, story: this.story.source }) ?? Promise.resolve() : undefined, undefined);
   }
 
   private equipped(): Equipment {
@@ -526,6 +539,7 @@ export class Run {
       depth: how.depth,
       standing: { main: how.main === true, above },
       chat: equipment.chat,
+      story: this.story.source,
       lore: equipment.lore,
       past: how.past ?? equipment.past,
       ...(how.writeReply ? { writeReply: how.writeReply } : {}),

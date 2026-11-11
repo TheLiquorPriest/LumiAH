@@ -20,6 +20,7 @@
 import type { AgentDefinition } from "./agents";
 import type { AgentUsage, ChatInfo, ModelMessage, RunKind, TurnKind, TurnRecord, TurnStatus } from "./ports";
 import type { Skill } from "./skills";
+import type { StorySetting, StorySource } from "./story";
 
 /**
  * A level of guidance (§12) by the name agents are told it under ("this world's"), and where its
@@ -30,8 +31,10 @@ export type GuidanceLevel = { name: string; path: string } | { name: string; tex
 
 /**
  * What an extension supplies for one chat it claims: the agent definition that answers it in place
- * of LumiAH's main agent; the middle level of guidance, in place of the character's; and the tools
- * of LumiAH's own it withdraws there, by name (none of this chat's agents is offered them).
+ * of LumiAH's main agent; the middle level of guidance, in place of the character's; the tools
+ * of LumiAH's own it withdraws there, by name (none of this chat's agents is offered them); and its
+ * word on what counts as the chat's story (§24.4), member by member: each member it gives stands
+ * over the chat's own choice and the user's setting, and the pages show it as set by the extension.
  *
  * Claiming a chat is also what lets the extension's own tools stand in for LumiAH's: in a chat it
  * claims, a tool of its that bears the name of one of LumiAH's replaces it (its `lore_search`, with
@@ -42,6 +45,7 @@ export interface ChatClaim {
   mainAgent?: string;
   guidance?: GuidanceLevel;
   withdraw?: string[];
+  story?: Partial<StorySetting>;
 }
 
 /** An extension's own definitions: its defaults, which the user's still override (§13). */
@@ -56,11 +60,20 @@ export interface DefinitionsAsk {
   chatId: string | null;
 }
 
-/** The chat a claim is asked about, and whose it is. */
+/**
+ * The chat a claim is asked about, and whose it is. `story`: what counts as the chat's story without
+ * the claim's word (the chat's own choice over the user's setting, Lumiverse's Sovereign Hand
+ * followed where they say to). The claim's `story` stands over it member by member, so the story the
+ * chat's runs read is known when the claim is made. `sovereignHand`: whether Lumiverse's Sovereign
+ * Hand is on for the user in this chat; null where Lumiverse doesn't tell extensions (a word that
+ * follows Lumiverse then counts it as off).
+ */
 export interface ClaimAsk {
   userId: string;
   chatId: string;
   chat: ChatInfo;
+  story: StorySource;
+  sovereignHand: boolean | null;
 }
 
 /** The writer's request as the core built it: Lumiverse's messages as they came, with the main agent's brief put in (null: it wrote none). */
@@ -73,13 +86,14 @@ export interface WriterRequest {
   messages: ModelMessage[];
 }
 
-/** A run beginning: a turn that answers a generation, a job's run, or a turn of a side session (`chatId` is empty for one about no chat). */
+/** A run beginning: a turn that answers a generation, a job's run, or a turn of a side session (`chatId` is empty for one about no chat). `story`: what counts as the chat's story for this run (§24.4), the claim's word included. */
 export interface RunBegan {
   userId: string;
   chatId: string;
   /** The run's id: the generation's, the job's, or the side session turn's. */
   turn: string;
   kind: RunKind;
+  story: StorySource;
 }
 
 /** A turn's reply, written whole: its text as it was sent, and how its last call ended. */

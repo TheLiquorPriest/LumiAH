@@ -11,12 +11,13 @@ import type { Definitions } from "../definitions";
 import type { HarnessHost, PathMessage } from "../ports";
 import { HarnessRefusal } from "../refusal";
 import { AGENT, type Settings } from "../settings";
+import type { StorySource } from "../story";
 import { TEXT, type Texts } from "../texts";
 import { countedIn, priced } from "../usage";
 import { tokensOf } from "../util";
 import { type AreaAccess, fileAt, showPath } from "../workspace";
 import { whoOf } from "./chat";
-import { type ChatHashes, checkChronicle, chronicleReach, readChronicle, uncoveredMessages, uncoveredRuns } from "./chronicle";
+import { checkChronicle, chronicleReach, readChronicle, storyHashes, uncoveredMessages, uncoveredRuns } from "./chronicle";
 import { checkCitation, namedMessage, placesOf } from "./cite";
 import { CHRONICLER, RECALL_SKILL, recallAgents } from "./definitions";
 import type { LoreDoc } from "./lore";
@@ -44,19 +45,18 @@ export interface RecallPage {
 
 export interface RecallPageDeps {
   host: HarnessHost;
-  /** The user's settings and texts as they stand, as a run about the chat would read them, and the definitions where the caller has them: the model the chronicler runs on is read from them. */
-  setup(chatId: string): Promise<{ settings: Settings; texts: Texts; definitions?: Pick<Definitions, "resolve"> }>;
+  /**
+   * The user's settings and texts as they stand, as a run about the chat would read them, the
+   * definitions where the caller has them (the model the chronicler runs on is read from them), what
+   * counts as the chat's story, and why LumiAH's own agents don't keep its chronicle (null: they do).
+   */
+  setup(chatId: string): Promise<{ settings: Settings; texts: Texts; definitions?: Pick<Definitions, "resolve">; story: StorySource; chronicle: string | null }>;
   /** The chat's `learned/` area. */
   learned(chatId: string): Promise<AreaAccess | null>;
 }
 
 /** The plan of a story's learning, within the `learned` area. A path the skill names, so fixed. */
 const PLAN = "chronicle/plan.md";
-
-/** A chat's messages by their hashes alone: what a citation is checked against where no text is needed. */
-function hashesOf(path: readonly PathMessage[]): ChatHashes {
-  return { hashes: () => new Map(path.map((m) => [m.index, m.hash])), last: path.at(-1) };
-}
 
 /**
  * What learning the rest of a story is expected to take (`StoryEstimate`): a plain reckoning from
@@ -127,11 +127,11 @@ export function recallPage(deps: RecallPageDeps): RecallPage {
   };
 
   /** A view of the chat for one request, with the user's settings and texts as they stand. */
-  const view = async (chatId: string): Promise<{ run: RecallRun; settings: Settings; texts: Texts; path: () => Promise<readonly PathMessage[]> }> => {
-    const { settings, texts } = await deps.setup(chatId);
+  const view = async (chatId: string): Promise<{ run: RecallRun; settings: Settings; texts: Texts }> => {
+    const { settings, texts, story } = await deps.setup(chatId);
     let read: Promise<PathMessage[]> | undefined;
     const path = (): Promise<PathMessage[]> => (read ??= host.chat.path(chatId));
-    return { run: recallOf({ host, run: { id: `page-${++asked}`, kind: "side", chatId }, settings, texts, chat: { path } }), settings, texts, path };
+    return { run: recallOf({ host, run: { id: `page-${++asked}`, kind: "side", chatId }, settings, texts, chat: { path }, story }), settings, texts };
   };
 
   const status = async (run: RecallRun, settings: Settings, start: boolean): Promise<EmbedStatus> => recall.meaning.status({ lore: await run.loreGroups(), chat: await run.chatGroup(), settings, start });
@@ -205,7 +205,8 @@ export function recallPage(deps: RecallPageDeps): RecallPage {
 
     async chronicle(input) {
       const chatId = chatOf(input);
-      return checkChronicle(await readChronicle(await deps.learned(chatId)), hashesOf(await host.chat.path(chatId)));
+      const { story } = await deps.setup(chatId);
+      return checkChronicle(await readChronicle(await deps.learned(chatId)), storyHashes(await host.chat.path(chatId), story));
     },
 
     async cited(input) {
@@ -236,12 +237,13 @@ export function recallPage(deps: RecallPageDeps): RecallPage {
 
     async story(input) {
       const chatId = chatOf(input);
-      const { settings, texts, definitions } = await deps.setup(chatId);
+      const { settings, texts, definitions, story, chronicle } = await deps.setup(chatId);
       const learned = await deps.learned(chatId);
       const path = await host.chat.path(chatId);
       const plan = learned && fileAt(await learned.index(), PLAN) ? showPath("learned", PLAN) : null;
       const files = await readChronicle(learned);
-      const chat = hashesOf(path);
+      // What the story leaves out is nothing to learn: it counts in no figure here.
+      const chat = storyHashes(path, story);
       const { covered } = chronicleReach(files, chat);
       const left = new Set(uncoveredMessages(files, chat));
       // The model the chronicler runs on: its own, else the one it follows, else its connection's. Where none of them can be read the estimate has no cost.
@@ -249,7 +251,7 @@ export function recallPage(deps: RecallPageDeps): RecallPage {
       const resolved = definitions?.resolve(CHRONICLER, settings) ?? (builtIn ? resolveAgent(builtIn, settings, baseAgents().find((agent) => agent.id === AGENT.main)) : undefined);
       const model = resolved?.model ?? (await host.connections.get(resolved?.connectionId ?? null).catch(() => null))?.model ?? null;
       const estimate = storyEstimate(path.filter((m) => left.has(m.index)), uncoveredRuns(files, chat).map(([from]) => from), settings, model === "" ? null : model);
-      return { plan, messages: path.length, covered, estimate, suggested: { task: texts.render(TEXT.recall.story.objective, { skill: RECALL_SKILL.learn }), agent: CHRONICLER } };
+      return { plan, messages: chat.story().length, covered, estimate, suggested: { task: texts.render(TEXT.recall.story.objective, { skill: RECALL_SKILL.learn }), agent: CHRONICLER }, refused: chronicle };
     },
   };
 }

@@ -22,6 +22,8 @@ export const BODIES: { [K in UiRequestType]: UiRequests[K]["body"] } = {
   "lah.chat.get": { chatId: "chat-mara" },
   "lah.chat.set": { chatId: "chat-mara", on: true },
   "lah.chat.takeover": { chatId: "chat-joss" },
+  "lah.chat.story.get": { chatId: "chat-mara" },
+  "lah.chat.story.set": { chatId: "chat-mara", story: { from: "replies" } },
   "lah.live.open": { stream: "chat-mara" },
   "lah.live.events": { stream: "chat-mara", turn: "turn-1", from: 1 },
   "lah.live.close": { stream: "chat-mara" },

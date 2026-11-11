@@ -15,7 +15,8 @@ export const HOME_CSS = `
 .lah-chatswitch-line>span{min-width:0}
 .lah-chatswitch-line[data-tone=pos]>.lah-icon{color:var(--lah-pos)}
 .lah-chatswitch-line[data-tone=warn]{color:var(--lah-warn)}
-.lah-chatswitch-place{display:flex;flex-direction:column;gap:var(--lah-s2);min-width:0;padding-top:var(--lah-s2);border-top:1px solid var(--lah-hairline)}
+.lah-chatswitch-place,.lah-chatswitch-story{display:flex;flex-direction:column;gap:var(--lah-s2);min-width:0;padding-top:var(--lah-s2);border-top:1px solid var(--lah-hairline)}
+.lah-chatswitch-story-row{display:flex;flex-direction:column;gap:var(--lah-s2);min-width:0}
 .lah-need{display:flex;flex-wrap:wrap;align-items:flex-start;gap:var(--lah-s2) var(--lah-s3);padding:var(--lah-s3);border-top:1px solid var(--lah-hairline);min-width:0}
 .lah-need:first-child{border-top:0}
 .lah-need>.lah-icon{margin-top:2px}

@@ -420,7 +420,7 @@ describe("what the pages read", () => {
     const left = path.slice(8).reduce((n, m) => n + m.chars, 0);
     const tokens = left / r.stored.values.loop.charsPerToken;
     const reckoned = { messages: 4, chars: left, stretches: 1, promptTokens: Math.ceil(tokens * 4), cachedTokens: 0, writtenTokens: Math.ceil(tokens * 0.25), weighedTokens: Math.ceil(tokens * 4), toolTurns: 4 };
-    expect(await r.harness.recall.story({ chatId: CHAT })).toEqual({ plan: null, messages: path.length, covered: 8, estimate: { ...reckoned, usd: null }, suggested: { task: "Learn this chat's story and build its chronicle in learned/chronicle/. Load the skill story-learn first and follow it.", agent: "chronicler" } });
+    expect(await r.harness.recall.story({ chatId: CHAT })).toEqual({ plan: null, messages: path.length, covered: 8, estimate: { ...reckoned, usd: null }, suggested: { task: "Learn this chat's story and build its chronicle in learned/chronicle/. Load the skill story-learn first and follow it.", agent: "chronicler" }, refused: null });
     // The chronicler runs where the main agent does: once the user has a price for that model, the estimate has a cost.
     r.stored.values.prices["model-main"] = { in: 2, cachedIn: 0.2, out: 8 };
     expect((await r.harness.recall.story({ chatId: CHAT })).estimate.usd).toBeCloseTo((reckoned.promptTokens * 2 + reckoned.writtenTokens * 8) / 1_000_000, 12);

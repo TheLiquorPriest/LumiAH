@@ -721,7 +721,8 @@ export function storyOf(raw: JsonValue): StoryRead {
     toolTurns: number(e.toolTurns, what),
     usd: numberOrNull(e.usd, what),
   };
-  return { plan: textOrNull(o.plan, what), messages: number(o.messages, what), covered: number(o.covered, what), suggested: { task: text(suggested.task, what), agent: text(suggested.agent, what) }, estimate };
+  // A runtime of an earlier build says nothing of a refusal: there the story can be learned, as it could then.
+  return { plan: textOrNull(o.plan, what), messages: number(o.messages, what), covered: number(o.covered, what), suggested: { task: text(suggested.task, what), agent: text(suggested.agent, what) }, estimate, refused: typeof o.refused === "string" ? o.refused : null };
 }
 
 /**

@@ -177,7 +177,7 @@ describe("Learn this story, offered for a long chat nobody has learned", () => {
   const real = realSettings();
   const own: UiState = new MockBackend(() => {}, { scenario: "ready", turn: "none", sections: real.sections, texts: real.texts, delay: 0, page: 50, fail: new Set(), now: () => T0, later: () => () => {} }).state;
   const ESTIMATE: StoryEstimate = { messages: 1840, chars: 1_656_000, stretches: 31, promptTokens: 459_000, cachedTokens: 0, writtenTokens: 30_000, weighedTokens: 459_000, toolTurns: 13, usd: 0.21 };
-  const view = (over: Partial<StoryView> = {}): StoryView => ({ job: null, plan: null, messages: 1840, covered: 0, suggested: { task: "Learn this story from its start.", agent: "archivist" }, estimate: ESTIMATE, ...over });
+  const view = (over: Partial<StoryView> = {}): StoryView => ({ job: null, plan: null, messages: 1840, covered: 0, suggested: { task: "Learn this story from its start.", agent: "archivist" }, estimate: ESTIMATE, refused: null, ...over });
   const story = (over: Partial<StoryView> = {}): HomeInput["story"] => ({ chatId: "chat-mara", view: view(over) });
   const learning: JobView = { id: "job-story", chatId: "chat-mara", agent: "archivist", task: "Learn this story from its start.", when: "now", state: "running", by: { who: "user" }, basis: null, createdAt: T0, usage: { calls: 0, toolTurns: 0, in: 0, cachedIn: 0, out: 0, reasoningOut: 0, estimated: false, ms: 0, cost: 0 } };
 

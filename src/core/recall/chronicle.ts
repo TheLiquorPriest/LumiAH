@@ -14,9 +14,15 @@
 // The check proves that a cited message exists and reads as cited, never that it supports the line:
 // that is the reading agent's to judge. `chronicle_check`, the Chronicle page and the turn all read
 // through this file.
+//
+// What counts as the story (§24.4) is what the chronicle covers: a message the story leaves out is
+// nothing to learn, so a chat whose last messages are left out is still learned to its end. A
+// citation of such a message still checks (it names a message of the chat), but a line whose every
+// citation names one is not given to the main agent.
 
-import type { JobView } from "../ports";
+import type { JobView, PathMessage } from "../ports";
 import type { Settings } from "../settings";
+import { leftOutWhy, type StorySource } from "../story";
 import { TEXT, type Texts } from "../texts";
 import { clip } from "../util";
 import { type AreaAccess, fileAt, filesIn, showPath } from "../workspace";
@@ -53,10 +59,21 @@ export interface ChronicleFile extends ChronicleText {
   version: string;
 }
 
-/** The little of a chat a check needs: each message's hash by its number, and the last message. A `ChatRun` is one; a turn makes one from the chat's path alone, without any message's text. */
+/**
+ * The little of a chat a check needs: each message's hash by its number, every message of the
+ * chat's (those the story leaves out among them: a citation names a message of the chat), and the
+ * numbers of the messages that count as the story, ascending: what the chronicle covers. A
+ * `ChatRun` is one; a turn makes one from the chat's path alone, without any message's text
+ * (`storyHashes`).
+ */
 export interface ChatHashes {
   hashes(): Map<number, string>;
-  readonly last: { index: number } | undefined;
+  story(): number[];
+}
+
+/** A chat's path as a check reads it: every message's hash, and the numbers of those that count as the story. */
+export function storyHashes(path: readonly PathMessage[], story: StorySource): ChatHashes {
+  return { hashes: () => new Map(path.map((m) => [m.index, m.hash])), story: () => path.filter((m) => leftOutWhy(m, story) === null).map((m) => m.index) };
 }
 
 /** Whether a path within the `learned` area is a file of the chronicle: markdown, directly in its folder, and not one of the two kept beside it. */
@@ -119,10 +136,11 @@ function linesOf(text: string): string[] {
   return lines;
 }
 
-/** What a check found beyond what the page is given: which lines of each file fail, for each failed citation (in the order of `check.failures`) the messages that read as cited where several do, and the highest message number a citation that passes names. */
+/** What a check found beyond what the page is given: which lines of each file fail, which pass but rest only on messages the story leaves out, for each failed citation (in the order of `check.failures`) the messages that read as cited where several do, and the highest number of a message of the story a citation that passes names. */
 interface Examined {
   check: ChronicleCheck;
   failed: Map<string, Set<number>>;
+  aside: Map<string, Set<number>>;
   several: (readonly number[])[];
   reach: number | null;
 }
@@ -133,21 +151,28 @@ interface Examined {
  * says something a reader would take for what the story established, and no check ever touched it.
  * Only layout is asked for no citation: a blank line, a rule (a line with no letter and no digit)
  * and a heading. A citation whose number alone is wrong (`moved`) passes: which message it means
- * is not in doubt.
+ * is not in doubt. A line that passes and cites no message of the story (each one it cites is left
+ * out now) is set aside: it is not the story's, so it reaches no further than the check.
  */
 function examine(files: readonly ChronicleText[], chat: ChatHashes): Examined {
   const hashes = chat.hashes();
   const places = placesOf(hashes);
+  const story = new Set(chat.story());
   const check: ChronicleCheck = { files: [], failures: [], moved: [], uncited: [] };
   const failed = new Map<string, Set<number>>();
+  const aside = new Map<string, Set<number>>();
   const several: (readonly number[])[] = [];
   let reach: number | null = null;
-  const passesAt = (index: number): void => {
+  /** A citation that passes names `index`: whether that is a message of the story, which is all the chronicle's reach counts. */
+  const passesAt = (index: number): boolean => {
+    if (!story.has(index)) return false;
     if (reach === null || index > reach) reach = index;
+    return true;
   };
   for (const { path, text } of files) {
     const lines = linesOf(text);
     const fails = new Set<number>();
+    const apart = new Set<number>();
     let cited = 0;
     lines.forEach((raw, i) => {
       const line = i + 1;
@@ -161,14 +186,15 @@ function examine(files: readonly ChronicleText[], chat: ChatHashes): Examined {
       }
       cited++;
       const seen = new Set<string>();
+      let rests = false;
       for (const cite of cites) {
         // A citation written twice on a line is listed once. Told apart as written, so that each way it is written is corrected where its number is wrong.
         if (seen.has(cite.text)) continue;
         seen.add(cite.text);
         const stands = checkCitation(cite, hashes, places);
-        if (stands.state === "ok") passesAt(cite.index);
+        if (stands.state === "ok") rests = passesAt(cite.index) || rests;
         else if (stands.state === "moved") {
-          passesAt(stands.now);
+          rests = passesAt(stands.now) || rests;
           check.moved.push({ path, line, citation: cite.text, index: cite.index, now: stands.now });
         } else {
           fails.add(line);
@@ -176,11 +202,13 @@ function examine(files: readonly ChronicleText[], chat: ChatHashes): Examined {
           several.push(stands.several);
         }
       }
+      if (!rests && !fails.has(line)) apart.add(line);
     });
     failed.set(path, fails);
+    aside.set(path, apart);
     check.files.push({ path, chars: text.length, lines: lines.length, cited, failed: fails.size });
   }
-  return { check, failed, several, reach };
+  return { check, failed, aside, several, reach };
 }
 
 /**
@@ -241,16 +269,17 @@ export function chroniclerJob(jobs: readonly Pick<JobView, "agent" | "state">[])
   return own.some((job) => job.state === "queued") ? "waiting" : "none";
 }
 
-/** One file's top as the pinned part shows it, within `room` characters; null where the room can't hold its heading and a line. */
-function pinnedBlock(file: ChronicleText, fails: ReadonlySet<number>, texts: Texts, room: number): string | null {
+/** One file's top as the pinned part shows it, within `room` characters; null where the room can't hold its heading and a line. `fails`: the lines that fail the check; `apart`: those that rest only on messages the story leaves out. Neither is shown, and the heading counts each. */
+function pinnedBlock(file: ChronicleText, fails: ReadonlySet<number>, apart: ReadonlySet<number>, texts: Texts, room: number): string | null {
   const C = TEXT.recall.chronicle;
   // A blank line parts nothing here that the next line's own opening doesn't, and costs room.
   const held = linesOf(file.text)
-    .map((line, i) => ({ text: line.trimEnd(), fails: fails.has(i + 1) }))
+    .map((line, i) => ({ text: line.trimEnd(), fails: fails.has(i + 1), apart: apart.has(i + 1) }))
     .filter((line) => line.text.trim() !== "");
-  const kept = held.filter((line) => !line.fails).map((line) => line.text);
-  const left = held.length - kept.length;
-  const failedNote = left === 0 ? "" : texts.render(C.pinnedFailed, { count: texts.counted(left, TEXT.recall.word.line) });
+  const kept = held.filter((line) => !line.fails && !line.apart).map((line) => line.text);
+  const failing = held.filter((line) => line.fails).length;
+  const resting = held.filter((line) => line.apart).length;
+  const failedNote = `${failing === 0 ? "" : texts.render(C.pinnedFailed, { count: texts.counted(failing, TEXT.recall.word.line) })}${resting === 0 ? "" : texts.render(C.pinnedApart, { count: texts.counted(resting, TEXT.recall.word.line) })}`;
   const block = (more: string, shown: readonly string[]): string => texts.render(C.pinnedFile, { path: file.path, more, failed: failedNote, lines: shown.join("\n") }).trimEnd();
   const more = (shown: number): string => texts.render(C.pinnedMore, { shown: String(shown), total: texts.counted(held.length, TEXT.recall.word.line) });
   const whole = block("", kept);
@@ -277,10 +306,12 @@ function pinnedBlock(file: ChronicleText, fails: ReadonlySet<number>, texts: Tex
 
 /**
  * The top of the chronicle for the main agent's turn (§24.7), within Pinned chronicle: length in
- * all: the top of each file, without the lines that fail the check and with a wrong number shown
- * right (the file is `chronicle_check`'s to correct); where the chronicle reaches, where the chat
- * is and how many messages it is past the chronicle; and one upkeep line, while Settings ask for it
- * and the chronicler's jobs are known (`jobs`; null: jobs can't run, or couldn't be read).
+ * all: the top of each file, without the lines that fail the check or rest only on messages the
+ * story leaves out, and with a wrong number shown right (the file is `chronicle_check`'s to
+ * correct); where the chronicle reaches, where the story is and how many of its messages it is past
+ * the chronicle; and one upkeep line, while Settings ask for it and the chronicler's jobs are known
+ * (`jobs`; null: jobs can't run, couldn't be read, or the chronicle isn't kept by LumiAH's own
+ * agents in this chat).
  *
  * The upkeep line is what keeps the chronicle from costing the reply a round: it says whether a job
  * is at work, and where one is wanted it carries the whole of how to start it, so the main agent
@@ -298,8 +329,8 @@ export async function pinnedChronicle(input: { learned: AreaAccess | null; chat:
   // No `learned` area, no place to keep a chronicle: nothing to pin, and nothing to ask for.
   if (!pin || !input.learned) return "";
   const keeper = remind ? input.jobs : null;
-  const numbers = [...chat.hashes().keys()].sort((a, b) => a - b);
-  const last = String(chat.last?.index ?? 0);
+  const numbers = chat.story();
+  const last = String(numbers.at(-1) ?? 0);
   const files = (await readChronicle(input.learned)).filter((file) => file.text.trim() !== "");
   const found = files.length === 0 ? null : examine(files, chat);
   const reach = found ? found.reach : null;
@@ -344,7 +375,7 @@ export async function pinnedChronicle(input: { learned: AreaAccess | null; chat:
   ordered.forEach((file, i) => {
     // Each file's share of what is left, less the line break that parts it from the next.
     const share = Math.floor(room / (ordered.length - i)) - 1;
-    const block = pinnedBlock({ path: file.path, text: correctedText(file, found.check.moved) }, found.failed.get(file.path) ?? new Set(), texts, share);
+    const block = pinnedBlock({ path: file.path, text: correctedText(file, found.check.moved) }, found.failed.get(file.path) ?? new Set(), found.aside.get(file.path) ?? new Set(), texts, share);
     if (block === null) return;
     blocks.push(block);
     room -= block.length + 1;
@@ -399,28 +430,25 @@ function coveredAmong(files: readonly ChronicleText[], numbers: readonly number[
   });
 }
 
-/** The chat's message numbers, ascending. */
-const numbersOf = (chat: ChatHashes): number[] => [...chat.hashes().keys()].sort((a, b) => a - b);
-
-/** How far the chronicle's outline reaches: how many of the chat's messages lie in a span one of its items names. */
+/** How far the chronicle's outline reaches: how many of the messages of the story lie in a span one of its items names. */
 export function chronicleReach(files: readonly ChronicleText[], chat: ChatHashes): { covered: number } {
-  return { covered: coveredAmong(files, numbersOf(chat)).filter((is) => is).length };
+  return { covered: coveredAmong(files, chat.story()).filter((is) => is).length };
 }
 
 /**
- * The numbers of the chat's messages no item of the outline covers, ascending: what nobody has read
- * into the chronicle, the messages after the outline's last among them. Every message where there
- * is no outline.
+ * The numbers of the story's messages no item of the outline covers, ascending: what nobody has read
+ * into the chronicle, the messages after the outline's last among them. Every message of the story
+ * where there is no outline. One the story leaves out is nothing to learn, and is never among them.
  */
 export function uncoveredMessages(files: readonly ChronicleText[], chat: ChatHashes): number[] {
-  const numbers = numbersOf(chat);
+  const numbers = chat.story();
   const covered = coveredAmong(files, numbers);
   return numbers.filter((_index, at) => !covered[at]);
 }
 
-/** Those messages as runs of neighbours in the chat, each from its first message's number to its last's: a covered message between two of them parts two runs. */
+/** Those messages as runs of neighbours in the story, each from its first message's number to its last's: a covered message between two of them parts two runs, one the story leaves out doesn't. */
 export function uncoveredRuns(files: readonly ChronicleText[], chat: ChatHashes): [number, number][] {
-  const numbers = numbersOf(chat);
+  const numbers = chat.story();
   const covered = coveredAmong(files, numbers);
   const runs: [number, number][] = [];
   let open = false;

@@ -13,6 +13,7 @@
 // id.
 
 import type { AgentDefinition } from "../agents";
+import type { Definitions } from "../definitions";
 import { AGENT, type AgentSettings, defaultSettings } from "../settings";
 import type { Skill } from "../skills";
 import { renderDefault, TEXT, TOOL } from "../texts";
@@ -22,6 +23,25 @@ export const CHRONICLER = "chronicler";
 
 /** The reader's id: what the chronicler's `delegate` names it by, and what its settings are kept under. */
 export const READER = "story-reader";
+
+/**
+ * Why LumiAH's own agents don't keep a chat's chronicle in a run: the chronicler or the story reader
+ * is switched off, or the extension that answers the chat gives an agent of its own under that id
+ * (one that does other work would be started in its place). Null where both are LumiAH's own, as
+ * shipped or as the user replaced them. Where they aren't, no upkeep is offered and the story isn't
+ * learned. `extension`: its name, as the reason says it.
+ */
+export function chronicleRefusal(definitions: Pick<Definitions, "sourced">, extension: string | null): string | null {
+  for (const [id, name] of [
+    [CHRONICLER, "chronicler"],
+    [READER, "story reader"],
+  ] as const) {
+    const sourced = definitions.sourced(id);
+    if (sourced === undefined) return `LumiAH's ${name} is switched off, so it keeps no chronicle for this chat and doesn't learn its story. Switch it on on the Agents page.`;
+    if (sourced.source === "extension" || sourced.over === "extension") return `${extension ?? "The extension that answers this chat"} gives this chat an agent of its own in place of LumiAH's ${name}, so LumiAH keeps no chronicle for it and doesn't learn its story.`;
+  }
+  return null;
+}
 
 /** The ids of the two skills, as `skill_load` takes them and the texts name them. */
 export const RECALL_SKILL = { keep: "chronicle-keep", learn: "story-learn" } as const;

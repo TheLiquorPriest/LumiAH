@@ -93,6 +93,9 @@ export const TEXT = {
     noteContinued: "main.turn.continued",
     replyOne: "main.turn.reply_one",
     replyMany: "main.turn.reply_many",
+    directed: "main.turn.directed",
+    direction: "main.turn.directed.direction",
+    noDirection: "main.turn.directed.none",
   },
   request: {
     message: "request.message",
@@ -345,7 +348,7 @@ const MAIN_TEXTS: TextDef[] = [
     label: "A turn's message",
     note: "What the main agent is sent each turn: why a reply is needed, anything that changed about its notes, the request, and what to do.",
     text: "{{kind}}\n\n{{notes}}The request, as Lumiverse assembled it for this reply ({{count}}, in order):\n\n{{request}}\n\n{{ask}}",
-    vars: [v("kind", "why a reply is needed, in the words below", true), v("notes", "what changed about its notes since its last turn, each ending in a blank line; nothing when nothing did. Required: a summary of its notes reaches the agent only here when no later turn follows it", true), v("count", 'how many messages the request has, with the word: "42 messages"'), v("request", "the request's messages, each framed as below", true), v("ask", "what to do with it, in the words below", true)],
+    vars: [v("kind", "why a reply is needed, in the words below", true), v("notes", "what changed about its notes since its last turn, and how the user directs the story where only the model's replies are its story, each ending in a blank line; nothing when there is none of it. Required: a summary of its notes reaches the agent only here when no later turn follows it", true), v("count", 'how many messages the request has, with the word: "42 messages"'), v("request", "the request's messages, each framed as below", true), v("ask", "what to do with it, in the words below", true)],
   },
   { id: TEXT.main.kindNew, group: MAIN, label: "Why: a new reply", note: "Fills {{kind}} for a new reply.", text: "The user sent a message: a reply is needed.", vars: [] },
   { id: TEXT.main.kindRegenerate, group: MAIN, label: "Why: a regenerate", note: "Fills {{kind}} when the user regenerated the reply.", text: "The user asked for this reply again (a regenerate): the last one is gone, and a new reply is needed in its place.", vars: [] },
@@ -360,6 +363,16 @@ const MAIN_TEXTS: TextDef[] = [
   { id: TEXT.main.noteContinued, group: MAIN, label: "The turn continued", note: "Leads a turn's message when it continues a reply the main agent already worked on: what it did then.", text: "You already worked on this reply before it was continued. What you did then:\n{{receipt}}", vars: [v("receipt", "the receipt of that work", true)] },
   { id: TEXT.main.replyOne, group: MAIN, label: "Notes dropped: one reply", note: "Fills {{replies}} in Notes dropped, and in its progress line, when one reply's notes were dropped.", text: "reply {{list}}", vars: [v("list", 'the reply\'s number: "#12"', true)] },
   { id: TEXT.main.replyMany, group: MAIN, label: "Notes dropped: several replies", note: "Fills {{replies}} in Notes dropped, and in its progress line, when several replies' notes were dropped.", text: "replies {{list}}", vars: [v("list", 'the replies\' numbers: "#12, #14"', true)] },
+  {
+    id: TEXT.main.directed,
+    group: MAIN,
+    label: "The user directs the story",
+    note: "A note of a turn's message where only the model's replies are the story (What counts as the story): the user's messages are directions from outside it.",
+    text: "The user directs this story from outside it. Their messages are directions to you, not events of the story and not their character's words, and the directions they gave before this one are not part of its record: the chat tools leave the user's messages out.{{direction}}",
+    vars: [v("direction", "the direction for this reply, or that there is none, in the words below; nothing where the user's newest message is left out too")],
+  },
+  { id: TEXT.main.direction, group: MAIN, label: "The direction for this reply", note: "Fills {{direction}} with the user's newest message, read from the chat, where it is given to the main agent (Your newest message: give it as the direction).", text: "\n\nThe direction for this reply:\n{{text}}", vars: [v("text", "the user's newest message", true)] },
+  { id: TEXT.main.noDirection, group: MAIN, label: "No direction for this reply", note: "Fills {{direction}} where the chat ends with a reply, or with a message the user hid, so the user gave no direction for this one.", text: "\n\nThe user gave no direction for this reply: carry the story on from where it stands.", vars: [] },
 ];
 
 const REQUEST_TEXTS: TextDef[] = [

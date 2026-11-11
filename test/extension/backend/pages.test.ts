@@ -38,6 +38,7 @@ const STORY: StoryStatus = {
   messages: 240,
   covered: 0,
   suggested: { task: "Read this chat from its first message and write down what its story has established.", agent: "chronicler" },
+  refused: null,
   estimate: { messages: 240, chars: 96_000, stretches: 3, promptTokens: 180_000, cachedTokens: 60_000, writtenTokens: 12_000, weighedTokens: 126_000, toolTurns: 24, usd: null },
 };
 
@@ -440,7 +441,7 @@ describe("the learning of a chat's story", () => {
     const chatId = await it.setUpBuiltin();
 
     // None was started yet: the page is given what to start one with and the core's own estimate of what the story takes, from which the page sizes the budget it offers.
-    expect(await it.page.request("lah.story.get", { chatId })).toEqual({ job: null, plan: null, messages: 240, covered: 0, suggested: { task: STORY.suggested.task, agent: "chronicler" }, estimate: STORY.estimate });
+    expect(await it.page.request("lah.story.get", { chatId })).toEqual({ job: null, plan: null, messages: 240, covered: 0, suggested: { task: STORY.suggested.task, agent: "chronicler" }, estimate: STORY.estimate, refused: null });
 
     // A job started by hand without saying so is no story's.
     await it.page.request("lah.job.start", { chatId, agent: "main", task: "Put the notes in order.", when: "now" });

@@ -8,12 +8,14 @@
 // the state, the settings and the live views; each area's requests are answered by its own part
 // under mock/.
 
+import { STORY_DEFAULTS, storyHolds } from "../../src/core/story";
 import {
   type ApprovalView,
   type KeptApproval,
   type BackendToFrontend,
   type CauseCode,
   chatAnswered,
+  type ChatStoryView,
   type ChatView,
   type JobView,
   type JsonObject,
@@ -297,7 +299,33 @@ export class MockBackend {
       return page instanceof Promise ? [] : page.jobs;
     };
     // The chronicle's files are read as any workspace file is: its part answers for those it holds, the workspace's for the rest.
-    this.handlers = { ...this.ownHandlers(), ...workspace, ...defsMock(ctx), ...jobs, ...spendMock(ctx), ...talkMock(ctx), ...homeMock(ctx), ...loreMock(ctx), ...chronicle.handlers, "lah.ws.read": (r) => chronicle.read(r) ?? workspace["lah.ws.read"](r), "lah.ws.list": (r) => { const view = workspace["lah.ws.list"](r); return view instanceof Promise ? view.then((v) => chronicle.list(r, v)) : chronicle.list(r, view); } };
+    // What counts as each chat's story: the chat's own choice over Settings' as shipped. No extension has a word on it here, and Lumiverse says nothing of its Sovereign Hand, as the one there is now.
+    const stories = new Map<string, ChatStoryView["chosen"]>();
+    const storyAt = (chatId: string): ChatStoryView => {
+      const chosen = stories.get(chatId) ?? {};
+      return { chatId, chosen, setting: { ...STORY_DEFAULTS }, claimed: null, sovereignHand: null, holds: storyHolds({ chat: chosen, user: STORY_DEFAULTS, sovereignHand: null }) };
+    };
+    this.handlers = {
+      ...this.ownHandlers(),
+      ...workspace,
+      ...defsMock(ctx),
+      ...jobs,
+      ...spendMock(ctx),
+      ...talkMock(ctx),
+      ...homeMock(ctx),
+      ...loreMock(ctx),
+      ...chronicle.handlers,
+      "lah.ws.read": (r) => chronicle.read(r) ?? workspace["lah.ws.read"](r),
+      "lah.ws.list": (r) => {
+        const view = workspace["lah.ws.list"](r);
+        return view instanceof Promise ? view.then((v) => chronicle.list(r, v)) : chronicle.list(r, view);
+      },
+      "lah.chat.story.get": (r) => ({ story: storyAt(r.chatId) }),
+      "lah.chat.story.set": (r) => {
+        stories.set(r.chatId, { ...r.story });
+        return { story: storyAt(r.chatId) };
+      },
+    };
     if (ready) {
       this.stored.set("chat-mara", storedTurns(now));
       // The open chat runs built in (DESIGN §25), so its turns are built-in ones: Lumiverse writes the reply.

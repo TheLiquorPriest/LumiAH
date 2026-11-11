@@ -51,6 +51,7 @@ async function rig(change: (s: Settings) => void = () => undefined, texts: Recor
     run: { id: "gen-now", kind: "new", chatId: CHAT },
     turn,
     settings,
+    story: { hidden: "leave_out", from: "everyone", newest: "directive" },
     texts: new Texts(texts),
     agent: "main",
     depth: 0,

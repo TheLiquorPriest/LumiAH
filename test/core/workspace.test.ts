@@ -48,7 +48,7 @@ function rig(change: (s: Settings) => void = () => undefined, own: Record<string
   };
   const agent = (as: Partial<WorkspaceView> = {}) => {
     const view: WorkspaceView = { author: MAIN, role: "main", areas, guard: () => null, ...as };
-    const env: ToolEnv = { host, run: { id: "gen-now", kind: "new", chatId: CHAT }, settings, texts: new Texts(own), agent: view.role, depth: 0, chat: chatView(host, CHAT, [], settings.tools), lore: loreView(host, { chatId: CHAT, generationId: "gen-now" }, settings.tools), past: [], workspace: view };
+    const env: ToolEnv = { host, run: { id: "gen-now", kind: "new", chatId: CHAT }, settings, story: { hidden: "leave_out", from: "everyone", newest: "directive" }, texts: new Texts(own), agent: view.role, depth: 0, chat: chatView(host, CHAT, [], settings.tools), lore: loreView(host, { chatId: CHAT, generationId: "gen-now" }, settings.tools), past: [], workspace: view };
     const tools = new Map(WORKSPACE_TOOLS.flatMap((d) => d.build(env) ?? []).map((t): [string, AgentTool] => [t.name, t]));
     const run = (name: string, args: JsonObject = {}): Promise<ToolOutcome> => {
       const tool = tools.get(name);

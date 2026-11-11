@@ -357,6 +357,11 @@ export interface BackendHost {
     list(userId: string, offset: number, limit: number): Promise<{ chats: HostChat[]; total: number }>;
     /** A character's name; null when there is no such character, or the permission to read characters isn't granted. */
     characterName(characterId: string, userId: string): Promise<string | null>;
+    /**
+     * Whether Lumiverse's Sovereign Hand is on for the user in a chat (DESIGN §24.4): what a story
+     * that follows Lumiverse reads. Null where Lumiverse doesn't tell extensions.
+     */
+    sovereignHand(chatId: string, userId: string): Promise<boolean | null>;
   };
 
   lore: {
@@ -1156,6 +1161,10 @@ export function createSpindleHost(identifier: string = EXTENSION_IDENTIFIER): Ba
       async characterName(characterId, userId) {
         if (!spindle.permissions.has("characters")) return null;
         return (await spindle.characters.get(characterId, userId))?.name ?? null;
+      },
+      // Lumiverse keeps Sovereign Hand among the user's settings, and no part of Spindle reads them. The one place an extension might hear it, `{{loomSovHandActive}}` through `macros.resolve`, is filled only where a prompt is assembled (`populateLumiaLoomContext`); the macro call an extension makes builds its environment without it (`handleMacrosResolve`), so it says "no" whatever the switch is. A "no" that may be false is no answer: this says nothing.
+      async sovereignHand() {
+        return null;
       },
     },
 

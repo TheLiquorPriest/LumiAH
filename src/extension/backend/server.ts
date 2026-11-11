@@ -28,6 +28,7 @@ import type { Caller, Relays } from "./relays";
 import type { SettingsStore } from "./settings";
 import type { BackendHost } from "./spindle";
 import type { StreamRegistry } from "./streams";
+import type { ChatSwitch } from "./switch";
 import type { Turns } from "./turns";
 
 export interface ServerDeps {
@@ -38,6 +39,8 @@ export interface ServerDeps {
   models: Models;
   turns: Turns;
   chats: Chats;
+  /** A chat as the core reads it, with what decides its story (§24.4), and what a claim on it is asked with. */
+  chatSwitch: Pick<ChatSwitch, "info" | "claimAsk">;
   storage: Storage;
   lore: Lore;
   presets: Presets;
@@ -379,7 +382,7 @@ export class LinkServer {
         return { accepted: true };
       }
       case "extension.call":
-        return callExtension(d.extension, r.member, r.arg, userId, d.chats);
+        return callExtension(d.extension, r.member, r.arg, userId, { own: (owner, chatId) => d.chats.own(owner, chatId), claimAsk: (owner, chatId) => d.chatSwitch.claimAsk(owner, chatId) });
       case "blob.list":
         return d.storage.blobs(userId, r.cursor);
       case "blob.remove":
@@ -388,7 +391,7 @@ export class LinkServer {
       case "doc.list":
         return { paths: await d.storage.docs(userId, r.prefix) };
       case "chat.info":
-        return { chat: await d.chats.info(userId, text(r.chat, "chat")) };
+        return { chat: await d.chatSwitch.info(userId, text(r.chat, "chat")) };
       case "chat.anchors":
         return d.chats.anchors(userId, typeof r.cursor === "string" && r.cursor !== "" ? r.cursor : null);
       case "job.changed":

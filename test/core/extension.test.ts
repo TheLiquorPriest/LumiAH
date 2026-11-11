@@ -10,7 +10,8 @@ import { createHarness, type Harness } from "../../src/core/harness";
 import type { ApprovalAsk, JsonValue, ModelRequest, ModelToolCall, RemoteTool } from "../../src/core/ports";
 import { recordOf } from "../../src/core/sessions";
 import { defaultSettings, type Settings } from "../../src/core/settings";
-import { renderDefault, TEXT } from "../../src/core/texts";
+import { renderDefault, TEXT, Texts } from "../../src/core/texts";
+import { directedNote } from "../../src/core/turn";
 import { call, idle, MemoryHost, runTurn, type Script, until } from "./support/host";
 import { HARBOUR, KEEPER, LOG_SKILL, READER, type SampleOptions, SEARCH, sampleExtension, TIDES } from "./support/sample-extension";
 
@@ -165,7 +166,7 @@ describe("a chat the extension claims: one of each thing it supplies", () => {
     expect(sent).toEqual([0]);
     expect(result.record).not.toBeNull();
     expect(r.sample.seen.hooks).toEqual([
-      { hook: "runBegan", told: { userId: "user-1", chatId: CLAIMED, turn: request.generationId, kind: "new" } },
+      { hook: "runBegan", told: { userId: "user-1", chatId: CLAIMED, turn: request.generationId, kind: "new", story: { hidden: "leave_out", from: "everyone", newest: "directive" } } },
       { hook: "replyWritten", told: { userId: "user-1", chatId: CLAIMED, turn: request.generationId, reply: REPLY, finish: "stop" } },
       { hook: "runEnded", told: { userId: "user-1", chatId: CLAIMED, turn: request.generationId, kind: "new", status: "done", reply: REPLY, record: result.record, usage: result.usage } },
     ]);
@@ -184,7 +185,7 @@ describe("a chat the extension claims: one of each thing it supplies", () => {
     await idle();
     expect(result.status).toBe("failed");
     expect(r.sample.seen.hooks).toEqual([
-      { hook: "runBegan", told: { userId: "user-1", chatId: CLAIMED, turn: request.generationId, kind: "new" } },
+      { hook: "runBegan", told: { userId: "user-1", chatId: CLAIMED, turn: request.generationId, kind: "new", story: { hidden: "leave_out", from: "everyone", newest: "directive" } } },
       { hook: "runEnded", told: { userId: "user-1", chatId: CLAIMED, turn: request.generationId, kind: "new", status: "failed", reason: result.reason ?? "", reply: "", record: null, usage: result.usage } },
     ]);
   });
@@ -669,5 +670,45 @@ describe("an extension's tools and the user's word", () => {
     });
     await r.turn(CLAIMED);
     expect(r.sample.seen.calls.map((c) => c.callId)).toEqual(["c1"]);
+  });
+});
+
+describe("what counts as the story, in a run", () => {
+  /** The opening note's word on the user's direction where only the model's replies are the story, as the chat stands before the turn. */
+  async function noteOf(host: MemoryHost, chatId: string, newest: "directive" | "leave_out"): Promise<string> {
+    const before = await host.chat.path(chatId);
+    const note = await directedNote({ source: { hidden: "leave_out", from: "replies", newest }, before, read: async (m) => (await host.chat.messages(chatId, m.index, m.index + 1))[0]?.content ?? null, texts: new Texts() });
+    if (note === null) throw new Error("no note where only the replies are the story");
+    return note;
+  }
+  /** Everything the main agent was sent, as one text. */
+  const toMain = (host: MemoryHost): string => host.calls.filter((c) => from(c) === "main").flatMap((c) => c.messages.map((m) => m.content)).join("\n");
+  const replies = (newest: "directive" | "leave_out") => (s: Settings): void => void (s.story = { hidden: "leave_out", from: "replies", newest });
+
+  test("the claim's word, then the chat's own choice, then the user's setting, member by member: the run is told what holds", async () => {
+    const r = rig(quick, (s) => void (s.story = { hidden: "include", from: "everyone", newest: "leave_out" }), { story: { from: "replies" } });
+    r.host.infos.set(CLAIMED, { story: { hidden: "leave_out", from: "everyone" } });
+    await r.turn();
+    await until(() => r.sample.seen.hooks.length === 3);
+    expect(r.sample.seen.hooks.flatMap((h) => (h.hook === "runBegan" ? [h.told.story] : []))).toEqual([{ hidden: "leave_out", from: "replies", newest: "leave_out" }]);
+  });
+
+  test("with only the replies, the main agent is told the user directs it, with the newest message as the direction or without it; with everyone's, nothing is added", async () => {
+    const directive = rig(quick, replies("directive"));
+    const told = await noteOf(directive.host, PLAIN, "directive");
+    expect(told).toContain("I ask Brann when the tide turns.");
+    await directive.turn(PLAIN);
+    expect(toMain(directive.host)).toContain(told);
+
+    const quiet = rig(quick, replies("leave_out"));
+    const untold = await noteOf(quiet.host, PLAIN, "leave_out");
+    expect(untold).not.toContain("I ask Brann");
+    await quiet.turn(PLAIN);
+    expect(toMain(quiet.host)).toContain(untold);
+
+    const everyone = rig(quick);
+    const notes = [await noteOf(everyone.host, PLAIN, "directive"), await noteOf(everyone.host, PLAIN, "leave_out")];
+    await everyone.turn(PLAIN);
+    for (const note of notes) expect(toMain(everyone.host)).not.toContain(note);
   });
 });

@@ -92,6 +92,7 @@ async function toolsOf(host: MemoryHost, book: Book | null, change: (s: Settings
     host,
     run: { id: "run-1", kind: "new", chatId: CHAT },
     settings,
+    story: { hidden: "leave_out", from: "everyone", newest: "directive" },
     texts: new Texts(),
     agent: "main",
     depth: 0,

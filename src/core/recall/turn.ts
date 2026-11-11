@@ -9,7 +9,7 @@
 import type { HarnessHost, JobView, PathMessage, PresetBlock, TraceEvent } from "../ports";
 import { errorText } from "../util";
 import type { AreaAccess } from "../workspace";
-import { type ChroniclerJob, chroniclerJob, pinnedChronicle } from "./chronicle";
+import { type ChroniclerJob, chroniclerJob, pinnedChronicle, storyHashes } from "./chronicle";
 import { promptNotes } from "./prompt";
 import type { RecallRun } from "./recall";
 
@@ -28,7 +28,7 @@ export interface ToldInput {
   writes: boolean;
   /** The chat's `learned/` area, where its chronicle is kept. */
   learned: AreaAccess | null;
-  /** The chat's jobs that haven't ended, read when the note is made, so it says whether the chronicler is at work already; null: jobs can't run, and the note says nothing of upkeep. */
+  /** The chat's jobs that haven't ended, read when the note is made, so it says whether the chronicler is at work already; null: jobs can't run, or LumiAH's own agents don't keep this chat's chronicle, and the note says nothing of upkeep. */
   jobs: (() => Promise<readonly Pick<JobView, "agent" | "state">[]>) | null;
   emit(event: TraceEvent): void;
   log: HarnessHost["log"];
@@ -70,8 +70,8 @@ export async function recallTold(run: RecallRun, input: ToldInput): Promise<Requ
         input.log("warn", `[LumiAH] the chat's jobs couldn't be read (${errorText(error)}): the main agent is told nothing of the chronicle's upkeep this turn`);
       }
     }
-    // The check needs each message's hash and nothing of its text: the path has them.
-    const pinned = await pinnedChronicle({ learned: input.learned, chat: { hashes: () => new Map(input.path.map((m) => [m.index, m.hash])), last: input.path.at(-1) }, settings, texts, jobs: keeper, writes: input.writes });
+    // The check needs each message's hash and nothing of its text: the path has them, and says which messages count as the story.
+    const pinned = await pinnedChronicle({ learned: input.learned, chat: storyHashes(input.path, run.env.story), settings, texts, jobs: keeper, writes: input.writes });
     if (pinned !== "") parts.push(pinned);
   } catch (error) {
     input.log("warn", `[LumiAH] the chat's chronicle couldn't be read (${errorText(error)}): the main agent is given the request without it`);

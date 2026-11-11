@@ -653,7 +653,7 @@ export function chronicleMock(ctx: StoryCtx): ChronicleMock {
       },
       "lah.story.get": (r): StoryView => {
         const chat = chatOf(ctx, r.chatId);
-        return { job: ctx.storyJob(r.chatId), plan: chat?.files.has(PLAN) ? `${AGENTS_DIR}${PLAN}` : null, messages: chat?.tale.messages ?? 0, covered: chat ? covered(chat) : 0, suggested: { ...SUGGESTED }, estimate: estimateOf(chat) };
+        return { job: ctx.storyJob(r.chatId), plan: chat?.files.has(PLAN) ? `${AGENTS_DIR}${PLAN}` : null, messages: chat?.tale.messages ?? 0, covered: chat ? covered(chat) : 0, suggested: { ...SUGGESTED }, estimate: estimateOf(chat), refused: null };
       },
     },
   };

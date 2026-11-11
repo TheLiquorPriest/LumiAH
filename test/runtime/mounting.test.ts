@@ -63,7 +63,7 @@ function lampRoom(): { options: BackendOptions; heard: Heard } {
       extension: {
         name: "Lamp Room",
         definitions: async () => ({ agents: [keeper], skills: [{ id: "trim_wick", name: "Trimming the wick", description: "How the lamp's wick is trimmed.", body: "Trim it at dusk, a finger's width, with the lamp cold." }] }),
-        claim: async (chat) => (chat.name === "Harbour light" ? { mainAgent: "lamp_keeper", guidance: { name: "of the lamp room", text: HOUSE_RULES } } : null),
+        claim: async (ask) => (ask.chat.name === "Harbour light" ? { mainAgent: "lamp_keeper", guidance: { name: "of the lamp room", text: HOUSE_RULES } } : null),
         // What it prepared goes where the preset's own messages end, before the chat's.
         writerRequest: async (request) => {
           heard.rewrote.push(request);

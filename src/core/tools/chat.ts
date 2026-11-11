@@ -1,10 +1,12 @@
 // The history tools (DESIGN §24.4): the chat from coarse to exact. chat_outline is the story as a
 // table of contents, chat_about the trail of a name through it, chat_search and chat_grep find by
 // words and by exact text, chat_read and chat_around give the messages themselves. Each reads the
-// chat as the run's own path has it (`RecallRun.chat`): every message before the reply, those the
-// request doesn't hold among them. A message is named by its number in the chat, as the request
-// names it, and every message an answer prints carries its citation (`[#412 a3f9c27e]`), which an
-// agent copies into the chronicle and `chronicle_check` reads back (§24.7).
+// chat as the run's own path has it (`RecallRun.chat`): every message before the reply that counts
+// as the story, those the request doesn't hold among them. A message is named by its number in the
+// chat, as the request names it, and every message an answer prints carries its citation
+// (`[#412 a3f9c27e]`), which an agent copies into the chronicle and `chronicle_check` reads back
+// (§24.7). A message the story leaves out is never listed, found or read: an answer whose span holds
+// some says in one line how many and why, so their numbers aren't taken for gaps.
 
 import { bestLines, queryTerms } from "../lexical";
 import type { JsonObject } from "../ports";
@@ -15,6 +17,7 @@ import { checkCitation, namedMessage, placesOf } from "../recall/cite";
 import { outlineHead, outlineOf, partLine, readerStretches, stretchesHead, stretchLine } from "../recall/outline";
 import { type RecallRun, recallOf } from "../recall/recall";
 import { type TrailLine, trailOf } from "../recall/trail";
+import type { LeftOutWhy } from "../story";
 import { FAMILY, TEXT, TOOL } from "../texts";
 import type { AgentTool, ToolCtx, ToolDefinition, ToolEnv, ToolOutcome } from "../tools";
 import { clip, textArg, wholeArg } from "../util";
@@ -31,12 +34,30 @@ interface Chat {
   last: ChatDoc;
 }
 
-/** The chat a tool is called on, or the answer for a chat with no message yet. */
+/**
+ * The line an answer says how many messages with numbers from `from` to `to` the story leaves out,
+ * and why; "" where it leaves out none.
+ */
+function leftNote(texts: Pager["texts"], chat: ChatRun, from: number, to: number): string {
+  const count = chat.leftIn(from, to);
+  const parts = [...(count.hidden > 0 ? [texts.render(A.chatLeftHidden, { count: texts.counted(count.hidden, WORD.message) })] : []), ...(count.direction > 0 ? [texts.render(A.chatLeftDirections, { count: texts.counted(count.direction, WORD.message) })] : [])];
+  return parts.length === 0 ? "" : texts.render(A.chatLeftOut, { parts: parts.join(", and ") });
+}
+
+/** The answer to a message the story leaves out, named alone: why it isn't read. */
+function leftOne(p: Pager, index: number, why: LeftOutWhy): ToolOutcome {
+  const { texts } = p;
+  return { text: texts.render(A.chatLeftOne, { index: String(index), why: texts.render(why === "hidden" ? A.chatLeftOneHidden : A.chatLeftOneDirection) }), error: true };
+}
+
+/** The chat a tool is called on, or the answer for a chat with no message of the story yet. */
 async function chatOf(env: ToolEnv): Promise<Chat | ToolOutcome> {
   const run = recallOf(env);
   const chat = await run.chat();
   const { first, last } = chat;
-  return first && last ? { run, chat, first, last } : { text: env.texts.render(A.chatEmpty) };
+  if (first && last) return { run, chat, first, last };
+  const left = leftNote(env.texts, chat, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY);
+  return { text: left === "" ? env.texts.render(A.chatEmpty) : env.texts.render(A.chatNoStory, { left }) };
 }
 
 /** A history tool before the run holds it: what it is offered as, and how it answers a call. */
@@ -79,12 +100,15 @@ interface Scope {
   end: number;
   /** The call gave `from` or `to`. */
   ranged: boolean;
+  /** How many messages of the range the story leaves out, and why, as the answer says it; "" for none. */
+  left: string;
 }
 
 /**
  * A call's filters, read: `from` and `to` are message numbers, both inside the range (a citation
  * names its number); `speaker` is a name as the chat shows it, in any letter case, or a role. A
- * range that holds no message and a speaker nobody goes by are answered with what there is.
+ * range that holds no message and a speaker nobody goes by are answered with what there is, and
+ * with what the story leaves out there.
  */
 function scopeOf(p: Pager, { chat, first, last }: Chat, args: JsonObject, speakers: boolean): Scope | ToolOutcome {
   const { texts } = p;
@@ -99,55 +123,64 @@ function scopeOf(p: Pager, { chat, first, last }: Chat, args: JsonObject, speake
   let high = to ?? last.index;
   // Both given the wrong way round still name one range; a lone bound past the chat's end names none.
   if (from !== null && to !== null && low > high) [low, high] = [high, low];
+  const ranged = from !== null || to !== null;
+  const left = ranged ? leftNote(texts, chat, low, high) : leftNote(texts, chat, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY);
   const start = chat.place(low);
   const end = chat.place(high + 1);
-  if (start >= end) return { text: texts.render(A.chatBadRange, { from: String(low), to: String(high), first: String(first.index), last: String(last.index) }), error: true };
-  const ranged = from !== null || to !== null;
+  if (start >= end) return { text: [left, texts.render(A.chatBadRange, { from: String(low), to: String(high), first: String(first.index), last: String(last.index) })].filter((part) => part !== "").join("\n"), error: true };
   const inRange = ranged ? chat.messages.slice(start, end) : chat.messages;
   const speaker = speakers ? textArg(args.speaker) : null;
-  if (speaker === null) return { docs: inRange, ...(ranged ? { keep: (doc: ChatDoc) => doc.index >= low && doc.index <= high } : {}), start, end, ranged };
+  if (speaker === null) return { docs: inRange, ...(ranged ? { keep: (doc: ChatDoc) => doc.index >= low && doc.index <= high } : {}), start, end, ranged, left };
   const wanted = speaker.toLowerCase();
   const spoken = (doc: ChatDoc): boolean => doc.role === wanted || whoOf(doc).trim().toLowerCase() === wanted;
   if (!chat.messages.some(spoken)) {
     const all = speakersOf(chat.messages).map(([who, count]) => `${who} (${texts.counted(count, WORD.message)})`);
-    return { text: fitted(p, all.join(", "), (list) => saidBack(p, speaker, (said) => texts.render(A.chatNoSpeaker, { speaker: said, speakers: list }))), error: true };
+    const whole = leftNote(texts, chat, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY);
+    const said = fitted(p, all.join(", "), (list) => saidBack(p, speaker, (named) => texts.render(A.chatNoSpeaker, { speaker: named, speakers: list })));
+    return { text: [whole, said].filter((part) => part !== "").join("\n"), error: true };
   }
-  return { docs: inRange.filter(spoken), keep: (doc) => doc.index >= low && doc.index <= high && spoken(doc), start, end, ranged };
+  return { docs: inRange.filter(spoken), keep: (doc) => doc.index >= low && doc.index <= high && spoken(doc), start, end, ranged, left };
 }
 
 // ---------------------------------------------------------------- reading messages
 
 /**
- * The message an argument names (`namedMessage`), with what an answer says first where it was named
- * by a citation that doesn't hold as written. A citation is checked against the chat as it stands
- * (`checkCitation`), and the answer says what was compared, never what may have happened to the
- * chat: the message at its number reads otherwise (it is read all the same, and the answer says
- * so); only its number is wrong, since exactly one other message reads as cited (that one is
- * read); or the chat has no message at its number and no single message reads as cited. Where
- * several messages read as cited none of them is taken for the one meant.
+ * The message an argument names (`namedMessage`), by its number, with what an answer says first
+ * where it was named by a citation that doesn't hold as written. A citation is checked against the
+ * chat as it stands (`checkCitation`), and the answer says what was compared, never what may have
+ * happened to the chat: the message at its number reads otherwise (it is read all the same, and the
+ * answer says so); only its number is wrong, since exactly one other message reads as cited (that
+ * one is read); or the chat has no message at its number and no single message reads as cited.
+ * Where several messages read as cited none of them is taken for the one meant. A message the story
+ * leaves out is never read: named alone, the answer says why; as a bound of a range (`bound`), the
+ * range runs over it.
  */
-function located({ chat, first, last }: Chat, p: Pager, named: { index: number; hash: string | null }): { doc: ChatDoc; note: string } | ToolOutcome {
+function located({ chat, first, last }: Chat, p: Pager, named: { index: number; hash: string | null }, bound = false): { index: number; note: string } | ToolOutcome {
   const { texts } = p;
   const span = { first: String(first.index), last: String(last.index) };
   const index = String(named.index);
-  const missing: ToolOutcome = { text: texts.render(A.chatNoMessage, { index, ...span }), error: true };
-  if (named.hash === null) {
-    const doc = chat.at(named.index);
-    return doc ? { doc, note: "" } : missing;
-  }
+  /** A number that names no message of the story: one it leaves out, or none at all. */
+  const elsewhere = (number: number): { index: number; note: string } | ToolOutcome => {
+    const why = chat.leftAt(number);
+    if (why === undefined) return { text: texts.render(A.chatNoMessage, { index: String(number), ...span }), error: true };
+    return bound ? { index: number, note: "" } : leftOne(p, number, why);
+  };
+  if (named.hash === null) return chat.at(named.index) ? { index: named.index, note: "" } : elsewhere(named.index);
   const hashes = chat.hashes();
   const state = checkCitation({ index: named.index, hash: named.hash }, hashes, placesOf(hashes));
   // The citation as it is said back: written as the tools write one, whatever space or length of hash the call gave it.
   const cited = citeDoc({ index: named.index, hash: named.hash });
-  const doc = chat.at(state.state === "moved" ? state.now : named.index);
-  if (state.state === "ok") return doc ? { doc, note: "" } : missing;
-  if (state.state === "moved") return doc ? { doc, note: texts.render(A.chatCiteMoved, { given: cited, index, now: String(doc.index), cite: citeDoc(doc) }) } : missing;
-  const where = state.several.length === 0 ? texts.render(A.chronicleNowhere) : texts.render(A.chronicleSeveral, { messages: clip(state.several.map((n) => texts.render(TEXT.recall.message, { index: String(n) })).join(", "), p.lineChars) });
-  if (state.state === "gone" || !doc) return { text: texts.render(A.chatCiteGone, { given: cited, index, where, ...span }), error: true };
-  return { doc, note: texts.render(A.chatCiteChanged, { given: cited, index, where, cite: citeDoc(doc) }) };
+  const where = state.state === "ok" || state.state === "moved" ? "" : state.several.length === 0 ? texts.render(A.chronicleNowhere) : texts.render(A.chronicleSeveral, { messages: clip(state.several.map((n) => texts.render(TEXT.recall.message, { index: String(n) })).join(", "), p.lineChars) });
+  if (state.state === "gone") return { text: texts.render(A.chatCiteGone, { given: cited, index, where, ...span }), error: true };
+  const target = state.state === "moved" ? state.now : named.index;
+  const doc = chat.at(target);
+  if (!doc) return elsewhere(target);
+  if (state.state === "ok") return { index: target, note: "" };
+  if (state.state === "moved") return { index: target, note: texts.render(A.chatCiteMoved, { given: cited, index, now: String(target), cite: citeDoc(doc) }) };
+  return { index: target, note: texts.render(A.chatCiteChanged, { given: cited, index, where, cite: citeDoc(doc) }) };
 }
 
-/** Messages read whole, a page at a time, each under its citation, who wrote it and when. `notes` lead the answer: what became of a citation the call named. */
+/** Messages read whole, a page at a time, each under its citation, who wrote it and when. `notes` lead the answer: what became of a citation the call named, and what the story leaves out between the messages read. */
 function readMessages(p: Pager, args: JsonObject, docs: readonly ChatDoc[], notes: readonly string[]): ToolOutcome {
   const { texts } = p;
   const head = texts.render(A.chatRead, { from: String(docs[0]?.index ?? 0), to: String(docs.at(-1)?.index ?? 0), count: String(docs.length) });
@@ -182,13 +215,19 @@ const chatRead: ToolDefinition = {
         if (!to) return notNamed(p, args.to);
         const read = await chatOf(env);
         if ("text" in read) return read;
-        const a = located(read, p, from);
+        // A range runs over what the story leaves out; one message named alone that it leaves out is answered with why.
+        const ranged = to !== from;
+        const a = located(read, p, from, ranged);
         if ("text" in a) return a;
-        const b = to === from ? a : located(read, p, to);
+        const b = ranged ? located(read, p, to, true) : a;
         if ("text" in b) return b;
         const { chat } = read;
-        const docs = chat.messages.slice(chat.place(Math.min(a.doc.index, b.doc.index)), chat.place(Math.max(a.doc.index, b.doc.index) + 1));
-        return readMessages(p, args, docs, [a.note, b.note]);
+        const low = Math.min(a.index, b.index);
+        const high = Math.max(a.index, b.index);
+        const docs = chat.messages.slice(chat.place(low), chat.place(high + 1));
+        const left = leftNote(texts, chat, low, high);
+        if (docs.length === 0) return { text: texts.render(A.chatAllLeftOut, { left, from: String(low), to: String(high) }) };
+        return readMessages(p, args, docs, [a.note, b.note, left]);
       },
     });
   },
@@ -221,9 +260,9 @@ const chatAround: ToolDefinition = {
         if ("text" in centre) return centre;
         const { chat } = read;
         const each = env.settings.recall.chat.around;
-        const place = chat.place(centre.doc.index);
+        const place = chat.place(centre.index);
         const docs = chat.messages.slice(Math.max(0, place - Math.max(0, wholeArg(args.before) ?? each)), place + 1 + Math.max(0, wholeArg(args.after) ?? each));
-        return readMessages(p, args, docs, [centre.note]);
+        return readMessages(p, args, docs, [centre.note, leftNote(texts, chat, docs[0]?.index ?? centre.index, docs.at(-1)?.index ?? centre.index)]);
       },
     });
   },
@@ -271,7 +310,7 @@ const chatGrep: ToolDefinition = {
         const bound = grepBound(env, ctx.signal);
         const found = await grepTexts(bodies, match, bound);
         if ("late" in found) return lateAnswer(p, bound, found, texts.counted(bodies.length, WORD.message));
-        if (found.length === 0) return { text: saidBack(p, needle, (said) => texts.render(A.chatGrepNothing, { query: said })) };
+        if (found.length === 0) return { text: [scope.left, saidBack(p, needle, (said) => texts.render(A.chatGrepNothing, { query: said }))].filter((part) => part !== "").join("\n") };
         return listPage(p, {
           total: found.length,
           noun: WORD.line,
@@ -281,6 +320,7 @@ const chatGrep: ToolDefinition = {
             const doc = line ? scope.docs[line.key] : undefined;
             return line && doc ? texts.render(A.chatLine, { cite: citeDoc(doc), index: String(doc.index), who: whoOf(doc), line: String(line.line), text: around(line.text, line.at, line.length, p.lineChars) }) : "";
           },
+          ...(scope.left !== "" ? { lead: scope.left } : {}),
         });
       },
     });
@@ -367,7 +407,7 @@ const chatSearch: ToolDefinition = {
         const searched = await searchChat(run, chat, queries, { ...(scope.keep ? { keep: scope.keep } : {}), signal: ctx.signal });
         const wordOnly = run.wordOnlyNote(searched.state);
         const parts = searched.queries.map((found) => searchPart(p, env, found));
-        const answer = searchAnswer(p, args, parts, [restNote(p, Math.max(1, limit), rest), wordOnly]);
+        const answer = searchAnswer(p, args, parts, [restNote(p, Math.max(1, limit), rest), wordOnly, scope.left]);
         // That search is by word is said once a run: an answer that failed didn't say it, so the next one does.
         if (answer.error && wordOnly !== "") run.saidWordOnly = false;
         return answer;
@@ -457,10 +497,10 @@ const chatAbout: ToolDefinition = {
         if ("text" in read) return read;
         const scope = scopeOf(p, read, args, false);
         if ("text" in scope) return scope;
-        const tail = restNote(p, Math.max(1, limit), rest);
+        const tail = [restNote(p, Math.max(1, limit), rest), scope.left].filter((note) => note !== "");
         // Each name's trail has an equal share of the page, less the line break that ends it.
-        const share = Math.max(1, Math.floor((p.pageChars - (tail === "" ? 0 : tail.length + 1)) / names.length) - 1);
-        return { text: [...names.map((name) => aboutText(p, env, read.chat, scope, name, share)), ...(tail === "" ? [] : [tail])].join("\n") };
+        const share = Math.max(1, Math.floor((p.pageChars - tail.reduce((n, note) => n + note.length + 1, 0)) / names.length) - 1);
+        return { text: [...names.map((name) => aboutText(p, env, read.chat, scope, name, share)), ...tail].join("\n") };
       },
     });
   },
@@ -491,16 +531,18 @@ const chatOutline: ToolDefinition = {
         if (args.stretches === true || args.stretches === "true") {
           const stretches = await readerStretches(run, chat, scope);
           const size = stretchesHead(texts, env.settings, stretches.length);
+          // What the story leaves out of the range heads the cut with its size: the readers see it again in what they read.
+          const top = scope.left === "" ? size : `${size}\n${scope.left}`;
           // The cut and nothing else: whoever asked for it hands each line on, and a note of what to call next would be read as one more.
           const cut: QueryPart = {
             query: "",
             total: stretches.length,
-            head: () => size,
+            head: () => top,
             item: (i) => {
               const stretch = stretches[i];
               return stretch ? stretchLine(texts, stretch) : "";
             },
-            nothing: size,
+            nothing: top,
           };
           return searchAnswer(p, args, [cut]);
         }
@@ -517,7 +559,7 @@ const chatOutline: ToolDefinition = {
           },
           nothing: head,
         };
-        return searchAnswer(p, args, [listing], [texts.render(outline.leaf ? A.outlineLeaf : A.outlineNext)]);
+        return searchAnswer(p, args, [listing], [texts.render(outline.leaf ? A.outlineLeaf : A.outlineNext), scope.left]);
       },
     });
   },

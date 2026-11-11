@@ -15,7 +15,7 @@
 //   LumiAH's record is folded into the harbour's log entry, so a reply has one record and not two.
 // - `seen`: everything it was asked and told, in order, for a test to read.
 
-import { type AgentDefinition, type ChatInfo, type HarnessExtension, isRecord, type JsonObject, type JsonValue, newAgentSettings, type RemoteTool, type RemoteToolCall, type ReplyWritten, type RunBegan, type RunEnded, type Skill, type ToolsPort, type WriterRequest } from "../../../src/core/index";
+import { type AgentDefinition, type ChatInfo, type HarnessExtension, isRecord, type JsonObject, type JsonValue, newAgentSettings, type RemoteTool, type RemoteToolCall, type ReplyWritten, type RunBegan, type RunEnded, type Skill, type StorySetting, type ToolsPort, type WriterRequest } from "../../../src/core/index";
 
 /** What the sample is made of, by name. */
 export const HARBOUR = {
@@ -118,6 +118,8 @@ export interface Seen {
 /** How the sample keeps its level of guidance: as a file of the user's area (`path`, which the user edits on the page like any other), or as a text of its own. */
 export interface SampleOptions {
   guidance?: "path" | "text";
+  /** Its word on what counts as the story in the chats it claims; none where absent. */
+  story?: Partial<StorySetting>;
 }
 
 export interface SampleExtension {
@@ -143,7 +145,7 @@ export function sampleExtension(options: SampleOptions = {}): SampleExtension {
         seen.asks.push({ member: "claim", userId: ask.userId, chatId: ask.chatId });
         seen.claims.push(ask.chat);
         if (!ask.chat.id.startsWith(HARBOUR.chats)) return null;
-        return { mainAgent: HARBOUR.keeper, guidance: options.guidance === "text" ? { name, text } : { name, path }, withdraw: [HARBOUR.withdrawn] };
+        return { mainAgent: HARBOUR.keeper, guidance: options.guidance === "text" ? { name, text } : { name, path }, withdraw: [HARBOUR.withdrawn], ...(options.story ? { story: options.story } : {}) };
       },
       async writerRequest(request) {
         seen.asks.push({ member: "writerRequest", userId: request.userId, chatId: request.chatId });

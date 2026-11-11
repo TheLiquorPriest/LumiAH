@@ -392,6 +392,8 @@ export class FakeHost implements BackendHost {
       return { chats: mine.slice(offset, offset + limit).map((chat) => ({ id: chat.id, name: chat.name, characterId: chat.characterId, metadata: clone(chat.metadata) })), total: mine.length };
     },
     characterName: async (characterId: string, _userId: string): Promise<string | null> => (this.permissions.has("characters") ? (this.characters.get(characterId) ?? null) : null),
+    // As the Lumiverse there is now: it doesn't tell extensions whether Sovereign Hand is on.
+    sovereignHand: async (_chatId: string, _userId: string): Promise<boolean | null> => null,
   };
 
   /** A book as held, when the permission to read world books is granted; a member without it answers that there is nothing, as Lumiverse's own does through the backend's host. */

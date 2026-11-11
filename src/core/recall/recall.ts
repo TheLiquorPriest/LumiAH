@@ -17,6 +17,7 @@ import { docKey } from "../paths";
 import type { HarnessHost, JsonValue, TurnRequest } from "../ports";
 import { isRecord } from "../ports";
 import type { Settings } from "../settings";
+import type { StorySource } from "../story";
 import { TEXT, type Texts } from "../texts";
 import type { ChatView, RunInfo } from "../tools";
 import { errorText } from "../util";
@@ -27,7 +28,7 @@ import type { ActivatedEntry, MemoryArc } from "./ports";
 import { type HeldDetail, type HeldLore, heldLore } from "./prompt";
 import type { HeldWhy, LoreChange } from "./shapes";
 
-/** What a run's view is made from: the host, the run, the generation it answers (none for a job's run and a side session's turn), the user's settings and texts, the run's own path of the chat, and the chat's book. A `ToolEnv` is one. */
+/** What a run's view is made from: the host, the run, the generation it answers (none for a job's run and a side session's turn), the user's settings and texts, the run's own path of the chat, what counts as the chat's story, and the chat's book. A `ToolEnv` is one. */
 export interface RunEnv {
   host: HarnessHost;
   run: RunInfo;
@@ -35,6 +36,7 @@ export interface RunEnv {
   settings: Readonly<Settings>;
   texts: Texts;
   chat: Pick<ChatView, "path">;
+  story: StorySource;
   book?: Book;
 }
 
@@ -228,10 +230,10 @@ export class RecallRun {
     return this.corpora.lore;
   }
 
-  /** The chat as the run's own path has it: its messages with their text, and the index a search of them uses. */
+  /** The chat as the run's own path has it: the messages that count as the story with their text, the index a search of them uses, and the numbers of those it leaves out. */
   async chat(): Promise<ChatRun> {
     const { pieceChars, chatBatch } = this.env.settings.tools;
-    return this.corpora.chat.sync(this.env.run.id, await this.env.chat.path(), { pieceChars, chatBatch });
+    return this.corpora.chat.sync(this.env.run.id, await this.env.chat.path(), { pieceChars, chatBatch }, this.env.story);
   }
 
   /** How Lumiverse activated what it put in the generation's prompt: from the recall port where the host has one, else what `LorePort` says, which is the entries alone. */
