@@ -5,16 +5,16 @@
 // the step that mends it), the offer to learn a long story nobody has learned, and the ways into
 // the other pages. The page (pages/home.tsx) only renders what `homeOf` gives.
 
-import { type ChatView, type HomeView, isReply, type LastTurn, type Notice, type RunPlace, type StoryView, type UiState } from "../../shared/ui";
-import { aboutOf, type PageEntry, type PageId, PAGES } from "./app";
+import { type ChatView, type HomeView, isReply, type LastTurn, type Notice, type StoryView, type UiState } from "../../shared/ui";
+import { type PageEntry, type PageId, PAGES } from "./app";
 import { estimateWords, storyCard } from "./chronicle-model";
 import { ago, counted, duration } from "./format";
 import type { IconName } from "./icons";
 import { loreNamesWords, type Mend, mendOf, roleLabel, spentWords, tookWords } from "./live-model";
-import { approvalTarget, type Mark, NOTICE_NEEDS, pageMarks, skippable, type Target } from "./nav-model";
+import { approvalTarget, type Mark, NOTICE_NEEDS, pageMarks, type Target } from "./nav-model";
 import { SETTING_LINKS } from "./setting-links";
 import { settingPlace, valueAt } from "./settings-model";
-import { type ChatStanding, chatStanding, neededPermissions, optionalPermissions, PLACE_LABEL, runtimeTrouble, type SetupStep, setupDone, setupSteps } from "./setup-model";
+import { type ChatStanding, chatStanding, neededPermissions, optionalPermissions, runtimeTrouble, type SetupStep, setupDone, setupSteps } from "./setup-model";
 
 /** What a need's one button does: asks Lumiverse to grant permissions, or goes to where the thing is dealt with. */
 export type NeedAction = { do: "grant"; label: string; permissions: string[] } | { do: "go"; label: string; target: Target };
@@ -37,17 +37,14 @@ export interface Need {
 }
 
 /** How the chat's latest turn stands. */
-export type LastState = "none" | "running" | "done" | "failed" | "stopped" | "lost" | "no_part";
+export type LastState = "none" | "running" | "done" | "failed" | "stopped" | "lost";
 
 /**
  * What LumiAH did for the chat's latest reply (ux B1, B2): a title (how it ended, how long it took
  * and what it cost, and when; or that it is working), the brief it gave the model that writes the
  * reply and the lore it added and left out by name, a sentence where there is more to say, the
- * counts and tokens for the fold, the way to it, and:
- * - while one runs built in, its time before the reply (`clock`: when it began and when that time
- *   ends; the page counts down with `replyClock`) and the reply to skip (`skip`);
- * - where it failed or LumiAH had no part in it, the cause as the title, what happened as the
- *   sentence, and the step that mends it (`mend`; null where the user skipped it themselves).
+ * counts and tokens for the fold, the way to it, and, where it failed, the cause as the title, what
+ * happened as the sentence, and the step that mends it (`mend`).
  */
 export interface LastLine {
   state: LastState;
@@ -58,8 +55,6 @@ export interface LastLine {
   lore: string;
   detail: string | null;
   counts: string | null;
-  clock: { startedAt: number; replyBy: number } | null;
-  skip: { stream: string; turn: string } | null;
   mend: Mend | null;
   action: { label: string; target: Target } | null;
 }
@@ -127,35 +122,20 @@ export function didWords(last: Pick<LastTurn, "agents" | "tools" | "lore" | "cha
 
 const sentence = (words: string): string | null => (words === "" ? null : `${words.charAt(0).toUpperCase()}${words.slice(1)}.`);
 
-/** The counts and the tokens of a turn, for the fold under what it did: "1 agent, 2 tool calls, built in. 3 calls · 12,345 in · 456 out · 4.2 s · $0.0018". */
+/** The counts and the tokens of a turn, for the fold under what it did: "1 agent, 2 tool calls. 3 calls · 12,345 in · 456 out · 4.2 s · $0.0018". */
 function countsWords(last: LastTurn): string | null {
-  const did = didWords(last);
-  const counts = sentence(`${did === "" ? "" : `${did}, `}${PLACE_LABEL[last.place].toLowerCase()}`);
-  return [counts, ...(last.usage !== null ? [spentWords(last.usage)] : [])].filter((p) => p !== null).join(" ") || null;
+  return [sentence(didWords(last)), ...(last.usage !== null ? [spentWords(last.usage)] : [])].filter((p) => p !== null).join(" ") || null;
 }
 
 function lastLine(state: UiState, home: HomeView | null, chat: ChatView | null, standing: ChatStanding | null, now: number): LastLine {
   const live: Target = { page: "live", chatId: null };
-  const plain = { brief: null, lore: "", counts: null, clock: null, skip: null, mend: null };
+  const plain = { brief: null, lore: "", counts: null, mend: null };
   const running = chat === null ? undefined : state.running.find((r) => isReply(r.kind) && r.chatId === chat.chatId);
   const last = home?.last ?? null;
   // What runs is the state's to say (it is pushed); the read says it only until the next one.
   const working = running ?? (last !== null && last.ended === null ? last : undefined);
   if (working !== undefined) {
-    const place: RunPlace | undefined = working.place;
-    const replyBy = working.replyBy ?? null;
-    return {
-      ...plain,
-      state: "running",
-      icon: "pulse",
-      tone: "accent",
-      title: "Working on a reply now",
-      detail: place === undefined ? null : place === "builtin" ? "Built in: once the main agent has briefed it, Lumiverse writes the reply." : "In your runtime.",
-      clock: replyBy === null ? null : { startedAt: working.startedAt, replyBy },
-      // Skipping is offered for the run the state names: only that one can be told to end.
-      skip: running !== undefined ? skippable(state, chat?.chatId ?? null) : null,
-      action: { label: "Watch it live", target: live },
-    };
+    return { ...plain, state: "running", icon: "pulse", tone: "accent", title: "Working on a reply now", detail: "In your runtime.", action: { label: "Watch it live", target: live } };
   }
   if (last === null || last.ended === null) {
     const detail = chat === null ? "Open a chat in Lumiverse, and what LumiAH did for its last reply shows here." : standing?.answered === true ? "Send a message in this chat. LumiAH works before the reply, and what it did shows here." : "Once LumiAH is switched on for this chat, what it did for each reply shows here.";
@@ -169,10 +149,9 @@ function lastLine(state: UiState, home: HomeView | null, chat: ChatView | null, 
   const counts = countsWords(last);
   const mend = mendOf(ended, did, neededPermissions(state).length > 0);
   if (mend !== null) {
-    const lastState: LastState = ended.noPart !== undefined ? "no_part" : ended.state === "lost" ? "lost" : ended.state === "stopped" ? "stopped" : "failed";
-    // What the user did themselves (a skip) is no failure: the card says it plainly, with nothing to mend. Else the cause stands as the card's title, over what happened and the step that mends it.
-    const own = mend.action === null;
-    return { ...plain, state: lastState, icon: own ? "info" : "alert", tone: mend.tone, title: `${mend.title}, ${when}`, detail: mend.text === "" ? null : mend.text, counts, mend: own ? null : mend, action: { label: own ? "See what it did" : "See what happened", target: live } };
+    const lastState: LastState = ended.state === "lost" ? "lost" : ended.state === "stopped" ? "stopped" : "failed";
+    // The cause stands as the card's title, over what happened and the step that mends it.
+    return { ...plain, state: lastState, icon: "alert", tone: mend.tone, title: `${mend.title}, ${when}`, detail: mend.text === "" ? null : mend.text, counts, mend, action: { label: "See what happened", target: live } };
   }
   if (ended.state === "done") {
     const brief = did?.brief ?? null;
@@ -234,7 +213,7 @@ function learnOf(state: UiState, chat: ChatView | null, story: StoryView | null)
 function waysOf(state: UiState, pages: readonly PageId[] | null | undefined): HomeModel["ways"] {
   const marks = pageMarks(state);
   const shown = PAGES.filter((p) => p.id !== "home" && (pages === null || pages === undefined || pages.includes(p.id)));
-  const way = (p: PageEntry): Way => ({ id: p.id, label: p.label, about: aboutOf(p, state.runtime.only), mark: marks[p.id] ?? null });
+  const way = (p: PageEntry): Way => ({ id: p.id, label: p.label, about: p.about, mark: marks[p.id] ?? null });
   return { main: shown.filter((p) => p.far !== true).map(way), more: shown.filter((p) => p.far === true).map(way) };
 }
 

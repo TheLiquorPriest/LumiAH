@@ -3,12 +3,12 @@
 // gaps); the turn's transcript is `transcript.tsx`, and what the user can do to it while it runs
 // (answer a held tool call, say something, pause) is `runs.tsx`. A reply LumiAH works on in another
 // chat is said across the top, with the way to it; so is a chat whose runtime isn't answering, with
-// the one press that runs it built in (none for a chat its extension plays only in the runtime).
+// the way to the Runtime page, where its line is.
 
 import { chatAnswered, isReply } from "../../../shared/ui";
 import { useApp } from "../app";
 import { ChatBar, chatLabel, useChatView, useShownChat } from "../chat";
-import { Banner, Button, Empty, IconButton, useBusy } from "../components";
+import { Banner, Button, Empty, IconButton } from "../components";
 import { LiveTurn, useLive } from "../runs";
 import { useSelect } from "../store";
 
@@ -22,17 +22,6 @@ export function LivePage() {
   const other = useChatView(elsewhere);
   const go = (page: "sessions" | "home"): void => app.nav.update((n) => ({ ...n, page }));
   const view = state.status === "ready" ? state.view : null;
-  const [fixing, fix] = useBusy();
-  const runBuiltIn = (): void =>
-    fix(async () => {
-      if (chat === null) return;
-      try {
-        await app.client.request("lah.chat.set", { chatId: chat.chatId, on: true, place: "builtin" });
-        app.toast(`${chatLabel(chat)} runs built in from its next reply.`);
-      } catch (error) {
-        app.fail(error);
-      }
-    });
   return (
     <div class="lah-stack" data-lah-view="live" style={{ flex: 1 }}>
       <ChatBar aside={chatId !== null ? <IconButton icon="refresh" label="Read the live view again" onClick={again} /> : null} />
@@ -53,18 +42,12 @@ export function LivePage() {
             tone="warn"
             title="Your runtime isn't answering"
             actions={
-              chat.needsRuntime === undefined ? (
-                <Button size="sm" variant="primary" busy={fixing} onClick={runBuiltIn}>
-                  Run it built in
-                </Button>
-              ) : (
-                <Button size="sm" variant="primary" icon="link" onClick={() => app.nav.update((n) => ({ ...n, page: "runtime" }))}>
-                  Start the runtime
-                </Button>
-              )
+              <Button size="sm" variant="primary" icon="link" onClick={() => app.nav.update((n) => ({ ...n, page: "runtime" }))}>
+                Start the runtime
+              </Button>
             }
           >
-            {chat.needsRuntime === undefined ? "This chat is set to run in it, so replies here may fail until it is back." : `${chat.needsRuntime.by} plays this chat only in your runtime, so it can't play until the runtime is back. Its line is on the Runtime page.`}
+            Replies in this chat fail until it is back. Its line is on the Runtime page.
           </Banner>
         </div>
       ) : null}

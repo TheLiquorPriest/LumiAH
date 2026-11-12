@@ -6,11 +6,10 @@
 //   - approval fails closed: only an answer that is exactly an approval runs a held call;
 //   - the loop detector counts a call as a repeat only where its result is the same too, a call an
 //     answer makes several times is run once, and waiting for a job is never a loop;
-//   - of one answer's calls to a tool whose result ends the send, the first alone is run;
-//   - where a reply is due at a set moment, a model call is given no longer than the time left.
+//   - of one answer's calls to a tool whose result ends the send, the first alone is run.
 
 import { describe, expect, test } from "bun:test";
-import { type AgentDeps, type AgentHandle, type AgentSpec, AgentTurn, type ApprovalGate, startAgent } from "../../src/core/loop";
+import { type AgentDeps, type AgentHandle, type AgentSpec, type ApprovalGate, startAgent } from "../../src/core/loop";
 import type { ApprovalAnswer, JobState, JobView, JsonObject, ModelRequest, TranscriptEntry } from "../../src/core/ports";
 import { AgentAccounts } from "../../src/core/provider";
 import { defaultSettings, type Settings } from "../../src/core/settings";
@@ -52,13 +51,13 @@ function stuck(): AgentTool & { runs: JsonObject[] } {
   };
 }
 
-function rig(script: Script, change: (s: Settings) => void = () => undefined, options: { turn?: (s: Settings, host: MemoryHost) => AgentTurn; approval?: ApprovalGate } = {}) {
+function rig(script: Script, change: (s: Settings) => void = () => undefined, options: { approval?: ApprovalGate } = {}) {
   const host = new MemoryHost();
   host.script = script;
   const settings = defaultSettings();
   change(settings);
   const texts = new Texts({});
-  const deps: AgentDeps = { host, settings, texts, accounts: new AgentAccounts(host), turn: options.turn?.(settings, host) ?? null, ...(options.approval ? { approval: options.approval } : {}) };
+  const deps: AgentDeps = { host, settings, texts, accounts: new AgentAccounts(host), turn: null, ...(options.approval ? { approval: options.approval } : {}) };
   const budget = { ...defaultSettings().agents.main!.budget };
   const spec = (over: Partial<AgentSpec> = {}): AgentSpec => ({ role: "main", connectionId: MAIN, model: null, effort: "medium", system: "You look things up.", prefix: [], tools: [], budget, ...over });
   return { host, deps, settings, texts, spec, start: (over: Partial<AgentSpec> = {}) => startAgent(spec(over), deps) };
@@ -509,90 +508,5 @@ describe("one answer, one call that ends the send (L1)", () => {
   test("write_reply as built carries the mark", () => {
     const made = built(REPLY_TOOLS, TOOL.writeReply, envOf({ writeReply: async (brief) => ({ text: `written from: ${brief}`, end: true }) }));
     expect(made.ends).toBe(true);
-  });
-});
-
-describe("where a reply is due at a set moment, no call is given longer than the time left (L4)", () => {
-  const due = (ms: number | null) => (s: Settings, host: MemoryHost) => {
-    const turn = new AgentTurn(s.turn, host.clock.now());
-    turn.replyBy = ms === null ? null : host.clock.now() + ms;
-    return turn;
-  };
-
-  test("a model call that hangs is given up the moment the reply is due, not at its own longer time", async () => {
-    const r = rig([{ hang: true }], undefined, { turn: due(10_000) });
-    const agent = r.start({ budget: { ...r.spec().budget, callMs: 60_000 } });
-    const sending = agent.send("go");
-    let done = false;
-    void sending.then(() => (done = true));
-    await until(() => r.host.calls.length === 1);
-    r.host.clock.advance(9999);
-    await idle();
-    expect(done).toBe(false);
-    r.host.clock.advance(1);
-    expect(await sending).toMatchObject({ status: "refused", code: "reply_time", reason: r.texts.render(TEXT.hosted.stop) });
-    expect(r.host.clock.now() - 1_000_000).toBe(10_000);
-  });
-
-  test("with no time per call at all the reply's moment still ends the call", async () => {
-    const r = rig([{ hang: true }], undefined, { turn: due(10_000) });
-    expect(r.spec().budget.callMs).toBeNull();
-    const sending = r.start().send("go");
-    await until(() => r.host.calls.length === 1);
-    r.host.clock.advance(10_000);
-    expect(await sending).toMatchObject({ status: "refused", code: "reply_time" });
-  });
-
-  test("a call's own shorter time still ends it first", async () => {
-    const r = rig([{ hang: true }], undefined, { turn: due(10_000) });
-    const sending = r.start({ budget: { ...r.spec().budget, callMs: 4000 } }).send("go");
-    await until(() => r.host.calls.length === 1);
-    r.host.clock.advance(4000);
-    expect(await sending).toMatchObject({ status: "refused", code: "call_time" });
-  });
-
-  test("no round is begun at or after the moment: an answer that came just as the reply fell due has none of its calls run", async () => {
-    const lookup = tool("lookup");
-    const r = rig(
-      () => {
-        r.host.clock.advance(10_000);
-        return { toolCalls: [call("lookup", { q: "lamp" }, "c1")] };
-      },
-      undefined,
-      { turn: due(10_000) },
-    );
-    expect(await r.start({ tools: [lookup] }).send("go")).toMatchObject({ status: "refused", code: "reply_time" });
-    expect(lookup.runs).toEqual([]);
-    expect(r.host.calls).toHaveLength(1);
-  });
-
-  test("no call is begun at or after it: a round that ran up to the moment is followed by none, and one that ended before it is", async () => {
-    const slow = (ms: number) =>
-      tool("lookup", () => {
-        r.host.clock.advance(ms);
-        return "found";
-      });
-    let r = rig([{ toolCalls: [call("lookup", { q: "lamp" }, "c1")] }, "never"], undefined, { turn: due(10_000) });
-    expect(await r.start({ tools: [slow(10_000)] }).send("go")).toMatchObject({ status: "refused", code: "reply_time" });
-    expect(r.host.calls).toHaveLength(1);
-    r = rig([{ toolCalls: [call("lookup", { q: "lamp" }, "c1")] }, "In time."], undefined, { turn: due(10_000) });
-    expect(await r.start({ tools: [slow(9999)] }).send("go")).toMatchObject({ status: "answered", text: "In time." });
-    // And before its first call too: an agent started once the reply is due makes none.
-    r = rig(["never"], undefined, { turn: due(0) });
-    expect(await r.start().send("go")).toMatchObject({ status: "refused", code: "reply_time" });
-    expect(r.host.calls).toHaveLength(0);
-  });
-
-  test("with no moment set nothing changes: the call has its own time, and a run with none waits", async () => {
-    const r = rig([{ hang: true }], undefined, { turn: due(null) });
-    const sending = r.start({ budget: { ...r.spec().budget, callMs: 60_000 } }).send("go");
-    let done = false;
-    void sending.then(() => (done = true));
-    await until(() => r.host.calls.length === 1);
-    r.host.clock.advance(59_999);
-    await idle();
-    expect(done).toBe(false);
-    r.host.clock.advance(1);
-    expect(await sending).toMatchObject({ status: "refused", code: "call_time" });
   });
 });

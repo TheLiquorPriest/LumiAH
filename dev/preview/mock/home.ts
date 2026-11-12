@@ -15,7 +15,7 @@ const ASKS: readonly PermissionNeed[] = [
   { id: "chats", what: "read a chat and switch itself on for it", without: "no chat can be switched on", todo: TODO, needed: true },
   { id: "generation", what: "make its agents' model calls, and hear when a reply starts and ends", without: "its agents can't call a model", todo: TODO, needed: true },
   { id: "chat_mutation", what: "read the chat's messages and write each reply's record on it", without: "no reply is worked on", todo: TODO, needed: true },
-  { id: "generation_parameters", what: "mark the replies a runtime works on", without: "no chat can run in a runtime (one that runs built in needs it for nothing)", todo: TODO, needed: false },
+  { id: "generation_parameters", what: "tag the replies your runtime answers", without: "no reply is worked on", todo: TODO, needed: true },
   { id: "world_books", what: "read your world books", without: "agents can't look up lore", todo: TODO, needed: false },
   { id: "mcp_servers", what: "use the tools of your MCP servers", without: "agents aren't offered those tools", todo: TODO, needed: false },
 ];

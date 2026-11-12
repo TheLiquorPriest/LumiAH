@@ -1,9 +1,10 @@
 // The Agents, Skills and Tools pages' requests (DESIGN §13, §17): what the user makes or switches is
 // kept with their settings and reaches the core with them, a definition the core refuses isn't
 // kept, what a tool's calls do is the same setting Settings holds, and the jobs' two switches are
-// settings too. The definitions are about no chat, so the core built in answers for them (§25); its
-// part (merging and checking in a run) is scripted here, but where an extension's own definitions
-// are saved over and what each agent can use in a chat is read, which the core itself answers.
+// settings too. The definitions are about no chat, so the user's runtime answers for them; its
+// core's part (merging and checking in a run) is scripted here, but where an extension's own
+// definitions are saved over and what each agent can use in a chat is read, which the core itself
+// answers.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import type { AgentDefinition } from "../../../src/core/agents";
@@ -15,7 +16,7 @@ import type { BackendExtension } from "../../../src/extension/backend/extension"
 import { UiFailure } from "../../support/fake-lumiverse";
 import { type Rig, rig, USER } from "../../support/rig";
 
-/** A harness that answers the pages' reads as the core would for a user with one tool (in the core's own type, so the two can't drift apart unseen), and remembers the settings it is handed. The rig gives it to both places; what is asked about no chat reaches the one built in. */
+/** A harness that answers the pages' reads as the core would for a user with one tool (in the core's own type, so the two can't drift apart unseen), and remembers the settings it is handed. The rig's runtime runs it, and is asked what is about no chat. */
 function scripted(seen: { definitions: unknown[] }): NonNullable<Parameters<typeof rig>[0]>["harness"] {
   return (_host, settings) => ({
     answer: async () => ({ status: "failed", reason: "no turn is answered in this test", record: null, reply: "", usage: { calls: 0, toolTurns: 0, in: 0, cachedIn: 0, out: 0, reasoningOut: 0, estimated: false, ms: 0 } }),
@@ -119,14 +120,15 @@ describe("an extension's own definitions", () => {
   const ledger: Skill = { id: "harbour_ledger", name: "The harbour's ledger", description: "How a berth is entered.", body: "Name the ship, then her berth.", owned: true };
   const extension: BackendExtension = { name: "Harbour", definitions: async () => ({ agents: [reader], skills: [ledger] }), claim: async () => ({ withdraw: ["lore_grep"] }) };
 
-  async function harbour(): Promise<Rig> {
+  /** A runtime linked, running the core itself, and a chat switched on: what the pages ask of the definitions is answered there. */
+  async function harbour(): Promise<{ it: Rig; chatId: string }> {
     const it = await rig({ backend: { extension } });
     open = it;
-    return it;
+    return { it, chatId: await it.setUp() };
   }
 
   test("a save of the user's version keeps their model and limits and stores none of the fields the extension keeps, which stay the extension's", async () => {
-    const it = await harbour();
+    const { it } = await harbour();
     const budget = { ...reader.budget, revisions: 1 };
     // Sent as a page of an older build would: with instructions of its own, other tools, and `owns`.
     await it.page.request("lah.agent.save", { agent: { ...reader, instructions: "Read it aloud.", tools: ["chat_read"], model: "tide-model-9", budget } });
@@ -137,21 +139,20 @@ describe("an extension's own definitions", () => {
   });
 
   test("a skill the extension keeps as its own can't be saved over", async () => {
-    const it = await harbour();
+    const { it } = await harbour();
     const refused = await it.page.request("lah.skill.save", { skill: { id: ledger.id, name: ledger.name, description: ledger.description, body: "Write the hour first." } }).catch((error: unknown) => error);
     expect((refused as UiFailure).error).toMatchObject({ code: "forbidden", message: "This skill belongs to the extension. You change it on that extension's own pages." });
     expect((await it.backend.settings.snapshot(USER)).definitions).toEqual({});
   });
 
   test("Settings keep no tools for it: a tools value sent there isn't stored, and its model is", async () => {
-    const it = await harbour();
+    const { it } = await harbour();
     await it.page.request("lah.settings.set", { set: [{ path: ["core", "agents", reader.id, "tools"], value: ["chat_read"] }, { path: ["core", "agents", reader.id, "model"], value: "tide-model-9" }], reset: [] });
     expect((((await it.backend.settings.snapshot(USER)).values.core as JsonObject).agents as JsonObject)[reader.id]).toEqual({ model: "tide-model-9" });
   });
 
   test("held says, for each agent of a chat, the tools it holds and why it can't use each other tool it names", async () => {
-    const it = await harbour();
-    const chatId = await it.setUpBuiltin();
+    const { it, chatId } = await harbour();
     await it.page.request("lah.def.switch", { kind: "tool", id: "chat_grep", off: true });
     const held = (await it.backend.agents.held(USER, chatId)).find((agent) => agent.id === reader.id);
     expect(held).toEqual({

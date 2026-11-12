@@ -1,26 +1,22 @@
 // What a page asks of the core (DESIGN §4, §8, §25). The core keeps the workspace, the jobs, the
-// side sessions, the spend and the rest in documents that only the place holding it writes, and
-// there are two such places: this extension, for what runs built in, and the user's runtime. So a
-// page's request for any of it is done in the place it belongs to:
+// side sessions, the spend and the rest in documents in the user's storage, and it runs in the
+// user's runtime. So a page's request for any of it is sent on to a runtime (the `ask` push), which
+// does it with its core and answers (`ask.answer`). Which runtime:
 //
-// - about a chat: where that chat's turns run (in a runtime while the chat generates on a loopback
-//   connection, else built in), since a chat's files, jobs and side sessions are written there;
-// - about a run under way, or a job that isn't over: where it runs;
-// - about no chat (the user's own files, their definitions, the spend, the sweep): built in, which
-//   is always there.
+// - about a chat on a loopback connection: the one that chat's replies reach (the one whose loopback
+//   connection the chat generates on), since its jobs and side sessions run there; while that one
+//   isn't linked there is nobody to ask, and the page is told so;
+// - about a run under way, or a job that isn't over: the one it runs in;
+// - about anything else (no chat, the user's own files, their definitions, the spend, the sweep, a
+//   chat that generates elsewhere): the user's runtime, the one linked now that was heard from last.
 //
-// Built in, it is one call of the core here. In a runtime, it is sent on (the `ask` push), and the
-// runtime does it with its core and answers (`ask.answer`). A user may have more than one runtime
-// linked, and each keeps its own documents: what is asked about a chat goes to the one whose
-// loopback connection the chat generates on, and while that one isn't linked there is nobody to
-// ask, and the page is told so.
+// With no runtime linked there is nobody to ask, and the page is told that in plain words.
 
 import type { JsonObject, JsonValue } from "../../core/ports";
 import { LINK } from "../../link/contract";
 import { isRecord } from "../../link/json";
-import type { RunPlace, UiErrorCode, UiProblem } from "../../shared/ui";
+import type { UiErrorCode, UiProblem } from "../../shared/ui";
 import { UiRefused } from "./errors";
-import { BUILTIN } from "./live";
 import type { Relays } from "./relays";
 import type { SettingsStore } from "./settings";
 
@@ -41,17 +37,15 @@ export interface Where {
 export interface AsksDeps {
   relays: Pick<Relays, "push" | "isLinked">;
   settings: Pick<SettingsStore, "transport">;
-  /** The core where it runs built in: one op of it, answered as the core answers; rejects with a `UiRefused`. */
-  builtin(userId: string, op: string, args: JsonObject): Promise<JsonValue>;
-  /** Where what is asked about a chat is done; rejects (`not_found`) for a chat that isn't the user's. */
-  placeOf(userId: string, chatId: string): Promise<RunPlace>;
-  /** The runtime a chat that runs in one generates on (the one whose loopback connection the chat is on), by its id; null while that runtime isn't linked. */
+  /** Whether a chat generates on a loopback connection, so its replies reach a runtime; rejects (`not_found`) for a chat that isn't the user's. */
+  onLoopback(userId: string, chatId: string): Promise<boolean>;
+  /** The runtime a chat on a loopback connection generates on (the one whose loopback connection the chat is on), by its id; null while that runtime isn't linked. */
   runtimeOf(userId: string, chatId: string): Promise<string | null>;
-  /** Whether the extension that answers a chat plays it only in a runtime, and its name; null where it doesn't. */
-  needsRuntime(userId: string, chatId: string): Promise<{ by: string } | null>;
-  /** The runtime a run under way runs in (`BUILTIN`: none, it runs here); null when it isn't under way. */
+  /** The user's runtime for what is about no chat: the one linked now that was heard from last; null while none is. */
+  userRuntime(userId: string): Promise<string | null>;
+  /** The runtime a run under way runs in; null when it isn't under way. */
   runOf(userId: string, stream: string, turn: string): string | null;
-  /** The runtime a job that isn't over runs in (`BUILTIN`: here); null when nothing was heard of it since the extension started. */
+  /** The runtime a job that isn't over runs in; null when nothing was heard of it since the extension started. */
   jobOf(userId: string, job: string): string | null;
   /** The extension as its pages show it. */
   name: string;
@@ -89,49 +83,44 @@ export class Asks {
 
   constructor(private readonly deps: AsksDeps) {}
 
-  /** The chat a job or a side session is about, as the built-in core reads it from the store both places share; null: none, or there is no such job or session. */
+  /** The chat a job or a side session is about, as the user's runtime reads it from the store; null: none, or there is no such job or session. */
   private async chatOf(userId: string, op: "jobs.read" | "sides.turns", id: string): Promise<string | null> {
     try {
-      const read = await this.deps.builtin(userId, op, { id });
+      const read = await this.ask(userId, op, { id });
       const row = isRecord(read) ? (op === "jobs.read" ? read.job : read.side) : undefined;
       return isRecord(row) && typeof row.chatId === "string" && row.chatId !== "" ? row.chatId : null;
     } catch (error) {
-      // No such job or session: asked built in, the op itself says so in the core's own words.
+      // No such job or session: the core says so in its own words, asked about it again where it runs.
       if (error instanceof UiRefused && error.code === "not_found") return null;
       throw error;
     }
   }
 
-  /** Where a request is done: `BUILTIN`, or a runtime by its id; `{ chat }`: in that chat's runtime, which isn't linked. */
-  private async place(userId: string, where: Where): Promise<string | { chat: string }> {
-    if (where.run !== undefined) return this.deps.runOf(userId, where.run.stream, where.run.turn) ?? BUILTIN;
+  /** The runtime a request goes to, by its id; `{ chat }`: that chat's runtime, which isn't linked; null: no runtime of the user's is linked. */
+  private async place(userId: string, where: Where): Promise<string | { chat: string } | null> {
+    const running = where.run !== undefined ? this.deps.runOf(userId, where.run.stream, where.run.turn) : null;
+    if (running !== null) return running;
     let chat = where.chat ?? null;
     if (where.job !== undefined) {
       const runs = this.deps.jobOf(userId, where.job);
       if (runs !== null) return runs;
       chat = await this.chatOf(userId, "jobs.read", where.job);
     } else if (where.side !== undefined) chat = await this.chatOf(userId, "sides.turns", where.side);
-    if (chat === null || (await this.deps.placeOf(userId, chat)) !== "runtime") return BUILTIN;
-    return (await this.deps.runtimeOf(userId, chat)) ?? { chat };
-  }
-
-  /** What a page is told of a chat whose runtime isn't linked: to start it, and, where the chat may run built in, that it may. */
-  private async awayWords(userId: string, chatId: string): Promise<string> {
-    const start = `Start it (its line is on ${this.deps.name}'s Runtime page) and try again`;
-    const needs = await this.deps.needsRuntime(userId, chatId).catch(() => null);
-    return needs !== null ? `${needs.by} plays this chat only in your runtime, which isn't linked now. ${start}.` : `This chat runs in a runtime, and its runtime isn't linked. ${start}, or set the chat to run built in, which needs no runtime.`;
+    if (chat !== null && (await this.deps.onLoopback(userId, chat))) return (await this.deps.runtimeOf(userId, chat)) ?? { chat };
+    return this.deps.userRuntime(userId);
   }
 
   /**
-   * Asks the core for `op` in the place `where` says: its own answer. Refused as the core or its
-   * place refused it. In a runtime: `unavailable` when the chat's isn't linked, when the one asked
-   * goes away, and when it doesn't answer in the time Settings give (`patient`: it is waited for as
-   * long as it stays linked).
+   * Asks the core for `op` in the runtime `where` says: its own answer. Refused as the core or the
+   * runtime refused it; `unavailable`, in words that say what to do, when no runtime of the user's
+   * is linked, when the chat's isn't, when the one asked goes away, and when it doesn't answer in
+   * the time Settings give (`patient`: it is waited for as long as it stays linked).
    */
   async ask(userId: string, op: string, args: JsonObject, where: Where = {}): Promise<JsonValue> {
     const relay = await this.place(userId, where);
-    if (relay === BUILTIN) return this.deps.builtin(userId, op, args);
-    if (typeof relay !== "string") throw new UiRefused("unavailable", await this.awayWords(userId, relay.chat));
+    const start = `Start it (its line is on ${this.deps.name}'s Runtime page) and try again.`;
+    if (relay === null) throw new UiRefused("unavailable", `${this.deps.name} needs its runtime for this, and none is linked now. ${start}`);
+    if (typeof relay !== "string") throw new UiRefused("unavailable", `This chat runs in a runtime, and that runtime isn't linked now. ${start}`);
     const waitMs = (await this.deps.settings.transport(userId)).pages.askMs;
     const id = this.deps.id();
     const { promise, resolve, reject } = Promise.withResolvers<JsonValue>();

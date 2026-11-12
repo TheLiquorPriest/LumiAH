@@ -32,14 +32,12 @@ export interface PlayEnd {
 /**
  * A run to play: whether it answers a generation in a chat (only the chat's own turns do; a job's
  * run and a side session's turn don't), its chat (null: none), the id its trace goes by (a job's
- * run goes by the job's id; left out, one is made), how long a built-in reply's turn has before
- * the reply (left out: the story's usual time), and what to do when it has ended.
+ * run goes by the job's id; left out, one is made), and what to do when it has ended.
  */
 export interface PlayOptions {
   reply: boolean;
   chatId: string | null;
   turn?: string;
-  replyMs?: number;
   done?(end: PlayEnd): void;
 }
 

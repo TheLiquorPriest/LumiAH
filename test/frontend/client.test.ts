@@ -40,7 +40,7 @@ describe("requests", () => {
     const w = wire();
     const asked = w.client.request("lah.chat.get", { chatId: "chat-mara" });
     expect(w.last()).toMatchObject({ lah: UI_VERSION, type: "lah.chat.get", chatId: "chat-mara" });
-    const chat: ChatView = { chatId: "chat-mara", name: "Mara at the harbour", on: true, since: 1, place: "builtin", connection: null };
+    const chat: ChatView = { chatId: "chat-mara", name: "Mara at the harbour", on: true, since: 1, connection: null };
     w.deliver(result(w.last().reqId, "lah.chat.get", { chat }));
     expect(await asked).toEqual({ chat });
   });

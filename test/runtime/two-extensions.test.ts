@@ -3,13 +3,12 @@
 // runtime, a port, a config, a loopback connection and a key of its own. A reply is answered by the
 // extension whose connection the chat generates on and by no other: the other one's interceptor
 // sees the generation and leaves it as it is, its runtime is asked nothing, and it keeps nothing.
-// The same holds for a chat that runs built in (§25), where no connection tells the two apart: the
-// extension the chat was switched on in works on its replies, and the other shows the chat as that
-// one's and offers no switch of its own.
+// A chat one of them answers shows in the other's pages as that one's, with no switch of its own,
+// until the user takes it over there.
 //
 // The core's place in the runtimes is taken by a harness that does of a turn what crosses the link
 // (a model call on the user's own connection, a body stored, the reply, a record to anchor): what
-// the core makes of a turn is its own tests' to check. Built in, each backend runs the core's own.
+// the core makes of a turn is its own tests' to check.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { textHash } from "../../src/core/hash";
@@ -57,14 +56,10 @@ interface Both {
   lantern: Installed;
   /** What the two `up` lines said. */
   said: string[];
-  /** A new chat with these messages, Mara's first, switched on in one extension's pages to run in its runtime. */
+  /** A new chat with these messages, Mara's first, switched on in one extension's pages. */
   chat(side: Installed, ...texts: string[]): Promise<string>;
-  /** The same, switched on to run built in: the chat stays on the user's own connection. */
-  chatHere(side: Installed, ...texts: string[]): Promise<string>;
   /** One generation as Lumiverse runs it: on the connection the chat generates on, at that connection's address, with the key Lumiverse holds for it. */
   generate(chatId: string): Promise<Generated>;
-  /** One generation in a chat on the user's own connection: Lumiverse writes the reply itself (`lumiverse.writes`), and no loopback endpoint is asked anything. */
-  generateOwn(chatId: string): Promise<Generated>;
 }
 
 const closers: (() => void)[] = [];
@@ -114,10 +109,10 @@ async function both(): Promise<Both> {
   const own = await install(lumiverse.host, {}, "mara");
   const lantern = await install(new FakeHost("other_ext", lumiverse.host), { identity: { name: "Lantern", connectionName: "Lantern loopback" } }, "mara-other_ext");
   const sides = [own, lantern];
-  const started = async (side: Installed, place: "runtime" | "builtin", texts: string[]): Promise<string> => {
+  const started = async (side: Installed, texts: string[]): Promise<string> => {
     const chat = side.host.addChat(USER, "Harbour light");
     texts.forEach((text, i) => side.host.say(chat.id, i % 2 === 0 ? "user" : "assistant", text));
-    await side.page.request("lah.chat.set", { chatId: chat.id, on: true, place });
+    await side.page.request("lah.chat.set", { chatId: chat.id, on: true });
     return chat.id;
   };
   return {
@@ -125,8 +120,7 @@ async function both(): Promise<Both> {
     lumiah: own,
     lantern,
     said: m.out,
-    chat: (side, ...texts) => started(side, "runtime", texts),
-    chatHere: (side, ...texts) => started(side, "builtin", texts),
+    chat: (side, ...texts) => started(side, texts),
     generate(chatId) {
       const pin = lumiverse.host.chatList.get(chatId)?.metadata.connection_profile_id;
       const connection = lumiverse.host.connectionList.find((c) => c.id === pin);
@@ -139,12 +133,6 @@ async function both(): Promise<Both> {
         return serving.runtime.fetch(request);
       };
       return lumiverse.generate(fetch, chatId, { key: lumiverse.keys.get(connection.id) ?? "", port });
-    },
-    generateOwn(chatId) {
-      const none = async (): Promise<Response> => {
-        throw new Error("no loopback endpoint serves a chat on the user's own connection");
-      };
-      return lumiverse.generate(none, chatId, { key: "", port: 0 });
     },
   };
 }
@@ -237,66 +225,25 @@ describe("LumiAH and an extension that has LumiAH built in, installed together",
     expect(reply.own).toBeNull();
   });
 
-  test("a chat switched on built in is worked on by the extension it was switched on in alone, and the other shows it as that one's and offers no switch", async () => {
-    const it = await both();
-    const chatId = await it.chatHere(it.lantern, "Who sells Okoro his lamp oil?");
-
-    // LumiAH's pages show the chat as the extension's, not as one it could answer, and refuse to take it.
-    expect((await it.lantern.page.request("lah.chat.get", { chatId })).chat).toMatchObject({ on: true, place: "builtin", connection: { id: "conn-main", loopback: false } });
-    const seen = (await it.lumiah.page.request("lah.chat.get", { chatId })).chat;
-    expect(seen).toMatchObject({ on: false, since: null, other: { identifier: "other_ext", name: "Lantern" } });
-    const refused = await it.lumiah.page.request("lah.chat.set", { chatId, on: true }).catch((error: unknown) => error);
-    expect(refused instanceof UiFailure ? refused.error : null).toMatchObject({ code: "unavailable", message: "Lantern answers this chat. Switch it off there first: two harnesses would both work on each of its replies. Or take the chat over here, which takes it from Lantern." });
-
-    it.lantern.host.script = [briefing("Brann sells Okoro his oil.", "reply_1")];
-    it.lumiverse.writes = () => "Brann does, every market day.";
-    const kept = [...it.lumiah.host.files.keys()];
-
-    const out = await it.generateOwn(chatId);
-
-    // The extension's main agent briefed, once; Lumiverse wrote the reply on the user's own connection.
-    expect(out).toMatchObject({ status: 200, error: null, content: "Brann does, every market day." });
-    expect(out.breakdown.map((b) => b.name)).toEqual(["Lantern: the main agent's brief"]);
-    expect(JSON.stringify(out.body.messages).split("Brann sells Okoro his oil.")).toHaveLength(2);
-    expect(it.lantern.host.calls).toHaveLength(1);
-    // LumiAH worked on nothing: it called no model, no runtime of either was asked, and it stored nothing.
-    expect(it.lumiah.host.calls).toEqual([]);
-    expect({ lumiah: it.lumiah.requests, lantern: it.lantern.requests }).toEqual({ lumiah: 0, lantern: 0 });
-    expect(it.lumiah.backend.live.runningOf(USER)).toEqual([]);
-    expect([...it.lumiah.host.files.keys()]).toEqual(kept);
-    const reply = it.lantern.host.message(chatId, out.messageId ?? "");
-    await until(() => reply.metadata.other_ext !== undefined, "the extension's record on the reply");
-    expect(Object.keys(reply.metadata)).toEqual(["other_ext"]);
-
-    // Switched off there, the chat is LumiAH's to take; from then on the extension's pages show it as LumiAH's, and its replies are LumiAH's to work on.
-    await it.lantern.page.request("lah.chat.set", { chatId, on: false });
-    expect((await it.lumiah.page.request("lah.chat.set", { chatId, on: true })).chat).toMatchObject({ on: true, place: "builtin" });
-    expect((await it.lantern.page.request("lah.chat.get", { chatId })).chat).toMatchObject({ on: false, other: { identifier: "lumi_ah", name: "LumiAH" } });
-    it.lumiverse.host.say(chatId, "user", "And who sold it before him?");
-    it.lumiah.host.script = [briefing("Ilse sold the oil before Brann.", "reply_2")];
-    it.lumiverse.writes = () => "Ilse, before the storm.";
-    const next = await it.generateOwn(chatId);
-    expect(next.content).toBe("Ilse, before the storm.");
-    expect(next.breakdown.map((b) => b.name)).toEqual(["LumiAH: the main agent's brief"]);
-    expect(it.lumiah.host.calls).toHaveLength(1);
-    expect(it.lantern.host.calls).toHaveLength(1);
-    const second = it.lumiah.host.message(chatId, next.messageId ?? "");
-    await until(() => second.metadata.lumi_ah !== undefined, "LumiAH's record on the next reply");
-    expect(Object.keys(second.metadata)).toEqual(["lumi_ah"]);
-  });
-
-  test("a chat one of them runs in its runtime is no chat the other can switch on, built in or not", async () => {
+  test("a chat one of them answers is no chat the other can switch on", async () => {
     const it = await both();
     const chatId = await it.chat(it.lumiah, "Who keeps the harbour light now?");
     expect((await it.lantern.page.request("lah.chat.get", { chatId })).chat).toMatchObject({ on: false, other: { identifier: "lumi_ah", name: "LumiAH" } });
-    for (const place of ["builtin", "runtime"] as const) {
-      const refused = await it.lantern.page.request("lah.chat.set", { chatId, on: true, place }).catch((error: unknown) => error);
-      expect(refused instanceof UiFailure ? refused.error.message : null).toContain("LumiAH answers this chat.");
-    }
+    const refused = await it.lantern.page.request("lah.chat.set", { chatId, on: true }).catch((error: unknown) => error);
+    expect(refused instanceof UiFailure ? refused.error.message : null).toContain("LumiAH answers this chat.");
     // The chat still generates on LumiAH's loopback, and LumiAH still answers it.
     it.lumiah.host.script = ["Okoro keeps it now."];
     expect((await it.generate(chatId)).content).toBe("Okoro keeps it now.");
     expect(it.lantern.host.calls).toEqual([]);
+
+    // Switched off in LumiAH, the chat is the extension's to switch on: from then on LumiAH's pages show it as the extension's, and the extension's runtime answers its replies.
+    await it.lumiah.page.request("lah.chat.set", { chatId, on: false });
+    expect((await it.lantern.page.request("lah.chat.set", { chatId, on: true })).chat).toMatchObject({ on: true, connection: { id: it.lantern.connection.id, loopback: true } });
+    expect((await it.lumiah.page.request("lah.chat.get", { chatId })).chat).toMatchObject({ on: false, other: { identifier: "other_ext", name: "Lantern" } });
+    it.lumiverse.host.say(chatId, "user", "And who kept it before him?");
+    it.lantern.host.script = ["Ilse kept it before him."];
+    expect((await it.generate(chatId)).content).toBe("Ilse kept it before him.");
+    expect([it.lumiah.host.calls.length, it.lantern.host.calls.length]).toEqual([1, 1]);
   });
 
   test("a request with the other one's key is refused, in words that name the page to mint a key on", async () => {
@@ -336,40 +283,42 @@ describe("LumiAH and an extension that has LumiAH built in, installed together",
     expect(lacking).toEqual({ id: "interceptor", needed: true, what: "see a reply's prompt before it is sent", without: "no reply is worked on", todo: "Grant it in Lumiverse (Extensions → Lantern → Permissions)." });
   });
 
-  test("a chat one of them answers is taken over by the other at the user's word: the other's mark goes, the chat gets back the connection it had, and it runs built in there", async () => {
+  test("a chat one of them answers is taken over by the other at the user's word: the other's mark goes, and the chat is pinned to the other's runtime, which remembers the connection it had", async () => {
     const it = await both();
-    // A chat the user had pinned to a connection of their own, then switched on in the extension, to run in its runtime.
+    // A chat the user had pinned to a connection of their own, then switched on in the extension.
     it.lumiah.host.addConnection({ id: "conn-own", name: "Own", provider: "openai", model: "model-own" });
     const chat = it.lantern.host.addChat(USER, "Harbour light");
     it.lantern.host.say(chat.id, "user", "Who keeps the harbour light now?");
     chat.metadata.connection_profile_id = "conn-own";
-    expect((await it.lantern.page.request("lah.chat.set", { chatId: chat.id, on: true, place: "runtime" })).chat).toMatchObject({ on: true, place: "runtime", connection: { id: it.lantern.connection.id } });
+    expect((await it.lantern.page.request("lah.chat.set", { chatId: chat.id, on: true })).chat).toMatchObject({ on: true, connection: { id: it.lantern.connection.id } });
 
     // LumiAH shows it as the extension's and won't switch it on beside it; the refusal says how to take it.
     expect((await it.lumiah.page.request("lah.chat.get", { chatId: chat.id })).chat).toMatchObject({ on: false, other: { identifier: "other_ext", name: "Lantern" } });
     const refused = await it.lumiah.page.request("lah.chat.set", { chatId: chat.id, on: true }).catch((error: unknown) => error);
     expect(refused instanceof UiFailure ? refused.error : null).toMatchObject({ code: "unavailable", message: expect.stringContaining("take the chat over here") });
 
-    // Taken over: the extension's mark is gone, the chat is back on the connection it had before the extension pinned it, and LumiAH answers it built in.
+    // Taken over: the extension's mark is gone, and the chat is pinned to LumiAH's own loopback connection, so LumiAH's runtime answers it.
     const taken = (await it.lumiah.page.request("lah.chat.takeover", { chatId: chat.id })).chat;
-    expect(taken).toMatchObject({ on: true, place: "builtin", connection: { id: "conn-own", loopback: false } });
+    expect(taken).toMatchObject({ on: true, connection: { id: it.lumiah.connection.id, loopback: true } });
     expect(taken.other).toBeUndefined();
     expect(Object.keys(chat.metadata).filter((key) => key.startsWith("lumiah_chat_"))).toEqual(["lumiah_chat_lumi_ah"]);
-    expect(chat.metadata.connection_profile_id).toBe("conn-own");
+    expect(chat.metadata.connection_profile_id).toBe(it.lumiah.connection.id);
     // The extension, still installed, now shows the chat as LumiAH's and works on none of its replies.
     expect((await it.lantern.page.request("lah.chat.get", { chatId: chat.id })).chat).toMatchObject({ on: false, other: { identifier: "lumi_ah", name: "LumiAH" } });
-    it.lumiah.host.script = [briefing("Okoro keeps the light.", "brief_1")];
-    it.lumiverse.writes = () => "Okoro keeps it now.";
-    const out = await it.generateOwn(chat.id);
+    it.lumiah.host.script = ["Okoro keeps it now."];
+    const out = await it.generate(chat.id);
     expect(out.content).toBe("Okoro keeps it now.");
+    expect({ lumiah: it.lumiah.requests, lantern: it.lantern.requests }).toEqual({ lumiah: 1, lantern: 0 });
     expect(it.lumiah.host.calls).toHaveLength(1);
     expect(it.lantern.host.calls).toEqual([]);
+    // Switched off in LumiAH, the chat gets back the connection it had before either pinned it.
+    expect((await it.lumiah.page.request("lah.chat.set", { chatId: chat.id, on: false })).chat).toMatchObject({ on: false, connection: { id: "conn-own", loopback: false } });
 
     // A mark left by an extension that is no longer installed is taken the same way: nobody is there to switch it off in.
     const orphan = it.lumiah.host.addChat(USER, "Brann's ledger");
-    orphan.metadata.lumiah_chat_gone_ext = { v: 1, chat: orphan.id, name: "Old Lantern", place: "builtin", since: 1 };
+    orphan.metadata.lumiah_chat_gone_ext = { v: 1, chat: orphan.id, name: "Old Lantern", since: 1 };
     expect((await it.lumiah.page.request("lah.chat.get", { chatId: orphan.id })).chat).toMatchObject({ on: false, other: { identifier: "gone_ext", name: "Old Lantern" } });
-    expect((await it.lumiah.page.request("lah.chat.takeover", { chatId: orphan.id })).chat).toMatchObject({ on: true, place: "builtin" });
+    expect((await it.lumiah.page.request("lah.chat.takeover", { chatId: orphan.id })).chat).toMatchObject({ on: true, connection: { id: it.lumiah.connection.id, loopback: true } });
     expect(Object.keys(orphan.metadata).filter((key) => key.startsWith("lumiah_chat_"))).toEqual(["lumiah_chat_lumi_ah"]);
   });
 });

@@ -463,7 +463,7 @@ describe("a reply asked of a runtime whose link is refused", () => {
     const told = await refusedWith({ type: "error", code: "version", message: why });
     expect(told.status).toBe(503);
     expect(told.reply).toEqual({ message: `${why} ${NO_FALLBACK}`, code: "revoked" });
-    // A request that is no chat's reply has no chat to set to run built in: it is told why, and no more.
+    // A request that is no chat's reply has no chat to say anything of: it is told why, and no more.
     expect(told.other).toEqual({ message: why, code: "revoked" });
   });
 

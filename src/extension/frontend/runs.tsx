@@ -387,8 +387,6 @@ export function LiveTurn(props: { stream: StreamId; view: LiveView; partial: boo
   const app = useApp();
   const { stream, view } = props;
   const talk = useTurnTalk(stream, view.turn);
-  // Built in, ending the agents' work on a reply stops no reply: Lumiverse writes it without them, and the page says that, not "stopping".
-  const skips = isReply(view.kind) && view.place === "builtin";
   return (
     <TurnFeed
       view={view}
@@ -397,7 +395,7 @@ export function LiveTurn(props: { stream: StreamId; view: LiveView; partial: boo
       onRetry={props.onRetry}
       onStop={() =>
         app.client.request("lah.turn.stop", { stream, turn: view.turn }).then(
-          (r) => app.toast(!r.stopped ? "The turn had already ended." : skips ? "Skipped: Lumiverse writes this reply without the agents." : "Stopping the turn…"),
+          (r) => app.toast(r.stopped ? "Stopping the turn…" : "The turn had already ended."),
           (e: unknown) => app.fail(e),
         )
       }

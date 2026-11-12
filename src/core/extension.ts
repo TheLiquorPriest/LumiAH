@@ -41,20 +41,17 @@ export type GuidanceLevel = { name: string; path: string } | { name: string; tex
  * rules of its own, is the one offered). In every other chat LumiAH's stands and the extension's
  * tool of that name isn't offered. A claim that names nothing (`{}`) is still a claim.
  *
- * `place: "runtime"` says the chat plays only in a runtime (§25): a core that runs built in never
- * runs its turns, jobs or side sessions, and hands a turn's prompt back as it came. `request` says
- * what of the request Lumiverse assembled the main agent is shown (and a sub-agent given the
- * request): all of it (`whole`, the default), or only the user's newest message (`newest`).
- * `reply: "released"` says the reply is only what the chat's agents release (`reply_write`,
- * `delegate`'s `to_reply`): in a runtime no writer writes it, and a turn that released nothing
- * fails with a plain reason. Built in, the reply is Lumiverse's own whatever it says.
+ * `request` says what of the request Lumiverse assembled the main agent is shown (and a sub-agent
+ * given the request): all of it (`whole`, the default), or only the user's newest message
+ * (`newest`). `reply: "released"` says the reply is only what the chat's agents release
+ * (`reply_write`, `delegate`'s `to_reply`): no writer writes it, and a turn that released nothing
+ * fails with a plain reason.
  */
 export interface ChatClaim {
   mainAgent?: string;
   guidance?: GuidanceLevel;
   withdraw?: string[];
   story?: Partial<StorySetting>;
-  place?: "runtime";
   request?: "whole" | "newest";
   reply?: "released";
 }

@@ -1,34 +1,25 @@
 // The turns that are owed something when the extension's worker stops (DESIGN §7): a runtime's
-// turn whose record is still to be handed over, and a built-in turn that waits for its reply
-// between its two halves. Lumiverse restarts a worker with an update, a reload or its own restart,
-// and everything the worker held in memory goes with it. So each such turn is kept in the user's
-// storage from the moment something is owed to it, and taken out when that is done:
-//
-// - a runtime's record is taken only for a turn the backend knows began here, in this worker or
-//   the one before it;
-// - a built-in turn whose reply was saved while no worker held it still gets its record, and one
-//   whose reply never came is let go in words (hosted.ts).
+// turn whose record is still to be handed over. Lumiverse restarts a worker with an update, a reload
+// or its own restart, and everything the worker held in memory goes with it. So each such turn is
+// kept in the user's storage from the moment its tag is spent, and taken out when its record is in
+// hand: a runtime's record is taken only for a turn the backend knows began here, in this worker or
+// the one before it. A turn kept by a build that could run a chat inside Lumiverse (LumiAH's `main`
+// branch) reads as any other, and is let go once its tag's life is over.
 
 import type { TurnKind } from "../../core/ports";
 import { isRecord } from "../../link/json";
-import type { NoPart, RunPlace } from "../../shared/ui";
 import { UserDocs } from "./docs";
 import type { BackendHost } from "./spindle";
 
-/** A turn something is owed to: where its record goes, and what a built-in one's second half needs that only its first half knew. */
+/** A turn something is owed to: where its record goes. */
 export interface OpenTurn {
   /** The turn's id: its generation's. */
   turn: string;
   chatId: string;
-  place: RunPlace;
   kind: TurnKind;
   target: { message: string | null; swipe: number };
-  /** When it became owed: a runtime's when its tag was spent, a built-in one's when its prompt was handed back. */
+  /** When it became owed: when its tag was spent. */
   at: number;
-  /** Built in, for a continue: what the reply's swipe held before the generation, which isn't the turn's reply. */
-  before?: string;
-  /** Built in: why LumiAH had no part in the reply, where it had none. */
-  noPart?: NoPart;
 }
 
 interface Stored {
@@ -39,21 +30,10 @@ interface Stored {
 const KINDS: Readonly<Record<string, true>> = { new: true, regenerate: true, swipe: true, continue: true };
 
 function openOf(turn: string, raw: unknown): OpenTurn | null {
-  if (!isRecord(raw) || typeof raw.chatId !== "string" || (raw.place !== "builtin" && raw.place !== "runtime") || typeof raw.kind !== "string" || !Object.hasOwn(KINDS, raw.kind) || typeof raw.at !== "number") return null;
+  if (!isRecord(raw) || typeof raw.chatId !== "string" || typeof raw.kind !== "string" || !Object.hasOwn(KINDS, raw.kind) || typeof raw.at !== "number") return null;
   const target = raw.target;
   if (!isRecord(target) || !(target.message === null || typeof target.message === "string") || typeof target.swipe !== "number" || !Number.isSafeInteger(target.swipe) || target.swipe < 0) return null;
-  const noPart = raw.noPart;
-  const why = isRecord(noPart) ? noPart.why : undefined;
-  return {
-    turn,
-    chatId: raw.chatId,
-    place: raw.place,
-    kind: raw.kind as TurnKind,
-    target: { message: target.message, swipe: target.swipe },
-    at: raw.at,
-    ...(typeof raw.before === "string" ? { before: raw.before } : {}),
-    ...(isRecord(noPart) && (why === "failed" || why === "time" || why === "stopped") && typeof noPart.text === "string" ? { noPart: { why, text: noPart.text } } : {}),
-  };
+  return { turn, chatId: raw.chatId, kind: raw.kind as TurnKind, target: { message: target.message, swipe: target.swipe }, at: raw.at };
 }
 
 function storedOf(raw: unknown): Stored | null {

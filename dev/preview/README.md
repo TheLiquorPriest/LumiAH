@@ -34,9 +34,9 @@ and make the window about 360 px wide (or use the browser's device toolbar). The
 | Parameter | Values | What it does |
 | --- | --- | --- |
 | `page` | `home` (default), `live`, `sessions`, `jobs`, `talk`, `lore`, `chronicle`, `workspace`, `guidance`, `agents`, `skills`, `tools`, `settings`, `spend`, `upkeep`, `runtime` | The page that opens. |
-| `scenario` | `ready` (default), `fresh`, `trouble` | Set up, with one chat built in and one in a linked runtime; a new install with nothing granted or switched on; a permission missing, a runtime gone quiet and one refused. |
-| `chat` | `chat-mara` (default), `chat-brann`, `chat-okoro`, `chat-ilse`, `none` | The chat open in the stand-in Lumiverse. `chat-mara` runs built in; `chat-brann` runs in the runtime and is long, with no chronicle yet; `chat-ilse` is one LumiAH doesn't answer. |
-| `turn` | `done` (default), `failed`, `long`, `worked`, `running`, `working`, `nopart`, `urgent`, `none` | The open chat's latest turn. `worked` has sub-agents, file writes, an approval and a job; `running` starts one as the page opens; `working` starts one that holds a tool call for your word; `nopart` is a reply LumiAH had no part in; `urgent` starts one with forty seconds left before the reply. |
+| `scenario` | `ready` (default), `fresh`, `trouble` | Set up, with chats answered by a linked runtime; a new install with nothing granted or switched on; a permission missing, a runtime gone quiet and one refused. |
+| `chat` | `chat-mara` (default), `chat-brann`, `chat-okoro`, `chat-ilse`, `none` | The chat open in the stand-in Lumiverse. `chat-mara` and `chat-brann` are answered by the runtime, and `chat-brann` is long, with no chronicle yet; `chat-okoro`'s connection was changed since it was switched on, so its replies don't reach LumiAH; `chat-ilse` is one LumiAH doesn't answer. |
+| `turn` | `done` (default), `failed`, `long`, `worked`, `running`, `working`, `none` | The open chat's latest turn. `worked` has sub-agents, file writes, an approval and a job; `running` starts one as the page opens; `working` starts one that holds a tool call for your word. |
 | `pointer` | `coarse`, `fine` (left out: your device's own) | Touch or mouse: touch makes everything pressed taller. |
 | `theme` | `dark` (default), `light` | The stand-in Lumiverse's theme. |
 | `drawer` | `wide` (default), `default`, a width in px | The drawer's width on a desktop. |

@@ -42,8 +42,8 @@ export interface RelaysEnv {
   send(frame: LinkFrame, userId: string, session: string): void;
   /** Whether the user has a loopback connection made. */
   hasLoopback(userId: string): Promise<boolean>;
-  /** Every chat of this backend plays only in a runtime (`BackendOptions.place`): its pages say so, by its name. */
-  only: boolean;
+  /** The extension whose own pages switch a chat on (`BackendOptions.ownSwitch`): its name, which the pages say instead of offering a switch. Absent: LumiAH's pages switch a chat. */
+  switchedBy?: string;
 }
 
 const SEP = "\u0000";
@@ -277,7 +277,7 @@ export class Relays {
     return true;
   }
 
-  /** Whether a runtime is there to choose for a chat (DESIGN §25): one is linked, the loopback key is minted and the loopback connection is made, so a chat set to run in the runtime is answered there now. */
+  /** Whether a runtime is there to answer (DESIGN §25): one is linked, the loopback key is minted and the loopback connection is made, so a chat switched on is answered now. */
   async ready(userId: string): Promise<boolean> {
     return (await this.linked(userId)).length > 0 && (await this.registry.read(userId)).key !== null && (await this.env.hasLoopback(userId));
   }
@@ -397,6 +397,6 @@ export class Relays {
       });
     const missing = [...(bun === null ? ["the path of Lumiverse's Bun (use the full path of your own bun)"] : []), ...(script === null ? [`where this extension is installed (the runtime is dist/lumiah.js in ${identity.name}'s extension folder)`] : [])];
     const line = (systemd: boolean): string | null => (bun === null || script === null ? null : `${[bun, script, "up", "--url"].map(shellWord).join(" ")} ${[URL_SLOT, ...named.map(shellWord), ...(systemd ? ["--systemd"] : [])].join(" ")}`);
-    return { build: this.env.build, link: LINK_VERSION, model: loopbackModel(identity.identifier), relays, start: { service: line(true), foreground: line(false), missing }, issues, ready: await this.ready(userId), ...(this.env.only ? { only: identity.name } : {}) };
+    return { build: this.env.build, link: LINK_VERSION, model: loopbackModel(identity.identifier), relays, start: { service: line(true), foreground: line(false), missing }, issues, ready: await this.ready(userId), ...(this.env.switchedBy !== undefined ? { switchedBy: this.env.switchedBy } : {}) };
   }
 }

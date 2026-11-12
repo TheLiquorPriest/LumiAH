@@ -1,9 +1,7 @@
 // The harness (DESIGN §1): `createHarness(host, options)` gives everything the runtime calls.
 //
 // - `answer` answers one generation that reached the loopback connection (`turn.ts`), and `side`
-//   one turn of a side session (`side.ts`). Where the core runs inside Lumiverse and Lumiverse's own
-//   generation writes the reply (§25), a turn is two calls instead: `prepare` before the reply,
-//   `complete` once it is written (or `abandon` when it never is).
+//   one turn of a side session (`side.ts`).
 // - `jobs.run` runs a job the host was told waits (`jobs.ts`).
 // - Everything else is the user's side of it, as the page reaches it through the runtime: the
 //   workspace, guidance, the definitions, jobs, side sessions, spend, upkeep, and talking to a run
@@ -20,7 +18,7 @@ import { type GuidanceId, type GuidanceRead, guidanceGuard, readGuidance } from 
 import { jobEnded } from "./job-words";
 import { Jobs } from "./jobs";
 import { DOC, docKey, ROOT_AREA } from "./paths";
-import type { FileAuthor, FileChange, JobAllowance, JobView, JobWhen, JsonObject, PreparedTurn, ReplySink, TurnRecord, TurnRequest, TurnResult, WorkspaceArea } from "./ports";
+import type { FileAuthor, FileChange, JobAllowance, JobView, JobWhen, JsonObject, ReplySink, TurnRecord, TurnRequest, TurnResult, WorkspaceArea } from "./ports";
 import { isRecord } from "./ports";
 import { AgentAccounts } from "./provider";
 import { chronicleRefusal, RECALL_SKILLS, recallAgents } from "./recall/definitions";
@@ -36,7 +34,7 @@ import type { SideRow } from "./stored";
 import { TEXT, textsOf } from "./texts";
 import { type JobRead, ToolRegistry } from "./tools";
 import { BASE_TOOLS } from "./tools/base";
-import { abandonStored, completeStored, NO_SINK, Turn } from "./turn";
+import { Turn } from "./turn";
 import { Upkeep, type UpkeepSummary } from "./upkeep";
 import { errorText } from "./util";
 import { type AreaAccess, type FileRow, type FileVersion, fileChanges, type PageWorkspace, pageWorkspace, showPath, Workspace, type WorkspaceView, type WrittenFile } from "./workspace";
@@ -143,34 +141,6 @@ export interface Harness {
    * for the caller to anchor on the reply's message.
    */
   answer(turn: TurnRequest, sink: ReplySink, signal: AbortSignal): Promise<TurnResult>;
-  /**
-   * The first half of a turn whose reply the host writes (§25, built in): the session is resumed
-   * and the main agent works, always briefing a writer, and what Lumiverse's own generation is to be
-   * sent comes back; no writer is called. `replyBy` is the moment, on the host's clock, by which this
-   * must have returned (null: none): the main agent is told how long it has, is warned near the end,
-   * and at that moment the turn hands over what it has; the agents it started are cancelled, the jobs
-   * it started stand. `signal` stops the first half. Never rejects: whatever fails, the request comes
-   * back as it came with why (`part: "none"`), so the host lets Lumiverse answer alone.
-   */
-  prepare(turn: TurnRequest, options: { replyBy: number | null }, signal: AbortSignal): Promise<PreparedTurn>;
-  /**
-   * The second half, for a turn `prepare` left pending: the text the host's generation wrote (for a
-   * continue: the part it added) and how it ended. The turn is recorded as any turn is, and its
-   * record comes back for the host to anchor on the reply's message. An empty reply gives the turn
-   * up, as `abandon` does. A turn this harness no longer holds (a restart since its hand-over, or
-   * the wait for its reply ran out) is finished from what storage kept of it, and the result and
-   * the record say so (`recovered`). Rejects (`not_found`) for a turn that was never handed over,
-   * or was recorded or given up already.
-   */
-  complete(input: { generationId: string; reply: string; finish: string }): Promise<TurnResult>;
-  /**
-   * Gives a pending turn up: its generation failed or was stopped, and no reply is coming. Nothing
-   * of the turn is kept: no record, the chat's area as it was before it, and its jobs learn that no
-   * record is coming. A pending turn nobody completes ends the same way once Settings' time for it
-   * has passed, but for what storage keeps of it, which stays until `complete` or `abandon`.
-   * Rejects (`not_found`) for a turn that was never handed over, or was recorded or given up already.
-   */
-  abandon(input: { generationId: string; reason?: string }): Promise<{ abandoned: boolean }>;
   /** One turn of a side session (§19): `generationId` is the turn's id, which its trace bears. */
   side(input: { session: string; generationId: string; text: string }, sink: ReplySink, signal: AbortSignal): Promise<SideResult>;
   /** Talking to a run that is under way (§18), by its id: a turn's generation, a job, a side session's turn. A note reaches the run's first agent at its next round; a hold stops every agent of it at its next round. */
@@ -301,14 +271,6 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
     latest: defaultSettings(),
   };
   const sides = new Sides(() => shared);
-  /** The turns between their two halves (§25), by generation: each waits for its reply to be written. */
-  const pending = new Map<string, Turn>();
-  /** A pending turn this harness holds, taken: whoever asks first has it. Undefined for one it doesn't hold: storage may (`completeStored`, `abandonStored`). */
-  const waiting = (generationId: unknown): Turn | undefined => {
-    const turn = typeof generationId === "string" ? pending.get(generationId) : undefined;
-    if (turn && typeof generationId === "string") pending.delete(generationId);
-    return turn;
-  };
   const upkeep = new Upkeep({ host, blobs, keep: () => shared.latest.keep });
   // The caps count what earlier runs of the process spent once the last day's calls are read; until then, what this one spent.
   shared.spend.ready().catch((error: unknown) => host.log("warn", `[LumiAH] the last day's spend couldn't be read (${errorText(error)}): the caps count from now`));
@@ -374,33 +336,6 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
     agents,
     skills,
     answer: (turn, sink, signal) => new Turn(shared, turn, sink, signal).answer(),
-    async prepare(turn, options, signal) {
-      const replyBy = typeof options.replyBy === "number" && Number.isFinite(options.replyBy) ? options.replyBy : null;
-      const hosted = new Turn(shared, turn, NO_SINK, signal, { replyBy, lapsed: () => pending.delete(turn.generationId) });
-      const prepared = await hosted.prepare();
-      if (prepared.pending) pending.set(turn.generationId, hosted);
-      return prepared;
-    },
-    async complete(input) {
-      const turn = waiting(input.generationId);
-      if (!turn) return completeStored(shared, input);
-      if (typeof input.reply !== "string" || input.reply === "") {
-        // Nothing was written: there is no reply to hold a record, so the turn is given up.
-        const given = turn.abandon();
-        await turn.forget();
-        return { status: "stopped", reason: given.reason, record: null, reply: "", usage: given.usage };
-      }
-      return turn.complete(input.reply, typeof input.finish === "string" ? input.finish : "");
-    },
-    async abandon(input) {
-      const turn = waiting(input.generationId);
-      if (!turn) await abandonStored(shared, input.generationId);
-      else {
-        turn.abandon(typeof input.reason === "string" ? input.reason.trim() : "");
-        await turn.forget();
-      }
-      return { abandoned: true };
-    },
     side: (input, sink, signal) => sides.turn(input, sink, signal),
 
     async say(input) {
@@ -618,14 +553,8 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
           for (const path of await store.list(folder)) paths.add(path);
           const owner = `/chat/${docKey(chatId)}/`;
           for (const path of await store.list(VECTORS)) if (path.includes(owner)) paths.add(path);
-          // A turn of the chat that waits for its reply in storage alone (its harness is gone: a restart, a wait that ran out) is kept by its generation and names its chat inside. Read as it is stored, whatever else it holds: one that is damaged goes too.
-          const waits = DOC.pending("x");
-          for (const path of await store.list(waits.slice(0, waits.indexOf("x")))) {
-            const kept = await store.read(path);
-            if (isRecord(kept) && kept.kind === "pending" && kept.chatId === chatId) paths.add(path);
-          }
         } else {
-          // A store that can't list gives up the documents a chat's id names; the heads its turns left under their own ids, its waiting turns and its vectors can't be found there.
+          // A store that can't list gives up the documents a chat's id names; the heads its turns left under their own ids and its vectors can't be found there.
           for (const path of [DOC.learned(chatId), DOC.chatArea(chatId, ROOT_AREA), DOC.approvals(chatId), DOC.session(chatId), DOC.chatJobs(chatId)]) if ((await store.read(path)) !== null) paths.add(path);
           host.log("warn", `[LumiAH] this runtime can't list its documents, so forgetting chat ${chatId} left what its turns kept under their own ids and its search vectors`);
         }

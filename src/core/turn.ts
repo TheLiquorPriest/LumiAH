@@ -24,23 +24,19 @@ import { foldKey, foldOf, summaryOf } from "./compaction";
 import { mergeDefinitions } from "./definitions";
 import { jobNews, jobState } from "./job-words";
 import { type AgentReply, cutShort } from "./loop";
-import { DOC } from "./paths";
-import { type AgentRef, type AgentUsage, type HarnessHost, isRecord, type JobView, type JsonObject, type ModelDelta, modelMessages, type PathMessage, type PreparedTurn, type PresetBlock, type RecordJob, type ReplySink, type RequestMessage, type TraceEvent, type TranscriptEntry, type TurnRecord, type TurnRequest, type TurnResult, type TurnStatus } from "./ports";
-import { AgentStop } from "./provider";
+import { type AgentRef, type AgentUsage, type HarnessHost, isRecord, type JobView, type ModelDelta, modelMessages, type PathMessage, type PresetBlock, type ReplySink, type RequestMessage, type TraceEvent, type TranscriptEntry, type TurnRecord, type TurnRequest, type TurnResult, type TurnStatus } from "./ports";
 import { chronicleRefusal } from "./recall/definitions";
 import { recallTold } from "./recall/turn";
 import { writerLore } from "./recall/writer";
 import { carriedOf, receiptOf } from "./receipts";
-import { HarnessRefusal } from "./refusal";
 import { briefedRequest, requestDocument, sentMessage } from "./request";
 import { askExtension, readSetup, Run, type Setup, type Shared } from "./run";
-import { type Compaction, compactionAsked, compactionDue, type PendingTurn, pendingOf, type ResumedSession, type SegmentStep, type SessionSegment, segmentOf } from "./sessions";
+import { type Compaction, compactionAsked, compactionDue, type ResumedSession, type SegmentStep, type SessionSegment } from "./sessions";
 import { AGENT, type Settings, settingsOf } from "./settings";
 import { leftOutWhy, type StorySource, storyHolds } from "./story";
 import { TEXT, TOOL, type Texts, textsOf } from "./texts";
 import type { PastTurn, ReplyStream, ToolCtx, ToolOutcome } from "./tools";
-import { emptyUsage } from "./usage";
-import { clip, errorText, type Limit, limitOf, stopWords, timerMs } from "./util";
+import { clip, errorText, limitOf, stopWords } from "./util";
 import { chatView, loreView } from "./views";
 import { type Area, changesBetween } from "./workspace";
 
@@ -55,19 +51,6 @@ class Stopped extends Error {}
 
 /** What the writer was given in the brief's place, as the trace and the thinking block name it: a brief the main agent gave with `write_reply`, its last answer where it never made that call, nothing because it stopped short, or nothing because something of LumiAH's failed before it gave one. */
 type BriefFrom = "call" | "answer" | "none" | "failed";
-
-/**
- * What a host that writes the reply itself gives a turn (DESIGN §25): when the reply is due, on its
- * clock (null: no such moment), and what to call when the turn is given up because its reply was
- * never written.
- */
-export interface Hosted {
-  replyBy: number | null;
-  lapsed(): void;
-}
-
-/** A sink for a turn that has none: where the host writes the reply, the reply's stream and its thinking block are the host's own. */
-export const NO_SINK: ReplySink = { progress: () => undefined, reasoning: () => undefined, content: () => undefined, done: () => undefined, error: () => undefined };
 
 /** What a turn's work leaves for its record. */
 class Work {
@@ -109,18 +92,6 @@ export class Turn {
   private broken: string | null = null;
   /** The main agent's id, once it started: its tool calls are the turn's progress lines. */
   private mainId: string | null = null;
-  /** What ends the turn's work: the user's stop, and, where the host writes the reply, the moment the reply is due. */
-  private readonly signal: AbortSignal;
-  /** The reply is due (§25): ends the first half's work. */
-  private readonly due = new AbortController();
-  /** The brief the main agent handed over, where the host writes the reply. */
-  private brief: string | null = null;
-  /** The turn between its two halves: what the first made, which the second records. */
-  private pending: { work: Work; run: Run } | null = null;
-  /** Ends the wait for the second half. */
-  private readonly waited = new AbortController();
-  /** The main agent was told the reply is nearly due. */
-  private warned = false;
   /** Text of the reply was released by the turn's agents themselves (`reply_write`, `to_reply`): the reply is what they released, and no writer writes it. */
   private streamed = false;
   /** A sub-agent's answer is streaming into the reply (`to_reply`): nothing else goes in meanwhile. */
@@ -132,13 +103,12 @@ export class Turn {
     private readonly shared: Shared,
     private readonly turn: TurnRequest,
     private readonly sink: ReplySink,
-    private readonly stop: AbortSignal,
-    private readonly hosted: Hosted | null = null,
+    /** What ends the turn's work: the user's stop. */
+    private readonly signal: AbortSignal,
   ) {
     this.host = shared.host;
     this.settings = shared.latest;
     this.startedAt = this.host.clock.now();
-    this.signal = hosted ? AbortSignal.any([stop, this.due.signal]) : stop;
   }
 
   async answer(): Promise<TurnResult> {
@@ -150,7 +120,7 @@ export class Turn {
     try {
       setup = await readSetup(shared, turn.chatId, userId);
     } catch (error) {
-      // The reply isn't lost to it (rule 5). The turn goes on with Settings as shipped, and only as far as the writer: the main agent, its tools and its budgets are the user's to set, and it isn't run on a guess of them. Settings as shipped name no connection, so the writer's call goes where the request says (`TurnRequest.connectionId`), else to the host's default: to no model the user didn't choose.
+      // The reply isn't lost to it (rule 5). The turn goes on with Settings as shipped, and only as far as the writer: the main agent, its tools and its budgets are the user's to set, and it isn't run on a guess of them. Settings as shipped name no connection, so the writer's call goes to the host's default: to no model the user didn't choose.
       // The words are fixed: the user's texts are read with the settings, so there are none to say it in.
       unread = `LumiAH couldn't read its settings (${errorText(error)}): check that the runtime is linked to the extension`;
       setup = shippedSetup(shared, userId ?? shared.options.userId ?? "");
@@ -158,7 +128,7 @@ export class Turn {
     this.settings = setup.settings;
     this.texts = setup.texts;
     const run = new Run(shared, setup, { info: { id: turn.generationId, kind: turn.kind, chatId: turn.chatId }, budget: this.settings.turn, startedAt: this.startedAt, messageId: turn.target.messageId, turn, heard: (event) => this.heard(event) });
-    run.reply = this.replyStream(run, false);
+    run.reply = this.replyStream(run);
     const work = new Work();
     return this.conclude(work, run, await this.outcome(work, run, unread));
   }
@@ -184,11 +154,6 @@ export class Turn {
     } catch (error) {
       return this.signal.aborted ? { status: "stopped", reason: this.stoppedWhy() } : { status: "failed", reason: errorText(error) };
     }
-  }
-
-  /** Whether the main agent writes the reply itself. Where the host writes the reply, a writer always does: the main agent briefs it, whatever Settings say of who writes. */
-  private mainWrites(): boolean {
-    return this.hosted === null && this.settings.reply.writer === "main";
   }
 
   /** A turn's end, whoever wrote its reply: its notes stored, the sink ended, its jobs and its run told how it ended, and its record made. */
@@ -221,226 +186,7 @@ export class Turn {
 
   /** Why a stopped turn stopped: what its signal said, where whoever stopped it gave a reason in words; else the user's text for a stop. */
   private stoppedWhy(): string {
-    return stopWords(this.stop) ?? this.text(TEXT.progress.turnStopped);
-  }
-
-  // ---------------------------------------------------------------- where the host writes the reply (§25)
-
-  /**
-   * The first half of a turn whose reply the host writes: the session is resumed, the main agent
-   * works, and what Lumiverse's own generation is to be sent comes back, with no writer called.
-   * Never rejects: whatever fails, the request comes back as it came with why, so the host lets
-   * Lumiverse answer alone. A turn whose main agent began then waits for its second half
-   * (`complete`), which records it, or is given up (`abandon`).
-   */
-  async prepare(): Promise<PreparedTurn> {
-    const { host, turn, shared } = this;
-    const asCame = (reason: string, usage: AgentUsage = emptyUsage()): PreparedTurn => ({ messages: turn.messages, part: "none", reason, pending: false, usage });
-    let setup: Setup;
-    try {
-      setup = await readSetup(shared, turn.chatId, turn.userId === "" ? undefined : turn.userId);
-    } catch (error) {
-      // As `answer` has it: never on the defaults, and in fixed words, since the user's texts are read with the settings.
-      return asCame(`LumiAH couldn't read its settings (${errorText(error)}), so it had no part in this reply.`);
-    }
-    this.settings = setup.settings;
-    this.texts = setup.texts;
-    // A chat whose extension says it plays only in a runtime is never worked on here (§25): Lumiverse writes its reply alone, and the view says why.
-    if (setup.claim?.place === "runtime") return asCame(this.text(TEXT.jobs.whyRuntimeOnly));
-    const replyBy = this.hosted?.replyBy ?? null;
-    const run = new Run(shared, setup, { info: { id: turn.generationId, kind: turn.kind, chatId: turn.chatId }, budget: this.settings.turn, startedAt: this.startedAt, messageId: turn.target.messageId, turn, ...(replyBy !== null ? { replyBy } : {}) });
-    run.reply = this.replyStream(run, true);
-    const work = new Work();
-    // The moment the reply is due ends whatever is under way, as a stop would, with its own reason. A reply already due ends it before anything is begun.
-    const timer = new AbortController();
-    const late = (): void => this.due.abort(new AgentStop("reply_time", { id: TEXT.hosted.stop }));
-    const left = replyBy === null ? null : timerMs(replyBy - this.startedAt);
-    if (left !== null && left <= 0) late();
-    else if (left !== null) host.clock.sleep(left, timer.signal).then(late, () => undefined);
-    try {
-      const main = await this.runMain(work, run);
-      return await this.handOver(work, run, main.reply);
-    } catch (error) {
-      // The main agent never began, the user stopped the turn, or something broke: nothing waits for a reply, and the request goes back as it came.
-      const stopped = this.stop.aborted;
-      const late = !stopped && this.due.signal.aborted;
-      const reason = stopped ? this.stoppedWhy() : late ? this.text(TEXT.hosted.stop) : errorText(error);
-      run.trace.emit({ kind: "notice", text: this.text(TEXT.hosted.noticeNone, { reason }), at: host.clock.now() });
-      return asCame(reason, this.discard(run, stopped || late || error instanceof Stopped ? "stopped" : "failed", reason));
-    } finally {
-      timer.abort();
-    }
-  }
-
-  /** The first half's end: what the host's generation is sent, and the turn left waiting for its reply. */
-  private async handOver(work: Work, run: Run, reply: AgentReply): Promise<PreparedTurn> {
-    const { host, turn, texts } = this;
-    // The user's stop ended it: Lumiverse generates nothing, so nothing is waited for.
-    if (this.stop.aborted) throw new Stopped();
-    const said = reply.text.trim();
-    const cut = reply.status === "answered" && cutShort(reply.finish);
-    let part: PreparedTurn["part"];
-    let reason: string | undefined;
-    let messages = turn.messages;
-    if (this.brief !== null) {
-      part = "brief";
-      messages = await this.request(this.brief, run);
-    } else if (reply.status === "answered" && said !== "" && !cut) {
-      // An answer without the call is handed over in the brief's place, and named as that everywhere, as where a writer of LumiAH's writes.
-      part = "answer";
-      work.answerAsBrief = true;
-      reason = texts.render(TEXT.hosted.noticeAnswer);
-      messages = await this.request(said, run);
-    } else {
-      // It stopped short (its time, a limit, a failed call): Lumiverse never loses a reply to that, whatever Settings say of a turn with a writer of LumiAH's.
-      part = "none";
-      reason = cut ? texts.render(TEXT.agents.cut) : (reply.reason ?? texts.render(TEXT.answer.replyEmpty));
-    }
-    // With a brief the turn went as it should: its notice only says how the reply is written, so it is marked as no warning.
-    run.trace.emit({ kind: "notice", text: part === "brief" ? texts.render(TEXT.hosted.noticeBrief) : part === "answer" ? texts.render(TEXT.hosted.noticeAnswer) : texts.render(TEXT.hosted.noticeNone, { reason: reason ?? "" }), ...(part === "brief" ? { info: true as const } : {}), at: host.clock.now() });
-    // Its work is over: the agents it started are let go, and nothing the user says now would be read. The jobs it started stand: they go on beside the reply.
-    run.letGo();
-    run.quiet(true);
-    // What its agents spent is written now, not when the run ends: the reply may be long in coming, and an extension that restarts meanwhile must not lose it.
-    this.shared.spend.flush().catch((error: unknown) => host.log("warn", `[LumiAH] what the turn spent couldn't be written (${errorText(error)})`));
-    this.pending = { work, run };
-    const wait = timerMs(limitOf(this.settings.reply.pendingMs));
-    await this.keep(work, run, wait);
-    if (wait !== null) {
-      host.clock.sleep(wait, this.waited.signal).then(
-        () => {
-          this.abandon(texts.render(TEXT.hosted.whyLapsed, { seconds: String(Math.round(wait / 1000)) }));
-          this.hosted?.lapsed();
-        },
-        () => undefined,
-      );
-    }
-    return { messages, part, ...(reason !== undefined ? { reason } : {}), pending: true, usage: { ...run.agents.usage } };
-  }
-
-  /**
-   * Keeps what the waiting turn's record needs in the user's storage (`DOC.pending`), so the turn
-   * still gets its record when its reply comes to a harness that no longer holds it: after a
-   * restart, or after the wait for it ran out (`wait`: how long that is; null for no end). A turn
-   * that can't be kept waits in memory alone, and the log says so.
-   */
-  private async keep(work: Work, run: Run, wait: number | null): Promise<void> {
-    const { host, turn, shared } = this;
-    const { session } = work;
-    if (!session) return;
-    try {
-      const earlier = session.continued?.segment.steps ?? [];
-      const draft = draftOf(work);
-      const at = host.clock.now();
-      const segment: SessionSegment = { v: 1, kind: "segment", reply: session.reply, generationId: turn.generationId, turn: turn.kind, at, request: work.request, steps: [...earlier, ...draft.steps] };
-      const summary = work.compaction ?? session.held;
-      const doc: PendingTurn = {
-        v: 1,
-        kind: "pending",
-        at,
-        until: wait === null ? null : at + wait,
-        userId: run.userId,
-        chatId: turn.chatId,
-        generationId: turn.generationId,
-        turn: turn.kind,
-        began: this.startedAt,
-        ...(work.heard !== null ? { heard: work.heard } : {}),
-        path: session.path,
-        draft: await shared.sessions.segment(segment),
-        replied: draft.replied.map((step) => step + earlier.length),
-        asBrief: draft.asBrief === null ? null : draft.asBrief + earlier.length,
-        ...(summary ? { summary } : {}),
-        basis: session.records.at(-1)?.workspace ?? null,
-        workspace: (await work.area?.headHash()) ?? null,
-        jobs: [...run.jobs],
-        usage: { ...run.agents.usage },
-      };
-      await host.store.write(DOC.pending(turn.generationId), doc as unknown as JsonObject);
-    } catch (error) {
-      host.log("warn", `[LumiAH] what the waiting turn's record needs couldn't be kept (${errorText(error)}): should its reply come after a restart or after the wait for it, the turn leaves no record`);
-    }
-  }
-
-  /** Removes what storage kept of the waiting turn, once it is recorded or given up for good: nothing of it is left to finish. */
-  async forget(): Promise<void> {
-    await this.host.store.remove(DOC.pending(this.turn.generationId)).catch((error: unknown) => this.host.log("warn", `[LumiAH] what was kept of a waiting turn couldn't be removed (${errorText(error)}): upkeep removes it`));
-  }
-
-  /**
-   * The second half: the reply as the host's generation wrote it. The turn is recorded as any turn
-   * is, and its record comes back for the host to anchor on the reply's message.
-   */
-  async complete(reply: string, finish: string): Promise<TurnResult> {
-    const pending = this.take();
-    if (!pending) throw new HarnessRefusal("not_found", "That turn isn't waiting for its reply: it was recorded or given up already.");
-    this.reply = reply;
-    this.finish = finish === "" ? "stop" : finish;
-    this.written = true;
-    try {
-      return await this.conclude(pending.work, pending.run, { status: "done" });
-    } finally {
-      await this.forget();
-    }
-  }
-
-  /**
-   * Gives a waiting turn up: its reply never came (`reason` says why, in whoever's words; without
-   * one, the user's text for a generation that wrote nothing). Nothing of its run is kept: no
-   * record, and the chat's area as it was before it. Gives the reason and what its agents spent. A
-   * turn that isn't waiting any more is left as it is. What storage holds of it stays until
-   * `forget`: a turn given up because its wait ran out can still be finished from it, should its
-   * reply come after all.
-   */
-  abandon(reason = ""): { reason: string; usage: AgentUsage } {
-    const why = reason !== "" ? reason : this.text(TEXT.hosted.whyAbandoned);
-    const pending = this.take();
-    return { reason: why, usage: pending ? this.discard(pending.run, "stopped", why) : emptyUsage() };
-  }
-
-  /** The waiting turn's work, taken once: whichever of `complete`, `abandon` and the wait's end comes first has it. */
-  private take(): { work: Work; run: Run } | null {
-    const { pending } = this;
-    this.pending = null;
-    this.waited.abort();
-    return pending;
-  }
-
-  /** Ends a run that leaves no record: its trace says how it ended, its jobs learn that no record is coming, and what its agents wrote to the chat's area is let go. What its agents spent. */
-  private discard(run: Run, status: Exclude<TurnStatus, "done">, reason: string): AgentUsage {
-    const { turn, shared } = this;
-    const usage: AgentUsage = { ...run.agents.usage };
-    shared.jobs.turnEnded(turn.generationId, false);
-    run.close({ status, reason, at: this.host.clock.now() }, usage);
-    shared.areas.closeTurn(turn.chatId, turn.generationId, false);
-    const extension = shared.options.extension;
-    run.hook("answer to a run ending", extension?.runEnded ? () => extension.runEnded?.({ userId: run.userId, chatId: turn.chatId, turn: turn.generationId, kind: turn.kind, status, reason, reply: "", record: null, usage }) ?? Promise.resolve() : undefined);
-    return usage;
-  }
-
-  /** `write_reply` where the host writes the reply: the brief is kept for the hand-over, and the main agent's turn ends there. */
-  private handBrief(brief: string, run: Run): ToolOutcome {
-    if (this.brief !== null) return { text: this.text(TEXT.answer.replyBusy), error: true };
-    this.brief = brief;
-    run.quiet(true);
-    return { text: this.text(TEXT.hosted.handed), end: true };
-  }
-
-  /** Once the reply is as nearly due as Settings say, the main agent is told so, once. */
-  private soon(): string[] {
-    const replyBy = this.hosted?.replyBy ?? null;
-    const { warnMs } = this.settings.reply;
-    if (replyBy === null || warnMs === null || this.warned) return [];
-    const left = replyBy - this.host.clock.now();
-    if (left > warnMs) return [];
-    this.warned = true;
-    return [this.text(TEXT.hosted.replySoon, { seconds: String(Math.max(0, Math.round(left / 1000))) })];
-  }
-
-  /** How long the extension is waited for: as Settings say, and where a reply is due, no longer than until then. */
-  private extensionWait(): Limit {
-    const { waitMs } = this.settings.extension;
-    const replyBy = this.hosted?.replyBy ?? null;
-    return replyBy === null ? waitMs : Math.min(limitOf(waitMs), Math.max(0, replyBy - this.host.clock.now()));
+    return stopWords(this.signal) ?? this.text(TEXT.progress.turnStopped);
   }
 
   // ---------------------------------------------------------------- the work
@@ -547,14 +293,14 @@ export class Turn {
     // The extension that claims the chat may name the agent that answers it; LumiAH's own answers every other.
     const claimed = run.claim?.mainAgent;
     const main = (claimed !== undefined ? run.resolve(claimed) : undefined) ?? this.resolved(run, AGENT.main);
-    const writes = this.mainWrites();
+    const writes = this.settings.reply.writer === "main";
     const blocks = await this.blocks();
     // What the prompt holds of the lore and of the chat (§24.1) and the top of the chat's chronicle (§24.7) follow the request's messages.
     // Upkeep is offered only where LumiAH's own agents keep the chronicle: in a chat whose extension puts an agent of its own in the chronicler's place, a job started for it would start that agent.
     const kept = settings.jobs.enabled && host.jobs !== undefined && chronicleRefusal(run.definitions, shared.options.extension?.name ?? null) === null;
     // Where the extension shows the main agent only the user's newest message, nothing of the prompt is told: it isn't shown the prompt.
     const newestOnly = run.claim?.request === "newest";
-    const releasedOnly = this.hosted === null && run.claim?.reply === "released";
+    const releasedOnly = run.claim?.reply === "released";
     const told = run.recall && !newestOnly ? await recallTold(run.recall, { path: session.before, blocks, writes, learned: run.areas.learned, jobs: kept ? () => shared.jobs.open(turn.chatId) : null, emit: (event) => run.trace.emit(event), log: host.log, now: host.clock.now() }) : undefined;
     const document = requestDocument(turn.messages, blocks, session.before, texts, told);
     work.request = { messages: document.messages, last: document.last };
@@ -591,9 +337,6 @@ export class Turn {
     const ask = texts.render(releasedOnly ? TEXT.main.askReleases : writes ? TEXT.main.askWrites : TEXT.main.ask);
     const noted = notes.map((note) => `${note}\n\n`).join("");
     const asked = newestOnly ? texts.render(TEXT.main.turnNewest, { kind: texts.render(kinds[turn.kind]), notes: noted, message: newest, ask }) : texts.render(TEXT.main.turn, { kind: texts.render(kinds[turn.kind]), notes: noted, count: run.request.count, request: document.text, ask });
-    // Where the reply is due at a moment the host named, the main agent is told how long it has.
-    const replyBy = this.hosted?.replyBy ?? null;
-    const message = replyBy === null ? asked : `${asked}\n\n${texts.render(TEXT.hosted.replyBy, { seconds: String(Math.max(0, Math.round((replyBy - host.clock.now()) / 1000))) })}`;
     const { agent, lead: pinned } = await run.agent(main, {
       depth: 0,
       history,
@@ -602,11 +345,10 @@ export class Turn {
       // LumiAH's own main agent has instructions for each way the reply is written; any other definition's are its own.
       ...(writes && main.definition.text === TEXT.main.system ? { system: texts.render(TEXT.main.systemWrites) } : {}),
       // Where only what the agents release is the reply, no writer is there to brief.
-      ...(writes || releasedOnly ? {} : { writeReply: this.hosted ? async (brief: string) => this.handBrief(brief, run) : (brief: string, ctx: ToolCtx) => this.writeReply(brief, ctx.agentId, run) }),
-      ...(this.hosted ? { notices: () => this.soon() } : {}),
+      ...(writes || releasedOnly ? {} : { writeReply: (brief: string, ctx: ToolCtx) => this.writeReply(brief, ctx.agentId, run) }),
     });
     this.mainId = agent.id;
-    const reply = await agent.send(pinned === "" ? message : `${pinned}\n\n${message}`, this.signal);
+    const reply = await agent.send(pinned === "" ? asked : `${pinned}\n\n${asked}`, this.signal);
     // Its rounds are over: nothing the user says now would be read.
     run.quiet(true);
     work.main = agent.transcript().entries;
@@ -697,7 +439,7 @@ export class Turn {
       return this.released();
     }
     // Where only what is released is the reply, no writer writes in the agents' place.
-    if (this.hosted === null && run.claim?.reply === "released") return { status: "failed", reason };
+    if (run.claim?.reply === "released") return { status: "failed", reason };
     // The reply stands as far as it was written: whole, the turn is done, and the log keeps what broke after it; in part, nothing can be written after it.
     if (this.written) {
       this.host.log("warn", `[LumiAH] the turn's work failed after its reply was written (${reason}): the reply stands`);
@@ -705,7 +447,7 @@ export class Turn {
     }
     if (this.broken !== null) return { status: "failed", reason: this.broken };
     // A main agent that writes the reply itself has no writer to fall back on, as when it stops short.
-    if (this.reply !== "" || this.mainWrites() || this.settings.reply.withoutBrief === "fail") return { status: "failed", reason };
+    if (this.reply !== "" || this.settings.reply.writer === "main" || this.settings.reply.withoutBrief === "fail") return { status: "failed", reason };
     this.progress(TEXT.progress.writingFailed, { reason });
     run.trace.emit({ kind: "notice", text: this.text(TEXT.progress.writingFailed, { reason }), at: this.host.clock.now() });
     work.failed = reason;
@@ -789,7 +531,7 @@ export class Turn {
     const built = briefedRequest(lore.messages, brief, settings.reply, texts, [...(settings.reply.writerGuidance ? run.guidanceLines() : []), ...lore.beside]);
     const extension = shared.options.extension;
     // The extension may place what it prepared where the user's preset expects it; without an answer the messages go as built.
-    const answered: unknown = await askExtension<unknown>(shared, "writer's request", this.extensionWait(), extension?.writerRequest ? () => extension.writerRequest?.({ userId: run.userId, chatId: turn.chatId, generationId: turn.generationId, kind: turn.kind, brief, messages: built.map(sentMessage) }) ?? Promise.resolve(null) : undefined, null);
+    const answered: unknown = await askExtension<unknown>(shared, "writer's request", this.settings.extension.waitMs, extension?.writerRequest ? () => extension.writerRequest?.({ userId: run.userId, chatId: turn.chatId, generationId: turn.generationId, kind: turn.kind, brief, messages: built.map(sentMessage) }) ?? Promise.resolve(null) : undefined, null);
     // Its answer comes from outside the core: only a list of model messages, with something in it, is sent. Anything else leaves the messages as built, and the log says so.
     const rewritten = answered === null || answered === undefined ? null : modelMessages(answered);
     if (answered !== null && answered !== undefined && (rewritten === null || rewritten.length === 0)) this.host.log("warn", "[LumiAH] the extension's answer to the writer's request isn't a list of model messages with something in it: the writer is sent the request as it was built");
@@ -873,13 +615,11 @@ export class Turn {
 
   /**
    * The reply as the turn's agents may write it themselves (`reply_write`, `delegate`'s
-   * `to_reply`). Built in, nothing can be released: Lumiverse's own generation writes the reply
-   * there (§25). In a runtime a passage goes out once nothing else holds the reply and the
-   * extension lets it (§21 `releasing`), in the order the calls came.
+   * `to_reply`): a passage goes out once nothing else holds the reply and the extension lets it
+   * (§21 `releasing`), in the order the calls came.
    */
-  private replyStream(run: Run, builtIn: boolean): ReplyStream {
+  private replyStream(run: Run): ReplyStream {
     const shut = (): string | null => {
-      if (builtIn) return this.text(TEXT.answer.releaseBuiltIn);
       if (this.closed || this.signal.aborted) return this.text(TEXT.answer.releaseEnded);
       if (this.writing || this.written || this.broken !== null) return this.text(TEXT.answer.releaseWriter);
       if (this.holder) return this.text(TEXT.answer.releaseHeld);
@@ -916,7 +656,7 @@ export class Turn {
     const extension = shared.options.extension;
     if (extension?.releasing) {
       const lost = {};
-      const verdict: unknown = await askExtension<unknown>(shared, "word on a passage of the reply", this.extensionWait(), () => extension.releasing?.({ userId: run.userId, chatId: turn.chatId, turn: turn.generationId, agent, text }) ?? Promise.resolve(null), lost);
+      const verdict: unknown = await askExtension<unknown>(shared, "word on a passage of the reply", this.settings.extension.waitMs, () => extension.releasing?.({ userId: run.userId, chatId: turn.chatId, turn: turn.generationId, agent, text }) ?? Promise.resolve(null), lost);
       if (verdict === lost) return this.text(TEXT.answer.releaseUnchecked);
       if (verdict !== null && verdict !== undefined) return isRecord(verdict) && typeof verdict.refused === "string" && verdict.refused.trim() !== "" ? clip(verdict.refused, this.settings.tools.pageChars) : this.text(TEXT.answer.releaseUnchecked);
       // Asked again: the reply may have ended, or another agent's answer begun streaming into it, while the extension looked.
@@ -1130,93 +870,6 @@ function finishedSteps(draft: DraftSteps, input: { reply: string; chars: string;
   // A turn that ended short of its agents' own stop (its signal, a failure outside them) says so too.
   if (input.stopped !== undefined && !steps.some((step) => step.kind === "stop")) steps.push({ kind: "stop", reason: input.stopped });
   return steps;
-}
-
-/** What storage keeps of a turn waiting for its reply, taken: whoever asks first has it, and nothing of it is left. Refused (`not_found`) for a turn storage holds nothing of: one never handed over, or recorded or given up already. */
-async function takeStored(host: HarnessHost, generationId: unknown): Promise<PendingTurn> {
-  const path = typeof generationId === "string" ? DOC.pending(generationId) : null;
-  const stored = path === null ? null : pendingOf(await host.store.read(path));
-  if (path === null || stored === null) throw new HarnessRefusal("not_found", "That turn isn't waiting for its reply: it was recorded or given up already, or it was never handed over.");
-  await host.store.remove(path);
-  return stored;
-}
-
-/** Gives up a waiting turn that only storage holds (its run ended with a restart, or when its wait ran out): what was kept of it is removed, and its jobs learn that no record is coming. What its agents spent. */
-export async function abandonStored(shared: Shared, generationId: unknown): Promise<AgentUsage> {
-  const stored = await takeStored(shared.host, generationId);
-  shared.jobs.turnEnded(stored.generationId, false);
-  return stored.usage;
-}
-
-/**
- * The second half of a waiting turn that only storage holds (DESIGN §25): its run ended with a
- * restart, or when the wait for its reply ran out, and the reply came after all. The turn gets its
- * record from what was kept at the hand-over (`PendingTurn`): its notes with the reply filled in,
- * the chat's files as its area stands now, its jobs as they stand now, and what it had spent. The
- * record says how it was made (`recovered`) and has no transcript: the run's trace went with the
- * run. An empty reply gives the turn up.
- */
-export async function completeStored(shared: Shared, input: { generationId: unknown; reply: unknown; finish: unknown }): Promise<TurnResult> {
-  const { host } = shared;
-  const stored = await takeStored(host, input.generationId);
-  const { chatId, generationId, userId, usage } = stored;
-  // The record's own words are the user's texts; where those can't be read now, the texts as shipped: a record is worth more than its wording.
-  const read = await shared.options.settings().catch(() => null);
-  const texts = textsOf(read?.texts ?? null);
-  if (typeof input.reply !== "string" || input.reply === "") {
-    shared.jobs.turnEnded(generationId, false);
-    return { status: "stopped", reason: texts.render(TEXT.hosted.whyAbandoned), record: null, reply: "", usage };
-  }
-  const reply = input.reply;
-  const at = host.clock.now();
-  // Which of the two it was is told from the hand-over's own clock: no reply is late before the wait for it has run out.
-  const recovered = stored.until !== null && at >= stored.until ? "late" : "restart";
-  const draft = segmentOf(await shared.blobs.getJson(stored.draft));
-  if (!draft) throw new HarnessRefusal("not_found", "What was kept of that turn can't be read any more, so it leaves no record.");
-  let record: TurnRecord | null = null;
-  try {
-    const steps = finishedSteps({ steps: draft.steps, replied: stored.replied, asBrief: stored.asBrief }, { reply: String(draft.reply), chars: String(reply.length), texts, failed: null, stopped: undefined, written: true });
-    // A job that ended while the turn waited is listed as it stands now, as one that ends during a run is. Only the turn's own jobs are read.
-    const now = new Map((await shared.jobs.some(stored.jobs.map((job) => job.id)).catch((): JobView[] => [])).map((job) => [job.id, job]));
-    const jobs = stored.jobs.map((job): RecordJob => {
-      const stands = now.get(job.id);
-      return stands ? { id: job.id, agent: job.agent, state: stands.state, ...(stands.report !== undefined ? { report: stands.report } : {}) } : job;
-    });
-    const made: TurnRecord = {
-      v: 1,
-      generationId,
-      kind: stored.turn,
-      began: stored.began,
-      ...(stored.heard !== undefined ? { heard: stored.heard } : {}),
-      at,
-      path: stored.path,
-      segment: await shared.sessions.segment({ ...draft, at, steps }),
-      ...(stored.summary ? { ...stored.summary } : {}),
-      ...(stored.workspace !== null ? { workspace: stored.workspace } : {}),
-      ...(jobs.length > 0 ? { jobs } : {}),
-      recovered,
-      usage,
-    };
-    try {
-      // The chat's files as the turn's own area stands now: what its agents wrote, and what its jobs wrote while it waited.
-      const workspace = await shared.areas.at(chatId, made).headHash();
-      const changed = changesBetween("chat", await shared.workspace.index(stored.basis), await shared.workspace.index(workspace)).length;
-      record = { ...made, ...(workspace !== null ? { workspace } : {}), ...(changed > 0 ? { changed } : {}) };
-    } catch (error) {
-      host.log("warn", `the chat's files couldn't be read for the turn's record (${errorText(error)}): the record names them as they stood at the hand-over`);
-      record = made;
-    }
-  } catch (error) {
-    host.log("warn", `the turn's record wasn't made (${errorText(error)}): the reply stands, and the main agent's notes won't hold this turn`);
-  }
-  shared.jobs.turnEnded(generationId, record !== null);
-  const extension = shared.options.extension;
-  const { waitMs } = settingsOf(read?.values ?? null).extension;
-  const finish = typeof input.finish === "string" && input.finish !== "" ? input.finish : "stop";
-  const told = askExtension(shared, "answer to the reply being written", waitMs, extension?.replyWritten ? () => extension.replyWritten?.({ userId, chatId, turn: generationId, reply, finish }) ?? Promise.resolve() : undefined, undefined);
-  // A turn whose wait ran out told the extension then that its run had ended; one a restart cut off never did.
-  if (recovered === "restart") void told.then(() => askExtension(shared, "answer to a run ending", waitMs, extension?.runEnded ? () => extension.runEnded?.({ userId, chatId, turn: generationId, kind: stored.turn, status: "done", reply, record, usage }) ?? Promise.resolve() : undefined, undefined));
-  return { status: "done", record, reply, usage, recovered };
 }
 
 /**

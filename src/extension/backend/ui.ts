@@ -20,7 +20,7 @@ import type { Connections } from "./connections";
 import { KeyedQueue } from "./docs";
 import { LinkRefused, UiRefused, wordsOf } from "./errors";
 import type { Keys } from "./keys";
-import { BUILTIN, type LiveBuffer } from "./live";
+import type { LiveBuffer } from "./live";
 import type { Approvals } from "./approvals";
 import type { Notices } from "./notices";
 import type { RegistryStore } from "./registry";
@@ -58,8 +58,6 @@ export interface UiDeps {
   issues(): string[];
   /** The permissions LumiAH lacks (§25), each with what it can't do without it and what to do; none when it has all it asks for. */
   permissions(): PermissionNeed[];
-  /** Stops a run that runs here, built in (a reply's turn before its reply, a job's run, a side session's turn), with why in words; false when it isn't under way here. */
-  stopHere(userId: string, turn: string, why: string): boolean;
   now(): number;
 }
 
@@ -104,7 +102,7 @@ export class Ui {
     return { set: key !== null, print: key?.print ?? null, at: key?.at ?? null };
   }
 
-  /** First-time setup (§25): built in needs nothing installed, so its steps are the permissions LumiAH can answer no chat without, a chat switched on, and a reply answered. */
+  /** First-time setup (§25): the permissions LumiAH can answer no chat without, a chat switched on, and a reply answered. The runtime's own steps are the Runtime page's. */
   private async setup(userId: string): Promise<SetupView> {
     const d = this.deps;
     const registry = await d.registry.read(userId);
@@ -167,9 +165,9 @@ export class Ui {
 
   /**
    * A request the core serves: `harness.<group>.<method>` is asked with the input the core's method
-   * takes, in the place the request belongs to (`where`, asks.ts: what is about a chat, a job or a
-   * side session is asked where that runs; what is about none of them, built in), and the core's
-   * own answer comes back, still to be read (views.ts).
+   * takes, of the runtime the request belongs to (`where`, asks.ts: what is about a chat, a job or a
+   * side session is asked where that runs; what is about none of them, of the user's runtime), and
+   * the core's own answer comes back, still to be read (views.ts).
    */
   private ask<G extends CoreGroup, M extends keyof Core[G] & string>(userId: string, group: G, method: M, input: CoreInput<G, M>, where: Where = {}): Promise<JsonValue> {
     return this.deps.asks.ask(userId, `${group}.${method}`, toJsonObject(input), where);
@@ -377,14 +375,14 @@ export class Ui {
       case "lah.chat.get":
         return { chat: await d.switch.view(userId, r.chatId) };
       case "lah.chat.set": {
-        const chat = await d.switch.set(userId, r.chatId, r.on, r.place);
+        const chat = await d.switch.set(userId, r.chatId, r.on);
         d.turns.unsure(userId);
         this.touch(userId, "chats", "setup");
         return { chat };
       }
       case "lah.chat.takeover": {
-        // The page asked the user first. The chat is taken from the backend whose mark it bears, whether or not that extension is still installed, and switched on here, built in.
-        const chat = await d.switch.set(userId, r.chatId, true, "builtin", true);
+        // The page asked the user first. The chat is taken from the backend whose mark it bears, whether or not that extension is still installed, and switched on here.
+        const chat = await d.switch.set(userId, r.chatId, true, true);
         d.turns.unsure(userId);
         this.touch(userId, "chats", "setup");
         return { chat };
@@ -407,8 +405,6 @@ export class Ui {
       case "lah.turn.stop": {
         const running = d.live.running(userId, r.stream, r.turn);
         if (running === null) return { stopped: false };
-        // A run that runs here, built in, is stopped here. For a reply's turn Lumiverse then sends the prompt as it was (§25), so nothing of its reply is taken away.
-        if (running.relay === BUILTIN) return { stopped: d.stopHere(userId, r.turn, "You stopped it from LumiAH's live view.") };
         const relay = running.relay;
         const why = "You stopped the reply from LumiAH's live view.";
         // Lumiverse hasn't heard of this stop: where the runtime can't make it stop the generation, the empty reply it then saves is taken away.
@@ -474,7 +470,7 @@ export class Ui {
       case "lah.approval.answer":
         return { answered: d.approvals.answer(userId, r.id, r.answer) };
       case "lah.approvals.kept": {
-        // One chat's are read where that chat runs; every chat's, built in, from the store both places share.
+        // One chat's are read where that chat runs; every chat's, of the user's runtime, from the store they all share.
         const chatId = await this.chat(userId, r.chatId);
         return { kept: await this.kept(userId, await this.ask(userId, "approvals", "kept", { chatId }, { chat: chatId })) };
       }
@@ -539,7 +535,7 @@ export class Ui {
       case "lah.tier.approval":
         return d.defs.tierApproval(userId, r.tier, r.approval);
       case "lah.jobs.list": {
-        // One chat's jobs are listed where that chat runs; every chat's, built in, from the list both places keep in the store they share.
+        // One chat's jobs are listed where that chat runs; every chat's, of the user's runtime, from the list kept in the store.
         const chatId = await this.chat(userId, r.chatId);
         const page = jobsOf(await this.ask(userId, "jobs", "list", { chatId, cursor: r.cursor, limit: r.limit }, { chat: chatId }));
         // The extension started again while jobs ran: what a first list says of the ones still under way fills the state.
@@ -579,7 +575,7 @@ export class Ui {
       case "lah.notice.dismiss":
         return { notices: await d.notices.dismiss(userId, r.id) };
       case "lah.side.list": {
-        // Every side session is in the store both places share, so the list is asked built in, which is always there.
+        // Every side session is in the store, so the list is asked of the user's runtime.
         const rows = sidesOf(await this.ask(userId, "sides", "list", {})).sides;
         const mine = this.said.get(userId);
         // A session removed on another page takes the turn it waited on with it.

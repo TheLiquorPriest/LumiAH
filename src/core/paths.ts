@@ -40,8 +40,6 @@ export const DOC = {
   spend: (day: string, hour: string): string => `spend/${day}/${hour}.json`,
   /** What the last sweep found and removed. */
   upkeep: "upkeep.json",
-  /** A turn handed over to the host's own generation and waiting for its reply (§25), by its generation id: what its record needs, so a restart or a late reply still gets one. */
-  pending: (generationId: string): string => `pending/${docKey(generationId)}.json`,
 } as const;
 
 /** The generation a chat's area is kept under before any turn has written to it. */

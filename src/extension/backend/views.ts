@@ -1,6 +1,6 @@
 // The core's answers as the pages take them (DESIGN §8, §25). A page's request for the workspace,
 // the jobs, the side sessions, the spend, what is stored, the lore or the chronicle is served by
-// the core in the place it belongs to (built in, or the user's runtime: asks.ts), and the core
+// the core in the user's runtime (asks.ts), and the core
 // answers its own shapes (its harness's, src/core/harness.ts), which are not always the pages'
 // (src/shared/ui.ts). Here each answer is read as it came, field by field, and made into the
 // page's view, with what the core doesn't hold put in by whoever calls: a chat's name, an agent
@@ -24,7 +24,7 @@ import type { TurnTranscript } from "../../core/transcript";
 import { clip } from "../../core/util";
 import { showPath } from "../../core/workspace";
 import { isRecord } from "../../link/json";
-import type { ApprovalChoice, CauseCode, ChangedFile, ChronicleView, CitedView, DefsView, EmbeddingStatus, FileVersion, GuidanceLevel, GuidanceLevelId, GuidanceView, JobsPage, LastTurn, LiveEndState, LiveView, LoreSearch, LoreView, McpServerView, NoPart, NoPartWhy, RunPlace, SettingPath, SideSession, SideTurn, SpendCap, SpendRow, SpendView, StoredKind, StoryEstimate, StoryView, ToolRow, TurnKind, UpkeepView, WorkspaceFile, WorkspaceView } from "../../shared/ui";
+import type { ApprovalChoice, CauseCode, ChangedFile, ChronicleView, CitedView, DefsView, EmbeddingStatus, FileVersion, GuidanceLevel, GuidanceLevelId, GuidanceView, JobsPage, LastTurn, LiveEndState, LiveView, LoreSearch, LoreView, McpServerView, SettingPath, SideSession, SideTurn, SpendCap, SpendRow, SpendView, StoredKind, StoryEstimate, StoryView, ToolRow, TurnKind, UpkeepView, WorkspaceFile, WorkspaceView } from "../../shared/ui";
 import { loreChangesOf, replyDid } from "../../shared/ui";
 import { causeOf } from "./cause";
 import { UiRefused } from "./errors";
@@ -770,34 +770,9 @@ export function keptOf(raw: JsonValue): { chatId: string; tool: string; at: numb
 // ---------------------------------------------------------------- home: a chat's latest turn
 
 /**
- * Where a turn ran and, where LumiAH had no part in its reply, why (DESIGN §25): what the
- * extension writes beside the core's record on the reply's message (`ran`). Empty for a record made
- * before there were two places.
- */
-export interface Ran {
-  place?: RunPlace;
-  noPart?: NoPart;
-}
-
-const NO_PART_WHYS: Readonly<Record<NoPartWhy, true>> = { failed: true, time: true, stopped: true };
-const isWhy = (v: unknown): v is NoPartWhy => typeof v === "string" && Object.hasOwn(NO_PART_WHYS, v);
-
-/** What a reply's record says of where its turn ran, read from the record as it is stored: the core's own reader keeps the core's fields alone. */
-export function ranOf(anchor: unknown): Ran {
-  const ran: unknown = isRecord(anchor) ? anchor.ran : undefined;
-  if (!isRecord(ran)) return {};
-  const noPart: unknown = ran.noPart;
-  return {
-    ...(ran.place === "builtin" || ran.place === "runtime" ? { place: ran.place } : {}),
-    ...(isRecord(noPart) && isWhy(noPart.why) && isText(noPart.text) ? { noPart: { why: noPart.why, text: noPart.text } } : {}),
-  };
-}
-
-/**
  * What a run's events come to, as the first screen counts them: what the run has spent so far,
  * the agents that worked, the tool calls they made, the lore entries the main agent added to and
- * dropped from what the writer saw (§24.3), the workspace files changed, the jobs started, and, for
- * a built-in reply's turn, when its time before the reply ends.
+ * dropped from what the writer saw (§24.3), the workspace files changed, and the jobs started.
  */
 export interface RunCounts {
   usage: AgentUsage | null;
@@ -806,7 +781,6 @@ export interface RunCounts {
   lore: { added: number; dropped: number };
   changes: number;
   jobs: number;
-  replyBy: number | null;
 }
 
 /**
@@ -816,16 +790,13 @@ export interface RunCounts {
  */
 export function runCounts(events: readonly TraceRecord[]): RunCounts {
   let usage: AgentUsage | null = null;
-  let replyBy: number | null = null;
   let agents = 0;
   let tools = 0;
   let lore = { added: 0, dropped: 0 };
   const files = new Set<string>();
   const jobs = new Set<string>();
   for (const { event } of events) {
-    if (event.kind === "turn_started") {
-      if (typeof event.replyBy === "number") replyBy = event.replyBy;
-    } else if (event.kind === "agent_started") agents += 1;
+    if (event.kind === "agent_started") agents += 1;
     else if (event.kind === "agent_entry") {
       const { entry } = event;
       // A call counts once the model has made it, whether or not its result is back yet.
@@ -841,7 +812,7 @@ export function runCounts(events: readonly TraceRecord[]): RunCounts {
     else if (event.kind === "job") jobs.add(event.job.id);
     else if (event.kind === "turn_ended") usage = event.usage;
   }
-  return { usage, agents, tools, lore, changes: files.size, jobs: jobs.size, replyBy };
+  return { usage, agents, tools, lore, changes: files.size, jobs: jobs.size };
 }
 
 /** A reply's turn once it has left its record: the message the reply is on, and the transcript the record names (null: none is kept). */
@@ -863,9 +834,6 @@ export function lastOfLive(view: LiveView, kind: TurnKind, kept: KeptReply | nul
     messageId: kept?.messageId ?? view.messageId,
     startedAt: view.startedAt,
     ended: view.ended,
-    // A view that names no place is of a run from before there were two: a runtime's.
-    place: view.place ?? "runtime",
-    replyBy: view.replyBy ?? counts.replyBy,
     usage: counts.usage,
     agents: counts.agents,
     tools: counts.tools,
@@ -879,28 +847,24 @@ export function lastOfLive(view: LiveView, kind: TurnKind, kept: KeptReply | nul
 
 /**
  * The same from the record on the reply's message, once the live buffer no longer holds the run:
- * the record, where its turn ran (`ran`), and the transcript it names (`stored`; null: none is kept,
- * or it is no longer stored). The counts are the transcript's events counted as a live run's are.
- * With no transcript there is nothing to count the agents, the tool calls and the lore from, so
- * those read 0; the record itself still says how many files its change set names and which jobs
- * it started, and how a reply LumiAH had no part in ended is told from why it had none.
+ * the record, and the transcript it names (`stored`; null: none is kept, or it is no longer
+ * stored). The counts are the transcript's events counted as a live run's are. With no transcript
+ * there is nothing to count the agents, the tool calls and the lore from, so those read 0; the
+ * record itself still says how many files its change set names and which jobs it started.
  */
-export function lastOfRecord(reply: { messageId: string; record: TurnRecord; ran: Ran }, stored: TurnTranscript | null): LastTurn {
-  const { record, ran } = reply;
+export function lastOfRecord(reply: { messageId: string; record: TurnRecord }, stored: TurnTranscript | null): LastTurn {
+  const { record } = reply;
   const counts = stored === null ? null : runCounts(stored.events);
-  const state: LiveEndState = stored?.ended.status ?? (ran.noPart === undefined ? "done" : ran.noPart.why === "failed" ? "failed" : "stopped");
+  const state: LiveEndState = stored?.ended.status ?? "done";
   const reason = stored?.ended.reason;
-  // Why, as a code a page can act on, where the reply was Lumiverse's own or its turn failed: read from the transcript, as the live view read it from the same events while the run was there.
-  const cause: CauseCode | null = ran.noPart?.why === "time" ? "time" : stored !== null && (ran.noPart !== undefined || state === "failed") ? causeOf(stored.events) : null;
+  // Why, as a code a page can act on, where its turn failed: read from the transcript, as the live view read it from the same events while the run was there.
+  const cause: CauseCode | null = stored !== null && state === "failed" ? causeOf(stored.events) : null;
   return {
     turn: record.generationId,
     kind: record.kind,
     messageId: reply.messageId,
     startedAt: stored?.startedAt ?? record.began ?? record.at,
-    ended: { state, at: stored?.ended.at ?? record.at, ...(reason !== undefined ? { reason } : {}), ...(ran.noPart !== undefined ? { noPart: ran.noPart } : {}), ...(cause !== null ? { cause } : {}) },
-    // A record that names no place was made before there were two: in a runtime.
-    place: ran.place ?? "runtime",
-    replyBy: counts?.replyBy ?? null,
+    ended: { state, at: stored?.ended.at ?? record.at, ...(reason !== undefined ? { reason } : {}), ...(cause !== null ? { cause } : {}) },
     usage: record.usage,
     agents: counts?.agents ?? 0,
     tools: counts?.tools ?? 0,

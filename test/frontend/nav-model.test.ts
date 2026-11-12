@@ -5,7 +5,7 @@ import { describe, expect, test } from "bun:test";
 import { MockBackend } from "../../dev/preview/mock-backend";
 import { sampleSettings } from "../../dev/preview/sections";
 import { groupOf, GROUPS, type Nav, PAGES, START_NAV } from "../../src/extension/frontend/app";
-import { approvalTarget, attentionOf, badgeOf, groupMark, noticeWords, PAGE_ICON, pageMarks, shownGroups, shownPage, shows, skippable, stripOver } from "../../src/extension/frontend/nav-model";
+import { approvalTarget, attentionOf, badgeOf, groupMark, noticeWords, PAGE_ICON, pageMarks, shownGroups, shownPage, shows, stripOver } from "../../src/extension/frontend/nav-model";
 import type { ApprovalView, ChatView, JobView, Notice, PermissionNeed, RelayView, RunningTurn, UiState } from "../../src/shared/ui";
 
 const T0 = Date.UTC(2026, 10, 10, 9, 0, 0);
@@ -36,7 +36,8 @@ describe("the pages and their groups", () => {
     expect(START_NAV.page).toBe("home");
     expect(GROUPS[0]).toMatchObject({ id: "home", pages: [{ id: "home" }] });
     const far = PAGES.filter((p) => p.far === true).map((p) => p.id);
-    expect(far.sort()).toEqual(["agents", "runtime", "skills", "spend", "tools", "upkeep"]);
+    // The Runtime page is none of those: no chat is answered without a runtime.
+    expect(far.sort()).toEqual(["agents", "skills", "spend", "tools", "upkeep"]);
     // Within the groups a newcomer opens first, nothing is one of those.
     for (const g of GROUPS.slice(0, 3)) expect(g.pages.some((p) => p.far === true)).toBe(false);
     expect(groupOf("lore")).toBe("story");
@@ -85,15 +86,15 @@ describe("marks on the page bar", () => {
     expect(pageMarks({ ...base, runtime: { ...base.runtime, issues: ["This Lumiverse is too old to keep a turn's record. Update Lumiverse."] } }).home).toBe("needs");
   });
 
-  test("a runtime is an option: none at all marks nothing, and one that isn't ready marks its page only for someone who uses it", () => {
-    const none: UiState = { ...base, runtime: { ...base.runtime, relays: [], ready: false }, key: { set: false, print: null, at: null }, connections: base.connections.filter((c) => !c.loopback), chats: base.chats.filter((c) => c.place === "builtin") };
-    expect(pageMarks(none)).toEqual({});
-    // A chat set to run in a runtime that isn't there: its replies fail until one is.
-    const waiting: ChatView = { chatId: "chat-brann", name: "Brann's long watch", on: true, since: T0, place: "runtime", connection: { id: "conn-loopback", name: "LumiAH loopback", loopback: true } };
-    const unready = pageMarks({ ...none, chats: [waiting] });
-    expect(unready.runtime).toBe("needs");
-    expect(groupMark("system", unready)).toBe("needs");
-    // A runtime registered that has gone quiet, with no chat resting on it.
+  test("no chat is answered without the runtime: its page is marked while none is ready, set up or not, and not once one is", () => {
+    const none: UiState = { ...base, runtime: { ...base.runtime, relays: [], ready: false }, key: { set: false, print: null, at: null }, connections: base.connections.filter((c) => !c.loopback), chats: [] };
+    const fresh = pageMarks(none);
+    expect(fresh).toEqual({ runtime: "needs" });
+    expect(groupMark("system", fresh)).toBe("needs");
+    // A chat switched on while none is ready: its replies fail until one is.
+    const waiting: ChatView = { chatId: "chat-brann", name: "Brann's long watch", on: true, since: T0, connection: { id: "conn-loopback", name: "LumiAH loopback", loopback: true } };
+    expect(pageMarks({ ...none, chats: [waiting] }).runtime).toBe("needs");
+    // A runtime registered that has gone quiet.
     const quiet: RelayView[] = base.runtime.relays.map((r) => ({ ...r, link: "quiet" }));
     expect(pageMarks({ ...none, runtime: { ...none.runtime, relays: quiet } }).runtime).toBe("needs");
     // The preview's set-up story has one linked and ready.
@@ -141,7 +142,7 @@ describe("what waits for the user, and where", () => {
 });
 
 describe("the signs outside the drawer", () => {
-  const replying: UiState = { ...base, running: [run({ place: "builtin" })] };
+  const replying: UiState = { ...base, running: [run({})] };
 
   test("the tab's badge counts what waits for the user first, shows a working mark while a reply is prepared for the open chat, and counts other runs otherwise", () => {
     expect(badgeOf(null, "chat-mara")).toBeNull();
@@ -153,20 +154,6 @@ describe("the signs outside the drawer", () => {
     // What needs the user outranks both; a job that only finished is news, not a mark.
     expect(badgeOf({ ...replying, approvals: [held({})], notices: [notice({ kind: "job_failed" })] }, "chat-mara")).toBe("2!");
     expect(badgeOf({ ...replying, notices: [notice({ kind: "job_done" })] }, "chat-mara")).toBe("…");
-  });
-
-  test("a built-in reply being prepared for the open chat can be skipped from Lumiverse's input bar; a runtime's, another chat's, a job's can't", () => {
-    expect(skippable(replying, "chat-mara")).toEqual({ stream: "chat-mara", turn: "t1" });
-    expect(skippable(replying, "chat-brann")).toBeNull();
-    expect(skippable(replying, null)).toBeNull();
-    expect(skippable(null, "chat-mara")).toBeNull();
-    expect(skippable({ ...base, running: [run({ place: "runtime" })] }, "chat-mara")).toBeNull();
-    expect(skippable({ ...base, running: [run({ stream: "job-1", kind: "job", turn: "job-1" })] }, "chat-mara")).toBeNull();
-    // Where the run doesn't say where it runs, the chat does: built in, or set to a runtime that isn't answering.
-    const chatAt = (over: Partial<ChatView>): UiState => ({ ...base, running: [run({})], chats: [{ chatId: "chat-mara", name: "Mara at the mill", on: true, since: T0, place: "builtin", connection: null, ...over }] });
-    expect(skippable(chatAt({}), "chat-mara")).toEqual({ stream: "chat-mara", turn: "t1" });
-    expect(skippable(chatAt({ place: "runtime" }), "chat-mara")).toBeNull();
-    expect(skippable(chatAt({ place: "runtime", away: true }), "chat-mara")).toEqual({ stream: "chat-mara", turn: "t1" });
   });
 
   test("the strip stands over every page but Home, which says what waits for the user itself", () => {

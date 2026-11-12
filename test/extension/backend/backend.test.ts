@@ -111,36 +111,66 @@ describe("the settings", () => {
     expect(kept.texts.own[def.id]).toBe(mine);
     expect((await it.page.request("lah.text.reset", { id: def.id })).texts.own[def.id]).toBeUndefined();
   });
+
+  test("pass over quietly a value kept at a setting this build took away, and leave it out of storage from the next change on", async () => {
+    const it = (r = await rig());
+    const stored = it.host.stored(USER, "settings.json") as { own: { path: string[]; value: unknown }[] };
+    // As a build that could run a chat inside Lumiverse kept them: how near the reply its main agent was warned and how long a turn waited for its reply, and that way's own group of timings; beside them, a setting this build keeps.
+    stored.own.push({ path: ["core", "reply", "warnMs"], value: 30_000 }, { path: ["core", "reply", "pendingMs"], value: 600_000 }, { path: ["transport", "builtin"], value: { marginMs: 15_000 } }, { path: ["transport", "history", "count"], value: 12 });
+    it.host.files.set(`${USER}/settings.json`, JSON.stringify(stored));
+    await it.restart();
+
+    const { values } = (await it.page.request("lah.hello", {})).settings;
+    for (const gone of [["core", "reply", "warnMs"], ["core", "reply", "pendingMs"], ["transport", "builtin"]]) expect(values).not.toHaveProperty(gone);
+    expect(values).toMatchObject({ transport: { history: { count: 12 } } });
+
+    // The next change is taken as any is, and what it stores holds nothing of what was taken away.
+    await it.page.request("lah.settings.set", { set: [{ path: ["transport", "history", "count"], value: 20 }], reset: [] });
+    await it.backend.settle();
+    const after = it.host.stored(USER, "settings.json") as { own: { path: string[]; value: unknown }[] };
+    expect(after.own).toEqual(expect.arrayContaining([{ path: ["transport", "streams", "coalesceMs"], value: 0 }, { path: ["transport", "history", "count"], value: 20 }]));
+    expect(after.own).toHaveLength(2);
+  });
 });
 
 describe("the per-chat switch and the secrets", () => {
-  test("on for a runtime pins the chat to the loopback connection, off puts back the connection it had; on built in leaves the chat's connection alone", async () => {
+  test("on pins the chat to the loopback connection and off puts back the connection it had; with no loopback connection yet, on is refused in words that say how to get one", async () => {
     const it = (r = await rig());
-    await it.setUp();
     it.host.addConnection({ id: "conn-other", name: "Other" });
     const chat = it.host.addChat(USER, "Ilse's ledger");
     chat.metadata.connection_profile_id = "conn-other";
-    const loopback = it.host.connectionList.find((c) => c.model === "lumiah");
 
-    const on = await it.page.request("lah.chat.set", { chatId: chat.id, on: true, place: "runtime" });
-    expect(on.chat).toMatchObject({ on: true, place: "runtime", connection: { id: loopback?.id, loopback: true } });
+    // No key minted yet, so no loopback connection: there is nothing to pin the chat to.
+    const early = await it.page.request("lah.chat.set", { chatId: chat.id, on: true }).catch((error: unknown) => error);
+    expect(early instanceof UiFailure ? early.error : null).toMatchObject({ code: "unavailable", message: "There is no runtime to answer this chat yet. Start one with its line on LumiAH's Runtime page and mint its key there, then switch the chat on." });
+    expect(chat.metadata.connection_profile_id).toBe("conn-other");
+    expect((await it.page.request("lah.chat.get", { chatId: chat.id })).chat).toMatchObject({ on: false, connection: { id: "conn-other", loopback: false } });
+
+    await it.setUp();
+    const loopback = it.host.connectionList.find((c) => c.model === "lumiah");
+    const on = await it.page.request("lah.chat.set", { chatId: chat.id, on: true });
+    expect(on.chat).toMatchObject({ on: true, connection: { id: loopback?.id, loopback: true } });
     expect(chat.metadata.connection_profile_id).toBe(loopback?.id ?? "");
 
     const off = await it.page.request("lah.chat.set", { chatId: chat.id, on: false });
     expect(off.chat).toMatchObject({ on: false, since: null, connection: { id: "conn-other", loopback: false } });
     expect(chat.metadata.connection_profile_id).toBe("conn-other");
 
-    // With the place left out, the chat runs where it ran before: in the runtime again.
-    const again = await it.page.request("lah.chat.set", { chatId: chat.id, on: true });
-    expect(again.chat).toMatchObject({ on: true, place: "runtime", connection: { id: loopback?.id, loopback: true } });
-    // Set to run built in, it gets back the connection it had and keeps generating on it.
-    const here = await it.page.request("lah.chat.set", { chatId: chat.id, on: true, place: "builtin" });
-    expect(here.chat).toMatchObject({ on: true, place: "builtin", connection: { id: "conn-other", loopback: false } });
-    expect(chat.metadata.connection_profile_id).toBe("conn-other");
-    expect((await it.page.request("lah.chat.set", { chatId: chat.id, on: false })).chat).toMatchObject({ on: false, since: null, place: "builtin", connection: { id: "conn-other", loopback: false } });
-    // A chat never set runs built in.
-    const fresh = it.host.addChat(USER, "Okoro's log");
-    expect((await it.page.request("lah.chat.set", { chatId: fresh.id, on: true })).chat).toMatchObject({ on: true, place: "builtin" });
+    // A page of an earlier build that still names a place to run the chat in is heard as asking for it on: the runtime is the one place.
+    const stale: { chatId: string; on: boolean } = Object.assign({ chatId: chat.id, on: true }, { place: "builtin" });
+    expect((await it.page.request("lah.chat.set", stale)).chat).toMatchObject({ on: true, connection: { id: loopback?.id, loopback: true } });
+
+    // A chat an earlier build switched on to run inside Lumiverse was never pinned: it reads as off, and switching it on pins it.
+    const old = it.host.addChat(USER, "Okoro's log");
+    old.metadata.connection_profile_id = "conn-other";
+    const kept = it.host.stored(USER, "chats.json") as { on: Record<string, unknown> };
+    kept.on[old.id] = { since: 1, place: "builtin", prior: null, priorModel: null };
+    it.host.files.set(`${USER}/chats.json`, JSON.stringify(kept));
+    await it.restart();
+    expect((await it.page.request("lah.chat.get", { chatId: old.id })).chat).toMatchObject({ on: false, since: null, connection: { id: "conn-other", loopback: false } });
+    expect((await it.page.request("lah.chat.set", { chatId: old.id, on: true })).chat).toMatchObject({ on: true, connection: { id: loopback?.id, loopback: true } });
+    expect(old.metadata.connection_profile_id).toBe(loopback?.id ?? "");
+
     // Another account's chat is no chat at all.
     const theirs = it.host.addChat("user-brann", "Brann's stall");
     const refused = await it.page.request("lah.chat.get", { chatId: theirs.id }).catch((error: unknown) => error);

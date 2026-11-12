@@ -7,8 +7,8 @@
 // ceilings no account sets, and a run whose runtime went away for good ended as lost.
 
 import { afterEach, describe, expect, test } from "bun:test";
-import type { AgentStopCode, TraceDelta, TraceRecord, TranscriptEntry } from "../../../src/core/ports";
-import { BUILTIN, LiveBuffer, type LiveCeilings, type RunStart } from "../../../src/extension/backend/live";
+import type { AgentStopCode, AgentUsage, TraceDelta, TraceRecord, TranscriptEntry } from "../../../src/core/ports";
+import { LiveBuffer, type LiveCeilings, type RunStart } from "../../../src/extension/backend/live";
 import { LINK } from "../../../src/link/contract";
 import { CEILINGS, TRANSPORT_DEFAULTS, type TransportSettings } from "../../../src/link/settings";
 import { type BackendToFrontend, type LiveDelta, type LiveView, followDelta, followLive } from "../../../src/shared/ui";
@@ -150,11 +150,16 @@ const reply = (chat: string, turn: string): RunStart => ({ stream: chat, chatId:
 /** The first record of a job's run, as a runtime traces it: all the buffer needs to start following one. */
 const jobStarted = (job: string, turn: string): TraceRecord => ({ turn, chatId: "", seq: 1, event: { kind: "turn_started", turn, chatId: "", generation: "job", messageId: null, job, at: 1 } });
 const step = (turn: string, seq: number): TraceRecord => ({ turn, chatId: "", seq, event: { kind: "notice", text: `Brann checks lamp ${seq}.`, at: seq } });
+const USAGE: AgentUsage = { calls: 1, toolTurns: 0, in: 10, cachedIn: 0, out: 5, reasoningOut: 0, estimated: false, ms: 1 };
+/** The record a runtime traces as a run of its ends. */
+const ended = (turn: string, seq: number, status: "done" | "stopped" = "done"): TraceRecord => ({ turn, chatId: "", seq, event: { kind: "turn_ended", status, usage: USAGE, at: seq } });
+/** The runtime the replies of these tests run in. */
+const RELAY = "relay-quay";
 
-/** A reply's run that began and ended done. */
+/** A reply's run that began and ended done, as its runtime traced it. */
 async function answered(live: LiveBuffer, userId: string, chat: string, turn: string): Promise<void> {
-  await live.begin(userId, BUILTIN, reply(chat, turn));
-  live.finish(userId, turn, { state: "done", at: 2 });
+  await live.begin(userId, RELAY, reply(chat, turn));
+  await live.push(userId, RELAY, [ended(turn, 1)]);
 }
 
 describe("two accounts on one server", () => {
@@ -165,7 +170,7 @@ describe("two accounts on one server", () => {
 
     await it.backend.settings.change(JOSS, [{ path: ["transport", "live", "chats"], value: 1 }], []);
     await answered(it.backend.live, JOSS, "chat-joss-quay", "gen-joss-1");
-    await it.backend.live.begin(JOSS, BUILTIN, reply("chat-joss-mill", "gen-joss-2"));
+    await it.backend.live.begin(JOSS, RELAY, reply("chat-joss-mill", "gen-joss-2"));
 
     expect(it.backend.live.whole(USER, mine.id)?.turn ?? null).toBe("gen-mara");
     expect(it.backend.live.chatsOf(USER)).toEqual([mine.id]);
@@ -190,24 +195,26 @@ describe("two accounts on one server", () => {
     await live.push(USER, "relay-mara", [jobStarted("job-tide", "run-1")]);
     await live.push(JOSS, "relay-joss", [jobStarted("job-tide", "run-1"), step("run-1", 2)]);
 
-    live.finish(JOSS, "run-1", { state: "stopped", at: 3 });
+    await live.push(JOSS, "relay-joss", [ended("run-1", 3, "stopped")]);
 
     expect(live.running(USER, "job-tide", "run-1")?.relay).toBe("relay-mara");
     expect(live.whole(USER, "job-tide")?.events.length).toBe(1);
     expect(live.whole(JOSS, "job-tide")?.ended?.state).toBe("stopped");
-    expect(live.whole(JOSS, "job-tide")?.events.length).toBe(2);
+    expect(live.whole(JOSS, "job-tide")?.events.length).toBe(3);
   });
 });
 
 describe("what the live buffer holds at most", () => {
   test("an account's own settings can't raise the events kept of a run or the chats kept past the fixed ceilings", async () => {
-    const { live, set } = buffer({ liveEvents: 3, liveChats: 2 });
+    const { live, set, gone } = buffer({ liveEvents: 3, liveChats: 2 });
     set.set(USER, { live: { events: 1_000_000, chats: 1024 } });
 
     const taken = await live.push(USER, "relay-mara", [jobStarted("job-tide", "run-1"), step("run-1", 2), step("run-1", 3), step("run-1", 4), step("run-1", 5)]);
-    live.finish(USER, "run-1", { state: "done", at: 6 });
     expect(taken).toBe(3);
     expect(live.whole(USER, "job-tide")?.events.map((e) => e.seq)).toEqual([1, 2, 3]);
+    // Its runtime goes away for good: the run ends, lost, and may be let go for room.
+    gone.set(`${USER} relay-mara`, TRANSPORT_DEFAULTS.runtime.lostMs);
+    await live.tick();
 
     await answered(live, USER, "chat-quay", "gen-1");
     await answered(live, USER, "chat-mill", "gen-2");
@@ -221,7 +228,7 @@ describe("what the live buffer holds at most", () => {
     set.set(USER, { live: { chats: CEILINGS.liveChats } });
     const over: string[] = [];
     live.onEnded((run) => over.push(`${run.userId} ${run.turn}`));
-    await live.begin(USER, BUILTIN, reply("chat-light", "gen-mara"));
+    await live.begin(USER, RELAY, reply("chat-light", "gen-mara"));
     await live.push(JOSS, "relay-joss", [jobStarted("job-joss", "run-joss")]);
 
     for (let n = 1; n < CEILINGS.liveRunning; n++) await live.push(USER, "relay-mara", [jobStarted(`job-${n}`, `run-${n}`)]);
@@ -242,9 +249,9 @@ describe("what the live buffer holds at most", () => {
 
   test("where every run under way of an account is a reply's turn, the one begun longest ago gives way", async () => {
     const { live } = buffer({ liveRunning: 2 });
-    await live.begin(USER, BUILTIN, reply("chat-quay", "gen-1"));
-    await live.begin(USER, BUILTIN, reply("chat-mill", "gen-2"));
-    await live.begin(USER, BUILTIN, reply("chat-light", "gen-3"));
+    await live.begin(USER, RELAY, reply("chat-quay", "gen-1"));
+    await live.begin(USER, RELAY, reply("chat-mill", "gen-2"));
+    await live.begin(USER, RELAY, reply("chat-light", "gen-3"));
 
     expect(live.whole(USER, "chat-quay")?.ended?.state).toBe("lost");
     expect(live.runningOf(USER).map((run) => run.turn)).toEqual(["gen-2", "gen-3"]);
@@ -261,7 +268,7 @@ describe("what the live buffer holds at most", () => {
     expect(live.chatsOf(JOSS)).toEqual(["chat-joss-1", "chat-joss-2", "chat-joss-3"]);
 
     // Now Joss holds the most: his fourth costs him his own first.
-    await live.begin(JOSS, BUILTIN, reply("chat-joss-4", "gen-joss-4"));
+    await live.begin(JOSS, RELAY, reply("chat-joss-4", "gen-joss-4"));
     expect(live.chatsOf(USER)).toEqual(["chat-mara-2", "chat-mara-3"]);
     expect(live.chatsOf(JOSS)).toEqual(["chat-joss-2", "chat-joss-3", "chat-joss-4"]);
     expect(live.running(JOSS, "chat-joss-4", "gen-joss-4")).not.toBeNull();
@@ -285,19 +292,18 @@ describe("what the live buffer holds at most", () => {
 });
 
 describe("a run whose runtime went away", () => {
-  test("ends as lost once the runtime's link has been gone for the account's lost-for time, saying so; a run whose runtime came back in time, and one that runs built in, go on", async () => {
+  test("ends as lost once the runtime's link has been gone for the account's lost-for time, saying so; a run whose runtime came back in time goes on", async () => {
     const { live, gone } = buffer();
     const lostMs = TRANSPORT_DEFAULTS.runtime.lostMs;
     await live.push(USER, "relay-quay", [jobStarted("job-tide", "run-tide")]);
     await live.begin(USER, "relay-quay", reply("chat-light", "gen-light"));
     await live.push(USER, "relay-mill", [jobStarted("job-lamp", "run-lamp")]);
-    await live.begin(USER, BUILTIN, reply("chat-keys", "gen-keys"));
 
     // Both runtimes' links drop. Not yet for long enough: nothing ends.
     gone.set(`${USER} relay-quay`, lostMs - 1);
     gone.set(`${USER} relay-mill`, lostMs - 1);
     await live.tick();
-    expect(live.runningOf(USER).length).toBe(4);
+    expect(live.runningOf(USER).length).toBe(3);
 
     // One comes back; the other stays away.
     gone.delete(`${USER} relay-mill`);
@@ -310,7 +316,7 @@ describe("a run whose runtime went away", () => {
     const turn = live.whole(USER, "chat-light")?.ended;
     expect(turn?.state).toBe("lost");
     expect(turn?.reason).toBe(`The runtime this ran in went away: its link has been gone for ${lostMs / 1000} seconds. The run ended with the runtime.`);
-    expect(live.runningOf(USER).map((run) => run.turn)).toEqual(["run-lamp", "gen-keys"]);
+    expect(live.runningOf(USER).map((run) => run.turn)).toEqual(["run-lamp"]);
   });
 
   test("is given up after each account's own lost-for time, not another's", async () => {
@@ -328,8 +334,7 @@ describe("a run whose runtime went away", () => {
   });
 });
 
-describe("why a turn failed or LumiAH had no part in a reply, as a code beside the sentence", () => {
-  const USAGE = { calls: 1, toolTurns: 0, in: 10, cachedIn: 0, out: 5, reasoningOut: 0, estimated: false, ms: 1 };
+describe("why a turn failed, as a code beside the sentence", () => {
   const CALL = { in: 10, cachedIn: 0, out: 5, reasoningOut: 0, estimated: [] };
   /** A run's trace, numbered from 1: its agents as they start (one with a `parent` is no main agent) and their steps. */
   const traced = (turn: string, events: ({ agent: string; parent?: string } | { of: string; entry: TranscriptEntry } | { ended: "done" | "failed" | "stopped"; reason?: string })[]): TraceRecord[] =>
@@ -359,10 +364,9 @@ describe("why a turn failed or LumiAH had no part in a reply, as a code beside t
     expect(worked?.cause).toBeUndefined();
   });
 
-  test("a limit of the user's that stopped the main agent is named as a limit, the time before the reply as time; a sub-agent's own limit is not the turn's cause", async () => {
+  test("a limit of the user's that stopped the main agent is named as a limit; a sub-agent's own limit is not the turn's cause", async () => {
     expect((await endOf(traced("gen-light", [{ agent: "a1" }, { of: "a1", entry: stopped("tool_turns") }, { ended: "failed", reason: "It used its 24 rounds." }])))?.cause).toBe("limit");
     expect((await endOf(traced("gen-light", [{ agent: "a1" }, { of: "a1", entry: stopped("spend") }, { ended: "failed" }])))?.cause).toBe("limit");
-    expect((await endOf(traced("gen-light", [{ agent: "a1" }, { of: "a1", entry: stopped("reply_time") }, { ended: "failed" }])))?.cause).toBe("time");
     expect((await endOf(traced("gen-light", [{ agent: "a1" }, { agent: "a2", parent: "a1" }, { of: "a2", entry: stopped("tool_turns") }, { of: "a1", entry: stopped("failed") }, { ended: "failed" }])))?.cause).toBeUndefined();
   });
 
@@ -370,19 +374,5 @@ describe("why a turn failed or LumiAH had no part in a reply, as a code beside t
     expect((await endOf(traced("gen-light", [{ agent: "a1" }, { of: "a1", entry: stopped("failed") }, { ended: "failed", reason: "Lumiverse refused the call." }]), true))?.cause).toBe("permission");
     expect((await endOf(traced("gen-light", [{ agent: "a1" }, { of: "a1", entry: plain }, { ended: "done" }]), true))?.cause).toBeUndefined();
     expect((await endOf(traced("gen-light", [{ agent: "a1" }, { of: "a1", entry: stopped("cancelled") }, { ended: "stopped", reason: "You stopped the reply." }])))?.cause).toBeUndefined();
-  });
-
-  test("what no trace can tell is said by whoever knows it: the user's skip, before the turn's end or after", async () => {
-    const { live } = buffer();
-    const noPart = { why: "stopped" as const, text: "You skipped LumiAH for this reply." };
-    await live.begin(USER, BUILTIN, reply("chat-light", "gen-1"));
-    live.noPart(USER, "gen-1", noPart, "skipped");
-    live.finish(USER, "gen-1", { state: "stopped", at: 2 });
-    expect(live.whole(USER, "chat-light")?.ended).toEqual({ state: "stopped", at: 2, noPart, cause: "skipped" });
-
-    await live.begin(USER, BUILTIN, reply("chat-quay", "gen-2"));
-    live.finish(USER, "gen-2", { state: "stopped", at: 3 });
-    live.noPart(USER, "gen-2", noPart, "skipped");
-    expect(live.whole(USER, "chat-quay")?.ended).toEqual({ state: "stopped", at: 3, noPart, cause: "skipped" });
   });
 });

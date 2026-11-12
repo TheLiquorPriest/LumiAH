@@ -1,18 +1,10 @@
-// First-time setup and where a chat runs (DESIGN §25), worked out from the state every page holds.
-// Home and the Runtime page render what these give. Built in is the default and needs nothing
-// installed, so setup is three steps (LumiAH's permissions, a chat switched on, a reply). A runtime
-// is an option with steps of its own, which show only to someone who asks for one.
+// First-time setup and how a chat stands (DESIGN §25), worked out from the state every page holds.
+// Home and the Runtime page render what these give. Setup is three steps (LumiAH's permissions, a
+// chat switched on, a reply); the runtime has steps of its own (start it, mint its key, have its
+// connection), which the Runtime page shows until they are done: no chat is answered without it.
 
-import type { ChatView, PermissionNeed, RunPlace, RuntimeView, SetupStepId, UiState } from "../../shared/ui";
+import type { ChatView, PermissionNeed, RuntimeView, SetupStepId, UiState } from "../../shared/ui";
 import { count, counted } from "./format";
-
-export const PLACE_LABEL: Readonly<Record<RunPlace, string>> = { builtin: "Built in", runtime: "Runtime" };
-
-/** What each place is, in one line, said wherever the choice is made. */
-export const PLACE_ABOUT: Readonly<Record<RunPlace, string>> = {
-  builtin: "LumiAH works inside Lumiverse before each reply. Nothing to install.",
-  runtime: "A program you start beside Lumiverse, for turns that need longer than Lumiverse allows before a reply.",
-};
 
 /** Where a step stands: done, the one to do now, or one that comes after it. */
 export type StepAt = "done" | "now" | "todo";
@@ -25,13 +17,13 @@ export interface SetupStep {
 }
 
 /** First-time setup's steps as the backend says they stand: switch LumiAH on for a chat, then send a message. */
-export function setupSteps(state: Pick<UiState, "setup"> & { runtime?: Pick<RuntimeView, "only"> }): SetupStep[] {
+export function setupSteps(state: Pick<UiState, "setup"> & { runtime?: Pick<RuntimeView, "switchedBy"> }): SetupStep[] {
   const done = (id: SetupStepId): boolean => state.setup.steps.find((s) => s.id === id)?.done ?? true;
   const chat = done("chat");
-  // An extension that plays its chats only in a runtime switches a chat on in its own pages.
-  const only = state.runtime?.only;
+  // An extension that switches its chats on in its own pages says where.
+  const by = state.runtime?.switchedBy;
   return [
-    { id: "chat", at: chat ? "done" : "now", title: only !== undefined ? `Switch this chat on in ${only}'s own pages` : "Switch LumiAH on for this chat" },
+    { id: "chat", at: chat ? "done" : "now", title: by !== undefined ? `Switch this chat on in ${by}'s own pages` : "Switch LumiAH on for this chat" },
     { id: "reply", at: done("reply") ? "done" : chat ? "now" : "todo", title: "Send a message in the chat" },
   ];
 }
@@ -84,7 +76,7 @@ export interface ChatStanding {
   answered: boolean;
   tone: "pos" | "neutral" | "warn";
   line: string;
-  fix: { label: string; place: RunPlace } | null;
+  fix: { label: string } | null;
   takeover: string | null;
 }
 
@@ -96,26 +88,18 @@ export function chatStanding(chat: ChatView, state: Pick<UiState, "permissions" 
   if (!chat.on) {
     // A chat on the runtime's connection reaches the runtime whether LumiAH pinned it or not.
     if (chat.connection?.loopback === true) return stands(true, "warn", `Switched off here, yet it generates on ${connection}, the runtime's connection, so the runtime still works on its replies. Choose another connection for the chat in Lumiverse to stop that.`);
-    const only = state.runtime.only;
-    if (only !== undefined) return stands(false, "neutral", `${only} plays this chat only in your runtime, and it is off. Switch it on in ${only}'s own pages.`);
-    if (chat.needsRuntime !== undefined) return stands(false, "neutral", `${chat.needsRuntime.by} plays this chat only in your runtime, and it is off. Switched on, it is pinned to the runtime by itself.`);
-    return stands(false, "neutral", "LumiAH is off for this chat.");
+    const by = state.runtime.switchedBy;
+    return stands(false, "neutral", by !== undefined ? `LumiAH is off for this chat. Switch it on in ${by}'s own pages.` : "LumiAH is off for this chat.");
   }
   if (neededPermissions(state).length > 0) return stands(false, "warn", "Switched on, but LumiAH can't work on a reply until it is allowed what it needs.");
-  if (chat.place === "builtin") return stands(true, "pos", "LumiAH prepares each reply in this chat, built in.");
-  // A chat its extension plays only in a runtime has no built-in way: what is wrong is said, with no press that would run it built in.
-  const only = chat.needsRuntime;
-  // Its runtime isn't linked now: nothing stands in for it, so a reply may fail until it is back, or until the chat is set to run built in, which is one press.
-  if (chat.away === true) return only !== undefined ? stands(false, "warn", `${only.by} plays this chat only in your runtime, which isn't answering, so it can't play until the runtime is back. Its line is on the Runtime page.`) : stands(false, "warn", "Set to run in your runtime, which isn't answering, so replies here may fail until it is back.", { label: "Run it built in", place: "builtin" });
-  if (chat.connection?.loopback !== true) {
-    const fix = only !== undefined || state.runtime.ready ? { label: "Pin it back", place: "runtime" as const } : { label: "Run it built in", place: "builtin" as const };
-    return stands(false, "warn", `Set to run in the runtime, but it generates on ${connection}, which isn't the runtime's connection, so its replies don't reach LumiAH.`, fix);
-  }
-  if (!state.runtime.ready) return only !== undefined ? stands(false, "warn", `${only.by} plays this chat only in your runtime, and none is ready now, so it can't play until one is. See the Runtime page.`) : stands(false, "warn", "Set to run in the runtime, but none is linked now, so its replies fail until one is.", { label: "Run it built in", place: "builtin" });
+  // Its runtime isn't linked now: nothing stands in for it, so its replies fail until it is back.
+  if (chat.away === true) return stands(false, "warn", "Switched on, but your runtime isn't answering, so its replies fail until it is back. Its line is on the Runtime page.");
+  if (chat.connection?.loopback !== true) return stands(false, "warn", `Switched on, but it generates on ${connection}, which isn't the runtime's connection, so its replies don't reach LumiAH.`, { label: "Pin it back" });
+  if (!state.runtime.ready) return stands(false, "warn", "Switched on, but no runtime is ready now, so its replies fail until one is. See the Runtime page.");
   return stands(true, "pos", "LumiAH prepares each reply in this chat, in your runtime.");
 }
 
-/** A runtime's own steps, for someone who asked for one: start it, mint the key that proves a request is theirs, have the connection that points at it. */
+/** The runtime's own steps: start it, mint the key that proves a request is the user's, have the connection that points at it. */
 export type RuntimeStepId = "start" | "key" | "connection";
 
 export interface RuntimeStep {
@@ -142,17 +126,11 @@ export function runtimeSteps(state: Pick<UiState, "runtime" | "key" | "connectio
   return ids.map((id) => ({ id, at: done[id] ? "done" : id === now ? "now" : "todo", title: RUNTIME_STEP_TITLE[id] }));
 }
 
-/** Whether the user has begun with a runtime (one registered, a key minted, a loopback connection made, or a chat set to run in one): the Runtime page then shows its steps and parts without being asked. */
-export function runtimeBegun(state: Pick<UiState, "runtime" | "key" | "connections" | "chats">): boolean {
-  return state.runtime.relays.length > 0 || state.key.set || state.connections.some((c) => c.loopback) || state.chats.some((c) => c.on && c.place === "runtime");
-}
-
-/** What is wrong with the runtime that its user should hear of, in a line; null for someone who uses none, and while one is ready. */
-export function runtimeTrouble(state: Pick<UiState, "runtime" | "key" | "connections" | "chats">): string | null {
-  if (state.runtime.ready || !runtimeBegun(state)) return null;
-  const waiting = state.chats.filter((c) => c.on && c.place === "runtime");
-  // A chat its extension plays only in the runtime can't be set to run built in: the way out is said only where some chat can.
-  if (waiting.length > 0) return `${counted(waiting.length, "chat is", "chats are")} set to run in the runtime, and none is ready: replies there may fail until one is${waiting.some((c) => c.needsRuntime === undefined) ? ", or until the chat is set to run built in" : ""}.`;
-  if (state.runtime.relays.length > 0 && !state.runtime.relays.some((r) => r.link === "linked")) return "Your runtime isn't linked. No chat is set to run in it, so nothing is lost.";
-  return null;
+/** What is wrong with the runtime that its user should hear of, in a line; null while one is ready. No chat is answered without one, so a user with none set up hears that too. */
+export function runtimeTrouble(state: Pick<UiState, "runtime" | "chats">): string | null {
+  if (state.runtime.ready) return null;
+  const waiting = state.chats.filter((c) => c.on);
+  if (waiting.length > 0) return `${counted(waiting.length, "chat is", "chats are")} switched on, and no runtime is ready: ${waiting.length === 1 ? "its" : "their"} replies fail until one is.`;
+  if (state.runtime.relays.length > 0 && !state.runtime.relays.some((r) => r.link === "linked")) return "Your runtime isn't linked. No chat is switched on, so nothing is lost yet.";
+  return "No chat is answered until your runtime is set up: its steps are on the Runtime page.";
 }

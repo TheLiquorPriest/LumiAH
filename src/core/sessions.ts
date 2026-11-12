@@ -127,75 +127,7 @@ export function recordOf(anchor: unknown): TurnRecord | null {
     ...(isHash(anchor.workspace) ? { workspace: anchor.workspace } : {}),
     ...(isCount(anchor.changed) && anchor.changed > 0 ? { changed: anchor.changed } : {}),
     ...(jobs.length > 0 ? { jobs } : {}),
-    ...(anchor.recovered === "restart" || anchor.recovered === "late" ? { recovered: anchor.recovered } : {}),
     usage: usageOf(anchor.usage),
-  };
-}
-
-// ---------------------------------------------------------------- a turn waiting for its reply
-
-/**
- * A turn handed over to the host's own generation (DESIGN §25), as stored while it waits for its
- * reply (`DOC.pending`): what its record needs that only the run knew, so the record can still be
- * made once the run is gone from memory. It holds hashes and counts, never a text: the turn's steps
- * are a blob (`draft`), as every segment is.
- *
- * `draft` is the turn's segment as far as it is known before the reply (a continue's earlier steps
- * first). The steps that state the reply are filled in once it is written: `replied` names them by
- * their place, and `asBrief` is where the note goes that an answer was taken as the brief (null:
- * the main agent gave a brief). `basis` is the chat area's index as the turn before left it and
- * `workspace` as this turn's stood at the hand-over; `jobs` the jobs its agents started, as they
- * stood then.
- */
-export interface PendingTurn {
-  v: 1;
-  kind: "pending";
-  /** When the turn was handed over. */
-  at: number;
-  /** When the wait for its reply runs out (Settings' time for it, counted from the hand-over); null where it has no end. A reply that comes from then on is late. */
-  until: number | null;
-  userId: string;
-  chatId: string;
-  generationId: string;
-  turn: TurnKind;
-  began: number;
-  heard?: number;
-  path: string;
-  draft: string;
-  replied: number[];
-  asBrief: number | null;
-  /** The summary the turn made, or the rolled-back one it carries on (`rolledBack`). */
-  summary?: Compaction & { rolledBack?: number };
-  basis: string | null;
-  workspace: string | null;
-  jobs: RecordJob[];
-  usage: AgentUsage;
-}
-
-/** A stored waiting turn, read; null when the document isn't one. */
-export function pendingOf(raw: unknown): PendingTurn | null {
-  if (!isRecord(raw) || raw.v !== 1 || raw.kind !== "pending" || typeof raw.at !== "number" || typeof raw.userId !== "string" || typeof raw.chatId !== "string" || typeof raw.generationId !== "string" || !isTurnKind(raw.turn) || typeof raw.began !== "number" || typeof raw.path !== "string" || !isHash(raw.draft)) return null;
-  const summary = isRecord(raw.summary) && isHash(raw.summary.summary) ? raw.summary : null;
-  return {
-    v: 1,
-    kind: "pending",
-    at: raw.at,
-    until: typeof raw.until === "number" ? raw.until : null,
-    userId: raw.userId,
-    chatId: raw.chatId,
-    generationId: raw.generationId,
-    turn: raw.turn,
-    began: raw.began,
-    ...(typeof raw.heard === "number" ? { heard: raw.heard } : {}),
-    path: raw.path,
-    draft: raw.draft,
-    replied: Array.isArray(raw.replied) ? raw.replied.filter(isCount) : [],
-    asBrief: isCount(raw.asBrief) ? raw.asBrief : null,
-    ...(summary ? { summary: { summary: summary.summary as string, kept: Array.isArray(summary.kept) ? summary.kept.filter(isHash) : [], folded: isCount(summary.folded) ? summary.folded : 0, ...(typeof summary.rolledBack === "number" ? { rolledBack: summary.rolledBack } : {}) } } : {}),
-    basis: isHash(raw.basis) ? raw.basis : null,
-    workspace: isHash(raw.workspace) ? raw.workspace : null,
-    jobs: Array.isArray(raw.jobs) ? raw.jobs.flatMap((job) => recordJobOf(job) ?? []) : [],
-    usage: usageOf(raw.usage),
   };
 }
 

@@ -104,8 +104,8 @@ export class FakeLumiverse {
   stopFails = false;
   /**
    * What the model on a connection that is no loopback answers, as Lumiverse's own generation gets
-   * it: the reply's text, for the prompt it was sent on the connection named. A test of a chat that
-   * runs built in sets it; it may take its time, and rejects to fail the generation.
+   * it: the reply's text, for the prompt it was sent on the connection named. A test of a chat
+   * LumiAH doesn't answer may set it; it may take its time, and rejects to fail the generation.
    */
   writes: (body: JsonObject, connectionId: string) => string | Promise<string> = () => "Joss trims the wick and says nothing.";
   /** Every prompt Lumiverse's own generation sent, in order. */

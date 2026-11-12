@@ -25,10 +25,10 @@ describe("a chat's own choice of what counts as its story", () => {
   test("a document saved before the choice existed reads as none, the chat still on; a choice is kept beside the switch, and taken back whole", async () => {
     const rigged = await rig();
     it = rigged;
-    const chatId = await rigged.setUpBuiltin();
-    // The document as an earlier build wrote it: the switch, and no story.
+    const chatId = await rigged.setUp();
+    // The document as an earlier build wrote it: the switch, where a chat switched off last ran, and no story.
     const saved = chatsDoc(rigged);
-    rigged.host.files.set(`${USER}/chats.json`, JSON.stringify({ v: 1, on: saved.on, ran: saved.ran }));
+    rigged.host.files.set(`${USER}/chats.json`, JSON.stringify({ v: 1, on: saved.on, ran: {} }));
     await rigged.restart();
 
     const first = (await rigged.page.request("lah.chat.story.get", { chatId })).story;
@@ -55,7 +55,7 @@ describe("a chat's own choice of what counts as its story", () => {
     const extension: BackendExtension = { name: "Tide keeper", claim: async () => ({ story: { from: "replies" } }) };
     const rigged = await rig({ backend: { extension } });
     it = rigged;
-    const chatId = await rigged.setUpBuiltin();
+    const chatId = await rigged.setUp();
     const view = (await rigged.page.request("lah.chat.story.set", { chatId, story: { from: "everyone", newest: "leave_out" } })).story;
     expect(view.claimed).toEqual({ by: "Tide keeper", story: { from: "replies" } });
     expect(view.chosen).toEqual({ from: "everyone", newest: "leave_out" });

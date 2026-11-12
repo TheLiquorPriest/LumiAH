@@ -23,6 +23,8 @@ export interface SettingsSection {
   check(values: unknown, userId: string): UiProblem[] | Promise<UiProblem[]>;
   /** The settings of the section that aren't the user's to set, for a user (the tools of an agent an extension keeps as its own): a change never stores a value there. */
   fixed?(userId: string): Promise<readonly SettingPath[]>;
+  /** The settings an earlier build had and this one took away, each a path within the section: a value the user kept at one is passed over quietly, never refused. */
+  retired?: readonly (readonly string[])[];
 }
 
 /** The texts a model is sent: their definitions, and what a text of the user's own is refused for (null: it is taken). */
@@ -79,16 +81,33 @@ function capped(schema: unknown, value: JsonValue): JsonValue {
   return value;
 }
 
-/** A stored document, read: `schema` is the settings' whole, which what it holds is capped by. */
-function storedOf(raw: unknown, schema: JsonObject): Stored | null {
+/**
+ * A stored value with what this build took away left out (`retired`, each a whole path): a value
+ * kept at a retired setting, or below one, is none; one put whole above it loses that member. For
+ * the same reason as `capped`: a value no schema takes any more would refuse every later change.
+ */
+function unretired(path: readonly string[], value: JsonValue, retired: readonly (readonly string[])[]): JsonValue | undefined {
+  for (const gone of retired) {
+    if (within(path, gone)) return undefined;
+    if (!within(gone, path)) continue;
+    const parent = at(value, gone.slice(path.length, -1));
+    if (isRecord(parent)) delete parent[gone.at(-1) ?? ""];
+  }
+  return value;
+}
+
+/** A stored document, read: `schema` is the settings' whole, which what it holds is capped by, and `retired` the settings this build took away, which are passed over quietly and go from storage with the next change. */
+function storedOf(raw: unknown, schema: JsonObject, retired: readonly (readonly string[])[]): Stored | null {
   if (!isRecord(raw) || raw.v !== 1) return null;
   const own: Own[] = [];
   if (Array.isArray(raw.own))
     for (const o of raw.own) {
       if (!isRecord(o) || !isPath(o.path) || o.path.length === 0 || o.value === undefined) continue;
+      const value = unretired(o.path, o.value as JsonValue, retired);
+      if (value === undefined) continue;
       let rule: unknown = schema;
       for (const key of o.path) rule = isRecord(rule) && isRecord(rule.properties) && hasOwn(rule.properties, key) ? rule.properties[key] : undefined;
-      own.push({ path: o.path, value: capped(rule, o.value as JsonValue) });
+      own.push({ path: o.path, value: capped(rule, value) });
     }
   const texts: Record<string, string> = {};
   if (isRecord(raw.texts)) for (const [id, text] of Object.entries(raw.texts)) if (typeof text === "string") texts[id] = text;
@@ -138,7 +157,7 @@ export class SettingsStore {
     this.docs = new UserDocs<Stored>(
       host,
       FILE,
-      (raw) => storedOf(raw, this.schema()),
+      (raw) => storedOf(raw, this.schema(), this.sections.flatMap((section) => (section.retired ?? []).map((path) => [section.key, ...path]))),
       () => ({ v: 1, rev: 0, own: [], texts: {} }),
     );
   }
@@ -194,7 +213,7 @@ export class SettingsStore {
   }
 
   /**
-   * What the core reads where it runs (a runtime's `settings.get`; built in, the same): the user's
+   * What the core reads where it runs (a runtime's `settings.get`): the user's
    * own values alone, with no default filled in. Each section's reader fills in its own defaults,
    * and the core's does so with the run's definitions in view: a default handed over as if the user
    * had set it would stand over what their own definition of an agent says.

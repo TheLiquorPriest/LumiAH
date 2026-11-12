@@ -1,25 +1,23 @@
-// The extension backend, put together (DESIGN §7): the prompt interceptor, the core where it runs
-// built in, the link server for a runtime, the model calls, the stores in the user's storage, the
-// anchors, the live buffer and the pages' requests, over one host (spindle.ts in Lumiverse, a fake
-// in the tests).
+// The extension backend, put together (DESIGN §7): the prompt interceptor, the link server for the
+// runtime, the model calls, the stores in the user's storage, the anchors, the live buffer and the
+// pages' requests, over one host (spindle.ts in Lumiverse, a fake in the tests).
 
 import type { ClaimAsk } from "../../core/extension";
 import type { HeldTools } from "../../core/definitions";
-import { checkSettings, defaultSettings, SETTINGS_SCHEMA, type SettingsScope, settingsOf } from "../../core/settings";
+import { checkSettings, defaultSettings, RETIRED_SETTINGS, SETTINGS_SCHEMA, type SettingsScope, settingsOf } from "../../core/settings";
 import { checkText, TEXT_DEFS } from "../../core/texts";
 import type { JsonObject } from "../../core/ports";
 import { LINK, loopbackModel, runtimeBase, sameBase } from "../../link/contract";
 import { isRecord } from "../../link/json";
-import { CEILINGS, checkTransport, TRANSPORT_KEY, TRANSPORT_SCHEMA, transportDefaults } from "../../link/settings";
-import type { PermissionNeed, RunPlace, RuntimeState, RuntimeView } from "../../shared/ui";
+import { CEILINGS, checkTransport, TRANSPORT_KEY, TRANSPORT_RETIRED, TRANSPORT_SCHEMA, transportDefaults } from "../../link/settings";
+import type { PermissionNeed, RuntimeState, RuntimeView } from "../../shared/ui";
 import { Approvals } from "./approvals";
 import { Asks } from "./asks";
-import { Builtin, type HarnessMaker } from "./builtin";
 import { type AnchorCodec, anchorsUnder, Chats, OWN_ANCHORS } from "./chat";
 import { randomHex } from "./docs";
 import { Definitions } from "./defs";
 import { type BackendExtension, type BackendTools, RemoteTools } from "./extension";
-import { HostedTurns } from "./hosted";
+import { Forgotten } from "./forget";
 import { JobsBoard } from "./jobs";
 import { Mcp } from "./mcp";
 import { Notices } from "./notices";
@@ -27,7 +25,7 @@ import { OpenTurns } from "./open";
 import { Connections } from "./connections";
 import { wordsOf } from "./errors";
 import { Keys } from "./keys";
-import { BUILTIN, LiveBuffer } from "./live";
+import { LiveBuffer } from "./live";
 import { Models } from "./models";
 import { Lore, Presets, Storage } from "./reads";
 import { Recall } from "./recall";
@@ -51,8 +49,6 @@ export interface BackendEnv {
   later(ms: number, fn: () => void): () => void;
   /** The build this bundle came from: runtimes compare theirs with it. */
   build: string;
-  /** What makes a user's harness where the core runs built in; absent: the core's own (a test of the transport alone scripts one). */
-  harness?: HarnessMaker;
 }
 
 /** The key the core's settings sit under, beside the transport's. */
@@ -70,6 +66,7 @@ export function settingsSections(scope?: (userId: string) => Promise<SettingsSco
       key: CORE_KEY,
       defaults: () => defaultSettings() as unknown as JsonObject,
       schema: SETTINGS_SCHEMA,
+      retired: RETIRED_SETTINGS,
       async check(values, userId) {
         const known = await scope?.(userId);
         const plain = checkSettings(values);
@@ -84,7 +81,7 @@ export function settingsSections(scope?: (userId: string) => Promise<SettingsSco
         return (known?.agents ?? []).filter((agent) => agent.owns?.includes("tools") === true).map((agent) => ["agents", agent.id, "tools"]);
       },
     },
-    { key: TRANSPORT_KEY, defaults: transportDefaults, schema: TRANSPORT_SCHEMA, check: checkTransport },
+    { key: TRANSPORT_KEY, defaults: transportDefaults, schema: TRANSPORT_SCHEMA, check: checkTransport, retired: TRANSPORT_RETIRED },
   ];
 }
 
@@ -94,14 +91,15 @@ export function settingsSections(scope?: (userId: string) => Promise<SettingsSco
  * an extension that builds LumiAH in may ask for fewer, so every one but those marked `needed` is
  * optional: without it the route it opens is quietly absent, and the pages say so as information.
  * `needed`: without it LumiAH answers no chat at all. `chat_mutation` is one of those because
- * Lumiverse puts reading a chat's messages under it, not only changing them.
+ * Lumiverse puts reading a chat's messages under it, not only changing them; `generation_parameters`
+ * because the tag that leads a reply to the runtime rides on a request's parameters.
  */
 const NEEDS: readonly { id: string; needed: boolean; what: string; without: string }[] = [
   { id: "interceptor", needed: true, what: "see a reply's prompt before it is sent", without: "no reply is worked on" },
   { id: "chats", needed: true, what: "read a chat and switch itself on for it", without: "no chat can be switched on" },
   { id: "generation", needed: true, what: "make its agents' model calls and hear when a reply starts and ends", without: "its agents can call no model" },
   { id: "chat_mutation", needed: true, what: "read the chat's messages and write each reply's record on it", without: "no reply is worked on" },
-  { id: "generation_parameters", needed: false, what: "tag the replies a runtime answers", without: "no chat can run in a runtime (a chat that runs built in needs it for nothing)" },
+  { id: "generation_parameters", needed: true, what: "tag the replies your runtime answers", without: "no reply is worked on" },
   { id: "world_books", needed: false, what: "read your world books", without: "agents can't look up lore" },
   { id: "presets", needed: false, what: "read the preset's instructions", without: "the agents know the preset only by the prompt it made" },
   { id: "characters", needed: false, what: "find the world books attached to the chat's character, and tell which character a piece of guidance is for", without: "those books aren't found, and guidance written for one character isn't matched" },
@@ -132,15 +130,13 @@ export interface Backend {
   readonly asks: Asks;
   readonly jobs: JobsBoard;
   readonly defs: Definitions;
-  readonly builtin: Builtin;
   /**
    * What each agent can really use in a chat, for the pages of an extension that builds LumiAH in:
    * each agent that can run there, the tools it holds, and each tool it names that it can't use,
    * with why (`off`: the user switched it off; `withdrawn`: the extension's claim withdraws it;
-   * `unknown`: nothing of that name is registered). Asked of the place the chat runs in.
+   * `unknown`: nothing of that name is registered). Asked of the runtime the chat's replies reach.
    */
   readonly agents: { held(userId: string, chatId: string): Promise<HeldTools[]> };
-  readonly hosted: HostedTurns;
   /**
    * A user's runtime, for the pages of an extension that builds LumiAH in: whether it is linked
    * (asked about a chat, the one that chat's replies reach), whether it is there to choose, whether
@@ -155,8 +151,8 @@ export interface Backend {
 
 /**
  * What an extension that builds LumiAH into its own backend gives it (DESIGN §21). LumiAH's own
- * backend gives none of it. Everything here runs in this backend: the core where it runs built in
- * is handed it directly, and a runtime, which stays the same for every extension, asks over the link.
+ * backend gives none of it. Everything here runs in this backend: the runtime, which stays the same
+ * for every extension, asks for it over the link.
  */
 export interface BackendOptions {
   /** Who this backend is in Lumiverse: what it names of itself over LumiAH's own. */
@@ -174,12 +170,10 @@ export interface BackendOptions {
    */
   declined?: readonly string[];
   /**
-   * Where every chat this backend answers plays: only in a runtime (LumiRPEngine). Each chat then
-   * has no built-in way, as a claim's `place` gives one chat, and the pages say the runtime is
-   * needed, name this extension, and leave switching a chat on to the extension's own pages.
-   * Absent: chats run built in unless the user or a claim says otherwise.
+   * Its own pages switch a chat on and off (LumiRPEngine): LumiAH's pages then offer no switch of
+   * their own, and say where it is, by this extension's name. Absent: LumiAH's pages switch a chat.
    */
-  place?: "runtime";
+  ownSwitch?: true;
   /**
    * The ids of built-in agents this backend leaves out (LumiRPEngine: `chronicler`, `story-reader`).
    * Such an agent isn't listed on the Agents page and can't be started by `job_start`, `delegate` or
@@ -201,22 +195,22 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
   const grant = `Grant it in Lumiverse (Extensions → ${name} → Permissions).`;
   /** The permissions the manifest asks for that the user hasn't granted, each with what it is for and what is absent without it. */
   const permissions = (): PermissionNeed[] => NEEDS.filter((need) => !declined.has(need.id) && !host.granted(need.id)).map((need) => ({ id: need.id, what: need.what, without: need.without, todo: grant, needed: need.needed }));
-  /** Why no chat can be switched on in a place now: a permission it can't do without there is missing. */
-  const blocked = (place: RunPlace): string | null => {
-    const missing = NEEDS.filter((need) => (need.needed || (place === "runtime" && need.id === "generation_parameters")) && !host.granted(need.id)).map((need) => `"${need.id}"`);
+  /** Why no chat can be switched on now: a permission it can't do without is missing. */
+  const blocked = (): string | null => {
+    const missing = NEEDS.filter((need) => need.needed && !host.granted(need.id)).map((need) => `"${need.id}"`);
     if (missing.length === 0) return null;
-    return `${name} can't answer a chat${place === "runtime" ? " in a runtime" : ""} without the permission${missing.length === 1 ? "" : "s"} ${missing.join(", ")}. ${missing.length === 1 ? "Grant it" : "Grant them"} in Lumiverse (Extensions → ${name} → Permissions).`;
+    return `${name} can't answer a chat without the permission${missing.length === 1 ? "" : "s"} ${missing.join(", ")}. ${missing.length === 1 ? "Grant it" : "Grant them"} in Lumiverse (Extensions → ${name} → Permissions).`;
   };
 
   // ---------------------------------------------------------------- the parts
 
   const registry = new RegistryStore(host);
   // The parts below need each other in a ring (the settings' check asks the core, the core reads the settings): each is reached through this once all are made.
-  const made: { server: LinkServer | null; builtin: Builtin | null; connections: Connections | null; chatSwitch: ChatSwitch | null } = { server: null, builtin: null, connections: null, chatSwitch: null };
-  /** What a user's runs have beyond the core's own names, as their built-in core merges it; none when it can't be read, and the core's own names are then all a setting may hold. */
+  const made: { server: LinkServer | null; asks: Asks | null; connections: Connections | null; chatSwitch: ChatSwitch | null } = { server: null, asks: null, connections: null, chatSwitch: null };
+  /** What a user's runs have beyond the core's own names, as the runtime's core merges it; none when it can't be read (no runtime is linked), and the core's own names are then all a setting may hold. */
   const scope = async (userId: string): Promise<SettingsScope | undefined> => {
     try {
-      const read = await made.builtin?.ask(userId, "definitions.get", {});
+      const read = await made.asks?.ask(userId, "definitions.get", {});
       // The core always has tools of its own: a scope that names none isn't one (a harness that answers the pages without the core's definitions).
       const said = isRecord(read) && isRecord(read.scope) ? read.scope : null;
       return said !== null && Array.isArray(said.tools) && said.tools.length > 0 && Array.isArray(said.agents) ? (said as unknown as SettingsScope) : undefined;
@@ -229,7 +223,7 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     now,
     build,
     identity,
-    only: options.place === "runtime",
+    ...(options.ownSwitch === true ? { switchedBy: name } : {}),
     send: (frame, userId, session) => made.server?.send(frame, userId, session),
     hasLoopback: async (userId) => ((await made.connections?.loopbacks(userId)) ?? []).length > 0,
   });
@@ -258,12 +252,11 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
   };
   /** What is being said of a reply's runtime now: `settle` waits for it. */
   const telling = new Set<Promise<void>>();
-  /** A reply is about to go to a runtime that isn't linked. Nothing answers it there and nothing here does in its place (§25), so the user is told before it fails, wherever they are in Lumiverse: how to run it built in, unless its extension plays it only in the runtime. The prompt isn't held for it. */
+  /** A reply is about to go to a runtime that isn't linked. Nothing answers it there and nothing here does in its place (§25), so the user is told before it fails, wherever they are in Lumiverse. The prompt isn't held for it. */
   const warnAway = (userId: string, chatId: string): void => {
     const told = (async (): Promise<void> => {
       if ((await runtimeOf(userId, chatId)) !== null) return;
-      const needs = (await made.chatSwitch?.needsRuntime(userId, chatId)) ?? null;
-      host.toast(userId, "warning", needs !== null ? `${needs.by} plays this chat only in your runtime, which isn't answering, so this reply will fail. Start the runtime (its line is on ${name}'s Runtime page), then send your message again.` : `${name}'s runtime isn't answering, so this reply may fail. On ${name}'s Home, set this chat to Built in, or start the runtime.`);
+      host.toast(userId, "warning", `${name}'s runtime isn't answering, so this reply will fail. Start the runtime (its line is on ${name}'s Runtime page), then send your message again.`);
     })()
       .catch(warn("whether a reply's runtime is linked couldn't be told"))
       .finally(() => telling.delete(told));
@@ -286,7 +279,6 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     registry,
     settings,
     open,
-    builtin: async (userId, chatId) => (await made.chatSwitch?.builtin(userId, chatId)) === true,
     toRuntime: warnAway,
     name,
     now,
@@ -319,12 +311,10 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
   const chatSwitch = new ChatSwitch(host, {
     chats,
     connections,
-    runtimeReady: (userId) => relays.ready(userId),
     runtimeLinked: async (userId, chatId) => (await runtimeOf(userId, chatId)) !== null,
     blocked,
     identity,
     now,
-    ...(options.place === "runtime" ? { only: true as const } : {}),
     storySetting: async (userId) => settingsOf((await settings.values(userId))[CORE_KEY]).story,
     // A claim that fails is none: the log says so, and the chat is set as any other meanwhile.
     ...(claimer?.claim !== undefined
@@ -349,52 +339,26 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
   // The MCP servers a user switched on are kept with their definitions, which list the servers through this.
   const mcp: Mcp = new Mcp(host, { on: (userId) => defs.mcpOn(userId), callMs: async (userId) => (await settings.transport(userId)).mcp.callMs });
   const tools = new RemoteTools(options.tools, mcp, (level, message) => host.log(level, message));
-  const builtin = new Builtin(host, {
-    without: options.withoutAgents ?? [],
-    settings,
-    storage,
-    chats,
-    chatSwitch,
-    lore,
-    presets,
-    connections,
-    models,
-    tools,
-    approvals,
-    live,
-    jobs,
-    activated: (userId, chatId, generationId) => turns.activated(userId, chatId, generationId),
-    recall,
-    extension: options.extension,
-    coreKey: CORE_KEY,
-    name,
-    now,
-    later,
-    id: () => randomHex(128),
-    ...(env.harness !== undefined ? { harness: env.harness } : {}),
-  });
-  made.builtin = builtin;
-  const hosted = new HostedTurns(host, { turns, chats, connections, settings, live, builtin, open, name, now, later });
-  turns.hostedBy((input, turn, omit) => hosted.intercept(input, turn, omit));
   const asks = new Asks({
     relays,
     settings,
-    builtin: (userId, op, args) => builtin.ask(userId, op, args),
-    placeOf: (userId, chatId) => chatSwitch.placeOf(userId, chatId),
+    onLoopback: async (userId, chatId) => (await connections.ofChat(userId, await chats.own(userId, chatId)))?.loopback === true,
     runOf: (userId, stream, turn) => live.running(userId, stream, turn)?.relay ?? null,
     jobOf: (userId, job) => jobs.runsIn(userId, job),
     runtimeOf,
-    needsRuntime: (userId, chatId) => chatSwitch.needsRuntime(userId, chatId),
+    userRuntime: async (userId) => (await relays.linked(userId))[0]?.id ?? null,
     name,
     later,
     id: () => randomHex(64),
   });
+  made.asks = asks;
+  const forgotten = new Forgotten(host, { asks, isLinked: async (userId) => (await relays.linked(userId)).length > 0, now });
   const defs = new Definitions({ settings, asks, mcp, coreKey: CORE_KEY }, now);
 
   /** What keeps LumiAH from working that no permission and no runtime's own row says, each in plain words that say what to do. */
   const issues = (): string[] => [
     ...(host.capability("chat-lean-messages-v1") ? [] : ["This Lumiverse can't write an extension's own entry on a message, so no turn's record can be kept and the session won't carry from one reply to the next. Update Lumiverse."]),
-    ...(host.capability("frontend-session-routing-v1") ? [] : ["This Lumiverse doesn't say which connection a message comes from, so no runtime can link (a chat that runs built in needs none). Update Lumiverse."]),
+    ...(host.capability("frontend-session-routing-v1") ? [] : ["This Lumiverse doesn't say which connection a message comes from, so no runtime can link. Update Lumiverse."]),
   ];
 
   const ui = new Ui(host, {
@@ -417,8 +381,6 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     keys,
     issues,
     permissions,
-    // A reply's turn that runs here, then a job's run or a side session's turn that does.
-    stopHere: (userId, turn, why) => hosted.stopFromLive(userId, turn) || builtin.stop(userId, turn, why),
     now,
   });
   const server = new LinkServer(host, {
@@ -464,9 +426,14 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     turns.unsure(userId);
     // What a runtime that is gone was asked will never be answered.
     asks.recheck(userId);
+    // A runtime that links now is handed the chats deleted while none was.
+    forgotten.handOver(userId);
     tellRuntime(userId);
   });
-  relays.onPing((userId, relay, named) => live.named(userId, relay, named));
+  relays.onPing((userId, relay, named) => {
+    live.named(userId, relay, named);
+    forgotten.pinged(userId);
+  });
   live.onChange((userId) => ui.touch(userId, "running", "chats", "setup"));
   approvals.onChange((userId) => ui.touch(userId, "approvals"));
   notices.onChange((userId) => ui.touch(userId, "notices"));
@@ -478,8 +445,6 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     server.settingsChanged(userId);
     // The jobs' two switches and what a tool's calls do are settings too.
     ui.touch(userId, "settings", "texts", "jobs", "defs");
-    // The user's hold on jobs reaches the core here as it reaches a runtime's.
-    builtin.held(userId);
     // Every runtime of the user's reads them again before it next needs them.
     void registry
       .read(userId)
@@ -492,12 +457,10 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
 
   // ---------------------------------------------------------------- turns
 
-  turns.onBegun((turn, facts) => void live.begin(turn.userId, turn.relay ?? BUILTIN, { stream: facts.chat, chatId: facts.chat, turn: facts.turn, kind: facts.kind, messageId: facts.target.message, place: "runtime" }).catch(warn("a turn's live view couldn't be started")));
+  turns.onBegun((turn, facts) => {
+    if (turn.relay !== null) void live.begin(turn.userId, turn.relay, { stream: facts.chat, chatId: facts.chat, turn: facts.turn, kind: facts.kind, messageId: facts.target.message }).catch(warn("a turn's live view couldn't be started"));
+  });
   turns.onStopped((turn, why) => {
-    if (turn.place === "builtin") {
-      hosted.stopped(turn, why);
-      return;
-    }
     // The runtime first, so it hears Stop before its calls end under it.
     if (turn.relay !== null) relays.push(turn.userId, turn.relay, { link: LINK, type: "stop", turn: turn.turn, why, by: "lumiverse" });
     streams.stopTurn(turn.userId, turn.turn, why);
@@ -522,8 +485,6 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
   host.events.onGenerationEnded((event) => {
     chats.touched(event.chatId);
     turns.ended(event);
-    // After the turn's own bookkeeping: a turn that ran here is completed with the saved reply, and its record goes where that bookkeeping says.
-    hosted.ended(event);
   });
   host.events.onGenerationStopped((event) => {
     chats.touched(event.chatId);
@@ -541,8 +502,8 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
       return;
     }
     chats.dropped(chatId);
-    // What the core kept of a chat goes with the chat (its learned files, its jobs and their reports, its approvals, its vectors), where Lumiverse says whose it was.
-    if (userId !== null) void builtin.forget(userId, chatId);
+    // What the core kept of a chat goes with the chat (its learned files, its jobs and their reports, its approvals, its vectors), where Lumiverse says whose it was: the runtime forgets it, now or once one links.
+    if (userId !== null) forgotten.deleted(userId, chatId);
   });
   host.events.onChatChanged((_chatId, userId) => {
     if (userId === null) return;
@@ -557,16 +518,12 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     turns.unsure(userId);
   });
 
-  // Never required. Lumiverse keeps one interceptor for an extension, and it serves both ways to run: a required one that failed or ran out of time would fail the reply, and a chat that runs built in must never lose one to LumiAH (§25). Not required, whatever goes wrong here leaves Lumiverse to send the prompt as it was.
+  // Never required. Lumiverse keeps one interceptor for an extension, and a required one that failed or ran out of time would fail the reply. Not required, whatever goes wrong here leaves Lumiverse to send the prompt as it was.
   host.registerInterceptor((input) => turns.intercept(input), { priority: INTERCEPTOR_PRIORITY, types: TAGGED_TYPES, required: false });
 
   // ---------------------------------------------------------------- messages
 
   host.frontend.onMessage((payload, userId, session) => {
-    // A user with a page or a runtime is here: what a restart of the extension cut off of their built-in jobs is found now.
-    builtin.wake(userId);
-    // And the replies' turns that waited for their replies when the worker before this one stopped.
-    hosted.recover(userId);
     void (async () => {
       if (await server.frame(payload, userId, session)) return;
       await ui.message(payload, userId, session);
@@ -601,7 +558,6 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
       streams.sweep();
       server.sweep();
       await turns.tick();
-      await hosted.tick();
       await live.tick();
     },
     async settle() {
@@ -609,6 +565,7 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
       await settings.settle();
       await chatSwitch.settle();
       await open.settle();
+      await forgotten.settle();
       await ui.settle();
       await Promise.all(telling);
     },
@@ -626,11 +583,9 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     asks,
     jobs,
     defs,
-    builtin,
     agents: {
       held: async (userId, chatId) => heldView(await asks.ask(userId, "definitions.held", { chatId }, { chat: chatId })),
     },
-    hosted,
     runtimeState,
     onRuntime(listener) {
       runtimeHeard.add(listener);

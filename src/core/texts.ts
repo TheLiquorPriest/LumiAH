@@ -16,7 +16,6 @@ import { CURSOR_ARG as CURSOR, GROUP, stopText as stop, type TextDef, TOOL, tool
 import { AGENTS_TEXT, AGENTS_TEXTS } from "./texts/agents";
 import { APPROVAL_TEXT, APPROVAL_TEXTS } from "./texts/approval";
 import { BOOK_TEXT, BOOK_TEXTS } from "./texts/book";
-import { HOSTED_TEXT, HOSTED_TEXTS } from "./texts/hosted";
 import { JOBS_TEXT, JOBS_TEXTS } from "./texts/jobs";
 import { RECALL_TEXT, RECALL_TEXTS } from "./texts/recall";
 import { SIDE_TEXT, SIDE_TEXTS } from "./texts/side";
@@ -173,7 +172,6 @@ export const TEXT = {
     replyEmpty: "tool.answer.reply_empty",
     replyReleased: "tool.answer.reply_released",
     released: "tool.answer.released",
-    releaseBuiltIn: "tool.answer.release_built_in",
     releaseWriter: "tool.answer.release_writer",
     releaseHeld: "tool.answer.release_held",
     releaseUnchecked: "tool.answer.release_unchecked",
@@ -230,8 +228,6 @@ export const TEXT = {
   spend: SPEND_TEXT,
   /** A story's book (§23). */
   book: BOOK_TEXT,
-  /** A turn whose reply Lumiverse's own generation writes (§25). */
-  hosted: HOSTED_TEXT,
   /** Lore and history (§24): what the prompt already holds, the lore and chat tools, the chronicle. */
   recall: RECALL_TEXT,
   /** A tool's description. */
@@ -504,7 +500,6 @@ const ANSWER_TEXTS: TextDef[] = [
   { id: TEXT.answer.replyEmpty, group: ANSWERS, label: "write_reply: an empty reply", note: "Fills {{reason}} in The writer failed, and the turn's error, when the writer's model answered with nothing.", text: "its model answered with nothing", vars: [] },
   { id: TEXT.answer.replyReleased, group: ANSWERS, label: "write_reply: the reply was released already", note: "write_reply's answer once part of the reply was released with reply_write: no writer writes after it.", text: "Not handed to the writer: you released part of this reply with reply_write, so the reply is yours to finish. Go on with reply_write, or end your turn.", vars: [] },
   { id: TEXT.answer.released, group: ANSWERS, label: "reply_write: released", note: "reply_write's answer once its passage reached the user.", text: "Released: {{chars}} characters reached the user. The reply holds {{total}} characters now. Release the next passage, or end your turn.", vars: [v("chars", "the passage's length", true), v("total", "the reply's length so far")] },
-  { id: TEXT.answer.releaseBuiltIn, group: ANSWERS, label: "reply_write: built in", note: "The answer of reply_write, and of delegate with to_reply, in a chat that runs inside Lumiverse: there Lumiverse's own generation writes the reply.", text: "Not released: this chat runs inside Lumiverse, which writes the reply itself, so no agent can release it here. Brief the writer with write_reply instead.", vars: [] },
   { id: TEXT.answer.releaseWriter, group: ANSWERS, label: "reply_write: the writer has the reply", note: "The answer of reply_write, and of delegate with to_reply, once the writer is writing the reply or has written it.", text: "Not released: the writer is writing this reply, or has written it, so nothing more can go into it.", vars: [] },
   { id: TEXT.answer.releaseHeld, group: ANSWERS, label: "reply_write: another agent's answer is streaming", note: "The answer of reply_write, and of delegate with to_reply, while a sub-agent's answer streams into the reply.", text: "Not released: another agent's answer is streaming into the reply now. Wait for that call to end, then release yours.", vars: [] },
   { id: TEXT.answer.releaseUnchecked, group: ANSWERS, label: "reply_write: the extension didn't say", note: "reply_write's answer when the extension that checks each passage gave no word on it in time, or gave one that isn't a word: nothing goes out unchecked.", text: "Not released: the check on each passage didn't answer, so nothing was sent. Try again.", vars: [] },
@@ -555,7 +550,7 @@ const WORD_TEXTS: TextDef[] = [
  * (`TextDef.group`), so an area's tool descriptions and answers sort under Tools and Tool answers
  * wherever its file puts them.
  */
-export const TEXT_DEFS: readonly TextDef[] = [...MAIN_TEXTS, ...REQUEST_TEXTS, ...WRITER_TEXTS, ...SESSION_TEXTS, ...AGENTS_TEXTS, ...WORKSPACE_TEXTS, ...JOBS_TEXTS, ...APPROVAL_TEXTS, ...SIDE_TEXTS, ...SPEND_TEXTS, ...BOOK_TEXTS, ...RECALL_TEXTS, ...HOSTED_TEXTS, ...TOOL_TEXTS, ...ANSWER_TEXTS, ...RUNTIME_TEXTS, ...STOP_TEXTS, ...PROGRESS_TEXTS, ...WORD_TEXTS];
+export const TEXT_DEFS: readonly TextDef[] = [...MAIN_TEXTS, ...REQUEST_TEXTS, ...WRITER_TEXTS, ...SESSION_TEXTS, ...AGENTS_TEXTS, ...WORKSPACE_TEXTS, ...JOBS_TEXTS, ...APPROVAL_TEXTS, ...SIDE_TEXTS, ...SPEND_TEXTS, ...BOOK_TEXTS, ...RECALL_TEXTS, ...TOOL_TEXTS, ...ANSWER_TEXTS, ...RUNTIME_TEXTS, ...STOP_TEXTS, ...PROGRESS_TEXTS, ...WORD_TEXTS];
 
 const BY_ID: ReadonlyMap<string, TextDef> = new Map(TEXT_DEFS.map((d) => [d.id, d]));
 

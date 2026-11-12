@@ -10,8 +10,10 @@ import { STACKED_TABS_MAX_PX, WIDE_MIN_PX } from "../layout";
 export const LIVE_CSS = `
 .lah-chatbar{display:flex;align-items:center;gap:var(--lah-s2);min-width:0}
 .lah-chatbar>.lah-input{flex:1 1 0}
-/* A turn lays itself out by its own width, not the page's: beside the Sessions list it has about half the page, where its two columns would squeeze its steps. */
-.lah-turn{container:lah / inline-size;display:flex;flex-direction:column;gap:var(--lah-s3);min-width:0;flex:1}
+/* A turn lays itself out by its own width, not the page's: beside the Sessions list it has about half the page, where its two columns would squeeze its steps. Where the two columns show (from ${WIDE_MIN_PX} px, room enough that the side column always takes its widest), --lah-side-w is that column's width. */
+.lah-turn{container:lah / inline-size;display:flex;flex-direction:column;gap:var(--lah-s3);min-width:0;flex:1;--lah-side-w:280px}
+/* "Back to top" leaves focus on the transcript itself (transcript.tsx): it is no control, so it shows no ring. */
+.lah-turn:focus{outline:none}
 .lah-turn-head{display:flex;flex-direction:column;gap:var(--lah-s2);min-width:0;padding:var(--lah-s3);border:1px solid var(--lah-hairline);border-radius:var(--lah-r-xl);background:var(--lah-card)}
 .lah-turn-title{display:flex;flex-wrap:wrap;align-items:center;gap:var(--lah-s1) var(--lah-s2);min-width:0}
 .lah-turn-state{display:flex;flex-wrap:wrap;align-items:center;gap:var(--lah-s1) var(--lah-s2);min-width:0;overflow-wrap:anywhere}
@@ -113,17 +115,29 @@ export const LIVE_CSS = `
 .lah-prompt-facts{font-size:var(--lah-fs-sm);color:var(--lah-muted);overflow-wrap:anywhere}
 /* While a turn runs, its state and what the user can do to it stay at the top of what the panel shows, under the page bar (transcript.tsx measures it as --lah-pin-h for the search row under it): never at the foot, where the drawer lies over Lumiverse's own Send and Stop. */
 .lah-pin{position:sticky;top:calc(var(--lah-stick-top,0px) + var(--lah-bar-h,0px));z-index:6;display:flex;flex-direction:column;gap:var(--lah-s1);min-width:0}
-.lah-pin-skip{display:flex;flex-wrap:wrap;align-items:center;gap:var(--lah-s1) var(--lah-s2);min-width:0;padding:var(--lah-s1) var(--lah-s2);border:1px solid var(--lah-border);border-radius:var(--lah-r-lg);background:var(--lah-bar-bg);box-shadow:var(--lah-shadow-lg);font-size:var(--lah-fs-sm)}
-.lah-pin-skip>span{flex:1 1 14em;min-width:0;color:var(--lah-muted);overflow-wrap:anywhere}
 /* What a turn came to for its reply: the brief as prose, the lore by name. */
 .lah-brief{display:flex;flex-direction:column;gap:var(--lah-s1);min-width:0}
 .lah-brief-text{overflow-wrap:anywhere}
 .lah-brief-more{display:flex}
-/* What stays at the foot of what the panel shows while a turn runs: the way back to the newest step, and the calls held for the user's word. */
-.lah-foot{position:sticky;bottom:var(--lah-s2);z-index:5;display:flex;flex-direction:column;gap:var(--lah-s2);min-width:0;pointer-events:none}
+/*
+  What stays at the foot of what the panel shows: while a turn runs, the way back to the newest step
+  and the calls held for the user's word; in any transcript well down from its top, "Back to top".
+  The two ways share one row and wrap onto two where a phone has no room for both, so neither lies
+  over the other. It stands in the flow at the transcript's end, so at the very end it covers
+  nothing. It rises over what stands at the panel's foot: what the host keeps there
+  (--lah-stick-bottom: a host that embeds these pages says how tall that is), or a page's own foot
+  under the transcript (--lah-page-foot-h: how far up Talk's box to say more reaches, which talk.tsx
+  measures), whichever reaches higher.
+*/
+.lah-foot{position:sticky;bottom:calc(var(--lah-s2) + max(var(--lah-stick-bottom,0px),var(--lah-page-foot-h,0px)));z-index:5;display:flex;flex-direction:column;gap:var(--lah-s2);min-width:0;pointer-events:none}
 .lah-foot>*{pointer-events:auto}
-.lah-foot>.lah-follow{display:flex;justify-content:center;pointer-events:none}
+.lah-foot>.lah-follow{display:flex;flex-wrap:wrap;justify-content:center;gap:var(--lah-s2);pointer-events:none}
 .lah-follow>.lah-btn{pointer-events:auto;box-shadow:var(--lah-shadow-lg)}
+/* A plain button's own fill lets what scrolls under it show through, which muddles its words: here it is solid. */
+.lah-follow>.lah-btn.lah-is-secondary{background:var(--lah-bar-bg)}
+.lah-follow>.lah-btn.lah-is-secondary:hover:not(:disabled){background:linear-gradient(var(--lah-hover),var(--lah-hover)),var(--lah-bar-bg)}
+/* A transcript in a box that scrolls on its own (Chronicle's) sticks to that box's foot, where neither the host nor a page keeps anything. */
+.lah-chron-run{--lah-stick-bottom:0px;--lah-page-foot-h:0px}
 .lah-pinned{display:flex;align-items:center;gap:var(--lah-s2);min-width:0;padding:var(--lah-s1) var(--lah-s1) var(--lah-s1) var(--lah-s3);border:1px solid var(--lah-border);border-radius:var(--lah-r-xl);background:var(--lah-bar-bg);box-shadow:var(--lah-shadow-lg);font-size:var(--lah-fs-sm)}
 .lah-pinned-text{flex:1 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-variant-numeric:tabular-nums}
 /* With no buttons beside it the bar's line has the room to say itself whole, on two lines where it must. */
@@ -145,10 +159,6 @@ export const LIVE_CSS = `
 .lah-changed-row[data-change=dropped]>.lah-icon{color:var(--lah-muted)}
 .lah-changed-row[data-change=refused]{color:var(--lah-warn)}
 .lah-lorechange{display:flex;flex-direction:column;gap:2px;min-width:0}
-.lah-replyclock{display:inline-flex;align-items:center;gap:var(--lah-s2);min-width:0;font-weight:600;overflow-wrap:anywhere}
-.lah-replyclock.lah-is-short{flex:0 0 auto;gap:var(--lah-s1);white-space:nowrap}
-.lah-replyclock[data-lah-clock=urgent],.lah-replyclock[data-lah-clock=over]{color:var(--lah-warn)}
-.lah-turn-clock{display:flex;min-width:0}
 .lah-heldprompt{min-width:0}
 .lah-heldprompt-sizes{color:var(--lah-muted)}
 .lah-heldprompt>.lah-disclosure-body{gap:var(--lah-s3)}
@@ -160,8 +170,8 @@ export const LIVE_CSS = `
 .lah-entryrow-text{flex:1 1 0;min-width:0;display:flex;flex-direction:column}
 .lah-entryrow-title{font-weight:600;color:var(--lah-fg);overflow-wrap:anywhere}
 .lah-entryrow-note{font-size:var(--lah-fs-sm);color:var(--lah-muted);overflow-wrap:anywhere}
-/* On a phone the bar has no room for its words beside the clock and the three controls: they were cut to a letter. The clock and the pulse say that it runs, so there the clock takes the words' room. */
-@container lah (max-width:${STACKED_TABS_MAX_PX}px){.lah-pinned-word{display:none}.lah-pinned.lah-is-timed>.lah-pinned-text{display:none}.lah-pinned.lah-is-timed>.lah-replyclock{flex:1 1 0}}
+/* On a phone the bar has no room for its controls' words beside the state: they were cut to a letter, so there the controls show their icons alone. */
+@container lah (max-width:${STACKED_TABS_MAX_PX}px){.lah-pinned-word{display:none}}
 .lah-tool[data-state=held]>summary>.lah-tool-state{color:var(--lah-warn);font-weight:600}
 .lah-statgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,132px),1fr));gap:var(--lah-s2);min-width:0}
 .lah-statcard{display:flex;flex-direction:column;gap:2px;min-width:0;padding:var(--lah-s2) var(--lah-s3);border:1px solid var(--lah-hairline);border-radius:var(--lah-r-lg);background:var(--lah-card)}
@@ -194,7 +204,9 @@ export const LIVE_CSS = `
 .lah-event-what{flex:1 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--lah-muted)}
 .lah-event-at{flex:none;color:var(--lah-dim);font-size:var(--lah-fs-xs);font-variant-numeric:tabular-nums;white-space:nowrap}
 @container lah (min-width:${WIDE_MIN_PX}px){
-.lah-turn-grid{display:grid;grid-template-columns:minmax(220px,280px) minmax(0,1fr);align-items:start;gap:var(--lah-s4)}
+.lah-turn-grid{display:grid;grid-template-columns:minmax(220px,var(--lah-side-w)) minmax(0,1fr);align-items:start;gap:var(--lah-s4)}
+/* Under the two columns the foot's buttons stand under the steps, not over the side column's outline and filters, which stick to the panel's foot too. */
+.lah-turn-grid~.lah-foot>.lah-follow{padding-left:calc(var(--lah-side-w) + var(--lah-s4))}
 .lah-turn-side{position:sticky;top:calc(var(--lah-stick-top,0px) + var(--lah-bar-h,0px) + var(--lah-s2));max-height:calc(var(--lah-fill-h,100vh) - var(--lah-bar-h,0px) - var(--lah-s3));overflow-y:auto;overscroll-behavior:contain;padding-right:2px}
 .lah-outline{flex-direction:column;overflow-x:visible;padding-bottom:0}
 .lah-outline-row{flex:none;max-width:none;width:100%;margin-left:calc(min(var(--lah-depth,0),4) * var(--lah-s3));width:calc(100% - min(var(--lah-depth,0),4) * var(--lah-s3))}

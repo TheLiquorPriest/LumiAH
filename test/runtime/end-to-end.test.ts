@@ -66,7 +66,7 @@ describe("a chat on the loopback connection", () => {
     expect(live.live?.ended?.state).toBe("done");
     expect(live.live?.events[0]?.event.kind).toBe("turn_started");
 
-    // First-time setup is done, down to its last step. A runtime is no step of it (§25): it is an option, and the state says this one is there to choose (linked, its key minted, its connection made).
+    // First-time setup is done, down to its last step. The runtime's own steps are no step of it (they are the Runtime page's), and the state says this one is ready: linked, its key minted, its connection made.
     await it.backend.settle();
     const state = await it.page.request("lah.hello", {});
     expect(state.setup.steps).toEqual([

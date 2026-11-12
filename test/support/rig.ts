@@ -51,8 +51,6 @@ export interface Rig {
   generate(chatId: string, options?: Partial<Parameters<FakeLumiverse["generate"]>[2]>): Promise<Generated>;
   /** Mints the loopback key, which has the runtime make the loopback connection, and switches LumiAH on for a new chat with one message of Mara's, to run in the runtime; the chat's id. */
   setUp(): Promise<string>;
-  /** Switches LumiAH on for a new chat with one message of Mara's, to run built in: no runtime, no key, the chat on the user's own connection; the chat's id. */
-  setUpBuiltin(name?: string): Promise<string>;
   /** Lumiverse starts the extension's worker anew (an update, a reload, its own restart): everything the backend held in memory is gone, what Lumiverse and the user's storage hold stays, and a new backend is put together over them. The runtime and the page stay as they are. */
   restart(): Promise<void>;
   close(): void;
@@ -61,14 +59,11 @@ export interface Rig {
 /** The runtime's timings for a test: nothing waits, so a test takes no longer than its work. */
 export const FAST: RuntimeTuning = { ...RUNTIME_DEFAULTS, traceMs: 0, resendMs: 20, reconnectMs: 5, reconnectMaxMs: 20, stopGraceMs: 0 };
 
-/** Where a harness a test scripts is made for: the runtime's process, or the extension's own (built in). */
-export type RigPlace = "runtime" | "builtin";
-
-/** What a rig may be given: the runtime's timings and build, a harness in place of the core's own in both places (a test of the transport alone scripts one, and is told which place each is made for), what an extension that builds LumiAH into itself gives its backend, and the runtime's way to Lumiverse where it isn't the fake's own (a test that kills a runtime's process pulls it: plug.ts). */
+/** What a rig may be given: the runtime's timings and build, a harness in place of the core's own in the runtime (a test of the transport alone scripts one), what an extension that builds LumiAH into itself gives its backend, and the runtime's way to Lumiverse where it isn't the fake's own (a test that kills a runtime's process pulls it: plug.ts). */
 export interface RigOptions {
   tuning?: Partial<RuntimeTuning>;
   build?: string;
-  harness?: (...args: [...Parameters<RuntimeDeps["harness"]>, place: RigPlace]) => Harness;
+  harness?: RuntimeDeps["harness"];
   backend?: BackendOptions;
   wire?: (lumiverse: FakeLumiverse) => Pick<FakeLumiverse, "http" | "openSocket">;
 }
@@ -97,7 +92,7 @@ export function runtimeFrom(config: RuntimeConfig, lumiverse: FakeLumiverse, log
       held = next;
     },
     keepTuning: () => undefined,
-    harness: scripted !== undefined ? (harnessHost, settings, extension) => scripted(harnessHost, settings, extension, "runtime") : (harnessHost, settings, extension) => core().createHarness(harnessHost, { settings, extension, place: "runtime" }),
+    harness: scripted ?? ((harnessHost, settings, extension) => core().createHarness(harnessHost, { settings, extension })),
     writerConnection: (values) => {
       const writer = isRecord(values) && isRecord(values.core) && isRecord(values.core.agents) ? values.core.agents.writer : undefined;
       return isRecord(writer) && typeof writer.connectionId === "string" ? writer.connectionId : null;
@@ -117,7 +112,6 @@ export async function rig(options: RigOptions = {}): Promise<Rig> {
   // An extension that LumiAH is built into is installed under its own identifier: Lumiverse lists it by that, and its runtime links to it.
   const host = new FakeHost(options.backend?.identity?.identifier);
   const lumiverse = new FakeLumiverse(host, USER);
-  const scripted = options.harness;
   // Put together again by `restart`, as Lumiverse does when it starts the extension's worker anew.
   const assemble = (): Backend =>
     createBackend(
@@ -129,19 +123,6 @@ export async function rig(options: RigOptions = {}): Promise<Rig> {
           return () => clearTimeout(timer);
         },
         build: BUILD,
-        // A scripted harness stands for the core in both places: built in, it answers what a page asks, and has no part in a reply (a test of a built-in turn runs the core's own).
-        ...(scripted !== undefined
-          ? {
-              harness: (harnessHost, given) => ({
-                prepare: async (turn) => ({ messages: turn.messages, part: "none" as const, reason: "This test's harness prepares no turn.", pending: false, usage: { calls: 0, toolTurns: 0, in: 0, cachedIn: 0, out: 0, reasoningOut: 0, estimated: false, ms: 0 } }),
-                complete: async () => {
-                  throw new Error("this test's harness completes no turn");
-                },
-                abandon: async () => ({ abandoned: true }),
-                ...scripted(harnessHost, given.settings, given.extension ?? { name: "LumiAH" }, "builtin"),
-              }),
-            }
-          : {}),
       },
       options.backend,
     );
@@ -176,13 +157,7 @@ export async function rig(options: RigOptions = {}): Promise<Rig> {
       made.key = minted.key;
       const chat = host.addChat(USER, "Harbour light");
       host.say(chat.id, "user", "Who keeps the harbour light now?");
-      await page.request("lah.chat.set", { chatId: chat.id, on: true, place: "runtime" });
-      return chat.id;
-    },
-    async setUpBuiltin(name = "Harbour light") {
-      const chat = host.addChat(USER, name);
-      host.say(chat.id, "user", "Who keeps the harbour light now?");
-      await page.request("lah.chat.set", { chatId: chat.id, on: true, place: "builtin" });
+      await page.request("lah.chat.set", { chatId: chat.id, on: true });
       return chat.id;
     },
     async restart() {

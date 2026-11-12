@@ -9,7 +9,7 @@ import { DOC, ROOT_AREA } from "../../src/core/paths";
 import type { JobView, JsonValue, ModelMessage, TurnRecord } from "../../src/core/ports";
 import { readCallPrompt } from "../../src/core/prompts";
 import { HarnessRefusal } from "../../src/core/refusal";
-import { type PendingTurn, pathHashes, type SessionSegment, Sessions } from "../../src/core/sessions";
+import { pathHashes, type SessionSegment, Sessions } from "../../src/core/sessions";
 import { defaultSettings, type Settings } from "../../src/core/settings";
 import type { JobDoc, SideDoc } from "../../src/core/stored";
 import type { PastTurn } from "../../src/core/tools";
@@ -411,31 +411,34 @@ describe("the store's documents keep what they name", () => {
     expect(r.stored(report, session, asked)).toEqual([false, false, true]);
   });
 
-  test("a turn that waits for its reply: what its document names is kept while it is young; past the grace time the document goes, and what only it named with it", async () => {
+  test("what built-in mode left (turns that waited for their replies, its own list of the jobs it ran) is removed by a sweep, damaged or not, with what only it named; a count removes nothing", async () => {
     const r = rig();
-    const draft = await r.blobs.put("The notes of a turn that waits for its reply.");
-    const summary = await r.blobs.put("Okoro keeps the lighthouse. Mara has asked twice.");
-    const kept = await r.blobs.put("The notes of a turn the summary keeps whole.");
+    const draft = await r.blobs.put("The notes of a turn that waited for its reply.");
     const report = await r.blobs.put("The report of a job the turn started.");
-    const before = await r.index({ "notes.md": ["As the turn before left it."] });
-    const handed = await r.index({ "notes.md": ["As it stood at the hand-over.", "As the turn before left it."] });
-    const named = [draft, summary, kept, report, before.hash, handed.hash, ...before.bodies, ...handed.bodies];
-    // The texts are older than the grace time when the turn is handed over: only the document keeps them.
+    const handed = await r.index({ "notes.md": ["As it stood at the hand-over."] });
+    const named = [draft, report, handed.hash, ...handed.bodies];
+    // Built in stored them before this build: older than the grace time.
     r.host.clock.advance(25 * HOUR);
     const at = r.host.clock.now();
-    const waiting: PendingTurn = { v: 1, kind: "pending", at, until: at + HOUR, userId: "user-1", chatId: CHAT, generationId: "gen-waiting", turn: "new", began: at, path: "", draft, replied: [], asBrief: null, summary: { summary, kept: [kept], folded: 2 }, basis: before.hash, workspace: handed.hash, jobs: [{ id: "job-1", agent: "summarizer", state: "done", report }], usage: emptyUsage() };
-    r.host.documents.set(DOC.pending("gen-waiting"), waiting as unknown as JsonValue);
-    // One that doesn't read as a waiting turn names nothing, and is nobody's to remove here.
-    r.host.documents.set(DOC.pending("gen-damaged"), { v: 1, kind: "pending", chatId: CHAT });
-    expect((await r.sweep()).lastSweep).toMatchObject({ removed: 0 });
-    expect(r.stored(...named)).toEqual(named.map(() => true));
-    expect(r.host.documents.has(DOC.pending("gen-waiting"))).toBe(true);
+    const left: Record<string, JsonValue> = {
+      "pending/gen-waiting.json": { v: 1, kind: "pending", at, until: null, userId: "user-1", chatId: CHAT, generationId: "gen-waiting", turn: "new", began: at, path: "", draft, replied: [], asBrief: null, basis: null, workspace: handed.hash, jobs: [{ id: "job-1", agent: "summarizer", state: "done", report }] },
+      "pending/gen-damaged.json": { v: 1, kind: "pending", chatId: CHAT },
+      "jobs/running.builtin.json": { v: 1, kind: "running", ids: ["job-1"] },
+    };
+    for (const [path, doc] of Object.entries(left)) r.host.documents.set(path, doc);
+    // The runtime's own list of running jobs is no leftover.
+    r.host.documents.set(DOC.runningJobs, { v: 1, kind: "running", ids: [] });
+    const paths = [...Object.keys(left), DOC.runningJobs];
 
-    // A day on, no reply is coming: the sweep removes the document, and with it what nothing else named.
-    r.host.clock.advance(24 * HOUR);
+    // A count only looks.
+    await r.upkeep.get();
+    expect(paths.map((path) => r.host.documents.has(path))).toEqual([true, true, true, true]);
+    expect(r.stored(...named)).toEqual(named.map(() => true));
+
+    // A sweep removes each document whole, and what only they named with them, as anything nothing names.
     expect((await r.sweep()).lastSweep).toMatchObject({ removed: new Set(named).size });
+    expect(paths.map((path) => r.host.documents.has(path))).toEqual([false, false, false, true]);
     expect(r.stored(...named)).toEqual(named.map(() => false));
-    expect([r.host.documents.has(DOC.pending("gen-waiting")), r.host.documents.has(DOC.pending("gen-damaged"))]).toEqual([false, true]);
   });
 
   test("a document or a blob that doesn't read as what it should be refers to nothing, and the sweep goes on", async () => {

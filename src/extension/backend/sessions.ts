@@ -21,7 +21,7 @@ import type { Chats } from "./chat";
 import { UiRefused } from "./errors";
 import type { Storage } from "./reads";
 import type { SettingsStore } from "./settings";
-import { lastOfLive, lastOfRecord, type Ran, ranOf } from "./views";
+import { lastOfLive, lastOfRecord } from "./views";
 
 export interface SessionsDeps {
   chats: Chats;
@@ -113,8 +113,8 @@ export class SessionsPage {
     return this.session(userId, chatId, await this.deps.chats.path(userId, chatId));
   }
 
-  /** A turn as the page lists it: the core's record, and where the turn ran (`ran`), which the extension wrote beside it. */
-  private row(turn: PathTurn, turns: readonly PathTurn[], standing: string | null, preview: string, ran: Ran): TurnRow {
+  /** A turn as the page lists it, from the core's record. */
+  private row(turn: PathTurn, turns: readonly PathTurn[], standing: string | null, preview: string): TurnRow {
     const { record } = turn;
     return {
       turn: record.generationId,
@@ -130,10 +130,6 @@ export class SessionsPage {
       usage: record.usage,
       // The record says how many files its turn's change set names, where the core counted them; the set itself is read on request (`lah.ws.changes`).
       changes: record.changed ?? 0,
-      ...(ran.place !== undefined ? { place: ran.place } : {}),
-      ...(ran.noPart !== undefined ? { noPart: ran.noPart } : {}),
-      // The core's own word that the record was written after the fact (the extension restarted between the turn's halves, or the reply came after the wait for it).
-      ...(record.recovered !== undefined ? { recovered: record.recovered } : {}),
     };
   }
 
@@ -163,7 +159,7 @@ export class SessionsPage {
     const previews = await this.previews(userId, chatId, page);
     const standing = sessionAt(turns).summary;
     return {
-      turns: page.map((t) => this.row(t, turns, standing, previews.get(t.index) ?? "", ranOf(path[t.at]?.anchor))),
+      turns: page.map((t) => this.row(t, turns, standing, previews.get(t.index) ?? "")),
       next: from + page.length < turns.length ? String(from + page.length) : null,
       total: turns.length,
       session: await this.session(userId, chatId, path),
@@ -184,9 +180,6 @@ export class SessionsPage {
     const events = stored.events.slice(from - 1, from - 1 + size);
     const read = from - 1 + events.length;
     const { ended } = stored;
-    // Only a built-in reply's turn has a time before its reply ends (§25), and its first event says when: a transcript that says so is one. Any other names no place: the record on the reply says where its turn ran (`TurnRow.place`).
-    const first = stored.events[0]?.event;
-    const replyBy = first?.kind === "turn_started" && typeof first.replyBy === "number" ? first.replyBy : null;
     return {
       // A stored turn is over: no call of it is in flight.
       view: {
@@ -199,7 +192,6 @@ export class SessionsPage {
         ended: { state: ended.status, at: ended.at, ...(ended.reason !== undefined ? { reason: ended.reason } : {}) },
         events,
         partials: [],
-        ...(replyBy !== null ? { place: "builtin" as const, replyBy } : {}),
       },
       next: stored.events.length > read ? read + 1 : null,
     };
@@ -220,7 +212,7 @@ export class SessionsPage {
     const kept = latestRecord(await this.deps.chats.path(userId, chatId), null);
     if (kept === null) return null;
     const stored = kept.record.transcript === undefined ? null : await this.stored(userId, kept.record.transcript);
-    return lastOfRecord({ messageId: kept.message.id, record: kept.record, ran: ranOf(kept.message.anchor) }, stored);
+    return lastOfRecord({ messageId: kept.message.id, record: kept.record }, stored);
   }
 
   /** `lah.prompt.get`: the exact request of a model call. */
@@ -247,6 +239,6 @@ export class SessionsPage {
     const turn = turns.find((t) => t.messageId === messageId && t.swipeId === swipe);
     if (turn === undefined) throw new UiRefused("not_found", "That reply is no longer on the chat's active path.");
     const previews = await this.previews(userId, chatId, [turn]);
-    return { turn: this.row(turn, turns, sessionAt(turns).summary, previews.get(turn.index) ?? "", ranOf(path[turn.at]?.anchor)), session: await this.session(userId, chatId, path) };
+    return { turn: this.row(turn, turns, sessionAt(turns).summary, previews.get(turn.index) ?? ""), session: await this.session(userId, chatId, path) };
   }
 }

@@ -1,9 +1,8 @@
-// What a turn's view says of the two ways to run (DESIGN §25) and of the lore and history a reply
-// rests on (§24.1, §24.3): the time a built-in turn has left before the reply, what a turn came to
-// for its reply (the brief as prose, the lore by name), the cause of a reply that failed or that
-// LumiAH had no part in with the step that mends it, the fold of what the prompt held, and the
-// entries a `write_reply` call added to and left out of the prompt, each with the way to it on the
-// Lore page. The words and the decisions are live-model.ts's; these render them.
+// What a turn's view says of the lore and history a reply rests on (DESIGN §24.1, §24.3): what a
+// turn came to for its reply (the brief as prose, the lore by name), the cause of a reply that
+// failed with the step that mends it, the fold of what the prompt held, and the entries a
+// `write_reply` call added to and left out of the prompt, each with the way to it on the Lore page.
+// The words and the decisions are live-model.ts's; these render them.
 
 import { useState } from "preact/hooks";
 import type { LoreChanges, PromptHeld } from "../../shared/ui";
@@ -12,22 +11,11 @@ import { Banner, Button, Disclosure } from "./components";
 import { Marked } from "./feed-parts";
 import { count, counted } from "./format";
 import { Icon, type IconName } from "./icons";
-import { briefOpening, heldLine, historyWords, indexWords, loreChangeLine, markPieces, type Mend, type MendStep, replyClock } from "./live-model";
+import { briefOpening, heldLine, historyWords, indexWords, loreChangeLine, markPieces, type Mend, type MendStep } from "./live-model";
 import { whyWords } from "./lore-model";
 import { Prose } from "./prose";
 import { openSetting } from "./setting-links";
 import { useGrant } from "./setup-parts";
-
-/** A built-in turn's time before the reply, counted down where the user looks while it works: whole in a turn's head and on Home, `short` in the pinned bar. */
-export function ReplyClock(props: { replyBy: number; startedAt: number; now: number; short?: boolean }) {
-  const clock = replyClock(props.replyBy, props.startedAt, props.now);
-  return (
-    <span class={props.short ? "lah-replyclock lah-is-short lah-num" : "lah-replyclock lah-num"} data-lah-clock={clock.over ? "over" : clock.urgent ? "urgent" : "plenty"} role="timer" aria-label={clock.text}>
-      <Icon name="hourglass" size={props.short ? 14 : 16} />
-      <span>{props.short ? clock.short : clock.over ? `${clock.text}: Lumiverse sends the prompt as it is.` : clock.text}</span>
-    </span>
-  );
-}
 
 /**
  * What a turn came to for its reply (ux B1): the brief the main agent gave the model that writes

@@ -13,7 +13,7 @@ import type { FrontendToBackend } from "../../shared/ui";
 import { type App, AppContext, createApp, type PageId, type PrefsStorage } from "./app";
 import { createHost } from "./host";
 import { TAB_ICON_SVG } from "./icons";
-import { badgeOf, SKIP_REPLY, skippable } from "./nav-model";
+import { badgeOf } from "./nav-model";
 import { Shell } from "./shell";
 import { CSS } from "./styles";
 
@@ -64,18 +64,6 @@ export function setup(ctx: SpindleFrontendContext, tabOptions: TabOptions = LUMI
   const badge = (): void => tab.setBadge(badgeOf(app.client.state.get(), host.activeChat.get()));
   cleanups.push(app.client.state.subscribe(badge), host.activeChat.subscribe(badge));
   badge();
-  // And Lumiverse's input bar (its Extras list) offers to skip LumiAH while it prepares a built-in reply for the open chat: the one thing a user who only waits for a reply may want of it. An older Lumiverse has no such place; hidden while there is nothing to skip.
-  const register = ctx.ui.registerInputBarAction;
-  if (typeof register === "function") {
-    const action = register.call(ctx.ui, { id: "skip-reply", label: SKIP_REPLY, subtitle: "It is reading up before this reply", enabled: false });
-    const offer = (): void => action.setEnabled(skippable(app.client.state.get(), host.activeChat.get()) !== null);
-    const skip = (): void => {
-      const reply = skippable(app.client.state.get(), host.activeChat.get());
-      if (reply) void app.client.request("lah.turn.stop", { stream: reply.stream, turn: reply.turn }).catch((error: unknown) => app.fail(error));
-    };
-    cleanups.push(app.client.state.subscribe(offer), host.activeChat.subscribe(offer), action.onClick(skip), () => action.destroy());
-    offer();
-  }
   cleanups.push(host.watch(() => app.client.resync()));
   void app.client.sync();
   return () => {

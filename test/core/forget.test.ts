@@ -75,15 +75,10 @@ describe("forgetting a chat", () => {
     const kept = await r.fill(KEPT);
     // A world book whose id is the chat's: its vectors are a book's, not the chat's.
     r.host.documents.set(vectors("book", GONE), { v: 1, dims: 0, vectors: {} });
-    // Turns handed over to Lumiverse's own generation that still wait for their replies in storage, kept by generation: two of the chat's (one of them damaged), one of the other's.
-    const waits = { gone: DOC.pending("gen-gone"), damaged: DOC.pending("gen-damaged"), kept: DOC.pending("gen-kept") };
-    r.host.documents.set(waits.gone, { v: 1, kind: "pending", at: 1, until: null, userId: "user-1", chatId: GONE, generationId: "gen-gone", turn: "new", began: 1, path: "", draft: "0".repeat(64), replied: [], asBrief: null, basis: null, workspace: null, jobs: [] });
-    r.host.documents.set(waits.damaged, { v: 1, kind: "pending", chatId: GONE });
-    r.host.documents.set(waits.kept, { v: 1, kind: "pending", at: 1, until: null, userId: "user-1", chatId: KEPT, generationId: "gen-kept", turn: "new", began: 1, path: "", draft: "0".repeat(64), replied: [], asBrief: null, basis: null, workspace: null, jobs: [] });
-    const mine = (path: string): boolean => path.startsWith(`chats/${GONE}/`) || path === vectors("chat", GONE) || [`jobs/${gone.done}.json`, `jobs/${gone.waiting}.json`, `sides/${gone.side}.json`, waits.gone, waits.damaged].includes(path);
+    const mine = (path: string): boolean => path.startsWith(`chats/${GONE}/`) || path === vectors("chat", GONE) || [`jobs/${gone.done}.json`, `jobs/${gone.waiting}.json`, `sides/${gone.side}.json`].includes(path);
     const before = new Map<string, JsonValue>(structuredClone([...r.host.documents]));
     expect(r.paths().filter(mine)).toEqual(
-      [`chats/${GONE}/approvals.json`, `chats/${GONE}/jobs.json`, `chats/${GONE}/learned.json`, `chats/${GONE}/recall.json`, `chats/${GONE}/session.json`, vectors("chat", GONE), `jobs/${gone.done}.json`, `jobs/${gone.waiting}.json`, `sides/${gone.side}.json`, waits.gone, waits.damaged, ...r.paths().filter((path) => path.startsWith(`chats/${GONE}/area/`))].sort(),
+      [`chats/${GONE}/approvals.json`, `chats/${GONE}/jobs.json`, `chats/${GONE}/learned.json`, `chats/${GONE}/recall.json`, `chats/${GONE}/session.json`, vectors("chat", GONE), `jobs/${gone.done}.json`, `jobs/${gone.waiting}.json`, `sides/${gone.side}.json`, ...r.paths().filter((path) => path.startsWith(`chats/${GONE}/area/`))].sort(),
     );
     expect(r.paths().filter((path) => path.startsWith(`chats/${GONE}/area/`)).length).toBeGreaterThan(0);
 
@@ -97,7 +92,6 @@ describe("forgetting a chat", () => {
     // Every other document is as it was, but for the three lists that named the chat's jobs and side session.
     const lists = ["jobs/all.json", "jobs/running.json", "sides.json"];
     for (const [path, doc] of before) if (!mine(path) && !lists.includes(path)) expect([path, r.host.documents.get(path)]).toEqual([path, doc]);
-    expect([r.host.documents.has(waits.gone), r.host.documents.has(waits.damaged), r.host.documents.has(waits.kept)]).toEqual([false, false, true]);
     expect(r.host.documents.get("jobs/all.json")).toMatchObject({ kind: "job_ids", jobs: [{ id: kept.done, chatId: KEPT }, { id: kept.waiting, chatId: KEPT }] });
     expect(r.host.documents.get("jobs/running.json")).toMatchObject({ kind: "running", ids: [kept.waiting] });
     expect((await r.harness.sides.list({})).sides.map((side) => side.id)).toEqual([kept.side]);

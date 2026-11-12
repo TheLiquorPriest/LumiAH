@@ -769,12 +769,9 @@ export interface RequestMessage extends ModelMessage {
  * where Lumiverse makes the reply's message only as it saves it, so the reply comes after every
  * message of the path; for a regenerate or a swipe, the new swipe; for a continue, the swipe it
  * continues), the preset the prompt was assembled from, the assembled messages as Lumiverse sent
- * them, and the request's own sampling parameters and answer room.
- *
- * `connectionId` is the connection this generation runs on, named where the core runs inside
- * Lumiverse (DESIGN §25): an agent with no connection set uses it. A runtime leaves it out (its
- * turns reach it over the loopback, which no agent may call): such an agent then uses the user's
- * default connection.
+ * them, and the request's own sampling parameters and answer room. It names no connection: its
+ * turns reach the runtime over the loopback, which no agent may call, so an agent with no
+ * connection set uses the chat's own, else the user's default.
  */
 export interface TurnRequest {
   userId: string;
@@ -787,7 +784,6 @@ export interface TurnRequest {
   params: SamplingParams;
   /** The answer room the request asks for; null when it names none. */
   maxTokens: number | null;
-  connectionId?: string | null;
 }
 
 /**
@@ -832,10 +828,6 @@ export interface RecordJob {
  * a list of turns says how much a turn changed without reading two indexes for each. `heard` is
  * when the turn looked which of the chat's jobs had stopped: the turn after it tells its main agent
  * of those that stopped since, so none is told twice.
- *
- * `recovered`: the turn waited for its reply where the host writes it (§25) and was finished from
- * what storage kept of it, since the run was no longer in memory: after a restart, or for a reply
- * that came after Settings' time for it had passed. Such a record has no transcript.
  */
 export interface TurnRecord {
   v: 1;
@@ -854,7 +846,6 @@ export interface TurnRecord {
   workspace?: string;
   changed?: number;
   jobs?: RecordJob[];
-  recovered?: "restart" | "late";
   usage: AgentUsage;
 }
 
@@ -864,37 +855,13 @@ export type TurnStatus = "done" | "failed" | "stopped";
 /**
  * What `answer` gives back: how the turn ended (and why, where it didn't finish), its record to
  * anchor (null when no reply was written, so there is no message to anchor it on, or its bodies
- * couldn't be stored), the reply's text as sent, and the turn's usage. `recovered`: `complete`
- * finished the turn from storage, as its record says; absent for a turn held in memory.
+ * couldn't be stored), the reply's text as sent, and the turn's usage.
  */
 export interface TurnResult {
   status: TurnStatus;
   reason?: string;
   record: TurnRecord | null;
   reply: string;
-  usage: AgentUsage;
-  recovered?: "restart" | "late";
-}
-
-/**
- * What the first half of a turn gives back where the host writes the reply (DESIGN §25, `prepare`):
- * the messages for the host's own generation, and what part LumiAH had in them.
- *
- * - `brief`: the main agent's brief is in, as one added message (it bears no `source`); the messages
- *   that came keep theirs.
- * - `answer`: the main agent never called `write_reply`, and its last answer stands in the brief's
- *   place.
- * - `none`: the messages exactly as they came. `reason` says why LumiAH had no part: it failed, it
- *   was stopped, or its time ran out before a brief.
- *
- * `pending` says the turn waits for its second half: `complete` with the reply once the host has
- * it, or `abandon`. It is false where nothing was begun that a record could hold.
- */
-export interface PreparedTurn {
-  messages: RequestMessage[];
-  part: "brief" | "answer" | "none";
-  reason?: string;
-  pending: boolean;
   usage: AgentUsage;
 }
 
@@ -940,8 +907,7 @@ export type AgentStatus = "answered" | "refused" | "stopped" | "cancelled" | "fa
 /**
  * Why an agent stopped short of an answer: a budget of its own, its turn's (or its job's), a
  * throttle, a connection that can't be used, the loop detector, a cancel, a failed call, a spend cap
- * (DESIGN §20), for a job, that the turn it belongs to left the chat's active path (§15), or, where
- * the host writes the reply, that the reply was due (`reply_time`, §25).
+ * (DESIGN §20), or, for a job, that the turn it belongs to left the chat's active path (§15).
  */
 export type AgentStopCode =
   | "revisions"
@@ -961,7 +927,6 @@ export type AgentStopCode =
   | "loop"
   | "spend"
   | "off_path"
-  | "reply_time"
   | "cancelled"
   | "failed";
 
@@ -1061,7 +1026,7 @@ export interface SessionTrace {
  * user should know about the run that is no agent's step: its notes couldn't be stored.
  */
 export type TraceEvent =
-  | { kind: "turn_started"; turn: string; chatId: string; generation: RunKind; messageId: string | null; job?: string; side?: string; replyBy?: number; at: number }
+  | { kind: "turn_started"; turn: string; chatId: string; generation: RunKind; messageId: string | null; job?: string; side?: string; at: number }
   | { kind: "session"; session: SessionTrace; at: number }
   // What the prompt of the generation held of the lore and of the chat, as the main agent was told (§24.1).
   | ({ kind: "prompt_held"; at: number } & PromptHeld)

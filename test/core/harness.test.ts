@@ -11,7 +11,7 @@ import { recordOf, segmentOf } from "../../src/core/sessions";
 import { defaultSettings, type Settings } from "../../src/core/settings";
 import { transcriptOf } from "../../src/core/transcript";
 import { parseJson } from "../../src/core/util";
-import { call, MAIN, MemoryHost, promptText, runTurn, type Script, Sink, settle, until, WRITER } from "./support/host";
+import { call, MAIN, MemoryHost, promptText, runTurn, type Script, settle, until, WRITER } from "./support/host";
 
 const CHAT = "chat-1";
 
@@ -453,17 +453,6 @@ describe("LumiAH failing never costs the reply", () => {
     expect(segmentOf(parseJson(host.blobStore.get(result.record?.segment ?? "") ?? ""))?.steps).toEqual([{ kind: "stop", reason: `LumiAH failed before you gave a brief (${unreadWhy}), so the writer was started on the reply from the request alone` }]);
     expect(result.record?.transcript).toBeUndefined();
     expect(events(host).some((e) => e.kind === "agent_entry" && e.entry.kind === "answer" && e.entry.prompt !== undefined)).toBe(false);
-  });
-
-  test("settings that can't be read, on a request that names its connection: the writer's call goes there", async () => {
-    const host = new MemoryHost();
-    host.script = ["A reply from the preset alone."];
-    host.say(CHAT, "user", "Hello?");
-    const harness = createHarness(host, { settings: () => Promise.reject(new Error("the link is down")) });
-    const sink = new Sink();
-    const result = await harness.answer({ userId: "user-1", chatId: CHAT, generationId: "gen-named", kind: "new", target: { messageId: null, swipeId: 0 }, presetId: null, messages: host.requestOf(CHAT, 1, null), params: { temperature: 0.9 }, maxTokens: null, connectionId: WRITER }, sink, new AbortController().signal);
-    expect(result).toMatchObject({ status: "done", reply: "A reply from the preset alone." });
-    expect(host.calls.map((c) => c.connectionId)).toEqual([WRITER]);
   });
 });
 

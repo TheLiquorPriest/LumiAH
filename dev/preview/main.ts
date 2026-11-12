@@ -1,11 +1,11 @@
 // The preview's boot: a mock host and a mock backend, then the real frontend `setup`.
 // http://127.0.0.1:7895/?page=<a page's id: home (default), live, sessions, jobs, talk, lore, chronicle, workspace, guidance, agents, skills, tools, settings, spend, upkeep, runtime>
-//   &scenario=ready|fresh|trouble   set up, with one chat built in and one in a linked runtime (default); a new install with nothing
+//   &scenario=ready|fresh|trouble   set up, with chats answered by a linked runtime (default); a new install with nothing
 //        granted or switched on; a permission missing, a runtime gone quiet and one refused
 //   &grant=none   this Lumiverse has no way for a page to ask for permissions: Home says where to grant them by hand
-//   &turn=done|failed|long|worked|running|working|nopart|urgent|none   the open chat's live turn (default done): `worked` has sub-agents,
+//   &turn=done|failed|long|worked|running|working|none   the open chat's live turn (default done): `worked` has sub-agents,
 //        workspace writes, an approval and a job in it; `running` starts one as the page opens; `working` starts one that holds a tool call
-//        for your word; `nopart` is a reply LumiAH had no part in (its time ran out); `urgent` starts one with forty seconds before the reply
+//        for your word
 //   &chat=chat-mara|chat-brann|chat-okoro|chat-ilse|chat-joss|none   the chat open in the host (chat-ilse: one LumiAH doesn't answer; chat-joss: one another extension answers)
 //   &settings=real|sample   LumiAH's own settings and texts (default), or a small made-up section using every kind of control
 //   &drawer=wide|default|<px>   the drawer's width on a desktop: as wide as the host lets it go (default), the host's 420 px, or a width
@@ -61,7 +61,7 @@ const delay = Number(params.get("delay") ?? "120");
 const host = createMockHost({ drawerOpen: params.get("drawerOpen") !== "false", chatId, canGrant: params.get("grant") !== "none" });
 const backend = new MockBackend((payload) => host.deliver(payload), {
   scenario,
-  turn: pick("turn", ["done", "failed", "long", "worked", "running", "working", "nopart", "urgent", "none"] as const, "done"),
+  turn: pick("turn", ["done", "failed", "long", "worked", "running", "working", "none"] as const, "done"),
   showcase: params.get("showcase") === "1",
   sections: settled.sections,
   texts: settled.texts,
@@ -113,7 +113,7 @@ picker.addEventListener("change", () => {
 const sendTurn = (said: string, held: boolean): void => {
   if (open === null) return;
   say("Mara", said, true);
-  if (!(held ? backend.startTurn(open, workingTurn(backend.placeOf(open))) : backend.startTurn(open))) say("Host", "LumiAH doesn't answer this chat, or a reply of it is being written already.");
+  if (!(held ? backend.startTurn(open, workingTurn()) : backend.startTurn(open))) say("Host", "LumiAH doesn't answer this chat, or a reply of it is being written already.");
 };
 (document.getElementById("send") as HTMLElement).addEventListener("click", () => sendTurn("I knock at Ilse's door.", false));
 (document.getElementById("send-held") as HTMLElement).addEventListener("click", () => sendTurn("I tell Ilse what Joss said.", true));

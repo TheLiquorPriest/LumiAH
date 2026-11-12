@@ -30,7 +30,7 @@ export function pageMarks(state: UiState | null): Partial<Record<PageId, Mark>> 
   if (state.notices.some((n) => NOTICE_NEEDS[n.kind])) marks.jobs = "needs";
   // Home is where a missing permission is granted and where what keeps LumiAH from working is said.
   if (neededPermissions(state).length > 0 || state.runtime.issues.length > 0) marks.home = "needs";
-  // A runtime is an option (§25): it marks its page only for someone who uses one and whose runtime isn't ready.
+  // No chat is answered without the runtime (§25): its page is marked while it isn't ready.
   if (runtimeTrouble(state) !== null) marks.runtime = "needs";
   return marks;
 }
@@ -94,12 +94,6 @@ export function noticeWords(notice: Notice, state: Pick<UiState, "chats">, activ
   return `${words} (${name ?? "another chat"})`;
 }
 
-/** What the pages call ending LumiAH's work on a built-in reply: Lumiverse then writes the reply without it. One name, on Live, on Home and in Lumiverse's input bar. */
-export const SKIP_REPLY = "Skip LumiAH for this reply";
-
-/** What that does, in the one line said beside it: it is no Stop, and the reply's own Stop is Lumiverse's. */
-export const SKIP_ABOUT = "It ends the agents' work, and Lumiverse writes the reply without them. To stop the reply itself, use Lumiverse's own Stop.";
-
 /** The mark the tab's badge shows while LumiAH prepares a reply for the open chat. A sign, so no setting. */
 const WORKING_MARK = "…";
 
@@ -116,21 +110,6 @@ export function badgeOf(state: UiState | null, activeChat: string | null): strin
   if (waiting > 0) return `${waiting}!`;
   if (activeChat !== null && state.running.some((r) => r.chatId === activeChat && isReply(r.kind))) return WORKING_MARK;
   return state.running.length > 0 ? String(state.running.length) : null;
-}
-
-/**
- * The reply LumiAH is preparing built in for the open chat, which the user may skip from outside
- * the drawer; null where there is none: no reply under way there, or one that runs in a runtime
- * (ending that one is a real stop, done from Live, where what it stops is in view).
- */
-export function skippable(state: UiState | null, activeChat: string | null): { stream: string; turn: string } | null {
-  if (state === null || activeChat === null) return null;
-  const run = state.running.find((r) => r.chatId === activeChat && isReply(r.kind));
-  if (!run) return null;
-  const chat = state.chats.find((c) => c.chatId === activeChat);
-  // The run says where it runs where the backend tells; else the chat does, and a chat whose runtime isn't answering runs built in meanwhile.
-  const builtin = run.place !== undefined ? run.place === "builtin" : chat !== undefined && (chat.place === "builtin" || chat.away === true);
-  return builtin ? { stream: run.stream, turn: run.turn } : null;
 }
 
 /** The groups a shell shows: all of them, or (for an extension that mounts only some pages) those that hold a page it names, each with only those pages, in the usual order. */

@@ -147,10 +147,6 @@ export interface TransportSettings {
     /** How long one call of an MCP tool may take. */
     callMs: number;
   };
-  builtin: {
-    /** How long before Lumiverse stops waiting for the extension a built-in turn hands the prompt back with what it has (DESIGN §25). */
-    marginMs: number;
-  };
   jobs: {
     /** The user holds every job: those running wait at their agents' next round, and one that begins waits at its first. */
     paused: boolean;
@@ -249,8 +245,6 @@ export const TRANSPORT_DEFAULTS: Readonly<TransportSettings> = Object.freeze({
   connections: Object.freeze({ oneToolAtATime: Object.freeze([]) as unknown as string[] }),
   // 30 seconds is Lumiverse's own default for a call it is given no time for.
   mcp: Object.freeze({ callMs: 30_000 }),
-  // The handover writes nothing that waits on a model: it builds the request and answers Lumiverse. Fifteen seconds covers a slow storage write and still leaves the agents nearly all of the five minutes.
-  builtin: Object.freeze({ marginMs: 15_000 }),
   jobs: Object.freeze({ paused: false }),
   pages: Object.freeze({ noticesKept: 200, askMs: 30_000, noticeChars: 400 }),
   // A runtime sends a large frame's parts one after another, so one account seldom has two frames under way: eight, and twice the largest frame, leave room without letting an account fill the extension's memory.
@@ -267,11 +261,18 @@ const whole = (title: string, description: string, minimum: number, maximum: num
 
 const DAY_MS = 24 * 60 * 60_000;
 
+/**
+ * Settings an earlier build had and this one took away, by path within the section: built-in mode's
+ * own group (it runs on LumiAH's `main` branch, not here). A value a user kept there names nothing
+ * now, and the settings' store passes over it quietly rather than refuse every later change for it.
+ */
+export const TRANSPORT_RETIRED: readonly (readonly string[])[] = [["builtin"]];
+
 /** The section's schema, each setting in the order the Settings page shows it. */
 export const TRANSPORT_SCHEMA: JsonObject = {
   type: "object",
   title: "Transport",
-  description: "How LumiAH carries a reply: built in, inside this extension before Lumiverse sends the prompt, or in a runtime beside Lumiverse over its link. The defaults suit a runtime on the same machine as Lumiverse.",
+  description: "How LumiAH carries a reply between this extension and your runtime beside Lumiverse, over its link. The defaults suit a runtime on the same machine as Lumiverse.",
   additionalProperties: false,
   properties: {
     history: {
@@ -336,16 +337,6 @@ export const TRANSPORT_SCHEMA: JsonObject = {
       properties: {
         // Lumiverse holds a call's time between 1 and 120 seconds, whatever it is asked for.
         callMs: ms("Call time", "How long one call of an MCP tool may take before it is given up.", 1_000, 120_000),
-      },
-    },
-    builtin: {
-      type: "object",
-      title: "Built in",
-      description: "A chat set to run built in is worked on inside Lumiverse, before the reply: Lumiverse waits up to five minutes for an extension, then sends the prompt as it was.",
-      additionalProperties: false,
-      properties: {
-        // Under four of Lumiverse's five minutes, so the agents always have some time; the least is what answering Lumiverse itself takes.
-        marginMs: ms("Margin before Lumiverse's limit", "How long before Lumiverse stops waiting the main agent's turn hands the prompt back with what it has. Too small, and a slow moment costs the turn its part in the reply; larger, and the agents have that much less time.", 2_000, 240_000),
       },
     },
     jobs: {

@@ -30,9 +30,8 @@
 //   events and the `seq` to read from next (`next`, null once there are no more).
 // - The frontend only renders what these messages carry and sends these requests: it reads nothing
 //   else of Lumiverse, and never calls the network itself.
-// - A chat's turns run built in (inside Lumiverse, in the extension: the default, with nothing to
-//   install) or in a runtime the user started (§25). Which is the chat's own (`ChatView.place`,
-//   `lah.chat.set`); a run says where it runs and, built in, when its time before the reply ends.
+// - A chat's turns run in the runtime the user starts beside Lumiverse (§25): a chat switched on is
+//   pinned to the loopback connection (`lah.chat.set`), and its replies reach the runtime there.
 // - Each area of the pages keeps its part of this file under its own heading: a builder adds to
 //   their own part, with the request's validator in `BODY`, and tells the backend's lane.
 
@@ -95,15 +94,14 @@ export const UI_VERSION = 1;
 /** How a turn ended: as core says (its reply written, failed, or stopped by the user), or lost with its runtime before core could say. */
 export type LiveEndState = TurnStatus | "lost";
 
-/** Why a turn failed or LumiAH had no part in a reply, as a code a page can act on; the sentence beside it (`reason`, `noPart.text`) stays what is shown. `no_tools`: the main agent's model took no tools and called none as text; `permission`: a permission LumiAH needs is missing (`UiState.permissions`, those `needed`); `limit`: the main agent stopped at a limit (which: `LastTurn.did.stop.code`); `skipped`: the user skipped LumiAH for the reply; `time`: the time before the reply ran out. */
-export type CauseCode = "no_tools" | "permission" | "limit" | "skipped" | "time";
+/** Why a turn failed, as a code a page can act on; the sentence beside it (`reason`) stays what is shown. `no_tools`: the main agent's model took no tools and called none as text; `permission`: a permission LumiAH needs is missing (`UiState.permissions`, those `needed`); `limit`: the main agent stopped at a limit (which: `LastTurn.did.stop.code`). */
+export type CauseCode = "no_tools" | "permission" | "limit";
 
-/** How and when a turn ended, with why in words where it didn't finish. `noPart`: the reply that followed is Lumiverse's own, LumiAH had no part in it (§25), and why; absent where the reply is LumiAH's or there was none. */
+/** How and when a turn ended, with why in words where it didn't finish. */
 export interface LiveEnded {
   state: LiveEndState;
   at: number;
   reason?: string;
-  noPart?: NoPart;
   /** Absent where the backend knows no cause a page can act on. */
   cause?: CauseCode;
 }
@@ -154,10 +152,6 @@ export interface LiveView {
   ended: LiveEnded | null;
   events: LiveEvent[];
   partials: LivePartial[];
-  /** Where it ran (§25); absent where the backend can't say (a transcript kept before there were two places). */
-  place?: RunPlace;
-  /** For a built-in reply's turn: when the time it has before the reply ends (epoch ms). Null or absent: it has no such limit (a runtime's turn, a job's run, a side session's turn). It stands after the turn ends, so the view can say how near the end it came. */
-  replyBy?: number | null;
 }
 
 /** What a page hears of a chat's live view: a new turn's view, whole, or what turn `turn` added since, with how it stands now. */
@@ -337,10 +331,10 @@ export interface RuntimeView {
   start: { service: string | null; foreground: string | null; missing: string[] };
   /** What keeps LumiAH from working that no permission (`UiState.permissions`) and no runtime's own row says (a Lumiverse too old to keep a turn's record, storage it can't write), each in plain words that say what to do; none when nothing does. */
   issues: string[];
-  /** A runtime is there to choose (§25): one is linked, the loopback key is minted and the loopback connection is made, so a chat set to run in the runtime is answered there now. */
+  /** A runtime is there to answer (§25): one is linked, the loopback key is minted and the loopback connection is made, so a chat switched on is answered now. */
   ready: boolean;
-  /** The extension that builds LumiAH in plays every chat it answers only in a runtime (LumiRPEngine): its name. The pages then say the runtime is needed, offer no built-in way, and leave switching a chat on to that extension's own pages. Absent for LumiAH, and for an extension whose chats may run built in. */
-  only?: string;
+  /** The extension that builds LumiAH in switches its chats on in its own pages (LumiRPEngine): its name. LumiAH's pages then offer no switch of their own, and say where it is. Absent for LumiAH. */
+  switchedBy?: string;
 }
 
 /**
@@ -360,10 +354,10 @@ export interface RuntimeState {
 }
 
 /**
- * First-time setup's steps, in order (§25: built in needs nothing installed): the permissions LumiAH
- * needs are granted, a chat is switched on, a reply was answered. A runtime is no step of it: it is
- * an option, and its own steps (start it, mint the key, have the connection) are worked out by the
- * Runtime page from `runtime`, `key` and `connections`, for someone who asks for one.
+ * First-time setup's steps, in order: the permissions LumiAH needs are granted, a chat is switched
+ * on, a reply was answered. The runtime's own steps (start it, mint the key, have the connection)
+ * are worked out by the Runtime page from `runtime`, `key` and `connections`, and shown there until
+ * they are done: no chat is answered without it (§25).
  */
 export type SetupStepId = "permissions" | "chat" | "reply";
 
@@ -377,14 +371,6 @@ export interface KeyView {
   print: string | null;
   at: number | null;
 }
-
-// ---------------------------------------------------------------- two ways to run (§25)
-
-/** Where a chat's turns run (§25): built in (inside Lumiverse, in the extension, before the reply; nothing to install), or in a runtime the user started beside Lumiverse (for turns that need longer than Lumiverse gives an extension before a reply). */
-export type RunPlace = "builtin" | "runtime";
-
-const PLACES: Readonly<Record<string, true>> = { builtin: true, runtime: true };
-const isPlace = (v: unknown): v is RunPlace => typeof v === "string" && Object.hasOwn(PLACES, v);
 
 /**
  * A permission LumiAH was not granted: Lumiverse's name for it (what a page asks the host to grant),
@@ -401,22 +387,12 @@ export interface PermissionNeed {
   needed: boolean;
 }
 
-/** Why LumiAH had no part in a reply (§25): its turn failed, ran out of the time it has before a reply, or was stopped before it briefed the writer. Lumiverse then sent the prompt as it was. */
-export type NoPartWhy = "failed" | "time" | "stopped";
-
-/** A reply LumiAH had no part in: why, and what happened and what to do about it, in plain words. */
-export interface NoPart {
-  why: NoPartWhy;
-  text: string;
-}
-
 // ---------------------------------------------------------------- chats and connections
 
 /**
- * A chat, and whether LumiAH answers it. Switched on, it is answered where `place` says (§25): built
- * in, whatever connection it generates on; in a runtime, through the loopback connection it is
- * pinned to. A chat that generates on a loopback connection is answered by the runtime though
- * LumiAH didn't pin it there (`chatAnswered`).
+ * A chat, and whether LumiAH answers it. Switched on, it is pinned to the loopback connection, and
+ * the runtime answers its replies there (§25). A chat that generates on a loopback connection is
+ * answered by the runtime though LumiAH didn't pin it there (`chatAnswered`).
  */
 export interface ChatView {
   chatId: string;
@@ -425,21 +401,17 @@ export interface ChatView {
   on: boolean;
   /** Since when it is on (epoch ms); null while off. */
   since: number | null;
-  /** Where its turns run while it is on: built in unless the user chose the runtime for it. It is kept while the chat is off, so switching it on again runs it where it ran. */
-  place: RunPlace;
-  /** The connection the chat generates on now (its own pin, else the user's active connection), and whether that is a loopback; null when Lumiverse names none. Built in, it is the chat's own; in a runtime, the loopback it is pinned to. */
+  /** The connection the chat generates on now (its own pin, else the user's active connection), and whether that is a loopback; null when Lumiverse names none. Switched on, it is the loopback it is pinned to. */
   connection: { id: string; name: string; loopback: boolean } | null;
   /** Another extension that has LumiAH built into itself (or LumiAH itself, seen from one) answers this chat: its identifier and its name. This backend then offers no switch for the chat: `on` is false, and switching it on is refused with `unavailable` in words that name the other. Absent where no other does. */
   other?: { identifier: string; name: string };
-  /** The chat is set to run in a runtime that isn't linked now, so its replies may fail until the runtime is back or, unless it `needsRuntime`, the chat is set to run built in (`on` stays true, `place` stays "runtime"). */
+  /** The chat is switched on, and the runtime its replies reach isn't linked now, so they fail until it is back (`on` stays true). */
   away?: true;
-  /** The extension that answers the chat plays it only in a runtime (its claim's `place`): its name. Its `place` is then always "runtime", switching it on pins it there, and no page offers built in for it. */
-  needsRuntime?: { by: string };
 }
 
-/** Whether a reply in the chat reaches LumiAH now: it is switched on to run built in, or it generates on a loopback connection (which a runtime serves). */
+/** Whether a reply in the chat reaches LumiAH now: it generates on a loopback connection, which a runtime serves. */
 export function chatAnswered(chat: ChatView): boolean {
-  return (chat.on && chat.place === "builtin") || chat.connection?.loopback === true;
+  return chat.connection?.loopback === true;
 }
 
 export type { StoryHolds, StorySetting, StorySource, StoryWord } from "../core/story";
@@ -469,10 +441,6 @@ export interface RunningTurn {
   kind: RunKind;
   startedAt: number;
   paused: boolean;
-  /** Where it runs (§25); absent where the backend doesn't say. */
-  place?: RunPlace;
-  /** For a built-in reply's turn: when the time it has before the reply ends (epoch ms). Null or absent: it has no such limit. */
-  replyBy?: number | null;
 }
 
 /** One of the user's connections: its provider and model, and whether it is the loopback (which no agent may use: its calls would come back to the runtime). */
@@ -610,12 +578,6 @@ export interface TurnRow {
   usage: AgentUsage | null;
   /** How many workspace files the turn's change set names (`lah.ws.changes`). */
   changes: number;
-  /** Where the turn ran (§25); absent on a record made before there were two places. */
-  place?: RunPlace;
-  /** LumiAH had no part in this reply (§25): it is Lumiverse's own, and this says why. `transcript` is then what LumiAH did before it gave up. */
-  noPart?: NoPart;
-  /** Its record was written after the fact: the extension restarted between the turn's two halves (`restart`), or the reply came after the wait for it had lapsed (`late`). */
-  recovered?: "restart" | "late";
 }
 
 /** A chat's session as it stands at the end of its active path: what the main agent would carry into the next turn. */
@@ -965,8 +927,7 @@ export function replyDid(events: readonly TraceRecord[]): ReplyDid {
 
 /**
  * A chat's latest turn in what the first screen says of it: the run and the message its reply is
- * on (null: none saved), when it began and how it ended (null while it runs; `ended.noPart` where
- * the reply was Lumiverse's own), where it ran and, built in, when its time before the reply ends,
+ * on (null: none saved), when it began and how it ended (null while it runs),
  * what it spent, how many agents worked and how many tool calls they made, the lore entries the
  * main agent added to and dropped from what the writer saw (§24.3), the workspace files it changed,
  * the jobs it started, its transcript where one is kept (`lah.transcript.get`), and what it came
@@ -979,8 +940,6 @@ export interface LastTurn {
   messageId: string | null;
   startedAt: number;
   ended: LiveEnded | null;
-  place: RunPlace;
-  replyBy: number | null;
   usage: AgentUsage | null;
   agents: number;
   tools: number;
@@ -1179,9 +1138,9 @@ export interface UiRequests {
   "lah.hello": { body: { active?: string | null }; result: UiState };
   /** A chat as the pages show it, whether LumiAH answers it or not. */
   "lah.chat.get": { body: { chatId: string }; result: { chat: ChatView } };
-  /** Switches LumiAH on for a chat or off, and says where its turns run (§25; `place` left out: where it ran before, built in for a chat never set). Built in, the chat keeps its own connection; in a runtime it is pinned to the loopback connection, and gets back the connection it had when it is switched off or set to run built in. Refused with `unavailable`, in words that say what to do, where `place` is the runtime and none is there to choose (`RuntimeView.ready`), and where a permission LumiAH needs is missing. */
-  "lah.chat.set": { body: { chatId: string; on: boolean; place?: RunPlace }; result: { chat: ChatView } };
-  /** Takes over a chat that bears another backend's mark (`ChatView.other`): that mark is removed, the chat gets back the connection it had, and it is switched on here, built in. */
+  /** Switches LumiAH on for a chat or off. On, the chat is pinned to the loopback connection, so the runtime answers its replies (§25); off, it gets back the connection it had. Refused with `unavailable`, in words that say what to do, where there is no loopback connection to pin it to yet, and where a permission LumiAH needs is missing. */
+  "lah.chat.set": { body: { chatId: string; on: boolean }; result: { chat: ChatView } };
+  /** Takes over a chat that bears another backend's mark (`ChatView.other`): that mark is removed, the chat gets back the connection it had, and it is switched on here, pinned to this backend's loopback connection. */
   "lah.chat.takeover": { body: { chatId: string }; result: { chat: ChatView } };
   /** What counts as a chat's story (§24.4): the chat's own choice, Settings', the word of the extension that answers it, what Lumiverse says of Sovereign Hand, and what holds. */
   "lah.chat.story.get": { body: { chatId: string }; result: { story: ChatStoryView } };
@@ -1317,7 +1276,7 @@ export interface UiRequests {
   "lah.upkeep.sweep": { body: Record<string, never>; result: UpkeepView };
 
   // -------------------------------- home
-  /** What the first screen shows of a chat (null: none is open): the chat with its switch and place, and its latest turn. */
+  /** What the first screen shows of a chat (null: none is open): the chat with its switch, and its latest turn. */
   "lah.home.get": { body: { chatId: string | null }; result: HomeView };
 
   // -------------------------------- lore (§24)
@@ -1427,7 +1386,7 @@ const isChoice = (v: unknown): v is ApprovalChoice => v === "allow" || v === "as
 const BODY: { [K in UiRequestType]: (r: Fields) => boolean } = {
   "lah.hello": (r) => r.active === undefined || isIdOrNull(r.active),
   "lah.chat.get": (r) => isId(r.chatId),
-  "lah.chat.set": (r) => isId(r.chatId) && typeof r.on === "boolean" && (r.place === undefined || isPlace(r.place)),
+  "lah.chat.set": (r) => isId(r.chatId) && typeof r.on === "boolean",
   "lah.chat.takeover": (r) => isId(r.chatId),
   "lah.chat.story.get": (r) => isId(r.chatId),
   "lah.chat.story.set": (r) => isId(r.chatId) && isRecord(r.story) && Object.entries(r.story).every(([member, value]) => STORY_MEMBERS.includes(member as keyof StorySetting) && storyValue(member as keyof StorySetting, value)),

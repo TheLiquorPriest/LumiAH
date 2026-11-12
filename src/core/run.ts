@@ -62,13 +62,6 @@ export interface HarnessOptions {
    * no user (`""`): enough where its backend serves one user, as behind a runtime's link.
    */
   userId?: string;
-  /**
-   * Where this core runs (§25): built in, inside Lumiverse, or in a runtime. A chat whose claim says
-   * it plays only in a runtime (`ChatClaim.place`) never has a job or a side session run by a core
-   * that runs built in. Absent: a turn's own call says where it runs (`prepare` built in, `answer`
-   * in a runtime), and jobs and side sessions run wherever they are asked to.
-   */
-  place?: "builtin" | "runtime";
 }
 
 /** What a harness keeps across runs. */
@@ -159,7 +152,6 @@ function claimOf(raw: unknown): ChatClaim | null {
     ...(guidance && typeof guidance.path === "string" ? { guidance: { name: guidance.name as string, path: guidance.path } } : guidance && typeof guidance.text === "string" ? { guidance: { name: guidance.name as string, text: guidance.text } } : {}),
     ...(Array.isArray(raw.withdraw) ? { withdraw: raw.withdraw.filter((name): name is string => typeof name === "string") } : {}),
     ...(Object.keys(story).length > 0 ? { story } : {}),
-    ...(raw.place === "runtime" ? { place: "runtime" as const } : {}),
     ...(raw.request === "whole" || raw.request === "newest" ? { request: raw.request } : {}),
     ...(raw.reply === "released" ? { reply: "released" as const } : {}),
   };
@@ -255,8 +247,6 @@ export interface RunStart {
   spent?: { usage: AgentUsage; workedMs: number };
   /** Told when the user holds the run and when they let it go. */
   held?: (paused: boolean) => void;
-  /** Where the host writes the reply (§25): when the reply is due, for the trace. */
-  replyBy?: number;
 }
 
 /** What a run's agents read and write, once that is known: the chat and its lore, the workspace's areas, the main agent's earlier turns, and the turn a job started from this run belongs to. */
@@ -295,8 +285,6 @@ export interface AgentStart {
   notes?: true;
   /** It is the run's main agent: the one the run starts with (a turn's main agent, a job's agent, a side session's). */
   main?: true;
-  /** What the run tells this agent as it works, asked at the start of each round (how little time is left before the reply is due, §25). */
-  notices?: () => string[];
   /** Its calls are made whatever the caps on a day's spend say (`AgentSpec.uncapped`): the writer's call of the reply the user waits for. */
   uncapped?: true;
   /** Told as each of its model calls comes back (`AgentSpec.onCall`). */
@@ -384,8 +372,6 @@ export class Run {
     this.agents = new AgentTurn(start.budget, start.startedAt - (start.spent?.workedMs ?? 0), this.trace, start.words);
     if (start.spent) addUsage(this.agents.usage, start.spent.usage);
     this.trace.turn = this.agents;
-    // Where the host writes the reply (§25): no call of the run's agents is given longer than the time left before it is due.
-    this.agents.replyBy = start.replyBy ?? null;
     const job = this.info.kind === "job";
     // A cap on a day's spend is asked about each call before it is made, with its prompt as estimated and that prompt's cost where the user priced its model; the call then holds that much against the caps while it is under way. A call that is made whatever they say only holds.
     this.agents.limits = (call) => {
@@ -398,8 +384,8 @@ export class Run {
     this.deps = { host, settings: this.settings, texts: this.texts, accounts: shared.accounts, turn: this.agents, approval: approvalGate(host, this.settings, this.info, approved) };
     this.delegator = new Delegator(this);
     shared.runs.set(this.info.id, this);
-    // Where the core runs inside Lumiverse (§25), an agent with no connection set uses the one this generation runs on, else the chat's own.
-    this.ownConnection = start.turn?.connectionId ?? setup.chat?.connectionId ?? null;
+    // An agent with no connection set uses the chat's own, where the host names one.
+    this.ownConnection = setup.chat?.connectionId ?? null;
     this.trace.emit({
       kind: "turn_started",
       turn: this.info.id,
@@ -408,7 +394,6 @@ export class Run {
       messageId: start.messageId,
       ...(start.job !== undefined ? { job: start.job } : {}),
       ...(start.side !== undefined ? { side: start.side } : {}),
-      ...(start.replyBy !== undefined ? { replyBy: start.replyBy } : {}),
       at: start.startedAt,
     });
   }
@@ -419,11 +404,6 @@ export class Run {
   /** The guidance its agents are given, each level as their instructions hold it (§12): what the writer is given beside the brief where Settings say so. */
   guidanceLines(): readonly string[] {
     return this.prefix;
-  }
-
-  /** Lets go of the agents its agents started: their work is cancelled and their handles are gone. A turn handing its reply over does this (§25); a run that ends does it too. */
-  letGo(): void {
-    this.delegator.close();
   }
 
   /**
@@ -611,7 +591,6 @@ export class Run {
         ...(how.task !== undefined ? { task: how.task } : {}),
         ...(how.as !== undefined ? { as: how.as } : {}),
         ...(how.notes ? { notes: () => this.said.splice(0) } : {}),
-        ...(how.notices ? { notices: how.notices } : {}),
       },
       this.deps,
     );

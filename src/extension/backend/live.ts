@@ -20,7 +20,7 @@
 
 import type { RunKind, TraceDelta, TraceRecord } from "../../core/ports";
 import { CEILINGS, type TransportSettings } from "../../link/settings";
-import type { CauseCode, LiveChange, LiveEnded, LivePartial, LiveView, NoPart, RunningTurn, RunPlace, StreamId, UiDeltaPush, UiLivePush } from "../../shared/ui";
+import type { CauseCode, LiveChange, LiveEnded, LivePartial, LiveView, RunningTurn, StreamId, UiDeltaPush, UiLivePush } from "../../shared/ui";
 import { UI_VERSION } from "../../shared/ui";
 import { causeOf } from "./cause";
 import type { BackendHost } from "./spindle";
@@ -33,25 +33,13 @@ interface InFlight {
   at: number;
 }
 
-/**
- * The runtime a run that runs here, built in, is kept under (DESIGN §25): no runtime's. A runtime's
- * registration has an id of its own, never empty, so the two can't be taken for each other.
- */
-export const BUILTIN = "";
-
-/**
- * A run as it begins: the stream it is followed under, its chat (null: a side session about none),
- * its id, what it is, the message a reply targets, and, where its starter says, where it runs and
- * (a built-in reply's turn) when the time it has before the reply ends.
- */
+/** A run as it begins: the stream it is followed under, its chat (null: a side session about none), its id, what it is, and the message a reply targets. */
 export interface RunStart {
   stream: StreamId;
   chatId: string | null;
   turn: string;
   kind: RunKind;
   messageId: string | null;
-  place?: RunPlace;
-  replyBy?: number | null;
 }
 
 /** A run that ended, by its own word or lost. */
@@ -76,10 +64,6 @@ interface LiveTurn extends RunStart {
   answered: Map<string, number>;
   /** The user holds its agents at their next round (§18), as its trace last said. */
   paused: boolean;
-  /** LumiAH had no part in the reply this turn was for (§25), and why: said with how the turn ended. */
-  noPart: NoPart | null;
-  /** Why, as a code a page can act on, where whoever said LumiAH had no part knew one the trace can't tell (the user's skip, a first half that never returned). */
-  cause: CauseCode | null;
   /** The buffer was only told of it by a runtime's trace record: no generation of Lumiverse's stands behind it, so a runtime can start any number of them. */
   told: boolean;
 }
@@ -198,27 +182,25 @@ export class LiveBuffer {
 
   private viewOf(turn: LiveTurn, events: TraceRecord[]): LiveView {
     const partials = [...turn.partials].map(([agentId, p]): LivePartial => ({ agentId, call: p.call, text: p.text, reasoning: p.reasoning, at: p.at }));
-    return { stream: turn.stream, chatId: turn.chatId, turn: turn.turn, kind: turn.kind, messageId: turn.messageId, startedAt: turn.startedAt, ended: turn.ended, events, partials, place: turn.place ?? (turn.relay === BUILTIN ? "builtin" : "runtime"), ...(turn.replyBy !== undefined ? { replyBy: turn.replyBy } : {}) };
+    return { stream: turn.stream, chatId: turn.chatId, turn: turn.turn, kind: turn.kind, messageId: turn.messageId, startedAt: turn.startedAt, ended: turn.ended, events, partials };
   }
 
   /**
-   * Why a turn that failed, or whose reply LumiAH had no part in, came to that, as a code a page
-   * can act on (cause.ts): what its ender said, else a needed permission that is missing, else what
-   * its own trace tells. Null for a turn that ended well, and where none of these is known.
+   * Why a turn that failed came to that, as a code a page can act on (cause.ts): what its ender
+   * said, else a needed permission that is missing, else what its own trace tells. Null for a turn
+   * that didn't fail, and where none of these is known.
    */
   private causeFor(turn: LiveTurn, ended: LiveEnded): CauseCode | null {
     if (ended.cause !== undefined) return ended.cause;
-    if (turn.cause !== null) return turn.cause;
-    const failed = ended.state === "failed" || turn.noPart?.why === "failed";
-    if (!failed && turn.noPart === null) return null;
-    return failed && this.env.missing?.() === true ? "permission" : causeOf(turn.events);
+    if (ended.state !== "failed") return null;
+    return this.env.missing?.() === true ? "permission" : causeOf(turn.events);
   }
 
   private end(turn: LiveTurn, ended: LiveEnded): void {
     if (turn.ended !== null) return;
     turn.partials.clear();
     const cause = this.causeFor(turn, ended);
-    turn.ended = { ...ended, ...(turn.noPart !== null ? { noPart: turn.noPart } : {}), ...(cause !== null ? { cause } : {}) };
+    turn.ended = { ...ended, ...(cause !== null ? { cause } : {}) };
     turn.paused = false;
     this.tell(turn.userId);
     for (const listener of this.finished) listener({ userId: turn.userId, stream: turn.stream, chatId: turn.chatId, turn: turn.turn, kind: turn.kind, messageId: turn.messageId, ended: turn.ended });
@@ -288,7 +270,7 @@ export class LiveBuffer {
       account = { streams: new Map(), runs: new Map() };
       this.accounts.set(userId, account);
     }
-    const turn: LiveTurn = { ...run, userId, relay, startedAt: this.env.now(), ended: null, events: [], overAt: null, unnamed: 0, partials: new Map(), answered: new Map(), paused: false, noPart: null, cause: null, told };
+    const turn: LiveTurn = { ...run, userId, relay, startedAt: this.env.now(), ended: null, events: [], overAt: null, unnamed: 0, partials: new Map(), answered: new Map(), paused: false, told };
     // Put last, so the streams let go for room are the ones whose turns began longest ago.
     account.streams.set(run.stream, turn);
     account.runs.set(turn.turn, turn);
@@ -424,24 +406,23 @@ export class LiveBuffer {
 
   /**
    * Every so often: a turn whose generation ended a while ago and that never said it ended is
-   * lost, and so is a run in a runtime whose link has been gone for as long as a runtime itself
-   * waits for the extension before it ends its work (`runtime.lostMs`): neither a ping nor a
-   * generation's end would ever come to end it.
+   * lost, and so is a run whose runtime's link has been gone for as long as a runtime itself waits
+   * for the extension before it ends its work (`runtime.lostMs`): neither a ping nor a generation's
+   * end would ever come to end it.
    */
   async tick(): Promise<void> {
     const now = this.env.now();
     for (const [userId, account] of [...this.accounts]) {
-      const waiting = [...account.streams.values()].filter((turn) => turn.ended === null && (turn.overAt !== null || turn.relay !== BUILTIN));
+      const waiting = [...account.streams.values()].filter((turn) => turn.ended === null);
       if (waiting.length === 0) continue;
       const { live, runtime } = await this.env.transport(userId);
       for (const turn of waiting) {
         // The wait may have seen it end, replaced or let go.
         if (turn.ended !== null || account.runs.get(turn.turn) !== turn) continue;
         if (turn.overAt !== null && now - turn.overAt > live.lostMs) {
-          this.lose(turn, turn.relay === BUILTIN ? "Lumiverse ended this reply's generation, and the turn never said how it ended." : "Lumiverse ended this reply's generation and the runtime never said how its turn ended.");
+          this.lose(turn, "Lumiverse ended this reply's generation and the runtime never said how its turn ended.");
           continue;
         }
-        if (turn.relay === BUILTIN) continue;
         const gone = this.env.linkGoneFor(userId, turn.relay);
         if (gone !== null && gone >= runtime.lostMs) this.lose(turn, `The runtime this ran in went away: its link has been gone for ${Math.round(gone / 1000)} seconds. The run ended with the runtime${turn.kind === "job" ? "; once the runtime is back, the job shows as interrupted" : ""}.`);
       }
@@ -459,35 +440,6 @@ export class LiveBuffer {
     return this.accounts.get(userId)?.runs.get(turnId)?.stream ?? null;
   }
 
-  /**
-   * LumiAH had no part in the reply a turn was for (§25): said with how the turn ended, now when it
-   * has ended already, else when it does. `cause`: why, as a code, where the caller knows one the
-   * turn's trace can't tell.
-   */
-  noPart(userId: string, turnId: string, noPart: NoPart, cause?: CauseCode): void {
-    const turn = this.accounts.get(userId)?.runs.get(turnId);
-    if (turn === undefined) return;
-    turn.noPart = noPart;
-    if (cause !== undefined) turn.cause = cause;
-    if (turn.ended === null) return;
-    const { cause: _before, ...ended } = turn.ended;
-    const why = this.causeFor(turn, ended);
-    turn.ended = { ...ended, noPart, ...(why !== null ? { cause: why } : {}) };
-    this.say(turn, { turn: turn.turn, events: [], ended: turn.ended });
-    this.tell(userId);
-  }
-
-  /**
-   * A run ends by the backend's own word: its core never traced how it ended (it never began, or
-   * the prompt had to go on without it). One that has ended already is left as it ended.
-   */
-  finish(userId: string, turnId: string, ended: LiveEnded): void {
-    const turn = this.accounts.get(userId)?.runs.get(turnId);
-    if (turn === undefined || turn.ended !== null) return;
-    this.end(turn, ended);
-    this.say(turn, { turn: turn.turn, events: [], ended: turn.ended });
-  }
-
   /** A stream's latest run, whole: every event the buffer holds of it. Null when the stream has had none since the extension started, or the buffer has let it go. */
   whole(userId: string, stream: StreamId): LiveView | null {
     const turn = this.accounts.get(userId)?.streams.get(stream);
@@ -499,7 +451,7 @@ export class LiveBuffer {
     const out: RunningTurn[] = [];
     for (const turn of this.accounts.get(userId)?.streams.values() ?? []) {
       if (turn.ended !== null) continue;
-      out.push({ stream: turn.stream, chatId: turn.chatId, turn: turn.turn, kind: turn.kind, startedAt: turn.startedAt, paused: turn.paused, place: turn.place ?? (turn.relay === BUILTIN ? "builtin" : "runtime"), ...(turn.replyBy !== undefined ? { replyBy: turn.replyBy } : {}) });
+      out.push({ stream: turn.stream, chatId: turn.chatId, turn: turn.turn, kind: turn.kind, startedAt: turn.startedAt, paused: turn.paused });
     }
     return out;
   }

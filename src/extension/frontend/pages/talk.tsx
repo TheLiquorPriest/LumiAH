@@ -137,6 +137,23 @@ function Conversation(props: { session: SideSession; working: boolean; onBack():
     const scroller = foot.current ? scrollParent(foot.current) : null;
     if (scroller) scroller.scrollTop = scroller.scrollHeight;
   }, [last]);
+  // The box to say more sticks at the pane's foot, and an answer's transcript above it keeps its own
+  // foot ("Back to top") there too: the box's height, with the gap under it, is measured for that
+  // foot to rise over it (styles/live.ts), as the stylesheet can't know how tall the box has grown.
+  // While the agent works the box isn't there and nothing sticks.
+  useLayoutEffect(() => {
+    const el = foot.current;
+    const pane = el?.parentElement;
+    if (props.working || !el || !pane) return;
+    const publish = (): void => pane.style.setProperty("--lah-page-foot-h", `${Math.ceil(el.getBoundingClientRect().height + (Number.parseFloat(getComputedStyle(el).bottom) || 0))}px`);
+    publish();
+    const observer = new ResizeObserver(publish);
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+      pane.style.removeProperty("--lah-page-foot-h");
+    };
+  }, [props.working]);
   const say = (): void => {
     if (!canSend(text)) return;
     send(async () => {

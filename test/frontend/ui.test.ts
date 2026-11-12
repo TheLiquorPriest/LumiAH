@@ -239,9 +239,6 @@ describe("what the backend takes for a request", () => {
       ["lah.relay", { op: "rotate" }],
       ["lah.blob.get", { hash: "x".repeat(257) }],
       ["lah.text.set", { id: "main.system" }],
-      // Where a chat runs is one of the two places, and nothing else.
-      ["lah.chat.set", { chatId: "chat-mara", on: true, place: "cloud" }],
-      ["lah.chat.set", { chatId: "chat-mara", on: true, place: null }],
       ["lah.job.start", { chatId: "chat-mara", agent: "main", task: "Learn this story.", when: "now", story: false }],
       // Home's read names a chat or none; the pages of a chat's lore and chronicle always name one.
       ["lah.home.get", {}],
@@ -288,20 +285,16 @@ describe("what a page works out for itself", () => {
     }
   });
 
-  test("a chat is answered where it is switched on to run built in, or generates on a loopback connection, whatever the switch last said", () => {
+  test("a chat is answered where it generates on a loopback connection, whatever the switch last said", () => {
     const chat = { chatId: "chat-mara", name: "Mara at the harbour", since: 1 };
     const loopback = { id: "c1", name: "LumiAH loopback", loopback: true };
     const own = { id: "c2", name: "Deepseek", loopback: false };
-    const answered = (over: Pick<ChatView, "on" | "place" | "connection">): boolean => chatAnswered({ ...chat, ...over });
-    // Built in, the chat keeps its own connection, and no connection at all doesn't matter.
-    expect(answered({ on: true, place: "builtin", connection: own })).toBe(true);
-    expect(answered({ on: true, place: "builtin", connection: null })).toBe(true);
-    expect(answered({ on: false, place: "builtin", connection: own })).toBe(false);
-    // In a runtime, it is answered through the loopback: off it, its replies don't reach LumiAH.
-    expect(answered({ on: true, place: "runtime", connection: loopback })).toBe(true);
-    expect(answered({ on: true, place: "runtime", connection: own })).toBe(false);
-    expect(answered({ on: true, place: "runtime", connection: null })).toBe(false);
-    expect(answered({ on: false, place: "runtime", connection: loopback })).toBe(true);
+    const answered = (over: Pick<ChatView, "on" | "connection">): boolean => chatAnswered({ ...chat, ...over });
+    // Its replies reach the runtime through the loopback; on any other connection, or none, they don't reach LumiAH.
+    expect(answered({ on: true, connection: loopback })).toBe(true);
+    expect(answered({ on: false, connection: loopback })).toBe(true);
+    expect(answered({ on: true, connection: own })).toBe(false);
+    expect(answered({ on: true, connection: null })).toBe(false);
   });
 
   test("a chronicle line's citations are read in the order written, each with where it starts", () => {

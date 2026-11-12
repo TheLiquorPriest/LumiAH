@@ -79,12 +79,6 @@ export interface AgentSpec {
    * to this agent while it works.
    */
   notes?: () => string[];
-  /**
-   * What its run has to tell it as it works (how little time is left before the reply is due,
-   * DESIGN §25): asked at the start of each round like `notes`, and told the same way, as the
-   * runtime's words. The transcript keeps each as a notice.
-   */
-  notices?: () => string[];
 }
 
 export interface AgentReply {
@@ -183,12 +177,6 @@ export class AgentTurn {
   limits: ((call: { estimate: number; model: string; always: boolean }) => AgentStop | (() => void) | null) | null = null;
   /** Told when an agent of the run comes to rest on the user's hold: by then what it has done is whole, so whoever keeps the run's session keeps it now (§22). */
   onHeld: (() => void) | null = null;
-  /**
-   * Where the host writes the reply (DESIGN §25): the moment the reply is due, on the host's clock.
-   * From then on the run's agents begin no call and no round, and a model call under way then is
-   * given up: no call is given longer than the time left. Null: no reply is due at a set moment.
-   */
-  replyBy: number | null = null;
   private pausedAt: number | null = null;
   private pausedFor = 0;
   private waiting: (() => void)[] = [];
@@ -671,10 +659,6 @@ class Agent implements AgentHandle {
       this.tell(this.text(TEXT.agents.note, { text: note }));
       this.record({ kind: "note", text: note, at: this.now() });
     }
-    for (const text of this.spec.notices?.() ?? []) {
-      this.tell(text);
-      this.record({ kind: "notice", text, at: this.now() });
-    }
   }
 
   /** Something for the model to read where it reads on from: with a round's results where the conversation ends on them, else as a message of its own. */
@@ -737,13 +721,12 @@ class Agent implements AgentHandle {
     return Math.max(0, Math.floor((window - after) * charsPerToken) - framing - notice);
   }
 
-  /** The agent's or the run's time, run out before a call or a round; or, where the host writes the reply, the moment the reply is due, come. */
+  /** The agent's or the run's time, run out before a call or a round. */
   private timeUp(): AgentStop | null {
     const now = this.now();
     if (this.spent(now) >= limitOf(this.spec.budget.wallMs)) return new AgentStop("wall_time", { id: TEXT.stop.wallTime });
     const turn = this.deps.turn;
     if (turn && now - turn.startedAt - turn.held(now) >= limitOf(turn.budget.wallMs)) return new AgentStop("turn_time", { id: turn.words.time });
-    if (turn && now >= limitOf(turn.replyBy)) return new AgentStop("reply_time", { id: TEXT.hosted.stop });
     return null;
   }
 
@@ -823,8 +806,8 @@ class Agent implements AgentHandle {
 
   /**
    * The signal a call (`call`) or a round's tool runs go with: ended by `cancel`, by the send's own
-   * signal, and by each deadline left: the agent's time, the run's and, for a call, its own and the
-   * moment the run's reply is due (`AgentTurn.replyBy`). The deadlines wait on the host's clock, and
+   * signal, and by each deadline left: the agent's time, the run's and, for a call, its own. The
+   * deadlines wait on the host's clock, and
    * `clear` ends their waits once the call or the round is over. The agent's time and the run's
    * leave out the time the user held the run and the time a call waited for their word, so when
    * such a deadline's wait is over the time left is worked out again, and whatever is left is
@@ -860,9 +843,6 @@ class Agent implements AgentHandle {
     if (call) {
       const until = this.now() + limitOf(this.spec.budget.callMs);
       deadline(() => until - this.now(), new AgentStop("call_time", { id: TEXT.stop.callTime }));
-      // Where the host writes the reply, a call begun before the reply is due is given no longer than the time left: what it brought after that would be handed to nobody.
-      const due = limitOf(turn?.replyBy ?? null);
-      deadline(() => due - this.now(), new AgentStop("reply_time", { id: TEXT.hosted.stop }));
     }
     return { signal: AbortSignal.any(sources), clear: () => over.abort() };
   }

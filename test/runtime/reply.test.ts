@@ -1,11 +1,11 @@
-// The runtime as a chat that requires it needs it (DESIGN §6, §21, §25): the engine writes the reply
-// itself, so each released passage and a character's answer handed on reach Lumiverse as one
-// reply, in order, each as it is released; Stop ends the turn wherever it is and tells the extension
-// what had been released; a chat its extension plays only in the runtime is never offered or run
-// built in, and with no runtime linked its reply fails in plain words; a restart mid-turn ends the
-// reply in plain words and the chat goes on; a dropped link comes back by itself; and a refused link
-// version says which side to update and how. Each test runs the real runtime, the real backend and
-// the core's own harness over the fake Lumiverse, with a scripted model behind the backend.
+// The runtime, which every chat needs (DESIGN §6, §21): the engine writes the reply itself, so each
+// released passage and a character's answer handed on reach Lumiverse as one reply, in order, each
+// as it is released; Stop ends the turn wherever it is and tells the extension what had been
+// released; with no runtime linked a chat's reply fails in plain words and nothing answers in the
+// runtime's place; a restart mid-turn ends the reply in plain words and the chat goes on; a dropped
+// link comes back by itself; and a refused link version says which side to update and how. Each
+// test runs the real runtime, the real backend and the core's own harness over the fake Lumiverse,
+// with a scripted model behind the backend.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import type { AgentDefinition } from "../../src/core/agents";
@@ -45,27 +45,24 @@ interface Heard {
 
 /**
  * An extension that plays the harbour's chats itself, as LumiRPEngine does: its author is the main
- * agent of every chat it claims and releases the reply passage by passage, Okoro is a character the
- * author hands the reply to, and the chat plays only in the runtime while `rules.only` holds. It
- * keeps back a passage that says "[kept back]", and hears each release, each agent's start, each
- * call of its tool and each turn's end.
+ * agent of every chat it claims and releases the reply passage by passage, and Okoro is a character
+ * the author hands the reply to. It keeps back a passage that says "[kept back]", and hears each
+ * release, each agent's start, each call of its tool and each turn's end.
  */
-function harbourPlay(): { options: BackendOptions; heard: Heard; rules: { only: boolean } } {
+function harbourPlay(): { options: BackendOptions; heard: Heard } {
   const heard: Heard = { ended: [], asked: [], released: [], models: [], tools: [] };
-  const rules = { only: true };
   const base = defaultSettings().agents.main as AgentDefinition;
   // A sub-agent is handed only tools its delegator holds (Settings' delegation grant), so the author holds the lamp log it lets Okoro read.
   const author: AgentDefinition = { ...base, id: "author", name: "Author", description: "Plays the harbour's story.", instructions: AUTHOR, given: "request", tools: ["reply_write", "delegate", "lamp_log"] };
   const okoro: AgentDefinition = { ...base, id: "okoro", name: "Okoro", description: "Okoro, who keeps the light.", instructions: OKORO, given: "task", tools: ["lamp_log"] };
   return {
     heard,
-    rules,
     options: {
       identity: { identifier: "harbour_play", name: "Harbour Play", connectionName: "Harbour Play loopback" },
       extension: {
         name: "Harbour Play",
         definitions: async () => ({ agents: [author, okoro] }),
-        claim: async () => ({ mainAgent: "author", ...(rules.only ? { place: "runtime" as const, reply: "released" as const } : {}) }),
+        claim: async () => ({ mainAgent: "author", reply: "released" as const }),
         agentModel: async (ask) => {
           heard.models.push(ask);
           return null;
@@ -180,8 +177,8 @@ describe("the reply a runtime streams", () => {
   });
 });
 
-describe("a chat its extension plays only in the runtime", () => {
-  test("is set to the runtime by itself and never offered built in; with no runtime linked its reply fails in plain words, and nothing works on it built in", async () => {
+describe("a chat whose runtime is gone", () => {
+  test("says so in its view and in the extension's runtime state, in plain words; its reply fails, the user told first, and nothing answers in the runtime's place", async () => {
     const sample = harbourPlay();
     const power = plug();
     const it = (r = await rig({ backend: sample.options, wire: power.wire }));
@@ -189,10 +186,9 @@ describe("a chat its extension plays only in the runtime", () => {
     const chat = it.host.addChat(USER, "The lamp room");
     it.host.say(chat.id, "user", "Who lit the lamp?");
 
-    // Built in is refused for it, in words that say why; switched on, it goes to the runtime by itself.
-    await expect(it.page.request("lah.chat.set", { chatId: chat.id, on: true, place: "builtin" })).rejects.toThrow("Harbour Play plays this chat only in your runtime, so it can't run built in.");
+    // Switched on, it is pinned to the loopback connection, and the extension reads its runtime as ready.
     const on = (await it.page.request("lah.chat.set", { chatId: chat.id, on: true })).chat;
-    expect(on).toMatchObject({ on: true, place: "runtime", needsRuntime: { by: "Harbour Play" }, connection: { loopback: true } });
+    expect(on).toMatchObject({ on: true, connection: { loopback: true } });
     expect(it.host.chatList.get(chat.id)?.metadata.connection_profile_id).toBe(on.connection?.id);
     expect(await it.backend.runtimeState(USER, chat.id)).toMatchObject({ linked: true, ready: true, connection: true, words: null });
 
@@ -202,14 +198,14 @@ describe("a chat its extension plays only in the runtime", () => {
     power.pull();
     await until(() => !it.backend.relays.isLinked(USER, it.registration.relay), "the runtime's link to be gone");
     expect(heard).toContain(USER);
-    // The chat's view says so, still set to the runtime; and the extension reads the same in plain words.
-    expect((await it.page.request("lah.chat.get", { chatId: chat.id })).chat).toMatchObject({ on: true, place: "runtime", away: true, needsRuntime: { by: "Harbour Play" } });
+    // The chat's view says so, still pinned to the runtime; and the extension reads the same in plain words.
+    expect((await it.page.request("lah.chat.get", { chatId: chat.id })).chat).toMatchObject({ on: true, away: true, connection: { loopback: true } });
     const state = await it.backend.runtimeState(USER, chat.id);
     expect(state).toMatchObject({ linked: false, ready: false, connection: true });
     expect(state.words).toContain("Start it again");
     expect(state.start.service).toContain("up --url");
 
-    // A reply: the user is told before it fails, with no built-in way offered; nothing answers at the loopback's address, so Lumiverse fails it.
+    // A reply: the user is told before it fails; nothing answers at the loopback's address, so Lumiverse fails it.
     const out = await it.lumiverse.generate(
       async () => {
         throw new TypeError("Unable to connect. Is the computer able to access the url?");
@@ -220,30 +216,10 @@ describe("a chat its extension plays only in the runtime", () => {
     expect(out.status).not.toBe(200);
     expect(out.error?.message).toContain("Unable to connect");
     await it.backend.settle();
-    expect(it.host.toasts.map((t) => t.text)).toContain("Harbour Play plays this chat only in your runtime, which isn't answering, so this reply will fail. Start the runtime (its line is on Harbour Play's Runtime page), then send your message again.");
-    expect(it.host.toasts.some((t) => t.text.includes("Built in"))).toBe(false);
-    // Nothing of it ran built in: no prompt went to Lumiverse's own generation, and no model was called for it.
+    expect(it.host.toasts.map((t) => t.text)).toContain("Harbour Play's runtime isn't answering, so this reply will fail. Start the runtime (its line is on Harbour Play's Runtime page), then send your message again.");
+    // Nothing stood in for the runtime: no prompt went to Lumiverse's own generation, and no model was called for the chat.
     expect(it.lumiverse.provided).toEqual([]);
     expect(it.host.calls).toEqual([]);
-  });
-
-  test("switched on built in before its extension said so, reads as off and is never worked on built in", async () => {
-    const sample = harbourPlay();
-    sample.rules.only = false;
-    const it = (r = await rig({ backend: sample.options }));
-    const chatId = await it.setUpBuiltin("The lamp room");
-    // The extension now plays the chat only in the runtime.
-    sample.rules.only = true;
-    expect((await it.page.request("lah.chat.get", { chatId })).chat).toMatchObject({ on: false, place: "runtime", needsRuntime: { by: "Harbour Play" } });
-
-    const out = await it.generate(chatId);
-
-    // Lumiverse's own generation wrote the reply from the prompt as it came: no agent of the core's worked on it, and it is no turn of LumiAH's.
-    expect(out.error).toBeNull();
-    expect(it.lumiverse.provided).toHaveLength(1);
-    expect(it.host.calls).toEqual([]);
-    expect(out.breakdown).toEqual([]);
-    expect(it.backend.live.runningOf(USER)).toEqual([]);
   });
 });
 
@@ -319,7 +295,7 @@ describe("an agent with no connection of its own, in a chat that plays in the ru
     const chat = it.host.addChat(USER, "Harbour light");
     chat.metadata.connection_profile_id = "conn-own";
     it.host.say(chat.id, "user", "Who keeps the harbour light now?");
-    await it.page.request("lah.chat.set", { chatId: chat.id, on: true, place: "runtime" });
+    await it.page.request("lah.chat.set", { chatId: chat.id, on: true });
     it.host.script = [
       { toolCalls: [toolCall("write_reply", { brief: "Okoro keeps the light." })] },
       "Okoro keeps it now.",
@@ -336,7 +312,7 @@ describe("an agent with no connection of its own, in a chat that plays in the ru
     // A chat that had no connection of its own before its pin ran on the one selected in Lumiverse, so its agents run on that one.
     const bare = it.host.addChat(USER, "The fish market");
     it.host.say(bare.id, "user", "What does Brann sell on market day?");
-    await it.page.request("lah.chat.set", { chatId: bare.id, on: true, place: "runtime" });
+    await it.page.request("lah.chat.set", { chatId: bare.id, on: true });
     it.host.select(USER, "conn-own");
     const selected = await it.generate(bare.id);
     expect(selected.error).toBeNull();
@@ -352,13 +328,12 @@ describe("an agent with no connection of its own, in a chat that plays in the ru
   });
 });
 
-describe("a backend that plays every chat only in the runtime", () => {
-  test("names itself on the Runtime view, sets each chat to the runtime and refuses built in, and its runtime's health names it", async () => {
-    const it = (r = await rig({ backend: { identity: { identifier: "harbour_play", name: "Harbour Play", connectionName: "Harbour Play loopback" }, place: "runtime" } }));
+describe("a backend that switches its chats on in its own pages", () => {
+  test("names itself on the Runtime view, pins its chats to the runtime like any, and its runtime's health names it", async () => {
+    const it = (r = await rig({ backend: { identity: { identifier: "harbour_play", name: "Harbour Play", connectionName: "Harbour Play loopback" }, ownSwitch: true } }));
     const chatId = await it.setUp();
-    expect((await it.page.request("lah.hello", {})).runtime.only).toBe("Harbour Play");
-    expect((await it.page.request("lah.chat.get", { chatId })).chat).toMatchObject({ on: true, place: "runtime", needsRuntime: { by: "Harbour Play" } });
-    await expect(it.page.request("lah.chat.set", { chatId, on: true, place: "builtin" })).rejects.toThrow("Harbour Play plays this chat only in your runtime, so it can't run built in.");
+    expect((await it.page.request("lah.hello", {})).runtime.switchedBy).toBe("Harbour Play");
+    expect((await it.page.request("lah.chat.get", { chatId })).chat).toMatchObject({ on: true, connection: { loopback: true } });
     const health = await it.runtime.fetch(new Request(`http://127.0.0.1:${PORT}/healthz`, { headers: { host: `127.0.0.1:${PORT}` } }));
     expect(await health.json()).toMatchObject({ link: "up", backend: "Harbour Play" });
   });

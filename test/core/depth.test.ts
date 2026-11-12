@@ -1,15 +1,15 @@
-// What LumiAH gives an extension that writes its own story engine on it (DESIGN §3.4, §14, §15, §21,
-// §25): the reply released a passage at a time, a sub-agent's answer handed the reply's stream, the
+// What LumiAH gives an extension that writes its own story engine on it (DESIGN §3.4, §14, §15,
+// §21): the reply released a passage at a time, a sub-agent's answer handed the reply's stream, the
 // extension's word on each agent's model and on each passage, jobs in lanes and due by the next
-// turn, and a claim that keeps a chat to the runtime, shows the main agent only the user's newest
-// message, and lets nothing but released text be the reply.
+// turn, and a claim that shows the main agent only the user's newest message and lets nothing but
+// released text be the reply.
 
 import { describe, expect, test } from "bun:test";
 import type { AgentDefinition } from "../../src/core/agents";
 import type { AgentModelAsk, ChatClaim, HarnessExtension, ReplyRelease } from "../../src/core/extension";
 import { Gate } from "../../src/core/gate";
 import { createHarness } from "../../src/core/harness";
-import type { ModelRequest, TurnRequest } from "../../src/core/ports";
+import type { ModelRequest } from "../../src/core/ports";
 import { HarnessRefusal } from "../../src/core/refusal";
 import { defaultSettings, newAgentSettings, type Settings } from "../../src/core/settings";
 import { renderDefault, TEXT } from "../../src/core/texts";
@@ -40,7 +40,7 @@ function lines(parts: { author?: Answer[]; voice?: Answer[] }): Script {
 }
 
 /** A chat an extension claims for its author, the extension hearing every passage released. */
-function rig(script: Script, options: { claim?: ChatClaim | null; extension?: Partial<HarnessExtension>; place?: "builtin" | "runtime"; change?: (s: Settings) => void } = {}) {
+function rig(script: Script, options: { claim?: ChatClaim | null; extension?: Partial<HarnessExtension>; change?: (s: Settings) => void } = {}) {
   const host = new MemoryHost();
   host.script = script;
   host.say(CHAT, "assistant", "The lamp room is cold.");
@@ -55,7 +55,7 @@ function rig(script: Script, options: { claim?: ChatClaim | null; extension?: Pa
     released: async (release) => void released.push(structuredClone(release)),
     ...options.extension,
   };
-  const harness = createHarness(host, { settings: async () => structuredClone(stored), extension, ...(options.place ? { place: options.place } : {}) });
+  const harness = createHarness(host, { settings: async () => structuredClone(stored), extension });
   /** The calls one agent made, in order. */
   const callsOf = (instructions: string): ModelRequest[] => host.calls.filter((request) => system(request).includes(instructions));
   return { host, harness, released, callsOf };
@@ -90,14 +90,6 @@ describe("the reply, released by the agents (§3.4)", () => {
       ["author", "Mara looks up."],
       ["author", ' "I saw the boat."'],
     ]);
-  });
-
-  test("built in, reply_write is refused with a plain reason, and Lumiverse writes the reply", async () => {
-    const r = rig(lines({ author: [{ toolCalls: [call("reply_write", { text: "Mara nods." })] }, "Mara should nod and say nothing."] }));
-    const prepared = await r.harness.prepare(request(r.host), { replyBy: null }, never);
-    expect(prepared.part).toBe("answer");
-    expect(seen(r.host.calls[1])).toContain(renderDefault(TEXT.answer.releaseBuiltIn));
-    expect(r.released).toEqual([]);
   });
 
   test("the extension's check: a refusal is the call's answer and nothing streams; a check that fails lets nothing go", async () => {
@@ -278,18 +270,7 @@ describe("jobs in lanes and due by the next turn (§15)", () => {
   });
 });
 
-describe("a claim that keeps a chat to the runtime, and what of the request the main agent is shown (§21, §25)", () => {
-  test("a claim that requires the runtime is never run built in: not the turn, not its jobs", async () => {
-    const r = rig(lines({}), { claim: { place: "runtime" }, place: "builtin" });
-    const turn = request(r.host);
-    const prepared = await r.harness.prepare(turn, { replyBy: null }, never);
-    expect(prepared).toMatchObject({ part: "none", pending: false, reason: renderDefault(TEXT.jobs.whyRuntimeOnly) });
-    expect(prepared.messages).toBe(turn.messages);
-    const { job } = await r.harness.jobs.start({ chatId: CHAT, agent: "voice", task: "Digest the beat.", when: "now" });
-    expect(await r.harness.jobs.run({ id: job.id }, never)).toMatchObject({ state: "failed", reason: renderDefault(TEXT.jobs.whyRuntimeOnly), lasting: true });
-    expect(r.host.calls).toHaveLength(0);
-  });
-
+describe("what of the request the main agent is shown (§21)", () => {
   test("the main agent is shown only the user's newest message where the claim says so", async () => {
     const r = rig(lines({ author: [{ toolCalls: [call("reply_write", { text: "Mara frowns." })] }, "Done."] }), { claim: { request: "newest" } });
     await runTurn(r.host, r.harness, CHAT);
@@ -490,8 +471,3 @@ describe("a job run again, what a job is told, and an answer cut while it though
     expect(calls[1]?.messages.at(-1)?.parts?.some((part) => part.type === "tool_result")).toBe(true);
   });
 });
-
-/** The request Lumiverse would assemble for a new reply in the chat. */
-function request(host: MemoryHost): TurnRequest {
-  return { userId: "user-1", chatId: CHAT, generationId: `gen-built-${host.calls.length}`, kind: "new", target: { messageId: null, swipeId: 0 }, presetId: null, messages: host.requestOf(CHAT, host.chats.get(CHAT)?.length ?? 0, null), params: {}, maxTokens: 700 };
-}

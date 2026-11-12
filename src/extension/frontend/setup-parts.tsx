@@ -1,60 +1,50 @@
-// What Home and the Runtime page share of setup and of where a chat runs (DESIGN §25): a chat's
-// switch with its place beside it and how it stands under it, the asking for permissions, and a
-// numbered step. The decisions are setup-model.ts's; these send the requests and say what came of
-// them.
+// What Home and the Runtime page share of setup (DESIGN §25): a chat's switch with how it stands
+// under it, the asking for permissions, and a numbered step. The decisions are setup-model.ts's;
+// these send the requests and say what came of them.
 
 import type { ComponentChildren } from "preact";
 import { useEffect, useState } from "preact/hooks";
-import type { ChatStoryView, ChatView, PermissionNeed, RunPlace, StorySetting } from "../../shared/ui";
+import type { ChatStoryView, ChatView, PermissionNeed, StorySetting } from "../../shared/ui";
 import { useApp } from "./app";
 import { chatLabel } from "./chat";
-import { Banner, Button, Disclosure, Seg, type SegOption, Switch, useBusy } from "./components";
+import { Banner, Button, Disclosure, Seg, Switch, useBusy } from "./components";
 import { counted } from "./format";
 import { Icon, type IconName } from "./icons";
-import { asksWords, chatStanding, grantReason, neededPermissions, PLACE_ABOUT, PLACE_LABEL, type StepAt } from "./setup-model";
+import { asksWords, chatStanding, grantReason, neededPermissions, type StepAt } from "./setup-model";
 import { useSelect } from "./store";
 import { storyChosen, storyRows, storySummary, storyWhy } from "./story-model";
-
-const PLACES: readonly SegOption<RunPlace>[] = [
-  { value: "builtin", label: PLACE_LABEL.builtin },
-  { value: "runtime", label: PLACE_LABEL.runtime },
-];
 
 const STANDING_ICON: Readonly<Record<"pos" | "neutral" | "warn", IconName>> = { pos: "check", neutral: "info", warn: "alert" };
 
 /**
- * A chat's switch: whether LumiAH is used in it, how that stands in a line (with the one press that
- * mends it where something is wrong), and, once it is on, where its replies are prepared. Switching
- * it on while Lumiverse hasn't yet allowed LumiAH what it needs asks for that first, so a newcomer
- * has one thing to press. A chat another extension holds has no switch here: it says whose it is,
- * and offers to take it over. `fold` keeps the choice of place under a line that says where it runs
- * (Home does: few change it); a list of chats shows the choice itself, and says what each place is
- * once above them. A chat its extension plays only in a runtime has no choice of place: it says so.
+ * A chat's switch: whether LumiAH is used in it, and how that stands in a line (with the one press
+ * that mends it where something is wrong). Switching it on while Lumiverse hasn't yet allowed
+ * LumiAH what it needs asks for that first, so a newcomer has one thing to press. A chat another
+ * extension holds has no switch here: it says whose it is, and offers to take it over. Where the
+ * extension that builds LumiAH in switches its chats on in its own pages, no switch is offered.
+ * `fold`: what counts as the chat's story shows under it once it is on (Home does).
  */
 export function ChatSwitch(props: { chat: ChatView; open: boolean; title?: string; fold?: boolean; onChanged?(chat: ChatView): void; children?: ComponentChildren }) {
   const app = useApp();
   const state = useSelect(app.client.state, (s) => s);
   const [busy, run] = useBusy();
-  // The runtime was chosen while none is there to choose: the page says what one is and where to set it up, rather than refusing.
-  const [asked, setAsked] = useState(false);
   // The switch was turned on while a permission LumiAH needs was missing: Lumiverse is asked, and the chat is switched on once it has allowed them.
   const [wanted, setWanted] = useState(false);
   const grant = useGrant();
   const { chat } = props;
   const name = chatLabel(chat);
   const needed = state === null ? 0 : neededPermissions(state).length;
-  const set = (on: boolean, place: RunPlace | undefined, said: string): void =>
+  const set = (on: boolean, said: string): void =>
     run(async () => {
       try {
-        const result = await app.client.request("lah.chat.set", { chatId: chat.chatId, on, ...(place !== undefined ? { place } : {}) });
+        const result = await app.client.request("lah.chat.set", { chatId: chat.chatId, on });
         props.onChanged?.(result.chat);
-        setAsked(false);
         app.toast(said);
       } catch (error) {
         app.fail(error);
       }
     });
-  const switchOn = (): void => set(true, undefined, `LumiAH is on for ${name}: it prepares the next reply.`);
+  const switchOn = (): void => set(true, `LumiAH is on for ${name}: it prepares the next reply.`);
   const takeOver = (other: string): void =>
     run(async () => {
       // Two can't both prepare a reply: taking a chat from an extension that is still installed leaves that one's pages saying what is no longer so, which is why it is asked first.
@@ -80,7 +70,7 @@ export function ChatSwitch(props: { chat: ChatView; open: boolean; title?: strin
   const standing = chatStanding(chat, state);
   const missing = state.permissions;
   const turn = (on: boolean): void => {
-    if (!on) return set(false, undefined, `LumiAH is off for ${name}.`);
+    if (!on) return set(false, `LumiAH is off for ${name}.`);
     if (needed === 0) return switchOn();
     setWanted(true);
     // What follows says it (the chat is switched on), so the grant itself needn't.
@@ -89,58 +79,11 @@ export function ChatSwitch(props: { chat: ChatView; open: boolean; title?: strin
       false,
     );
   };
-  const choose = (place: RunPlace): void => {
-    if (place === chat.place) return;
-    if (place === "runtime" && !state.runtime.ready) return setAsked(true);
-    set(true, place, place === "builtin" ? `${name} runs built in from its next reply.` : `${name} runs in your runtime from its next reply.`);
-  };
-  const only = chat.needsRuntime;
-  const places =
-    only !== undefined ? (
-      <p class="lah-field-help" data-lah-runtime-only>
-        {`${only.by} plays this chat only in your runtime: there is no built-in way for it. ${PLACE_ABOUT.runtime}`}
-      </p>
-    ) : (
-      <>
-        <Seg value={chat.place} options={PLACES} label={`Where ${name} runs`} disabled={busy} onChange={choose} />
-        {props.fold === true ? (
-          <ul class="lah-facts" data-lah-places>
-            <li>
-              <span>
-                <strong>{PLACE_LABEL.builtin}.</strong> {PLACE_ABOUT.builtin}
-              </span>
-            </li>
-            <li>
-              <span>
-                <strong>{PLACE_LABEL.runtime}.</strong> {PLACE_ABOUT.runtime}
-              </span>
-            </li>
-          </ul>
-        ) : null}
-        {asked ? (
-          <Banner
-            tone="info"
-            title="No runtime is set up yet"
-            actions={
-              <>
-                <Button variant="primary" icon="link" onClick={() => app.nav.update((n) => ({ ...n, page: "runtime" }))}>
-                  Set up a runtime
-                </Button>
-                <Button variant="ghost" onClick={() => setAsked(false)}>
-                  Stay built in
-                </Button>
-              </>
-            }
-          >
-            {`${PLACE_ABOUT.runtime} This chat keeps running built in until one is linked.`}
-          </Banner>
-        ) : null}
-      </>
-    );
+  const switchedBy = state.runtime.switchedBy;
   return (
-    <div class="lah-chatswitch" data-lah-chat={chat.chatId} data-answered={standing.answered} data-place={chat.place} data-on={chat.on} data-lah-other={chat.other?.identifier}>
-      {/* Where the extension plays its chats only in a runtime, its own pages switch a chat on: LumiAH's switch isn't offered. */}
-      {state.runtime.only === undefined ? <Switch checked={chat.on || wanted} disabled={busy || wanted || chat.other !== undefined} label={<strong>{props.title ?? (props.open ? "Use LumiAH in this chat" : name)}</strong>} help={props.title === undefined && props.open ? name : undefined} onChange={turn} /> : <strong>{props.title ?? name}</strong>}
+    <div class="lah-chatswitch" data-lah-chat={chat.chatId} data-answered={standing.answered} data-on={chat.on} data-lah-other={chat.other?.identifier}>
+      {/* Where the extension switches its chats on in its own pages, LumiAH's switch isn't offered. */}
+      {switchedBy === undefined ? <Switch checked={chat.on || wanted} disabled={busy || wanted || chat.other !== undefined} label={<strong>{props.title ?? (props.open ? "Use LumiAH in this chat" : name)}</strong>} help={props.title === undefined && props.open ? name : undefined} onChange={turn} /> : <strong>{props.title ?? name}</strong>}
       {wanted ? (
         <span class="lah-chatswitch-line" data-tone="neutral" role="status">
           <Icon name="hourglass" size={16} />
@@ -149,7 +92,7 @@ export function ChatSwitch(props: { chat: ChatView; open: boolean; title?: strin
       ) : (
         <span class="lah-chatswitch-line" data-tone={standing.tone} role={standing.tone === "warn" ? "alert" : undefined}>
           <Icon name={STANDING_ICON[standing.tone]} size={16} />
-          <span>{!chat.on && !standing.answered && chat.other === undefined && state.runtime.only === undefined ? `${standing.line} Switched on, its agents read up before each reply and brief the model that writes it${chat.place === "builtin" ? ". Nothing to install." : ", in your runtime."}` : standing.line}</span>
+          <span>{!chat.on && !standing.answered && chat.other === undefined && switchedBy === undefined ? `${standing.line} Switched on, its agents read up before each reply in your runtime and brief the model that writes it.` : standing.line}</span>
         </span>
       )}
       {standing.takeover !== null ? (
@@ -180,24 +123,12 @@ export function ChatSwitch(props: { chat: ChatView; open: boolean; title?: strin
       ) : null}
       {standing.fix !== null ? (
         <div class="lah-actions">
-          <Button variant="primary" disabled={busy} onClick={() => set(true, standing.fix?.place, standing.fix?.place === "builtin" ? `${name} runs built in from its next reply.` : `${name} is pinned to the runtime's connection again.`)}>
+          <Button variant="primary" disabled={busy} onClick={() => set(true, `${name} is pinned to the runtime's connection again.`)}>
             {standing.fix.label}
           </Button>
         </div>
       ) : null}
-      {chat.on && props.fold === true ? (
-        <>
-          <Disclosure class="lah-chatswitch-place" summary={`Where it runs: ${PLACE_LABEL[chat.place].toLowerCase()}`} defaultOpen={asked}>
-            {places}
-          </Disclosure>
-          <ChatStory chatId={chat.chatId} />
-        </>
-      ) : chat.on ? (
-        <div class="lah-chatswitch-place">
-          <span class="lah-field-label">Where it runs</span>
-          {places}
-        </div>
-      ) : null}
+      {chat.on && props.fold === true ? <ChatStory chatId={chat.chatId} /> : null}
       {props.children}
     </div>
   );

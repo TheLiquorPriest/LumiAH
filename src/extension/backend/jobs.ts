@@ -1,6 +1,6 @@
-// The jobs as the pages hear of them (DESIGN §15). The core keeps every job and the place that
-// holds it runs them (a runtime, or this extension for what runs built in); each time one is queued
-// or changes, that place says so (a runtime's `job.changed`), and this keeps what
+// The jobs as the pages hear of them (DESIGN §15). The core keeps every job and the runtime that
+// holds it runs them; each time one is queued or changes, the runtime says so (`job.changed`), and
+// this keeps what
 // the state every page holds needs: the jobs not yet over, a counter that moves with every change
 // (a page showing a list reads it again), and a notice for the user when a job finishes, fails, is
 // interrupted, or waits on their word, so they hear of it on whichever page they open next.
@@ -48,7 +48,7 @@ interface UserJobs {
   changed: number;
   /** The jobs whose end was told already, the one told longest ago first: an end the runtime says twice (its request sent again) is told once. */
   told: Set<string>;
-  /** Where each job that isn't over runs, as its place said when it told of it: a runtime's id, or `BUILTIN`. */
+  /** Where each job that isn't over runs, as its runtime said when it told of it: that runtime's id. */
   runs: Map<string, string>;
 }
 
@@ -137,8 +137,8 @@ export class JobsBoard {
   }
 
   /**
-   * A job was queued, or changed, as the place that runs it says (`relay`: a runtime's `job.changed`,
-   * or `BUILTIN` for the core here). Said twice (a request sent again) changes nothing the second time.
+   * A job was queued, or changed, as the runtime that runs it says (`relay`, its `job.changed`).
+   * Said twice (a request sent again) changes nothing the second time.
    */
   async took(userId: string, job: JobView, relay: string): Promise<void> {
     const user = this.of(userId);
@@ -179,7 +179,7 @@ export class JobsBoard {
     return this.users.get(userId)?.active.get(jobId) ?? null;
   }
 
-  /** Where a job that isn't over runs (a runtime's id, or `BUILTIN`); null when it is over, or nothing was heard of it since the extension started. */
+  /** Where a job that isn't over runs (a runtime's id); null when it is over, or nothing was heard of it since the extension started. */
   runsIn(userId: string, jobId: string): string | null {
     return this.users.get(userId)?.runs.get(jobId) ?? null;
   }

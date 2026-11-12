@@ -119,7 +119,7 @@ export class Delegator {
     const resolved = workers.some((d) => d.id === input.agent) ? run.resolve(input.agent) : undefined;
     if (!resolved) return run.definitions.without.has(input.agent) ? run.refusal(TEXT.agents.notOffered, { agent: clip(input.agent, settings.tools.lineChars) }) : run.refusal(TEXT.agents.noAgent, { agent: clip(input.agent, settings.tools.lineChars), agents: workers.map((d) => d.id).join(", ") });
     if (input.as !== undefined && input.as.length > settings.delegation.asChars) return run.refusal(TEXT.agents.asLong, { chars: String(input.as.length), limit: String(settings.delegation.asChars) });
-    // Only an agent that may write the reply hands it on, and only while the reply can take text: never built in, nor while the writer or another agent's answer is at it.
+    // Only an agent that may write the reply hands it on, and only while the reply can take text: never while the writer or another agent's answer is at it.
     const reply = input.toReply === true ? from.reply : undefined;
     if (input.toReply === true && !reply) return run.refusal(TEXT.agents.noReply);
     const shut = reply?.refused() ?? null;

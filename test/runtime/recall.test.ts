@@ -40,8 +40,8 @@ describe("a runtime's core reads lore and history through the link", () => {
   test("each port for the runtime's own user, in the port's own shapes", async () => {
     const held: { host: HarnessHost | null; activated: ActivatedEntry[] | null } = { host: null, activated: null };
     const it = await rig({
-      harness: (host, _settings, _extension, place) => {
-        if (place === "runtime") held.host = host;
+      harness: (host) => {
+        held.host = host;
         return {
           // A reply's turn asks how Lumiverse activated the lore in its prompt, as the core does once a turn.
           answer: async (turn, sink) => {

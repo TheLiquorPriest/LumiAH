@@ -26,10 +26,8 @@ import {
   type LivePartial,
   type LiveView,
   loreChangesOf,
-  type NoPart,
   type RelayView,
   replyDid,
-  type RunPlace,
   isRecord,
   isReply,
   type SessionView,
@@ -48,7 +46,7 @@ import {
   URL_SLOT,
 } from "../../src/shared/ui";
 import { causeOf } from "../../src/extension/backend/cause";
-import { CHATS, CONNECTIONS, failedTurn, fakeHash, finishedTurn, handedTurn, type HeldWord, lateTurn, longTurn, MODELS, OTHER_CHAT, type PlayStep, playedHanded, playedTurn, REPLY_MS, replyDue, slowTurn, storedTurns, SUMMARY, THEIR_CHAT, Trace, workedTurn, workingTurn, WRITING_MS } from "./fixtures";
+import { briefedTurn, CHATS, CONNECTIONS, failedTurn, fakeHash, type HeldWord, longTurn, MODELS, OTHER_CHAT, type PlayStep, playedTurn, storedTurns, SUMMARY, THEIR_CHAT, Trace, workedTurn, workingTurn } from "./fixtures";
 import { chronicleMock } from "./mock/chronicle";
 import { type Handlers, hashOf, type HomeCtx, type PlayedCall, type PlayOptions, Refusal, type StoryCtx } from "./mock/ctx";
 import { defsMock } from "./mock/defs";
@@ -77,7 +75,7 @@ export interface MockOptions {
    * once (`running`), one that plays with sub-agents and a tool call it holds for the user's word
    * (`working`), or none.
    */
-  turn: "done" | "failed" | "long" | "worked" | "running" | "working" | "nopart" | "urgent" | "none";
+  turn: "done" | "failed" | "long" | "worked" | "running" | "working" | "none";
   /** The README's pictures (`?showcase=1`): the made-up story as it stands once it is learned to its end, so the Chronicle page opens on a whole chronicle. Left out, the story is as the scenario has it. */
   showcase?: boolean;
   sections: MockSection[];
@@ -130,10 +128,6 @@ interface Live {
   /** The call it holds for the user's word, and what answers it. */
   held: { id: string; answer(word: HeldWord): void } | null;
   options: PlayOptions;
-  /** Where it runs (§25), as its chat stood when it began. */
-  place: RunPlace;
-  /** For a built-in reply's turn: when its time before the reply ends. */
-  replyBy: number | null;
 }
 
 /**
@@ -156,14 +150,8 @@ const START_SERVICE = `sudo -u lumiverse /usr/local/bin/bun --cwd / /srv/lumiver
 const START_FOREGROUND = `sudo -u lumiverse /usr/local/bin/bun --cwd / /srv/lumiverse/data/extensions/lumi_ah/dist/lumiah.js up --url ${URL_SLOT}`;
 const BUILD = "4c1e9a70";
 
-/** What the page says of a reply LumiAH had no part in because the user skipped it before the brief (DESIGN §25), in the backend's own words. */
-const STOPPED_PART: NoPart = { why: "stopped", text: "You skipped LumiAH for this reply. Lumiverse wrote the reply from the prompt as it was. To stop a reply itself, use Lumiverse's own Stop." };
-
-/** And because its turn failed before the brief. */
-const FAILED_PART: NoPart = { why: "failed", text: "LumiAH's agents didn't finish. Lumiverse sent the prompt as it was, so the reply is its own." };
-
-/** How the story's built-in reply opens: Lumiverse's own generation writes it, so the stand-in has no text of it but this. */
-const BUILTIN_REPLY = "The door opened a hand's width. Ilse stood behind it with the night key already in her fist, as if she had heard the knock coming up the lane.";
+/** Why a chat can't be switched on with no loopback connection, in the backend's own words. */
+const NO_RUNTIME = "There is no runtime to answer this chat yet. Start one with its line on LumiAH's Runtime page and mint its key there, then switch the chat on.";
 
 /** What a turn's trace counts up to for the first screen: the agents that worked, their tool calls, the lore entries added to and dropped from what the writer saw, and the jobs started. */
 function countsOf(trace: Trace): Pick<LastTurn, "agents" | "tools" | "lore" | "jobs"> {
@@ -328,25 +316,21 @@ export class MockBackend {
     };
     if (ready) {
       this.stored.set("chat-mara", storedTurns(now));
-      // The open chat runs built in (DESIGN §25), so its turns are built-in ones: Lumiverse writes the reply.
+      // The open chat is pinned to the loopback connection, so the runtime answers it.
       const first =
         options.turn === "done"
-          ? handedTurn("chat-mara", "turn-0043", now - 3 * 60_000, { messageId: "msg-0043" })
+          ? briefedTurn("chat-mara", "turn-0043", now - 3 * 60_000, { messageId: "msg-0043" })
           : options.turn === "failed"
             ? failedTurn("chat-mara", "turn-0039", now - 26 * 60_000)
             : options.turn === "long"
               ? longTurn("chat-mara", "turn-0037", now - 44 * 60_000, 90)
               : options.turn === "worked"
-                ? workedTurn("chat-mara", "turn-0045", now - 2 * 60_000, "builtin")
-                : options.turn === "nopart"
-                  ? lateTurn("chat-mara", "turn-0049", now - 6 * 60_000)
-                  : null;
+                ? workedTurn("chat-mara", "turn-0045", now - 2 * 60_000)
+                : null;
       if (first) this.hold("chat-mara", first, { reply: true, chatId: "chat-mara" });
       this.hold("chat-brann", failedTurn("chat-brann", "turn-b-0007", now - 50 * 60_000), { reply: true, chatId: "chat-brann" });
       if (options.turn === "running") options.later(() => this.startTurn("chat-mara"), 400);
-      if (options.turn === "working") options.later(() => this.startTurn("chat-mara", workingTurn("builtin")), 400);
-      // A slow main agent with forty seconds before the reply: the countdown turns urgent as you watch, then runs out.
-      if (options.turn === "urgent") options.later(() => this.play("chat-mara", slowTurn(), { reply: true, chatId: "chat-mara", replyMs: 40_000 }), 400);
+      if (options.turn === "working") options.later(() => this.startTurn("chat-mara", workingTurn()), 400);
     }
     this.starting = false;
   }
@@ -387,13 +371,12 @@ export class MockBackend {
       "lah.chat.get": (r) => ({ chat: this.chat(r.chatId) }),
       "lah.chat.set": (r) => {
         const before = this.chat(r.chatId);
-        const place = r.place ?? before.place;
         if (r.on && this.state.permissions.some((p) => p.needed)) throw new Refusal("unavailable", "LumiAH can't answer a chat yet: Lumiverse hasn't allowed it what it needs. Allow it on Home, then switch the chat on.");
-        if (r.on && place === "runtime" && !this.state.runtime.ready) throw new Refusal("unavailable", "No runtime is ready, so this chat can't run in one yet. Set one up on the Runtime page, or run the chat built in.");
         const loopback = this.state.connections.find((c) => c.loopback);
-        // Built in, a chat keeps its own connection; in a runtime it is pinned to the loopback, and gets its own back when it leaves.
-        const connection = r.on && place === "runtime" && loopback ? { id: loopback.id, name: loopback.name, loopback: true } : { id: "conn-deepseek", name: "Deepseek", loopback: false };
-        const chat: ChatView = { ...before, on: r.on, since: r.on ? (before.on && before.since !== null ? before.since : this.options.now()) : null, place, connection };
+        if (r.on && loopback === undefined) throw new Refusal("unavailable", NO_RUNTIME);
+        // Switched on, a chat is pinned to the loopback connection, so the runtime answers it; switched off, it gets its own back.
+        const connection = r.on && loopback ? { id: loopback.id, name: loopback.name, loopback: true } : { id: "conn-deepseek", name: "Deepseek", loopback: false };
+        const chat: ChatView = { ...before, on: r.on, since: r.on ? (before.on && before.since !== null ? before.since : this.options.now()) : null, connection };
         const chats = this.state.chats.some((c) => c.chatId === chat.chatId) ? this.state.chats.map((c) => (c.chatId === chat.chatId ? chat : c)) : [...this.state.chats, chat];
         this.push({ chats: chats.filter((c) => c.on || chatAnswered(c)), ...(r.on ? { setup: this.stepDone("chat") } : {}) });
         return { chat };
@@ -401,9 +384,11 @@ export class MockBackend {
       "lah.chat.takeover": (r) => {
         const before = this.chat(r.chatId);
         if (before.other === undefined) throw new Refusal("conflict", "No other extension answers this chat, so there is nothing to take over. Switch LumiAH on for it instead.");
-        // The other's mark goes, the chat gets back the connection it had, and it is switched on here, built in.
+        const loopback = this.state.connections.find((c) => c.loopback);
+        if (loopback === undefined) throw new Refusal("unavailable", NO_RUNTIME);
+        // The other's mark goes, and the chat is switched on here: pinned to the loopback connection, so the runtime answers it.
         const { other: _mark, ...mine } = before;
-        const chat: ChatView = { ...mine, on: true, since: this.options.now(), place: "builtin", connection: { id: "conn-deepseek", name: "Deepseek", loopback: false } };
+        const chat: ChatView = { ...mine, on: true, since: this.options.now(), connection: { id: loopback.id, name: loopback.name, loopback: true } };
         const chats = this.state.chats.some((c) => c.chatId === chat.chatId) ? this.state.chats.map((c) => (c.chatId === chat.chatId ? chat : c)) : [...this.state.chats, chat];
         this.push({ chats });
         return { chat };
@@ -468,8 +453,7 @@ export class MockBackend {
         const trace = reply?.trace ?? other?.trace;
         if (!trace) throw new Refusal("not_found", "The store no longer has that transcript.");
         const page = this.pageOf(trace.events, r.from);
-        const where = reply ? { reply: true, place: reply.row.place ?? (trace.chatId === "" ? ("builtin" as const) : this.chat(trace.chatId).place) } : undefined;
-        return { view: { ...this.viewOf(other?.stream ?? trace.chatId, trace.chatId === "" ? null : trace.chatId, trace, [], where), events: page.events }, next: page.next };
+        return { view: { ...this.viewOf(other?.stream ?? trace.chatId, trace.chatId === "" ? null : trace.chatId, trace, [], reply ? { reply: true } : undefined), events: page.events }, next: page.next };
       },
       "lah.prompt.get": (r) => {
         for (const trace of this.traces()) {
@@ -564,16 +548,10 @@ export class MockBackend {
     this.push({ permissions, ...(permissions.some((p) => p.needed) ? {} : { setup: this.stepDone("permissions") }) });
   }
 
-  /** Where a chat's turns run now: what the preview's own buttons read to play a turn that fits. */
-  placeOf(chatId: string): RunPlace {
-    return this.chat(chatId).place;
-  }
-
-  /** A reply is asked for in a chat: its turn plays a step at a time (`steps`; left out, a plain turn as the chat's place has it: handed to Lumiverse's own generation built in, written by LumiAH's writer in a runtime). False when the chat isn't answered (it is off, LumiAH lacks a permission, or its runtime isn't ready), or a turn of it runs already. */
+  /** A reply is asked for in a chat: its turn plays a step at a time (`steps`; left out, a plain turn whose writer writes the reply). False when the chat isn't answered (it is off, LumiAH lacks a permission, or no runtime is ready), or a turn of it runs already. */
   startTurn(chatId: string, steps?: PlayStep[]): boolean {
-    const chat = this.chat(chatId);
-    if (!chatAnswered(chat) || this.state.permissions.some((p) => p.needed) || (chat.place === "runtime" && !this.state.runtime.ready)) return false;
-    return this.play(chatId, steps ?? (chat.place === "builtin" ? playedHanded() : playedTurn()), { reply: true, chatId }) !== null;
+    if (!chatAnswered(this.chat(chatId)) || this.state.permissions.some((p) => p.needed) || !this.state.runtime.ready) return false;
+    return this.play(chatId, steps ?? playedTurn(), { reply: true, chatId }) !== null;
   }
 
   /** A push the page never hears: the next one leaves a gap for it to mend. */
@@ -583,10 +561,7 @@ export class MockBackend {
 
   /** A run that is over (or was read whole) stands under its stream. */
   private hold(stream: StreamId, trace: Trace, options: PlayOptions): Live {
-    // A chat's jobs run where its turns run; a side session about no chat runs built in.
-    const place = options.chatId === null ? "builtin" : this.chat(options.chatId).place;
-    const replyBy = options.reply && place === "builtin" ? (trace.replyBy ?? trace.startedAt + (options.replyMs ?? REPLY_MS)) : null;
-    const held: Live = { stream, reply: options.reply, chatId: options.chatId, trace, view: this.viewOf(stream, options.chatId, trace, [], { reply: options.reply, place, replyBy }), steps: [], cancel: null, partials: [], paused: false, resume: null, notes: [], held: null, options, place, replyBy };
+    const held: Live = { stream, reply: options.reply, chatId: options.chatId, trace, view: this.viewOf(stream, options.chatId, trace, [], { reply: options.reply }), steps: [], cancel: null, partials: [], paused: false, resume: null, notes: [], held: null, options };
     this.live.set(stream, held);
     return held;
   }
@@ -601,9 +576,6 @@ export class MockBackend {
     this.played.push(trace);
     const held = this.hold(stream, trace, options);
     held.steps = [...steps];
-    // A played turn's `turn_started` says when its reply is due, as core's does; and at that moment its work stops, whatever it is at.
-    trace.replyBy = held.replyBy;
-    if (held.replyBy !== null) this.options.later(() => this.due(held), held.replyBy - this.options.now());
     this.advance(held, true);
     return trace.turn;
   }
@@ -641,31 +613,9 @@ export class MockBackend {
     held.trace.now = Math.max(held.trace.now, this.options.now());
     // The words the core's own stop carries: the page says each thing once, and is shown here against what it will really get.
     for (const agentId of held.trace.working()) held.trace.stop(agentId, "cancelled", "cancelled", "the agent was cancelled").idle(agentId);
-    // Built in, a turn stopped before its brief leaves the reply to Lumiverse alone, and its trace says so, as core's does.
-    if (held.reply && held.place === "builtin" && !held.trace.handedOver && held.trace.part === null) held.trace.unaided(STOPPED_PART, "you stopped it");
     held.trace.ended("stopped", why);
     this.grew(held, before);
     return true;
-  }
-
-  /** The reply is due while a built-in turn still works: its agents stop where they are and LumiAH has no part in the reply, which Lumiverse writes from its prompt as it was; the turn is recorded once that reply is saved. A turn that has handed its brief over, or is over, is left as it is. */
-  private due(held: Live): void {
-    if (held.view.ended !== null || held.trace.handedOver || held.trace.part !== null) return;
-    held.cancel?.();
-    held.steps = [];
-    held.partials = [];
-    held.resume = null;
-    if (held.held) this.release(held);
-    const before = held.trace.events.length;
-    held.trace.now = Math.max(held.trace.now, this.options.now());
-    replyDue(held.trace);
-    this.grew(held, before);
-    held.cancel = this.options.later(() => {
-      const had = held.trace.events.length;
-      held.trace.now = Math.max(held.trace.now, this.options.now());
-      held.trace.ended("done");
-      this.grew(held, had);
-    }, WRITING_MS);
   }
 
   private advance(held: Live, first: boolean): void {
@@ -745,12 +695,12 @@ export class MockBackend {
     held.view = view;
     held.partials = view.partials;
     const running = this.state.running.some((x) => x.turn === view.turn);
-    if (view.ended === null && !running) this.push({ running: [...this.state.running, { stream: held.stream, chatId: held.chatId, turn: view.turn, kind: view.kind, startedAt: view.startedAt, paused: held.paused, place: held.place, replyBy: held.replyBy }], ...(held.reply ? { runtime: this.withTurns(1) } : {}) });
+    if (view.ended === null && !running) this.push({ running: [...this.state.running, { stream: held.stream, chatId: held.chatId, turn: view.turn, kind: view.kind, startedAt: view.startedAt, paused: held.paused }], ...(held.reply ? { runtime: this.withTurns(1) } : {}) });
     if (view.ended !== null && running) {
       this.push({ running: this.state.running.filter((x) => x.turn !== view.turn), ...(held.reply ? { runtime: this.withTurns(-1), setup: view.ended.state === "done" ? this.stepDone("reply") : this.state.setup } : {}) });
       const transcript = fakeHash(`transcript:${view.turn}`);
-      // Built in, a turn that ended without its reply leaves no record on the chat (core keeps nothing of it); its transcript is still read while the live view holds it.
-      if (held.reply && held.chatId !== null && (held.place !== "builtin" || view.ended.state === "done")) this.keep(held.chatId, held, transcript);
+      // A reply's turn is recorded on the chat only where its reply was written, as core records one; the transcript of one that ended without its reply is still read while the live view holds it.
+      if (held.reply && held.chatId !== null && view.ended.state === "done") this.keep(held.chatId, held, transcript);
       else this.kept.set(transcript, { trace: held.trace, stream: held.stream });
       held.options.done?.({ turn: view.turn, state: view.ended.state, transcript, trace: held.trace });
     }
@@ -766,22 +716,19 @@ export class MockBackend {
   private keep(chatId: string, held: Live, transcript: string): void {
     const all = (this.stored.get(chatId) ?? []).map((x) => (x.row.compaction?.rollback === "pending" ? { ...x, row: { ...x.row, compaction: { ...x.row.compaction, rollback: "done" as const } } } : x));
     const index = (all[0]?.row.index ?? 1) + 2;
-    const said = held.trace.events.flatMap((e) => (e.event.kind === "agent_entry" && e.event.agentId === "writer-1" && e.event.entry.kind === "answer" ? [e.event.entry.text] : []))[0] ?? (held.place === "builtin" ? BUILTIN_REPLY : "");
-    const row: TurnRow = { turn: held.view.turn, messageId: `msg-${String(index).padStart(4, "0")}`, index, swipe: 0, at: held.view.startedAt, kind: isReply(held.view.kind) ? held.view.kind : "new", onPath: true, preview: said.slice(0, 96), transcript, compaction: null, usage: held.trace.tally, changes: held.trace.changed(), place: held.place, ...(held.view.ended?.noPart !== undefined ? { noPart: held.view.ended.noPart } : {}) };
+    const said = held.trace.events.flatMap((e) => (e.event.kind === "agent_entry" && e.event.agentId === "writer-1" && e.event.entry.kind === "answer" ? [e.event.entry.text] : []))[0] ?? "";
+    const row: TurnRow = { turn: held.view.turn, messageId: `msg-${String(index).padStart(4, "0")}`, index, swipe: 0, at: held.view.startedAt, kind: isReply(held.view.kind) ? held.view.kind : "new", onPath: true, preview: said.slice(0, 96), transcript, compaction: null, usage: held.trace.tally, changes: held.trace.changed() };
     this.stored.set(chatId, [{ row, trace: held.trace }, ...all]);
   }
 
-  /** A run's view from its trace. `where` says where it ran and whether it answers a generation: a built-in reply's turn that ended without its reply says LumiAH had no part in the one Lumiverse wrote. */
-  private viewOf(stream: StreamId, chatId: string | null, trace: Trace, partials: LivePartial[], where?: { reply: boolean; place: RunPlace; replyBy?: number | null }): LiveView {
+  /** A run's view from its trace. `where` says whether it answers a generation: a reply's turn that failed names its cause. */
+  private viewOf(stream: StreamId, chatId: string | null, trace: Trace, partials: LivePartial[], where?: { reply: boolean }): LiveView {
     const started = trace.events.find((e) => e.event.kind === "turn_started")?.event;
     const last = trace.events.at(-1)?.event;
-    // Built in, a reply's turn that ended without handing its brief over had no part in the reply Lumiverse wrote: the trace says why where it knows (its time ran out, the user stopped it); else it failed.
-    const noPart = where?.reply === true && where.place === "builtin" && last?.kind === "turn_ended" ? (trace.part ?? (last.status !== "done" && !trace.handedOver ? (last.status === "stopped" ? STOPPED_PART : FAILED_PART) : null)) : null;
-    // Why, as the code a page acts on: the user's skip and the time are the backend's own to say; the rest is read from the trace with the real backend's reader, so the preview names the cause the extension would.
-    const failed = last?.kind === "turn_ended" && last.status === "failed";
-    const cause: CauseCode | null = noPart === STOPPED_PART ? "skipped" : noPart?.why === "time" ? "time" : noPart !== null || (where?.reply === true && failed) ? causeOf(trace.events) : null;
-    const ended: LiveEnded | null = last?.kind === "turn_ended" ? { state: last.status, at: last.at, ...(last.reason !== undefined ? { reason: last.reason } : {}), ...(noPart !== null ? { noPart } : {}), ...(cause !== null ? { cause } : {}) } : null;
-    return { stream, chatId, turn: trace.turn, kind: started?.kind === "turn_started" ? started.generation : "new", messageId: started?.kind === "turn_started" ? started.messageId : null, startedAt: trace.startedAt, ended, events: [...trace.events], partials: ended !== null ? [] : partials, ...(where ? { place: where.place, replyBy: where.replyBy ?? null } : {}) };
+    // Why a reply's turn failed, as the code a page acts on: read from the trace with the real backend's reader, so the preview names the cause the extension would.
+    const cause: CauseCode | null = where?.reply === true && last?.kind === "turn_ended" && last.status === "failed" ? causeOf(trace.events) : null;
+    const ended: LiveEnded | null = last?.kind === "turn_ended" ? { state: last.status, at: last.at, ...(last.reason !== undefined ? { reason: last.reason } : {}), ...(cause !== null ? { cause } : {}) } : null;
+    return { stream, chatId, turn: trace.turn, kind: started?.kind === "turn_started" ? started.generation : "new", messageId: started?.kind === "turn_started" ? started.messageId : null, startedAt: trace.startedAt, ended, events: [...trace.events], partials: ended !== null ? [] : partials };
   }
 
   /** A chat's latest turn as the first screen reads it: the run its live view holds, else the newest of its stored turns. */
@@ -789,13 +736,13 @@ export class MockBackend {
     const held = this.live.get(chatId);
     if (held?.reply === true) {
       const view = held.view;
-      return { turn: view.turn, kind: isReply(view.kind) ? view.kind : "new", messageId: view.messageId, startedAt: view.startedAt, ended: view.ended, place: held.place, replyBy: held.replyBy, usage: held.trace.tally, ...countsOf(held.trace), changes: held.trace.changed(), transcript: view.ended !== null ? fakeHash(`transcript:${view.turn}`) : null, did: replyDid(held.trace.events) };
+      return { turn: view.turn, kind: isReply(view.kind) ? view.kind : "new", messageId: view.messageId, startedAt: view.startedAt, ended: view.ended, usage: held.trace.tally, ...countsOf(held.trace), changes: held.trace.changed(), transcript: view.ended !== null ? fakeHash(`transcript:${view.turn}`) : null, did: replyDid(held.trace.events) };
     }
     const stored = this.stored.get(chatId)?.[0];
     if (!stored) return null;
     const { row, trace } = stored;
     const counts = trace ? countsOf(trace) : { agents: 0, tools: 0, lore: { added: 0, dropped: 0 }, jobs: 0 };
-    return { turn: row.turn, kind: row.kind, messageId: row.messageId, startedAt: row.at, ended: { state: "done", at: row.at + (row.usage?.ms ?? 0), ...(row.noPart !== undefined ? { noPart: row.noPart } : {}) }, place: row.place ?? this.chat(chatId).place, replyBy: null, usage: row.usage, ...counts, changes: row.changes, transcript: row.transcript, ...(trace ? { did: replyDid(trace.events) } : {}) };
+    return { turn: row.turn, kind: row.kind, messageId: row.messageId, startedAt: row.at, ended: { state: "done", at: row.at + (row.usage?.ms ?? 0) }, usage: row.usage, ...counts, changes: row.changes, transcript: row.transcript, ...(trace ? { did: replyDid(trace.events) } : {}) };
   }
 
   private pageOf(events: readonly LiveEvent[], from: number): { events: LiveEvent[]; next: number | null } {
@@ -834,7 +781,7 @@ export class MockBackend {
     // Another extension answers this one, until it is taken over (it is then among the chats listed).
     if (chatId === THEIR_CHAT.chatId) return { ...THEIR_CHAT };
     const name = [...CHATS, OTHER_CHAT].find((c) => c.chatId === chatId)?.name ?? null;
-    return { chatId, name, on: false, since: null, place: "builtin", connection: { id: "conn-deepseek", name: "Deepseek", loopback: false } };
+    return { chatId, name, on: false, since: null, connection: { id: "conn-deepseek", name: "Deepseek", loopback: false } };
   }
 
   /** Whether a runtime is there to choose: one linked, the key minted, the loopback connection made. */

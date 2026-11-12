@@ -32,9 +32,9 @@ export interface ToolCtx {
  * `to_reply`), in place of a writer: what they release streams to the user in the order released,
  * and the reply is all of it.
  *
- * - `refused`: why nothing can be released now, in words for the model (the turn runs built in,
- *   where Lumiverse writes the reply; the writer is at work on it; another agent's answer is
- *   streaming into it); null where something can.
+ * - `refused`: why nothing can be released now, in words for the model (the turn has ended; the
+ *   writer is at work on it; another agent's answer is streaming into it); null where something
+ *   can.
  * - `write`: one passage from the agent `ctx` names, once the extension lets it go (§21
  *   `releasing`), in the order the calls came: null once it went out, else why not. The extension
  *   is told of what went out (`released`).

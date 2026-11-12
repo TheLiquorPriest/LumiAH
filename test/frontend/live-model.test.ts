@@ -2,7 +2,7 @@
 // under a filter, what a search finds, the totals of tokens, time and cost, and the turn as a file.
 
 import { describe, expect, test } from "bun:test";
-import { failedTurn, finishedTurn, handedTurn, lateTurn, longTurn, NO_PART_TIME, PROMPT_HELD, REPLY_MS, Trace, workedTurn } from "../../dev/preview/fixtures";
+import { briefedTurn, failedTurn, finishedTurn, longTurn, PROMPT_HELD, Trace, workedTurn } from "../../dev/preview/fixtures";
 import {
   type AgentFeed,
   addsTo,
@@ -23,14 +23,10 @@ import {
   loreChangeText,
   loreNamesWords,
   mendOf,
-  NO_PART_TITLE,
   rangeCount,
   rangesWords,
-  replyClock,
   tookWords,
   withoutPhrase,
-  runningWords,
-  turnPhase,
   type Filter,
   findMatches,
   markPieces,
@@ -633,61 +629,18 @@ describe("a stop is said once", () => {
   });
 });
 
-describe("a turn that runs built in", () => {
-  const handed = handedTurn("chat-mara", "turn-b", T0);
-  const builtin = (trace: Trace, upTo = trace.events.length): LiveView => ({ ...viewOf(trace, upTo), place: "builtin", replyBy: T0 + REPLY_MS });
+describe("a reply that failed names its cause and the step that mends it (ux B2)", () => {
+  const FAILED = "The main agent stopped before it wrote a brief.";
+  const ended = (over: Partial<LiveEnded> = {}): LiveEnded => ({ state: "failed", at: T0, reason: FAILED, ...over });
 
-  test("its clock says the most it may still take before the reply (a limit, not the wait), turns urgent in its last fifth, and says when the time is up", () => {
-    expect(replyClock(T0 + 270_000, T0, T0 + 2000)).toEqual({ text: "At most 4 min 28 s before the reply", short: "at most 4 min 28 s", urgent: false, over: false });
-    expect(replyClock(T0 + 270_000, T0, T0 + 216_000)).toMatchObject({ text: "At most 54 s before the reply", urgent: true, over: false });
-    expect(replyClock(T0 + 270_000, T0, T0 + 215_000).urgent).toBe(false);
-    expect(replyClock(T0 + 270_000, T0, T0 + 270_000)).toEqual({ text: "Out of time before the reply", short: "out of time", urgent: true, over: true });
-  });
-
-  test("while its main agent works it counts down; once the brief is handed over Lumiverse writes; then it is over", () => {
-    // Up to the main agent's first answer.
-    const working = turnView(builtin(handed, 6));
-    expect(turnPhase(working)).toEqual({ at: "working", replyBy: T0 + REPLY_MS });
-    expect(runningWords(turnPhase(working), false)).toBe("Running");
-    expect(runningWords(turnPhase(working), true)).toBe("Paused");
-    // The brief handed over and the main agent at rest, the reply not yet saved.
-    const writing = turnView(builtin(handed, handed.events.length - 1));
-    expect(turnPhase(writing)).toEqual({ at: "writing" });
-    expect(runningWords(turnPhase(writing), false)).toBe("Lumiverse is writing the reply");
-    expect(turnPhase(turnView(builtin(handed)))).toEqual({ at: "over" });
-  });
-
-  test("a turn in a runtime, a job's run and a turn whose place isn't said keep no such time", () => {
-    const done = finishedTurn("chat-mara", "turn-r", T0);
-    expect(turnPhase(turnView({ ...viewOf(done, 6), place: "runtime", replyBy: null }))).toEqual({ at: "working", replyBy: null });
-    expect(turnPhase(turnView(viewOf(done, 6)))).toEqual({ at: "working", replyBy: null });
-    expect(turnPhase(turnView({ ...viewOf(done, 6), kind: "job", place: "builtin", replyBy: T0 + 1000 }))).toEqual({ at: "working", replyBy: null });
-    // In a runtime the writer is an agent of the turn: while it writes, the turn works.
-    const writerAt = done.events.findIndex((e) => e.event.kind === "agent_started" && e.event.agent.role === "writer");
-    expect(turnPhase(turnView({ ...viewOf(done, writerAt + 2), place: "runtime" }))).toEqual({ at: "working", replyBy: null });
-  });
-
-  test("a reply LumiAH had no part in is written into the transcript with why", () => {
-    const late = lateTurn("chat-mara", "turn-late", T0);
-    const md = transcriptMarkdown(turnView({ ...builtin(late), ended: { state: "done", at: T0 + REPLY_MS + 6200, noPart: NO_PART_TIME } }));
-    expect(md).toContain(`${NO_PART_TITLE}. It ran out of the time Lumiverse allows before a reply`);
-    expect(md).toContain("· built in");
-  });
-});
-
-describe("a reply that failed, or that LumiAH had no part in, names its cause and the step that mends it (ux B2)", () => {
-  const FAILED = "LumiAH's agents didn't finish. Lumiverse sent the prompt as it was, so the reply is its own.";
-  const ended = (over: Partial<LiveEnded> = {}): LiveEnded => ({ state: "failed", at: T0, noPart: { why: "failed", text: FAILED }, ...over });
-
-  test("a turn that finished with its part in the reply, and one the user stopped in a runtime, need neither", () => {
+  test("a turn that finished, and one the user stopped, need neither", () => {
     expect(mendOf({ state: "done", at: T0 }, null, false)).toBeNull();
     expect(mendOf({ state: "stopped", at: T0, reason: "You stopped it from the live view." }, null, false)).toBeNull();
   });
 
-  test("the backend's cause decides where it sends one: another model, a permission, the runtime, the limit's own setting", () => {
+  test("the backend's cause decides where it sends one: another model, a permission, the limit's own setting", () => {
     expect(mendOf(ended({ cause: "no_tools" }), null, false)).toEqual({ title: "The agents' model can't call tools", text: FAILED, tone: "neg", action: { label: "Choose another model for the agents", step: { go: "setting", link: "agentsModel" } } });
     expect(mendOf(ended({ cause: "permission" }), null, false)).toMatchObject({ title: "LumiAH is missing a permission it needs", action: { label: "Allow it", step: { go: "grant" } } });
-    expect(mendOf(ended({ cause: "time", noPart: NO_PART_TIME }), null, false)).toMatchObject({ title: "LumiAH ran out of time before the reply", tone: "warn", action: { step: { go: "page", page: "runtime" } } });
     const stop = (code: "tool_turns" | "turn_tokens_in" | "spend") => ({ stop: { code, reason: "It reached a limit." } });
     expect(mendOf(ended({ cause: "limit" }), stop("tool_turns"), false)?.action).toEqual({ label: "Raise the main agent's limits", step: { go: "setting", link: "agentLimits" } });
     expect(mendOf(ended({ cause: "limit" }), stop("turn_tokens_in"), false)?.action).toEqual({ label: "Raise the limits of a reply", step: { go: "setting", link: "turnLimits" } });
@@ -696,25 +649,21 @@ describe("a reply that failed, or that LumiAH had no part in, names its cause an
     expect(mendOf(ended({ cause: "limit" }), null, false)).toMatchObject({ title: "A limit was reached", action: { step: { go: "problems" } } });
   });
 
-  test("without a cause from the backend, the page tells what it can: a missing permission, the time, a limit the main agent stopped at, a connection it can't use", () => {
+  test("without a cause from the backend, the page tells what it can: a missing permission, a limit the main agent stopped at, a connection it can't use", () => {
     expect(mendOf(ended(), null, true)?.title).toBe("LumiAH is missing a permission it needs");
-    expect(mendOf(ended({ noPart: NO_PART_TIME }), null, false)?.title).toBe("LumiAH ran out of time before the reply");
     expect(mendOf(ended(), { stop: { code: "tokens_out", reason: "It wrote its 4,000 tokens." } }, false)?.title).toBe("The main agent reached one of its limits");
     expect(mendOf(ended(), { stop: { code: "connection", reason: "No connection." } }, false)?.action?.step).toEqual({ go: "setting", link: "agentsModel" });
     expect(mendOf({ state: "lost", at: T0 }, null, false)).toMatchObject({ title: "The turn was lost with its runtime", action: { label: "Open Runtime" } });
     // Else it failed for a reason only its steps say: the way is to them.
-    expect(mendOf(ended(), null, false)).toEqual({ title: NO_PART_TITLE, text: FAILED, tone: "warn", action: { label: "Show what went wrong", step: { go: "problems" } } });
+    expect(mendOf(ended(), null, false)).toEqual({ title: "The turn failed", text: FAILED, tone: "neg", action: { label: "Show what went wrong", step: { go: "problems" } } });
     expect(mendOf({ state: "failed", at: T0, reason: "The main agent ran out of tool rounds." }, null, false)).toMatchObject({ title: "The turn failed", text: "The main agent ran out of tool rounds.", tone: "neg" });
   });
 
-  test("what the user did themselves is no failure, has nothing to mend, and is said once", () => {
-    const text = "You skipped LumiAH for this reply. Lumiverse wrote the reply from the prompt as it was. To stop a reply itself, use Lumiverse's own Stop.";
-    expect(mendOf({ state: "stopped", at: T0, noPart: { why: "stopped", text }, cause: "skipped" }, null, false)).toEqual({ title: "You skipped LumiAH for this reply", text: "Lumiverse wrote the reply from the prompt as it was. To stop a reply itself, use Lumiverse's own Stop.", tone: "neutral", action: null });
-    // Another reply asked for meanwhile: the backend's words stand under the plain heading, the heading never twice.
-    expect(mendOf({ state: "stopped", at: T0, noPart: { why: "stopped", text: "LumiAH had no part in this reply: another reply was asked for before it had briefed the model." } }, null, false)).toEqual({ title: NO_PART_TITLE, text: "Another reply was asked for before it had briefed the model.", tone: "neutral", action: null });
-    expect(withoutPhrase("LumiAH had no part in this reply. Its time ran out.", NO_PART_TITLE)).toBe("Its time ran out.");
-    expect(withoutPhrase("Its time ran out.", NO_PART_TITLE)).toBe("Its time ran out.");
-    expect(withoutPhrase("LumiAH had no part in this reply.", NO_PART_TITLE)).toBe("");
+  test("the backend's words stand under the heading without saying it twice", () => {
+    expect(mendOf(ended({ reason: "The turn failed: the provider answered 503." }), null, false)?.text).toBe("The provider answered 503.");
+    expect(withoutPhrase("The turn failed. The provider answered 503.", "The turn failed")).toBe("The provider answered 503.");
+    expect(withoutPhrase("The provider answered 503.", "The turn failed")).toBe("The provider answered 503.");
+    expect(withoutPhrase("The turn failed.", "The turn failed")).toBe("");
   });
 });
 
@@ -743,8 +692,8 @@ describe("what a reply's turn came to, in words (ux B1)", () => {
 });
 
 describe("what the prompt held, and the lore the writer saw", () => {
-  const handed = handedTurn("chat-mara", "turn-h", T0);
-  const turn = turnView(viewOf(handed));
+  const briefed = briefedTurn("chat-mara", "turn-h", T0);
+  const turn = turnView(viewOf(briefed));
 
   test("the turn holds what the main agent was told of the prompt, and its fold's line says how much", () => {
     expect(turn.held?.lore.map((e) => e.entryId)).toEqual(["lore-town-rules", "lore-harbour-office", "lore-joss"]);
@@ -773,7 +722,7 @@ describe("what the prompt held, and the lore the writer saw", () => {
 
   test("write_reply's call says which entries it added and which it left out of this prompt, and a search finds them", () => {
     const write = feedOf(turn, NO_FILTER)[0]?.items.find((i) => i.kind === "tool" && i.call.name === "write_reply");
-    if (write?.kind !== "tool" || write.lore === null) throw new Error("the built-in turn's write_reply says nothing of the lore");
+    if (write?.kind !== "tool" || write.lore === null) throw new Error("the turn's write_reply says nothing of the lore");
     expect(loreChangeLine(write.lore)).toBe("The main agent added 1 lore entry and left 1 out of this prompt; 1 entry it named was refused.");
     expect(loreChangeText(write.lore).split("\n")).toEqual(["Added: The night key", "Left out of this prompt: Joss", "Refused: lore-ilse (The chat's books have no entry lore-ilse. lore_index lists the entries there are.)"]);
     expect(loreChangeLine({ added: [], dropped: [], refused: [] })).toBe("The main agent left the lore in the prompt as Lumiverse had it.");

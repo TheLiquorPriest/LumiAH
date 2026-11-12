@@ -121,7 +121,7 @@ export class Definitions {
 
   /**
    * `lah.defs.get`: every definition as the core has it for the user (they are about no chat, so
-   * the core built in merges them: asks.ts), each tool with what its calls do, and the MCP servers
+   * the user's runtime merges them: asks.ts), each tool with what its calls do, and the MCP servers
    * with their switches.
    */
   async view(userId: string): Promise<DefsView> {
@@ -191,8 +191,9 @@ export class Definitions {
   async remove(userId: string, kind: "agent" | "skill", id: string): Promise<DefsView> {
     const held = storedOf(await this.deps.settings.definitions(userId))[KIND_KEY[kind]];
     if (!Object.hasOwn(held, id)) throw new UiRefused("not_found", `You have no ${kind} of your own named "${id}". A built-in or an extension's can be switched off, not removed.`);
-    const agents = kind === "agent" ? (await this.merged(userId)).agents : [];
-    const alone = (Array.isArray(agents) ? agents : []).some((a) => isRecord(a) && a.id === id && a.over === undefined);
+    // Read before anything changes: with no runtime linked the removal is refused whole, not kept with no view to answer.
+    const { agents } = await this.merged(userId);
+    const alone = kind === "agent" && (Array.isArray(agents) ? agents : []).some((a) => isRecord(a) && a.id === id && a.over === undefined);
     await this.edit(userId, (stored) => {
       delete stored[KIND_KEY[kind]][id];
     });
@@ -202,6 +203,8 @@ export class Definitions {
 
   /** `lah.def.switch`: an agent, a skill or a tool off or on again; an MCP server's tools on for agents, or off again. */
   async switch(userId: string, kind: "agent" | "skill" | "tool" | "mcp", id: string, off: boolean): Promise<DefsView> {
+    // The answer is the core's view of the definitions: with no runtime linked to give it, the switch is refused before it is kept.
+    await this.merged(userId);
     await this.edit(userId, (stored) => {
       const list = kind === "mcp" ? stored.mcp : stored.off[KIND_KEY[kind]];
       // The MCP list holds what is on; the others hold what is off.
@@ -214,6 +217,8 @@ export class Definitions {
   }
 
   private async approve(userId: string, path: string[], value: JsonValue | null): Promise<DefsView> {
+    // As for a switch: refused before it is kept where no runtime is linked to give the view.
+    await this.merged(userId);
     await this.deps.settings.change(userId, value === null ? [] : [{ path, value }], value === null ? [path] : []);
     this.moved(userId);
     return this.view(userId);

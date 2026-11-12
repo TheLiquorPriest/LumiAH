@@ -12,7 +12,6 @@ import { ago, compact, count, counted, dateTime } from "../format";
 import { Icon } from "../icons";
 import { costWords, TURN_KIND_WORDS } from "../live-model";
 import { useBlob, useTranscript } from "../runs";
-import { PLACE_LABEL } from "../setup-model";
 import { useSelect } from "../store";
 import { revealInScroller } from "../scroll";
 import { TurnFeed } from "../transcript";
@@ -90,7 +89,7 @@ function Detail(props: { chatId: string; turn: TurnRow; kind: Chosen["kind"]; bu
         </span>
         <span class="lah-pane-title">
           <strong class="lah-h">{props.kind === "summary" ? `The summary made at reply #${turn.index}` : `Reply #${turn.index} · ${TURN_KIND_WORDS[turn.kind]}`}</strong>
-          <span class="lah-dim lah-small">{[dateTime(turn.at), ...(turn.place !== undefined ? [PLACE_LABEL[turn.place].toLowerCase()] : []), `swipe ${turn.swipe + 1}`].join(" · ")}</span>
+          <span class="lah-dim lah-small">{[dateTime(turn.at), `swipe ${turn.swipe + 1}`].join(" · ")}</span>
         </span>
         {turn.changes > 0 ? (
           <Button size="sm" icon="folder" onClick={props.onChanges}>
@@ -288,15 +287,12 @@ export function SessionsPage() {
                     <span class="lah-navrow-text">
                       <span class="lah-turnrow-title">
                         <span>{`#${t.index} · ${TURN_KIND_WORDS[t.kind]}`}</span>
-                        {t.noPart !== undefined ? <Badge tone="warn">Lumiverse's own reply</Badge> : null}
                         {t.onPath ? null : <Badge tone="warn">no longer used</Badge>}
                         {t.compaction ? <Badge tone="accent">summary made</Badge> : null}
                       </span>
                       <span class="lah-turnrow-preview">{t.preview === "" ? "(an empty reply)" : t.preview}</span>
-                      {/* LumiAH had no part in the reply: the row says why in the backend's own words, as Live does. */}
-                      {t.noPart !== undefined ? <span class="lah-navrow-sub" data-lah-nopart>{`LumiAH had no part in it. ${t.noPart.text}`}</span> : null}
                       <span class="lah-navrow-sub lah-num">
-                        {[ago(now, t.at), ...(t.place !== undefined ? [PLACE_LABEL[t.place].toLowerCase()] : []), ...(t.usage ? [counted(t.usage.calls, "call"), `${compact(t.usage.in)} in`, `${compact(t.usage.out)} out`, costWords(t.usage)] : []), ...(t.changes > 0 ? [`${counted(t.changes, "file")} changed`] : []), ...(t.transcript === null ? ["steps not kept"] : [])].join(" · ")}
+                        {[ago(now, t.at), ...(t.usage ? [counted(t.usage.calls, "call"), `${compact(t.usage.in)} in`, `${compact(t.usage.out)} out`, costWords(t.usage)] : []), ...(t.changes > 0 ? [`${counted(t.changes, "file")} changed`] : []), ...(t.transcript === null ? ["steps not kept"] : [])].join(" · ")}
                       </span>
                     </span>
                     <Icon name="chevron-right" size={16} class="lah-chev" />

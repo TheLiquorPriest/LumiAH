@@ -114,16 +114,10 @@ export const GROUPS: readonly { id: GroupId; label: string; pages: readonly Page
       { id: "settings", label: "Settings", about: "Models, limits, and every text sent to a model. The defaults work as they are." },
       { id: "spend", label: "Spend", about: "Tokens and cost by day, chat, agent and model, and the caps you set.", far: true },
       { id: "upkeep", label: "Storage", about: "What LumiAH stores, how big it is, and clearing what is no longer needed.", far: true },
-      { id: "runtime", label: "Runtime", about: "Optional. A runtime is a program you start beside Lumiverse, for turns that need longer than Lumiverse allows before a reply.", far: true },
+      { id: "runtime", label: "Runtime", about: "Needed. A runtime is a program you start beside Lumiverse: LumiAH's agents work there before each reply, and no chat is answered without it." },
     ],
   },
 ];
-
-/** What a page is for, in words: as `PAGES` says it, but where the extension that builds LumiAH in plays its chats only in a runtime (`RuntimeView.only`), the Runtime page is no option. */
-export function aboutOf(entry: Pick<PageEntry, "id" | "about">, only: string | undefined): string {
-  if (entry.id !== "runtime" || only === undefined) return entry.about;
-  return `Needed. ${only} plays its chats only in a runtime, a program you start beside Lumiverse: none of them plays without it.`;
-}
 
 export const PAGES: readonly PageEntry[] = GROUPS.flatMap((g) => g.pages);
 

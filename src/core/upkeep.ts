@@ -24,7 +24,7 @@ import { DOC } from "./paths";
 import type { BlobInfo, HarnessHost, JsonValue, TurnRecord } from "./ports";
 import { isRecord } from "./ports";
 import { HarnessRefusal } from "./refusal";
-import { type PendingTurn, pathTurns, pendingOf, recordOf } from "./sessions";
+import { pathTurns, recordOf } from "./sessions";
 import type { Settings } from "./settings";
 import { transcriptOf } from "./transcript";
 import { errorText, type Limit } from "./util";
@@ -118,7 +118,12 @@ const DAY_MS = 24 * HOUR_MS;
 const AREA_DOC = /^(?:workspace\/user|chats\/[^/]+\/learned|chats\/[^/]+\/area\/[^/]+)\.json$/;
 const JOB_DOC = /^jobs\/[^/]+\.json$/;
 const SIDE_DOC = /^sides\/[^/]+\.json$/;
-const PENDING_DOC = /^pending\/[^/]+\.json$/;
+/**
+ * What built-in mode left in the store, which LumiAH's `main` branch still has: its turns that waited
+ * for their replies, and its own list of the jobs it ran. Nothing reads them here, and they name
+ * nothing a sweep keeps: a sweep removes them.
+ */
+const LEFTOVER_DOC = /^(?:pending\/[^/]+|jobs\/running\.builtin)\.json$/;
 
 /** A record, and the swipe that holds it. */
 interface Held {
@@ -216,16 +221,6 @@ class Walk {
       this.mark(turn.segment, "segment");
       if (typeof turn.at === "number") await this.transcript(turn.transcript, turn.at);
     }
-  }
-
-  /** A turn that waits for its reply in storage (§25): its notes as far as they go, the summary it made or carries on and the segments that keeps whole, the reports of the jobs it lists, and the chat's area as the turn before left it and as it stood at the hand-over. */
-  async pending(turn: PendingTurn): Promise<void> {
-    this.mark(turn.draft, "segment");
-    this.mark(turn.summary?.summary, "summary");
-    for (const segment of turn.summary?.kept ?? []) this.mark(segment, "segment");
-    for (const job of turn.jobs) this.mark(job.report, "report");
-    await this.index(turn.basis);
-    await this.index(turn.workspace);
   }
 }
 
@@ -332,8 +327,8 @@ export class Upkeep {
     const keep = this.deps.keep();
     const walk = new Walk(this.deps.blobs, startedAt, keep);
     const graceFrom = startedAt - keep.graceHours * HOUR_MS;
-    /** The waiting turns handed over before the grace time began, whose wait has run out: no reply is coming for them any more, so a sweep removes their documents, and what only they named with them. */
-    const lapsed: string[] = [];
+    /** What built-in mode left in the store (`LEFTOVER_DOC`): a sweep removes it. */
+    const leftovers: string[] = [];
 
     // Every record on every swipe, listed before anything a record names is read: the listing is over quickly, and holds still while it lasts.
     const held: Held[] = [];
@@ -359,18 +354,12 @@ export class Upkeep {
     }
     for (const path of await store.list("")) {
       ended();
-      if (AREA_DOC.test(path)) {
+      if (LEFTOVER_DOC.test(path)) leftovers.push(path);
+      else if (AREA_DOC.test(path)) {
         const doc = await store.read(path);
         if (isRecord(doc) && doc.v === 1 && doc.kind === "area") await walk.index(doc.head);
       } else if (SIDE_DOC.test(path)) await walk.side(await store.read(path));
       else if (JOB_DOC.test(path)) await walk.job(await store.read(path));
-      else if (PENDING_DOC.test(path)) {
-        // A document that doesn't read as a waiting turn names nothing, and is left as it is.
-        const waiting = pendingOf(await store.read(path));
-        // A wait Settings let run longer than the grace time isn't over while it runs.
-        if (waiting && waiting.at <= graceFrom && (waiting.until ?? 0) <= startedAt) lapsed.push(path);
-        else if (waiting) await walk.pending(waiting);
-      }
     }
 
     // Every blob stored, each under its kind, or loose. Nothing is removed while the listing is read: it has to hold still.
@@ -406,8 +395,8 @@ export class Upkeep {
     let gone = 0;
     let cut: { why: unknown } | null = null;
     try {
-      // The documents of the waiting turns whose time is long over go first, each whole; what they named is among the blobs that follow.
-      for (const path of removing ? lapsed : []) {
+      // What built-in mode left goes first, each document whole; what it named is among the blobs that follow.
+      for (const path of removing ? leftovers : []) {
         ended();
         await store.remove(path);
       }

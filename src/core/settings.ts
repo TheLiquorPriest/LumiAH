@@ -100,10 +100,6 @@ export interface Settings {
     progressChars: number;
     /** Whether the writer is given the guidance the agents are given (§12), beside the brief. Off: the writer's call is the prompt as it came with the brief alone (§3.2), and the main agent carries what matters. */
     writerGuidance: boolean;
-    /** Where Lumiverse's own generation writes the reply (§25): how long before the reply is due the main agent is warned, in milliseconds; null: it isn't. */
-    warnMs: Limit;
-    /** Where Lumiverse's own generation writes the reply (§25): how long a turn waits for its reply to be written before it is given up, in milliseconds; null: as long as it takes. */
-    pendingMs: Limit;
   };
   /** What counts as a chat's story (§24.4): the user's setting, which a chat's own choice and the claiming extension's word stand over. */
   story: StorySetting;
@@ -371,8 +367,7 @@ export function defaultSettings(): Settings {
   const unlimited = { callTokensIn: null, callMs: null, callTools: null, tokensIn: null, tokensOut: null, wallMs: null };
   return {
     // A separate writer writes, so the user's preset governs the prose as it does without LumiAH: for the same reason the writer isn't given the agents' guidance unless the user says so.
-    // Built in, Lumiverse waits five minutes at most for an extension before a reply: a minute's warning leaves the main agent a round to brief in. A reply that hasn't been written ten minutes after the hand-over isn't coming.
-    reply: { writer: "writer", briefAt: "before_last_user", briefRole: "system", withoutBrief: "write", progress: true, progressChars: 160, writerGuidance: false, warnMs: 60_000, pendingMs: 600_000 },
+    reply: { writer: "writer", briefAt: "before_last_user", briefRole: "system", withoutBrief: "write", progress: true, progressChars: 160, writerGuidance: false },
     // A message the user hid from the prompt was hidden for a reason; whose messages are the story is Lumiverse's Sovereign Hand's to say until the user says otherwise.
     story: { ...STORY_DEFAULTS },
     agents: {
@@ -561,8 +556,6 @@ export const SETTINGS_SCHEMA: JsonObject = {
         progress: flag("Progress lines", "Write what the main agent is doing into the reply's thinking block as it works."),
         progressChars: whole("Progress line length", "The most characters one progress line holds.", 20, "characters"),
         writerGuidance: flag("Give the writer your guidance", "Put the guidance your agents are given (yours, the character's, the chat's) beside the brief in the writer's prompt. Off, the writer is sent the prompt as Lumiverse assembled it with the brief alone, and the main agent carries into the brief what of your guidance bears on the prose."),
-        warnMs: { ...limit("Warn before the reply is due", "Where Lumiverse's own generation writes the reply, it waits only so long for LumiAH. This long before that time is up, the main agent is told to brief the writer with what it has.", "ms", 0), "x-none": "No warning" },
-        pendingMs: { ...limit("Give up a reply that isn't written", "Where Lumiverse's own generation writes the reply: how long a turn waits for that reply before it is given up, with no record of it kept.", "ms"), "x-none": "As long as it takes" },
       },
     },
     story: {
@@ -909,6 +902,16 @@ function read(schema: JsonObject, fallback: JsonValue, value: unknown, path: (st
   }
   return refuse("It can't be set.");
 }
+
+/**
+ * Settings an earlier build had and this one took away, by path: what built-in mode read (it runs
+ * on LumiAH's `main` branch, not here). A value a user kept at one names nothing now, and the
+ * settings' store passes over it quietly rather than refuse every later change for it.
+ */
+export const RETIRED_SETTINGS: readonly (readonly string[])[] = [
+  ["reply", "warnMs"],
+  ["reply", "pendingMs"],
+];
 
 /** The settings' JSON Schema for a harness whose registries hold more than the core's own (`scope`). */
 export function settingsSchema(scope: SettingsScope): JsonObject {

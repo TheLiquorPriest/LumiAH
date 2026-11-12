@@ -116,8 +116,8 @@ select.lah-input{appearance:auto;text-overflow:ellipsis}
 .lah-stepper{display:inline-flex;align-items:center;gap:var(--lah-s1);max-width:100%;min-width:0}
 .lah-stepper>.lah-input{flex:1 1 96px;width:96px;min-width:56px;text-align:center;font-variant-numeric:tabular-nums}
 .lah-stepper>.lah-btn{flex:0 0 var(--lah-tap);padding:0}
-/* The notices take no room of their own and stand over the page's foot, above whatever a running turn keeps there (--lah-foot-h: the bar with Stop, a held call's card; transcript.tsx measures it), so a notice never covers a control the user may need at once. */
-.lah-toasts{position:sticky;bottom:calc(var(--lah-s2) + var(--lah-foot-h,0px));z-index:8;height:0;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:var(--lah-s1);pointer-events:none;margin-top:auto}
+/* The notices take no room of their own and stand over the page's foot, above whatever a running turn keeps there (--lah-foot-h: the bar with Stop, a held call's card; transcript.tsx measures it) and above what the host or the page keeps at the panel's foot (--lah-stick-bottom, --lah-page-foot-h: the same two the transcript's own foot rises over), so a notice never covers a control the user may need at once. */
+.lah-toasts{position:sticky;bottom:calc(var(--lah-s2) + var(--lah-foot-h,0px) + max(var(--lah-stick-bottom,0px),var(--lah-page-foot-h,0px)));z-index:8;height:0;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:var(--lah-s1);pointer-events:none;margin-top:auto}
 .lah-toast{pointer-events:auto;display:flex;align-items:center;gap:var(--lah-s2);max-width:min(100%,520px);padding:var(--lah-s1) var(--lah-s1) var(--lah-s1) var(--lah-s3);border-radius:var(--lah-r-lg);border:1px solid var(--lah-border);background:var(--lah-bar-bg);box-shadow:var(--lah-shadow-lg);font-size:var(--lah-fs-sm)}
 .lah-toast.lah-is-error{border-color:color-mix(in srgb,var(--lah-danger) 50%,transparent);color:var(--lah-neg)}
 .lah-toast-text{flex:1;min-width:0;overflow-wrap:anywhere;color:var(--lah-fg)}

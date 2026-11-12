@@ -1,12 +1,10 @@
 // A turn from the extension's side (DESIGN §2, §25). The prompt interceptor sees every reply's
 // prompt and decides whose it is:
 //
-// - On a loopback connection it is a runtime's: the generation is tagged with a single-use tag and
+// - On a loopback connection it is the runtime's: the generation is tagged with a single-use tag and
 //   the messages the history cutoff hides are left out; the runtime shows the tag once and gets the
 //   turn back; and the record the turn leaves is written on the reply's message once Lumiverse has
 //   saved it.
-// - In a chat switched on to run built in, the turn is worked on here, before the prompt goes on
-//   (hosted.ts): this file knows the generation and where its record goes, as for a runtime's.
 // - Any other prompt is left exactly as it came.
 //
 // A generation is known from Lumiverse's own events: its start says which chat, what kind and which
@@ -22,7 +20,6 @@ import { recordOf } from "../../core/sessions";
 import type { Anchoring, SourceMark, TurnFacts } from "../../link/contract";
 import { TAG_PARAM, contentMark } from "../../link/contract";
 import { CEILINGS, TRANSPORT_DEFAULTS, type TransportSettings } from "../../link/settings";
-import type { RunPlace } from "../../shared/ui";
 import type { Chats } from "./chat";
 import type { Connections } from "./connections";
 import { randomHex } from "./docs";
@@ -71,8 +68,6 @@ export interface Target {
 export interface Turn {
   /** The turn's id: its generation's. */
   turn: string;
-  /** Where it runs (§25): in a runtime, which shows `tag` once to get it; or here, built in, where the tag is never sent and admits nobody. */
-  place: RunPlace;
   tag: string;
   userId: string;
   chatId: string;
@@ -84,12 +79,12 @@ export interface Turn {
   /** The World Info entries Lumiverse activated for the prompt, and how each got there where it said. */
   activated: ActivatedInfo[];
   at: number;
-  /** The runtime's request that spent the tag, and the runtime it came from; null while unspent, and for a turn that runs here. */
+  /** The runtime's request that spent the tag, and the runtime it came from; null while unspent. */
   request: string | null;
   relay: string | null;
   /** The turn as the runtime was told, once its target is known. */
   facts: Promise<Omit<TurnFacts, "settings">> | null;
-  /** Where its record goes, once it was fixed (a runtime's `begin`, or `aim` for a turn that runs here): moved down since by every swipe of that message deleted before it. */
+  /** Where its record goes, once it was fixed (the runtime's `begin`): moved down since by every swipe of that message deleted before it. */
   target: Target | null;
   /** The user stopped it from LumiAH's live view. */
   stoppedHere: boolean;
@@ -102,13 +97,11 @@ interface Pending {
   /** The turn's own target (`Turn.target`, the same object) while this extension holds the turn; else as the runtime said it. */
   target: Target;
   record: TurnRecord;
-  /** What this backend keeps on the record beside the core's fields: where the turn ran, and why LumiAH had no part in the reply where it had none. */
-  ran: JsonObject;
   at: number;
 }
 
-/** Where a prompt is answered: in a runtime, here (built in), or nowhere (`false`: the prompt is none of LumiAH's). */
-type Verdict = RunPlace | false;
+/** Whether a prompt is the runtime's: `true` on a loopback connection, `false` where it is none of LumiAH's. */
+type Verdict = boolean;
 
 /**
  * One account's part of the interceptor's bookkeeping. Nothing in it is another account's: a turn
@@ -143,8 +136,6 @@ export interface TurnsDeps {
   settings: SettingsStore;
   /** The turns something is owed to across a restart of this worker (open.ts). */
   open: OpenTurns;
-  /** Whether a chat is switched on to run built in, from what the extension remembers alone (switch.ts). */
-  builtin(userId: string, chatId: string): Promise<boolean>;
   /** A reply is about to go to a runtime (never a prompt preview): where that runtime isn't linked the user is told so, since nothing here answers in its place (§25). Not waited for. */
   toRuntime?(userId: string, chatId: string): void;
   /** The extension as its pages show it, for the words a reply that couldn't start is given. */
@@ -153,9 +144,6 @@ export interface TurnsDeps {
   /** Runs `fn` once after `ms`; what it returns cancels that. */
   later(ms: number, fn: () => void): () => void;
 }
-
-/** A built-in turn's part of the interceptor (hosted.ts): given the prompt, its turn and the places of the messages the history cutoff hides, what Lumiverse is to send. It never rejects. */
-export type HostedTurn = (input: InterceptorInput, turn: Turn, omit: number[]) => Promise<InterceptorVerdict>;
 
 /** The places of the history messages a prompt leaves out: all but the latest `count`, when only the latest are kept. */
 export function cutoff(messages: readonly PromptMessage[], history: TransportSettings["history"]): number[] {
@@ -174,8 +162,6 @@ export class Turns {
   /** The generations whose account Lumiverse didn't name, until their prompt comes and says whose they are; and the latest of them in each chat. */
   private readonly unowned = new Map<string, Generation>();
   private readonly unownedLatest = new Map<string, string>();
-  /** What works a built-in turn before its prompt goes on (hosted.ts); null until the backend is put together. */
-  private hosted: HostedTurn | null = null;
   /** How many swipe deletions were heard: a target read from the chat while one came is read again. */
   private swipesDeleted = 0;
   private readonly begun: ((turn: Turn, facts: Omit<TurnFacts, "settings">) => void)[] = [];
@@ -212,14 +198,9 @@ export class Turns {
     return this.home.get(id)?.byTurn.get(id);
   }
 
-  /** The latest turn of a user's chat that LumiAH answered, in either place; none when it has had none since the extension started. */
+  /** The latest turn of a user's chat that LumiAH answered; none when it has had none since the extension started. */
   ofChat(userId: string, chatId: string): Turn | undefined {
     return this.accounts.get(userId)?.byChat.get(chatId);
-  }
-
-  /** What works a built-in turn before its prompt goes on (hosted.ts). */
-  hostedBy(work: HostedTurn): void {
-    this.hosted = work;
   }
 
   // ---------------------------------------------------------------- an account's own
@@ -472,23 +453,13 @@ export class Turns {
   }
 
   /**
-   * Where a prompt is answered, as Lumiverse has the connections and the user has the switch now:
-   * in a runtime when it is on a loopback connection (its request reaches the runtime there,
-   * whatever the switch says), else here when its chat is switched on to run built in. The two are
-   * asked apart, so a chat switched on here is answered here though Lumiverse won't say what its
-   * connection is.
+   * Whether a prompt is the runtime's, as Lumiverse has the connections now: it is on a loopback
+   * connection, so its request reaches the runtime there, whatever the switch says.
    */
   private async placeNow(input: InterceptorInput): Promise<Verdict> {
     const { connections, chats } = this.deps;
-    const [loop, here] = await Promise.allSettled([
-      input.connectionId !== null ? connections.isLoopback(input.userId, input.connectionId) : chats.own(input.userId, input.chatId).then(async (chat) => (await connections.ofChat(input.userId, chat))?.loopback === true),
-      this.deps.builtin(input.userId, input.chatId),
-    ]);
-    if (loop.status === "fulfilled" && loop.value) return "runtime";
-    if (here.status === "fulfilled" && here.value) return "builtin";
-    if (loop.status === "rejected") throw loop.reason;
-    if (here.status === "rejected") throw here.reason;
-    return false;
+    if (input.connectionId !== null) return connections.isLoopback(input.userId, input.connectionId);
+    return (await connections.ofChat(input.userId, await chats.own(input.userId, input.chatId)))?.loopback === true;
   }
 
   /**
@@ -517,13 +488,12 @@ export class Turns {
   }
 
   /**
-   * Where this prompt is answered. The check asks Lumiverse, which can fail (a permission revoked)
-   * or be slow. Nothing here may fail or hold up a chat that isn't LumiAH's, and nothing may cost a
-   * reply (the interceptor isn't required: a failure here leaves the prompt as it came):
+   * Whether this prompt is the runtime's. The check asks Lumiverse, which can fail (a permission
+   * revoked) or be slow. Nothing here may fail or hold up a chat that isn't LumiAH's, and nothing
+   * may cost a reply (the interceptor isn't required: a failure here leaves the prompt as it came):
    * - known to be none of LumiAH's: it goes on at once, and the check runs behind it, for the next reply;
    * - not known: the check is waited for, a bounded time; failing or late, the prompt goes on untouched;
-   * - known to run built in: failing or late, it is worked on here all the same;
-   * - known to be a runtime's: failing or late, the prompt is left untagged, in words Lumiverse
+   * - known to be the runtime's: failing or late, the prompt is left untagged, in words Lumiverse
    *   shows: tagged blindly, a connection that is no loopback any more would be sent the tag. The
    *   runtime passes an untagged request on to the writer, so the reply is still written.
    * A chat that became LumiAH's since it was last seen is so answered from its second reply on.
@@ -557,7 +527,6 @@ export class Turns {
         this.host.log("warn", `[LumiAH] a reply's connection couldn't be checked (${wordsOf(error)}), so it was left as it is`);
         return false;
       }
-      if (held === "builtin") return "builtin";
       throw new Error(`${this.deps.name} answers this chat in its runtime, and couldn't check its connection now (${wordsOf(error)}), so its agents had no part in this reply. Try again in a moment; if it keeps happening, see ${this.deps.name}'s Runtime page.`);
     } finally {
       unwait();
@@ -592,7 +561,7 @@ export class Turns {
   }
 
   /** A generation becomes a turn of LumiAH's: known by its generation's id, by its chat and, for a runtime's, by its tag. The messages the cutoff hides are left out of what it says of the prompt's sources. */
-  private take(input: InterceptorInput, kind: TurnKind, generation: Generation, place: RunPlace, omit: readonly number[]): Turn {
+  private take(input: InterceptorInput, kind: TurnKind, generation: Generation, omit: readonly number[]): Turn {
     const account = this.of(input.userId);
     const left = new Set(omit);
     const sources = input.messages.flatMap((m, i): SourceMark[] => {
@@ -603,7 +572,7 @@ export class Turns {
     });
     const earlier = account.byTurn.get(generation.id);
     if (earlier !== undefined) account.byTag.delete(earlier.tag);
-    const turn: Turn = { turn: generation.id, place, tag: randomHex(128), userId: input.userId, chatId: input.chatId, kind, presetId: input.presetId, personaId: input.personaId, sources, activated: input.activated, at: this.deps.now(), request: null, relay: null, facts: null, target: null, stoppedHere: false };
+    const turn: Turn = { turn: generation.id, tag: randomHex(128), userId: input.userId, chatId: input.chatId, kind, presetId: input.presetId, personaId: input.personaId, sources, activated: input.activated, at: this.deps.now(), request: null, relay: null, facts: null, target: null, stoppedHere: false };
     account.byTag.set(turn.tag, turn);
     account.byTurn.set(turn.turn, turn);
     account.byChat.set(turn.chatId, turn);
@@ -616,24 +585,13 @@ export class Turns {
   /**
    * The prompt interceptor (DESIGN §2 step 2, §25). A prompt that is none of LumiAH's is left as it
    * is. On a loopback, the messages the history cutoff hides are left out, and the generation is
-   * tagged: the tag goes into the request's body, where the runtime finds it. In a chat that runs
-   * built in, the turn is worked on here and the prompt goes on with its brief (hosted.ts). A prompt
-   * preview (a dry run) shows the cutoff and nothing else, since nothing will be sent.
+   * tagged: the tag goes into the request's body, where the runtime finds it. A prompt preview (a
+   * dry run) shows the cutoff and nothing else, since nothing will be sent.
    */
   async intercept(input: InterceptorInput): Promise<InterceptorVerdict> {
     const kind = KINDS[input.type];
     if (kind === undefined) return {};
-    const place = await this.where(input);
-    if (place === false) return {};
-    if (place === "builtin") {
-      try {
-        return await this.here(input, kind);
-      } catch (error) {
-        // It never costs the user a reply: whatever fails before the turn begins, the prompt goes on as it came.
-        this.host.log("warn", `[LumiAH] a built-in turn couldn't begin (${wordsOf(error)}), so Lumiverse wrote this reply on its own`);
-        return {};
-      }
-    }
+    if (!(await this.where(input))) return {};
     if (!input.dryRun) this.deps.toRuntime?.(input.userId, input.chatId);
     // Without the permission to set a request's parameters the tag can't travel, so nothing is changed and the reply is the connection's own, whole. The pages say what that permission is for.
     if (!this.host.granted("generation_parameters")) return {};
@@ -642,28 +600,8 @@ export class Turns {
     if (input.dryRun) return { omit };
     const generation = this.generationOf(input);
     if (generation === null) throw new Error(`${this.deps.name} couldn't tell which generation this prompt belongs to, so its agents had no part in this reply. Send the message again.`);
-    const turn = this.take(input, kind, generation, "runtime", omit);
+    const turn = this.take(input, kind, generation, omit);
     return { omit, parameters: { [TAG_PARAM]: turn.tag } };
-  }
-
-  /** A prompt of a chat that runs built in: its turn is made known, and worked on before the prompt goes on. */
-  private async here(input: InterceptorInput, kind: TurnKind): Promise<InterceptorVerdict> {
-    const transport = await this.deps.settings.transport(input.userId);
-    const omit = cutoff(input.messages, transport.history);
-    if (input.dryRun) return { omit };
-    if (this.hosted === null) return {};
-    const generation = this.generationOf(input);
-    if (generation === null) {
-      this.host.log("warn", `[LumiAH] a prompt's generation couldn't be told, so Lumiverse wrote that reply on its own`);
-      return {};
-    }
-    return this.hosted(input, this.take(input, kind, generation, "builtin", omit), omit);
-  }
-
-  /** Fixes where a turn that runs here writes its record, as `begin` does for a runtime's: read from what Lumiverse said of its generation, else from the chat. */
-  async aim(turn: Turn): Promise<Target> {
-    turn.target ??= await this.targetOf(turn);
-    return turn.target;
   }
 
   // ---------------------------------------------------------------- the runtime's requests
@@ -703,8 +641,7 @@ export class Turns {
     const lifeMs = (await this.deps.settings.transport(userId)).tags.lifeMs;
     const settings = await this.deps.settings.revision(userId);
     const turn = this.accounts.get(userId)?.byTag.get(tag);
-    // A turn that runs here has a tag too, which is never sent: no request may be answered by it.
-    if (turn === undefined || turn.place !== "runtime" || this.deps.now() - turn.at > lifeMs) throw new LinkRefused("not_found", `${name} doesn't know this reply's tag: the extension started again since the reply was asked for, or the tag is too old. Send the message again.`);
+    if (turn === undefined || this.deps.now() - turn.at > lifeMs) throw new LinkRefused("not_found", `${name} doesn't know this reply's tag: the extension started again since the reply was asked for, or the tag is too old. Send the message again.`);
     if (turn.request !== null && turn.request !== request) throw new LinkRefused("conflict", "This reply's tag was already used. A tag admits one request, so this one wasn't answered: send the message again.");
     if (turn.facts === null) {
       turn.request = request;
@@ -713,7 +650,7 @@ export class Turns {
         // Kept apart from what the runtime is told: a swipe deleted later moves this one, and the runtime's copy stays as it was said.
         turn.target = target;
         // The record this turn leaves is handed over when the turn ends, which may be after this worker was restarted: what says the turn began here outlives it.
-        void this.deps.open.put(userId, { turn: turn.turn, chatId: turn.chatId, place: "runtime", kind: turn.kind, target: { message: target.message, swipe: target.swipe }, at: this.deps.now() }).catch((error: unknown) => this.host.log("warn", `[LumiAH] turn ${turn.turn.slice(0, 8)} couldn't be kept across a restart (${wordsOf(error)})`));
+        void this.deps.open.put(userId, { turn: turn.turn, chatId: turn.chatId, kind: turn.kind, target: { message: target.message, swipe: target.swipe }, at: this.deps.now() }).catch((error: unknown) => this.host.log("warn", `[LumiAH] turn ${turn.turn.slice(0, 8)} couldn't be kept across a restart (${wordsOf(error)})`));
         const facts: Omit<TurnFacts, "settings"> = { turn: turn.turn, user: turn.userId, chat: turn.chatId, generation: turn.turn, kind: turn.kind, target: { message: target.message, swipe: target.swipe }, preset: turn.presetId, sources: turn.sources };
         for (const listener of this.begun) listener(turn, facts);
         return facts;
@@ -726,10 +663,8 @@ export class Turns {
    * `turn.commit` (DESIGN §2 step 8): the turn's record goes on the reply's message, now when
    * Lumiverse has saved the reply, else when it says it has. A record is taken only for a turn the
    * backend knows began here: one this worker holds, or one the worker before it kept (open.ts).
-   * `ran` is given for a turn that ran here (hosted.ts): where it ran, and why LumiAH had no part
-   * in the reply where it had none; a runtime's record is marked as the runtime's.
    */
-  async commit(userId: string, turnId: unknown, chatId: unknown, target: unknown, rawRecord: unknown, ran?: JsonObject): Promise<Anchoring> {
+  async commit(userId: string, turnId: unknown, chatId: unknown, target: unknown, rawRecord: unknown): Promise<Anchoring> {
     const { name, open } = this.deps;
     const record = recordOf(rawRecord);
     const where = target as { message?: unknown; swipe?: unknown } | null;
@@ -740,13 +675,11 @@ export class Turns {
     const account = this.of(userId);
     const known = account.byTurn.get(turnId);
     const kept = known === undefined ? await open.get(userId, turnId) : null;
-    const place = known?.place ?? kept?.place;
-    if (place === undefined || (known?.chatId ?? kept?.chatId) !== chatId) throw new LinkRefused("not_found", `${name} knows no such turn in that chat, so its record wasn't taken: a record is kept only for a reply that began here.`);
-    if (place === "builtin" && ran === undefined) throw new LinkRefused("forbidden", "That turn ran built in: its record is the extension's own to write.");
+    if ((known?.chatId ?? kept?.chatId) !== chatId) throw new LinkRefused("not_found", `${name} knows no such turn in that chat, so its record wasn't taken: a record is kept only for a reply that began here.`);
     // What was owed to the turn is in hand now.
     void open.drop(userId, turnId).catch(() => undefined);
     // The runtime says the target it was told at `begin`. Where this extension still holds the turn, its own stands: a swipe deleted since has moved it.
-    const pending: Pending = { turn: turnId, userId, chatId, target: known?.target ?? { message: where.message, swipe: where.swipe, gone: false }, record, ran: ran ?? { place: "runtime" }, at: this.deps.now() };
+    const pending: Pending = { turn: turnId, userId, chatId, target: known?.target ?? { message: where.message, swipe: where.swipe, gone: false }, record, at: this.deps.now() };
     if (pending.target.gone) {
       this.host.log("warn", `[LumiAH] turn ${turnId.slice(0, 8)}: the swipe its reply was written on was deleted, so its record wasn't written`);
       return "never";
@@ -803,8 +736,7 @@ export class Turns {
           return false;
         }
         const aimed = target.swipe;
-        // The core's record, with what this backend keeps beside it (`ran`): the core reads its own fields and passes over the rest.
-        const written = await this.deps.chats.anchor(pending.userId, pending.chatId, messageId, own ? () => target.swipe : null, { ...(pending.record as unknown as JsonObject), ran: pending.ran });
+        const written = await this.deps.chats.anchor(pending.userId, pending.chatId, messageId, own ? () => target.swipe : null, pending.record as unknown as JsonObject);
         if (written) {
           for (const listener of this.answered) listener(pending.userId);
           return true;
@@ -849,8 +781,8 @@ export class Turns {
       }
       for (const turn of [...account.byTag.values()]) if (now - turn.at > transport.tags.lifeMs && !account.pending.has(turn.turn)) this.forget(account, turn);
       for (const [id, generation] of [...account.generations]) if (now - generation.at > transport.tags.lifeMs && !account.byTurn.has(id) && !account.pending.has(id)) this.dropGeneration(account, id);
-      // A runtime's turn whose record never came (the runtime went away for good) is owed nothing past its tag's life.
-      for (const kept of await this.deps.open.list(account.userId).catch(() => [])) if (kept.place === "runtime" && now - kept.at > transport.tags.lifeMs) await this.deps.open.drop(account.userId, kept.turn).catch(() => undefined);
+      // A turn whose record never came (the runtime went away for good) is owed nothing past its tag's life.
+      for (const kept of await this.deps.open.list(account.userId).catch(() => [])) if (now - kept.at > transport.tags.lifeMs) await this.deps.open.drop(account.userId, kept.turn).catch(() => undefined);
     }
     for (const [id, generation] of [...this.unowned]) {
       if (now - generation.at <= TRANSPORT_DEFAULTS.tags.lifeMs) continue;

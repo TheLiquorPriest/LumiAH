@@ -81,13 +81,12 @@ describe("a chat LumiAH answers", () => {
     it.host.permissions.delete("generation_parameters");
     expect(await intercept({ connectionId: loopback, messages: Array.from({ length: 80 }, (_, i) => ({ role: "user" as const, text: `Message ${i}`, history: true })) })).toEqual({});
     const { permissions } = await it.page.request("lah.hello", {});
-    // Not one LumiAH can't do without: a chat that runs built in needs it for nothing.
+    // One LumiAH can't do without: every chat it answers runs in the runtime, and the tag that leads a reply there rides on the request's parameters.
     const lacking = permissions.find((p) => p.id === "generation_parameters");
-    expect(lacking?.needed).toBe(false);
-    expect(lacking).toMatchObject({ what: "tag the replies a runtime answers", without: expect.stringContaining("no chat can run in a runtime") });
-    // And no chat can be switched on to run in a runtime until it is granted.
+    expect(lacking).toMatchObject({ needed: true, what: "tag the replies your runtime answers", without: "no reply is worked on" });
+    // And no chat can be switched on until it is granted.
     const other = it.host.addChat(USER, "Brann's ledger");
-    const refused = await it.page.request("lah.chat.set", { chatId: other.id, on: true, place: "runtime" }).catch((error: unknown) => error);
+    const refused = await it.page.request("lah.chat.set", { chatId: other.id, on: true }).catch((error: unknown) => error);
     expect(String(refused)).toContain('"generation_parameters"');
   });
 });

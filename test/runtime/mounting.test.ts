@@ -179,7 +179,7 @@ describe("an extension that has LumiAH built in", () => {
     // A chat by another name isn't the lamp room's: LumiAH's own main agent answers it, without the lamp room's guidance, and the writer's request still goes by the extension.
     const other = it.host.addChat(USER, "The fish market");
     it.host.say(other.id, "user", "What does Brann sell on market day?");
-    await it.page.request("lah.chat.set", { chatId: other.id, on: true, place: "runtime" });
+    await it.page.request("lah.chat.set", { chatId: other.id, on: true });
     const play = cast({ name: "main", is: offers("write_reply"), lines: [{ toolCalls: [toolCall("write_reply", { brief: "Brann sells lamp oil." }, "reply_1")] }] }, { name: "writer", is: bare, lines: ["Lamp oil, mostly."] });
     it.host.script = play.script;
     const out = await it.generate(other.id);

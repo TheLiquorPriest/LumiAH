@@ -1,6 +1,6 @@
-// What runs besides replies, and what the pages ask of the core (DESIGN §15, §18, §19, §20), in
-// whichever place holds the core: a runtime, or the extension itself for what runs built in (§25).
-// The core keeps its state in documents only the place that holds it writes, so:
+// What runs besides replies, and what the pages ask of the core (DESIGN §15, §18, §19, §20), in the
+// runtime, which holds the core. The core keeps its state in documents only the place that holds it
+// writes, so:
 //
 // - A job the core queued is run here when its time comes: at once for `now`; for `after_reply`,
 //   once a reply turn of its chat has returned (the turn that started it, or the chat's next one for
@@ -11,8 +11,10 @@
 // - Whatever else a page asks of the core (a workspace file read or written, a list of jobs, the
 //   spend, the sweep) is one call of the harness: the request's body in, the core's own answer out.
 //   Only the methods listed here can be reached.
+// - A chat Lumiverse deleted is forgotten here when the extension hands it over (`chats.forget`):
+//   the core removes what it kept of it. No page asks for that; the extension does, on its own.
 //
-// Both ends of the link run this, so it is here; nothing in it crosses the link.
+// The ops an `ask` push may name are fixed here, beside the link's contract; the runtime runs this.
 
 import type { JobView, ReplySink } from "../core/ports";
 import type { JsonObject, JsonValue } from "./json";
@@ -40,6 +42,8 @@ export interface WorkHarness {
   /** Holds every agent of a run at its next round, and lets them go on; `resume` of a job a restart left held has the core queue it again. Each rejects when there is no such run or job. */
   pause?(input: { run: string }): Promise<{ paused: boolean }>;
   resume?(input: { run: string }): Promise<{ paused: boolean }>;
+  /** Forgets a chat Lumiverse deleted: whatever the core kept of it. Rejects (`conflict`) while a reply or a side session's answer is worked on in it. */
+  chats?: { forget(input: { chatId: string }): Promise<unknown> };
 }
 
 /** A request the place that holds the core (or the core itself) refuses, with one of the pages' error codes and words the page shows. */
@@ -313,6 +317,12 @@ export class Work {
         if (this.harness.resume === undefined) throw new OpRefused("unavailable", this.env.words.notYet);
         await this.harness.resume({ run: args.id });
         return this.ask("jobs.read", { id: args.id });
+      }
+      case "chats.forget": {
+        if (typeof args.chatId !== "string" || args.chatId === "") throw new OpRefused("bad_request", "Say which chat to forget.");
+        if (this.harness.chats === undefined) throw new OpRefused("unavailable", this.env.words.notYet);
+        const forgot = await this.harness.chats.forget({ chatId: args.chatId });
+        return forgot === undefined ? null : (forgot as JsonValue);
       }
       default:
         break;

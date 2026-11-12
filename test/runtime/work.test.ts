@@ -44,12 +44,9 @@ function script(): Script {
 
 /** A harness that does what its script says and traces as the core would. */
 function scripted(s: Script): NonNullable<Parameters<typeof rig>[0]>["harness"] {
-  return (host, _settings, extension, place) => {
-    // The same script stands for the core in both places; what a test does to "the harness's host" it does to the runtime's.
-    if (place === "runtime") {
-      s.host = host;
-      s.extension = extension;
-    }
+  return (host, _settings, extension) => {
+    s.host = host;
+    s.extension = extension;
     const seqs = new Map<string, number>();
     const trace = (turn: string, chatId: string, event: TraceEvent): void => {
       const seq = (seqs.get(turn) ?? 0) + 1;

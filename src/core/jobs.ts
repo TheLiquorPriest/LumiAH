@@ -670,8 +670,6 @@ export class Jobs {
       if (typeof setup === "string") return await this.stopped(doc, live.cancelled !== null ? { state: "cancelled", reason: live.cancelled } : { state: "failed", reason: setup });
       const { settings, texts } = setup;
       if (!settings.jobs.enabled) return await this.stopped(doc, { state: "cancelled", reason: texts.render(TEXT.jobs.whyOff) });
-      // A chat that plays only in a runtime has none of its work done inside Lumiverse (§25): there the job fails, in words that say where it runs, and can be started again there.
-      if (setup.claim?.place === "runtime" && shared.options.place === "builtin") return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyRuntimeOnly), lasting: true });
       const resolved = setup.definitions.resolve(doc.job.agent, settings);
       if (!resolved) return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyGone, { agent: doc.job.agent }), lasting: true });
       if (!(await this.stands(doc.job, settings.jobs.recordWaitMs, signal).catch(() => true))) return await this.stopped(doc, { state: "off_path", reason: texts.render(this.ended.get(doc.job.basis ?? "")?.record === false ? TEXT.jobs.whyNoRecord : TEXT.jobs.whyOffPath) });

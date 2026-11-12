@@ -6,9 +6,10 @@
 // each agent with what it was told, each call with its figures, its thinking, its answer, its tool
 // calls (each a card holding its arguments and its result) and its exact prompt on request, each
 // stop, what it waits on now, and what it spent. A long transcript shows its latest steps and the
-// earlier ones a page at a time; a long text shows its start and the rest on request.
+// earlier ones a page at a time; a long text shows its start and the rest on request; and well down
+// a long transcript, "Back to top" at its foot goes back up in one press (to-top-model.ts).
 
-import type { ComponentChildren } from "preact";
+import type { ComponentChildren, RefObject } from "preact";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { type CallPrompt, isReply, type LiveView, replyDid } from "../../shared/ui";
 import { errorWords, useApp } from "./app";
@@ -61,9 +62,7 @@ import {
   totalTokensWords,
   totalsCsv,
   transcriptMarkdown,
-  runningWords,
   runTitle,
-  turnPhase,
   type TurnTotals,
   type TurnView,
   turnTotals,
@@ -71,10 +70,10 @@ import {
 } from "./live-model";
 import { agentLabel } from "./live-model";
 import { atFoot, revealInScroller, scrollParent } from "./scroll";
-import { SKIP_ABOUT, SKIP_REPLY } from "./nav-model";
-import { neededPermissions, PLACE_LABEL } from "./setup-model";
-import { HeldPrompt, LoreChange, MendBanner, ReplyBrief, ReplyClock } from "./turn-parts";
+import { neededPermissions } from "./setup-model";
+import { HeldPrompt, LoreChange, MendBanner, ReplyBrief } from "./turn-parts";
 import { useSelect } from "./store";
+import { showsToTop } from "./to-top-model";
 import { EventsView, PromptBlock, TotalsView } from "./transcript-views";
 import { type Folds, FeedText, Hits, Marked, TextBlock, useNow } from "./feed-parts";
 
@@ -429,6 +428,42 @@ function filtered(filter: Filter): number {
   return (filter.agent !== null ? 1 : 0) + (filter.kinds.length < ALL_KINDS.length ? 1 : 0) + (filter.tool !== null ? 1 : 0) + (filter.problems ? 1 : 0);
 }
 
+/**
+ * Whether a transcript's "Back to top" shows (to-top-model.ts), and what pressing it does. The panel
+ * that scrolls is the host's, found as the follow logic finds it; it is found again when `again`
+ * changes (another turn). `root` takes focus (`tabIndex={-1}`): the button goes away near the top,
+ * and focus waits at the transcript's start rather than being lost to the page.
+ */
+function useToTop(root: RefObject<HTMLElement | null>, again: unknown): { shown: boolean; toTop(): void } {
+  const [shown, setShown] = useState(false);
+  useEffect(() => {
+    const scroller = root.current ? scrollParent(root.current) : null;
+    if (!scroller) {
+      setShown(false);
+      return;
+    }
+    const heard = (): void => setShown(showsToTop({ top: scroller.scrollTop, height: scroller.clientHeight, scrollable: scroller.scrollHeight > scroller.clientHeight }));
+    heard();
+    scroller.addEventListener("scroll", heard, { passive: true });
+    // Turning the phone or its keyboard opening changes the height that shows without a scroll.
+    window.addEventListener("resize", heard);
+    return () => {
+      scroller.removeEventListener("scroll", heard);
+      window.removeEventListener("resize", heard);
+    };
+  }, [again]);
+  const toTop = (): void => {
+    const el = root.current;
+    const scroller = el ? scrollParent(el) : null;
+    if (!el || !scroller) return;
+    // Nothing moves under reduced motion: the jump is instant there.
+    const still = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true;
+    scroller.scrollTo({ top: 0, behavior: still ? "auto" : "smooth" });
+    el.focus({ preventScroll: true });
+  };
+  return { shown, toTop };
+}
+
 export interface TurnFeedProps {
   view: LiveView;
   /** The stream's live turn: while it runs, its state and what the user can do to it stay in view at the top, and the feed follows its newest step. */
@@ -473,6 +508,9 @@ export function TurnFeed(props: TurnFeedProps) {
   const foot = useRef<HTMLDivElement>(null);
   const pin = useRef<HTMLDivElement>(null);
   const pinned = props.live && running;
+  const top = useToTop(root, view.turn);
+  // The foot stands while the turn runs, and in any transcript once "Back to top" shows.
+  const footed = pinned || top.shown;
   // What stays under the page bar while the turn runs is measured for the search row, which sticks right under it (styles/live.ts): the stylesheet can't know how tall the box to say something makes it.
   useLayoutEffect(() => {
     const el = pin.current;
@@ -487,7 +525,7 @@ export function TurnFeed(props: TurnFeedProps) {
       host.style.removeProperty("--lah-pin-h");
     };
   }, [pinned]);
-  // What stands at the foot while the turn runs is measured for the notices, which rise over it (styles/components.ts): the stylesheet can't know how tall a held call's card makes it.
+  // What stands at the foot is measured for the notices, which rise over it (styles/components.ts): the stylesheet can't know how tall a held call's card makes it.
   useLayoutEffect(() => {
     const el = foot.current;
     const host = el?.closest<HTMLElement>("[data-lah-root]");
@@ -500,7 +538,7 @@ export function TurnFeed(props: TurnFeedProps) {
       observer.disconnect();
       host.style.removeProperty("--lah-foot-h");
     };
-  }, [pinned]);
+  }, [footed]);
   // Another turn is another transcript: nothing filtered, folded or paged carries over.
   useEffect(() => {
     setFilter(NO_FILTER);
@@ -594,19 +632,15 @@ export function TurnFeed(props: TurnFeedProps) {
   };
   const tools = toolsCalled(turn);
   const connection = (id: string): string => connections?.find((c) => c.id === id)?.name ?? id;
-  const phase = turnPhase(turn);
-  const replyBy = phase.at === "working" ? phase.replyBy : null;
   const t = totals.turn;
   // How long and how much, where a cost is known: "Finished in 12.4 s, $0.0018".
   const priced = t.calls > 0 && !(t.unpriced >= t.calls && t.cost === 0);
-  const stateLine = ended === null ? `${runningWords(phase, turn.paused)} · ${elapsed(now, view.startedAt)}` : `${END_LINE_WORDS[ended.state]} ${duration(ended.at - view.startedAt)}${priced ? `, ${totalCostWords(t)}` : ""}`;
-  // For a reply: what the turn came to in words, and, where it failed or LumiAH had no part in it, the cause with the step that mends it. A permission missing now says nothing of a reply long past.
+  const stateLine = ended === null ? `${turn.paused ? "Paused" : "Running"} · ${elapsed(now, view.startedAt)}` : `${END_LINE_WORDS[ended.state]} ${duration(ended.at - view.startedAt)}${priced ? `, ${totalCostWords(t)}` : ""}`;
+  // For a reply: what the turn came to in words, and, where it failed, the cause with the step that mends it. A permission missing now says nothing of a reply long past.
   const reply = isReply(view.kind);
   const did = useMemo(() => (reply ? replyDid(view.events) : null), [reply, view.events]);
   const lacking = useSelect(app.client.state, (s) => s !== null && neededPermissions(s).length > 0);
   const mend = ended !== null && did !== null ? mendOf(ended, did, props.live && lacking) : null;
-  // Built in, ending the agents' work stops no reply: Lumiverse writes it without them. So it isn't called Stop there.
-  const skips = reply && view.place === "builtin";
   const stats = (
     <p class="lah-stats" data-lah-turn-totals>
       <span>
@@ -637,8 +671,10 @@ export function TurnFeed(props: TurnFeedProps) {
       <IconButton icon="shrink" label="Fold every block" onClick={() => (setAll(false), setChosen({}))} />
     </>
   );
+  // "Jump to the newest": a running turn's steps, scrolled away from the newest.
+  const jump = pinned && !following && mode === "steps";
   return (
-    <div ref={root} class="lah-turn" data-lah-turn={view.turn} data-state={ended === null ? "running" : ended.state}>
+    <div ref={root} class="lah-turn" data-lah-turn={view.turn} data-state={ended === null ? "running" : ended.state} tabIndex={-1}>
       {/*
         While the turn runs, its state and what the user can do to it stay at the top of what the
         panel shows: the feed follows its newest step, so the head is soon scrolled out of reach, and
@@ -646,34 +682,24 @@ export function TurnFeed(props: TurnFeedProps) {
       */}
       {pinned ? (
         <div ref={pin} class="lah-pin" data-lah-pin>
-          <div class={replyBy !== null && phase.at === "working" ? "lah-pinned lah-is-timed" : "lah-pinned"} data-lah-pinned={phase.at}>
+          <div class="lah-pinned" data-lah-pinned="working">
             <span class="lah-pulse" aria-hidden="true" />
-            <span class={phase.at === "working" ? "lah-pinned-text" : "lah-pinned-text lah-is-whole"}>{phase.at === "working" ? stateLine : `${stateLine}. Stop it in the chat, as any reply.`}</span>
-            {replyBy !== null ? <ReplyClock replyBy={replyBy} startedAt={view.startedAt} now={now} short /> : null}
-            {phase.at === "working" ? props.controls : null}
-            {phase.at === "working" && props.onStop && !skips ? (
+            <span class="lah-pinned-text">{stateLine}</span>
+            {props.controls}
+            {props.onStop ? (
               <Button variant="danger" size="sm" icon="stop" busy={stopping} onClick={() => props.onStop && stop(props.onStop)}>
                 Stop
               </Button>
             ) : null}
           </div>
-          {phase.at === "working" && props.onStop && skips ? (
-            <div class="lah-pin-skip" data-lah-skip>
-              <Button size="sm" icon="arrow-right" busy={stopping} onClick={() => props.onStop && stop(props.onStop)}>
-                {SKIP_REPLY}
-              </Button>
-              <span>{SKIP_ABOUT}</span>
-            </div>
-          ) : null}
-          {phase.at === "working" ? props.below : null}
+          {props.below}
         </div>
       ) : null}
       <header class="lah-turn-head">
         <div class="lah-stack lah-turn-what">
           <div class="lah-turn-title">
             <strong class="lah-h">{runTitle(view)}</strong>
-            {ended?.noPart !== undefined ? <Badge tone="warn">no part in the reply</Badge> : <Badge tone={ended === null ? "accent" : END_TONE[ended.state]}>{ended === null ? "running" : END_STATE_WORDS[ended.state]}</Badge>}
-            {view.place !== undefined && isReply(view.kind) ? <Badge>{PLACE_LABEL[view.place]}</Badge> : null}
+            <Badge tone={ended === null ? "accent" : END_TONE[ended.state]}>{ended === null ? "running" : END_STATE_WORDS[ended.state]}</Badge>
             <span class="lah-dim lah-small">{dateTime(view.startedAt)}</span>
           </div>
           <p class="lah-turn-state" role="status" aria-live="polite">
@@ -681,17 +707,6 @@ export function TurnFeed(props: TurnFeedProps) {
             <span>{stateLine}</span>
             {ended !== null && mend === null && endReason(ended, stateLine) !== null ? <span class="lah-warn">{endReason(ended, stateLine)}</span> : null}
           </p>
-          {replyBy !== null ? (
-            <p class="lah-turn-clock" data-lah-turn-clock>
-              <ReplyClock replyBy={replyBy} startedAt={view.startedAt} now={now} />
-            </p>
-          ) : null}
-          {phase.at === "writing" ? (
-            <p class="lah-line lah-dim" data-lah-writing>
-              <Icon name="info" size={14} />
-              <span>LumiAH's work on this reply is over. The reply itself streams in the chat, and this turn is recorded once it is saved.</span>
-            </p>
-          ) : null}
           {did !== null ? <ReplyBrief brief={did.brief} lore={loreNamesWords(did.lore)} /> : null}
           {/* A reply's head leads with what was done for it; its counts and tokens are a press away. Any other run's figures are what its head is for. */}
           {reply ? (
@@ -875,18 +890,36 @@ export function TurnFeed(props: TurnFeedProps) {
           </div>
         </div>
       )}
-      {/* At the foot while the turn runs: the way back to the newest step, and the calls held for the user's word, whose answers must stay in reach. */}
-      {pinned ? (
+      {/*
+        At the foot of what the panel shows: while the turn runs, the way back to the newest step and
+        the calls held for the user's word, whose answers must stay in reach; in any transcript well
+        down from its top, the way back to it. Both ways share one row, so neither lies over the other.
+      */}
+      {footed ? (
         <div ref={foot} class="lah-foot">
-          {!following && mode === "steps" ? (
+          {jump || top.shown ? (
             <div class="lah-follow">
-              <Button size="sm" variant="primary" icon="chevron-down" onClick={() => setFollowing(true)}>
-                Jump to the newest
-              </Button>
+              {jump ? (
+                <Button size="sm" variant="primary" icon="chevron-down" onClick={() => setFollowing(true)}>
+                  Jump to the newest
+                </Button>
+              ) : null}
+              {top.shown ? (
+                <Button
+                  size="sm"
+                  icon="chevron-up"
+                  onClick={() => {
+                    // At the top the feed must stay put: following would pull it back down to the newest step. "Jump to the newest" follows again.
+                    setFollowing(false);
+                    top.toTop();
+                  }}
+                >
+                  Back to top
+                </Button>
+              ) : null}
             </div>
           ) : null}
-          {/* Built in, once the agents are at rest Lumiverse writes the reply: nothing of LumiAH's waits for an answer any more. */}
-          {phase.at === "working" ? props.dock : null}
+          {pinned ? props.dock : null}
         </div>
       ) : null}
     </div>

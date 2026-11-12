@@ -12,7 +12,6 @@ import { count, counted, duration, elapsed, money } from "./format";
 import { whyWords } from "./lore-model";
 import { plainWords } from "./prose-model";
 import type { SettingLink } from "./setting-links";
-import { PLACE_LABEL } from "./setup-model";
 
 type Ended = Extract<TraceEvent, { kind: "turn_ended" }>;
 type Started = Extract<TraceEvent, { kind: "turn_started" }>;
@@ -55,7 +54,7 @@ export interface AgentView {
   lastAt: number;
 }
 
-/** Something that happened to a run as a whole, or was started from it, at its place in the run: the user held it or let it go on (DESIGN §18), one of its agents started a job (§15), or the runtime has something to tell the user about the run that is no agent's step: something that went wrong (its notes couldn't be stored), or, `info`, something that only says how it went (built in, the brief was handed to Lumiverse). */
+/** Something that happened to a run as a whole, or was started from it, at its place in the run: the user held it or let it go on (DESIGN §18), one of its agents started a job (§15), or the runtime has something to tell the user about the run that is no agent's step: something that went wrong (its notes couldn't be stored), or, `info`, something that only says how it went. */
 export type TurnMark = { seq: number; at: number; kind: "paused" | "resumed" } | { seq: number; at: number; kind: "job"; job: JobView } | { seq: number; at: number; kind: "notice"; text: string; info: boolean };
 
 export interface TurnView {
@@ -274,49 +273,6 @@ export const END_LINE_WORDS: Readonly<Record<NonNullable<LiveView["ended"]>["sta
 /** How a turn ended, as a sentence: "The turn was stopped: …". */
 export const END_SENTENCE_WORDS: Readonly<Record<NonNullable<LiveView["ended"]>["state"], string>> = { done: "The turn finished", failed: "The turn failed", stopped: "The turn was stopped", lost: "The turn was lost with its runtime" };
 
-// ---------------------------------------------------------------- two ways to run (§25)
-
-/**
- * The share of a built-in turn's time at which its countdown turns urgent: its last fifth. A way of
- * drawing the clock, not a limit on anything, so it is no setting: the time itself is one, and this
- * follows whatever it is set to.
- */
-const URGENT_SHARE = 0.2;
-
-/** A built-in turn's time before the reply, as a clock says it: the most it still has, in words (`short` for a narrow bar), whether it is nearly gone, and whether it is over (Lumiverse then sends the prompt as it is). It is a limit, not the wait: most replies are prepared long before it. */
-export function replyClock(replyBy: number, startedAt: number, now: number): { text: string; short: string; urgent: boolean; over: boolean } {
-  const left = replyBy - now;
-  if (left <= 0) return { text: "Out of time before the reply", short: "out of time", urgent: true, over: true };
-  const time = elapsed(replyBy, now);
-  return { text: `At most ${time} before the reply`, short: `at most ${time}`, urgent: left <= (replyBy - startedAt) * URGENT_SHARE, over: false };
-}
-
-/**
- * Where a run stands for the user who waits on it. Built in, a reply's turn works against the time
- * Lumiverse allows before a reply (`working`, with when that time ends); once its agents have come
- * to rest nothing of LumiAH's is under way, and Lumiverse's own generation writes the reply
- * (`writing`). A run with no such time (a runtime's turn, a job's run, a side session's turn) is
- * `working` with no clock until it is `over`.
- */
-export type TurnPhase = { at: "working"; replyBy: number | null } | { at: "writing" } | { at: "over" };
-
-export function turnPhase(turn: Pick<TurnView, "view" | "agents">): TurnPhase {
-  const { view } = turn;
-  if (view.ended !== null) return { at: "over" };
-  const builtin = view.place === "builtin" && isReply(view.kind);
-  if (builtin && turn.agents.length > 0 && turn.agents.every((a) => a.state !== "working")) return { at: "writing" };
-  return { at: "working", replyBy: builtin ? (view.replyBy ?? null) : null };
-}
-
-/** How a run that is under way stands, in the words its head and its pinned bar open with. */
-export function runningWords(phase: TurnPhase, paused: boolean): string {
-  if (phase.at === "writing") return "Lumiverse is writing the reply";
-  return paused ? "Paused" : "Running";
-}
-
-/** What stands over a reply LumiAH had no part in. */
-export const NO_PART_TITLE = "LumiAH had no part in this reply";
-
 // ---------------------------------------------------------------- what a reply's turn came to, in words (the head of Live, Home's last reply)
 
 /**
@@ -350,19 +306,18 @@ export function tookWords(ms: number, usage: { cost?: number } | null): string {
   return usage?.cost !== undefined ? `${time}, ${money(usage.cost)}` : time;
 }
 
-/** The step that mends a reply that failed or that LumiAH had no part in: a setting to change, a page to go to, permissions to grant, or the steps that went wrong to look at. */
+/** The step that mends a reply that failed: a setting to change, a page to go to, permissions to grant, or the steps that went wrong to look at. */
 export type MendStep = { go: "setting"; link: SettingLink } | { go: "page"; page: PageId } | { go: "grant" } | { go: "problems" };
 
 /**
- * What a reply that failed, or that LumiAH had no part in, says of itself (ux B2): the cause in
- * plain words, what happened in the backend's own sentence (never the cause over again), and the
- * one step that mends it (null: there is nothing to mend, as where the user skipped it themselves).
+ * What a reply that failed says of itself (ux B2): the cause in plain words, what happened in the
+ * backend's own sentence (never the cause over again), and the one step that mends it.
  */
 export interface Mend {
   title: string;
   text: string;
   tone: "neutral" | "warn" | "neg";
-  action: { label: string; step: MendStep } | null;
+  action: { label: string; step: MendStep };
 }
 
 /** The limits a stop may name, by whose they are: the place each is raised. */
@@ -387,7 +342,7 @@ const LIMIT_MEND: Readonly<Record<"agent" | "turn" | "day", Pick<Mend, "title" |
   day: { title: "A day's spending limit was reached", action: { label: "See the day's limits", step: { go: "page", page: "spend" } } },
 };
 
-/** A sentence without the phrase it would only say over again at its start ("LumiAH had no part in this reply. …" under that very heading), its first letter raised. */
+/** A sentence without the phrase it would only say over again at its start ("The turn failed. …" under that very heading), its first letter raised. */
 export function withoutPhrase(text: string, phrase: string): string {
   const said = text.trim();
   if (!said.toLowerCase().startsWith(phrase.toLowerCase())) return said;
@@ -396,29 +351,23 @@ export function withoutPhrase(text: string, phrase: string): string {
 }
 
 /**
- * The cause and the step for a turn as it ended; null for one that needs neither (it finished with
- * LumiAH's part in the reply, or the user stopped a reply the runtime was writing). `did` is what
- * the run's events say it came to (`replyDid`; null where they aren't at hand), and `lacking`
- * whether a permission LumiAH needs is missing now. The backend's cause code decides where it sends
- * one; else what the page can tell for itself does.
+ * The cause and the step for a turn as it ended; null for one that needs neither (it finished, or
+ * the user stopped it). `did` is what the run's events say it came to (`replyDid`; null where they
+ * aren't at hand), and `lacking` whether a permission LumiAH needs is missing now. The backend's
+ * cause code decides where it sends one; else what the page can tell for itself does.
  */
 export function mendOf(ended: LiveEnded, did: Pick<ReplyDid, "stop"> | null, lacking: boolean): Mend | null {
-  const part = ended.noPart;
-  if (part === undefined && (ended.state === "done" || ended.state === "stopped")) return null;
-  const said = part?.text ?? ended.reason ?? "";
+  if (ended.state === "done" || ended.state === "stopped") return null;
+  const said = ended.reason ?? "";
   const stop = did?.stop ?? null;
   const limit = stop !== null ? LIMIT_OF[stop.code] : undefined;
-  const cause = ended.cause ?? (lacking ? "permission" : part?.why === "time" ? "time" : limit !== undefined ? "limit" : null);
-  const of = (title: string, tone: Mend["tone"], action: Mend["action"]): Mend => ({ title, text: withoutPhrase(withoutPhrase(said, NO_PART_TITLE), title), tone, action });
+  const cause = ended.cause ?? (lacking ? "permission" : limit !== undefined ? "limit" : null);
+  const of = (title: string, tone: Mend["tone"], action: Mend["action"]): Mend => ({ title, text: withoutPhrase(said, title), tone, action });
   switch (cause) {
-    case "skipped":
-      return of("You skipped LumiAH for this reply", "neutral", null);
     case "no_tools":
       return of("The agents' model can't call tools", "neg", { label: "Choose another model for the agents", step: { go: "setting", link: "agentsModel" } });
     case "permission":
       return of("LumiAH is missing a permission it needs", "neg", { label: "Allow it", step: { go: "grant" } });
-    case "time":
-      return of("LumiAH ran out of time before the reply", "warn", { label: "See how a runtime lifts the limit", step: { go: "page", page: "runtime" } });
     case "limit": {
       const mend = limit !== undefined ? LIMIT_MEND[limit] : { title: "A limit was reached", action: { label: "Show what went wrong", step: { go: "problems" as const } } };
       return of(mend.title, "warn", mend.action);
@@ -429,9 +378,7 @@ export function mendOf(ended: LiveEnded, did: Pick<ReplyDid, "stop"> | null, lac
   if (ended.state === "lost") return of("The turn was lost with its runtime", "neg", { label: "Open Runtime", step: { go: "page", page: "runtime" } });
   // A connection that can't be used is mended where the agents' model is chosen, whatever else the stop says.
   if (stop?.code === "connection") return of("The agents have no model they can use", "neg", { label: "Choose another model for the agents", step: { go: "setting", link: "agentsModel" } });
-  // The user's own doing (another reply asked for meanwhile, the generation stopped) is no failure, and there is nothing to mend.
-  if (part?.why === "stopped") return of(NO_PART_TITLE, "neutral", null);
-  return of(part !== undefined ? NO_PART_TITLE : "The turn failed", part !== undefined ? "warn" : "neg", { label: "Show what went wrong", step: { go: "problems" } });
+  return of("The turn failed", "neg", { label: "Show what went wrong", step: { go: "problems" } });
 }
 
 // ---------------------------------------------------------------- what the prompt held (§24.1) and the lore the writer saw (§24.3)
@@ -1221,8 +1168,7 @@ export function transcriptMarkdown(turn: TurnView, feeds: readonly AgentFeed[] =
   out.push(`# ${runTitle(view)} · turn ${view.turn}`);
   const why = view.ended ? endReason(view.ended, END_LINE_WORDS[view.ended.state]) : null;
   const ended = view.ended ? `${END_LINE_WORDS[view.ended.state].toLowerCase()} ${duration(view.ended.at - view.startedAt)}${why !== null ? `: ${why}` : ""}` : "still running";
-  out.push(`${view.chatId !== null ? `Chat ${view.chatId}` : "No chat"}${view.messageId ? ` · message ${view.messageId}` : ""} · started ${new Date(view.startedAt).toISOString()} · ${ended}${view.place !== undefined ? ` · ${PLACE_LABEL[view.place].toLowerCase()}` : ""}`);
-  if (view.ended?.noPart !== undefined) out.push(`${NO_PART_TITLE}. ${view.ended.noPart.text}`);
+  out.push(`${view.chatId !== null ? `Chat ${view.chatId}` : "No chat"}${view.messageId ? ` · message ${view.messageId}` : ""} · started ${new Date(view.startedAt).toISOString()} · ${ended}`);
   out.push(`Spent: ${totalsWords(totals.turn)}`);
   if (turn.session) out.push(`Session: ${sessionWords(turn.session).join(" ")}`);
   if (turn.held) out.push(heldMarkdown(turn.held));

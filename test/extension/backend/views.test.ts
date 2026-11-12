@@ -1,11 +1,11 @@
-// The pages' requests the core serves (DESIGN §8, §11, §12, §15, §19, §20), each in the place it
-// belongs to (§25: what is about a chat that runs in a runtime, through the link; what is about no
-// chat, built in), with a scripted harness in the core's place in both: each request reaches the
-// core with the input its method takes, and the page is answered a view of its own contract
-// (src/shared/ui.ts), with what the core doesn't hold put in: a chat's name, an agent's, a
-// connection's, a setting's title, the reply a version was made at, a side session's turn under way.
-// The scripted answers are typed with the core's own types, so the core and what is checked here
-// can't drift apart unseen.
+// The pages' requests the core serves (DESIGN §8, §11, §12, §15, §19, §20), each asked of the
+// runtime it belongs to (what is about a chat on a loopback connection, of that chat's runtime; what
+// is about no chat, of the user's runtime), with a scripted harness in the core's place: each
+// request reaches the core with the input its method takes, and the page is answered a view of its
+// own contract (src/shared/ui.ts), with what the core doesn't hold put in: a chat's name, an
+// agent's, a connection's, a setting's title, the reply a version was made at, a side session's
+// turn under way. The scripted answers are typed with the core's own types, so the core and what is
+// checked here can't drift apart unseen.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import type { Harness as Core } from "../../../src/core/harness";
@@ -530,7 +530,7 @@ describe("an answer that isn't this build's core's", () => {
 
 describe("the core itself", () => {
   test("answers these requests in what the views read: a file's versions, the guidance, a side session, the spend and what is stored", async () => {
-    // No script: the core's own harness answers in both places, so what it gives at run time is what is read here.
+    // No script: the core's own harness answers in the runtime, so what it gives at run time is what is read here.
     const it = await rig();
     open = it;
     const chatId = await it.setUp();

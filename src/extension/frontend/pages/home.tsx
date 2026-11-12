@@ -1,28 +1,22 @@
-// Home: the first screen (DESIGN §25). Whether LumiAH is used in the open chat (its switch, with
-// where it runs beside it), what needs the user (each thing with its one action), what it did for
-// the last reply in a sentence (where that failed, the cause and the step that mends it), the offer
-// to learn a long story nobody has learned, and the way into every other page with a line that
-// says what it is for. For someone new the same screen is setup: allow LumiAH what it needs, switch
-// it on, send a message. Nothing is installed and no key or connection is asked for: a runtime is
-// an option, on its own page. What shows is decided in home-model.ts.
+// Home: the first screen (DESIGN §25). Whether LumiAH is used in the open chat (its switch),
+// what needs the user (each thing with its one action), what it did for the last reply in a
+// sentence (where that failed, the cause and the step that mends it), the offer to learn a long
+// story nobody has learned, and the way into every other page with a line that says what it is
+// for. For someone new the same screen is setup: allow LumiAH what it needs, switch it on, send a
+// message; the runtime it needs has its own steps on its own page, and Home says so until it is
+// ready. What shows is decided in home-model.ts.
 
 import { useContext, useEffect, useState } from "preact/hooks";
 import { type HomeView, isReply, type StoryView } from "../../../shared/ui";
 import { errorWords, ShownPagesContext, useApp } from "../app";
 import { Banner, Button, Disclosure, IconButton, Section, useBusy, useTick } from "../components";
 import { ago } from "../format";
-import { homeOf, type LastLine, type Need, type Way } from "../home-model";
+import { homeOf, type Need, type Way } from "../home-model";
 import { Icon } from "../icons";
-import { PAGE_ICON, SKIP_ABOUT, SKIP_REPLY, type Target } from "../nav-model";
+import { PAGE_ICON, type Target } from "../nav-model";
 import { ChatSwitch, GrantHelp, Step, useGrant } from "../setup-parts";
 import { useSelect } from "../store";
-import { ReplyBrief, ReplyClock, useMendStep } from "../turn-parts";
-
-/** A built-in turn's time before the reply, counted down a second at a time. */
-function HomeClock(props: { clock: NonNullable<LastLine["clock"]> }) {
-  const now = useTick(1000);
-  return <ReplyClock replyBy={props.clock.replyBy} startedAt={props.clock.startedAt} now={now} />;
-}
+import { ReplyBrief, useMendStep } from "../turn-parts";
 
 /** A way into another page: its name, a line on what it is for, and its mark. */
 function WayRow(props: { way: Way; onGo(): void }) {
@@ -51,7 +45,6 @@ export function HomePage() {
   const [failed, setFailed] = useState<string | null>(null);
   const [again, setAgain] = useState(0);
   const [busy, run] = useBusy();
-  const [skipping, skip] = useBusy();
   const grant = useGrant();
   // How far the open chat's story is learned, read where LumiAH is switched on for it and again whenever a job changes: Home offers to learn a long one nobody has.
   const chatOn = useSelect(app.client.state, (s) => s?.chats.find((c) => c.chatId === active)?.on === true);
@@ -131,15 +124,6 @@ export function HomePage() {
     ) : null;
   const first = model.setup?.find((s) => s.at !== "done")?.id ?? null;
   const last = model.last;
-  const skipReply = (reply: NonNullable<LastLine["skip"]>): void =>
-    skip(async () => {
-      try {
-        const r = await app.client.request("lah.turn.stop", { stream: reply.stream, turn: reply.turn });
-        app.toast(r.stopped ? "Skipped: Lumiverse writes this reply without the agents." : "The agents had already finished.");
-      } catch (error) {
-        app.fail(error);
-      }
-    });
   return (
     <div class="lah-home" data-lah-view="home" data-lah-setup={model.setup !== null ? "todo" : "done"}>
       <div class="lah-home-col">
@@ -198,33 +182,22 @@ export function HomePage() {
               <Icon name={last.icon} size={18} />
               <span>{last.title}</span>
             </span>
-            {last.clock !== null ? <HomeClock clock={last.clock} /> : null}
             <ReplyBrief brief={last.brief} lore={last.lore} />
             {last.detail !== null ? (
               <p class="lah-lead" data-lah-last-detail>
                 {last.detail}
               </p>
             ) : null}
-            {last.skip !== null ? (
-              <p class="lah-field-help" data-lah-skip-about>
-                {SKIP_ABOUT}
-              </p>
-            ) : null}
-            {last.action !== null || last.mend?.action != null || last.skip !== null ? (
+            {last.action !== null || last.mend !== null ? (
               <div class="lah-actions">
-                {last.mend !== null && last.mend.action !== null ? (
-                  <Button variant="primary" busy={last.mend.action.step.go === "grant" && mending.busy} onClick={() => last.mend?.action && mending.take(last.mend.action.step)}>
+                {last.mend !== null ? (
+                  <Button variant="primary" busy={last.mend.action.step.go === "grant" && mending.busy} onClick={() => last.mend && mending.take(last.mend.action.step)}>
                     {last.mend.action.label}
                   </Button>
                 ) : null}
                 {last.action !== null ? (
                   <Button icon={last.state === "running" ? "pulse" : "arrow-right"} variant={last.state === "running" ? "primary" : "secondary"} onClick={() => last.action && go(last.action.target)}>
                     {last.action.label}
-                  </Button>
-                ) : null}
-                {last.skip !== null ? (
-                  <Button icon="arrow-right" busy={skipping} onClick={() => last.skip && skipReply(last.skip)}>
-                    {SKIP_REPLY}
                   </Button>
                 ) : null}
               </div>
