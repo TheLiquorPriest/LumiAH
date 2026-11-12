@@ -1,0 +1,223 @@
+// The working store and its mirror (PI-BUILD-PLAN §4.4): the mark in the extension's storage that
+// says whose working copy it mirrors, so two runtimes never write over each other unseen; the
+// forgetting of a deleted chat, from the working copy and from the mirror; and closing, which leaves
+// nothing half done and the rest for the next start.
+
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { WorkingStore } from "../../../src/runtime/store/index";
+import { type Bench, bench, cleanUp, files, holding, open, outcome, until } from "./rig";
+
+let b: Bench;
+/** Another machine's folder: a second runtime of the same user keeps its copy there. */
+let elsewhere: string;
+const opened: WorkingStore[] = [];
+const keep = (store: WorkingStore): WorkingStore => {
+  opened.push(store);
+  return store;
+};
+
+beforeEach(async () => {
+  b = await bench();
+  elsewhere = await mkdtemp(join(tmpdir(), "lumiah-store-elsewhere-"));
+});
+
+afterEach(async () => {
+  for (const store of opened.splice(0)) await store.close();
+  await cleanUp(b);
+  await rm(elsewhere, { recursive: true, force: true });
+});
+
+const TAKEN = "Another runtime (runtime two) keeps the extension's storage now, so this runtime threw its own copy away, with what it hadn't sent there yet.";
+
+describe("the mark", () => {
+  test("a runtime that finds its own mark carries on with its copy, and sends what it hadn't", async () => {
+    const first = open(b);
+    await first.settle();
+    b.mirror.down = "the extension isn't linked";
+    await first.store.write("chats/c1/session.json", { asked: 1 });
+    await first.close();
+
+    b.mirror.down = null;
+    const again = keep(open(b));
+    await again.settle();
+    expect(b.mirror.doc("chats/c1/session.json")).toEqual({ asked: 1 });
+    expect(again.state().takeover).toBeNull();
+    expect(b.mirror.doc("mirror.json")).toMatchObject({ v: 1, kind: "mirror", owner: "runtime one" });
+  });
+
+  test("a runtime that finds another's mark throws its copy away, reads the mirror afresh and takes the mark", async () => {
+    const path = "chats/c1/session.json";
+    const one = open(b);
+    await one.store.write(path, { asked: 1 });
+    await one.settle();
+    b.mirror.down = "the extension isn't linked";
+    await one.store.write(path, { asked: 2 });
+    await one.close();
+    b.mirror.down = null;
+
+    const two = open(b, { dir: elsewhere, owner: "runtime two" });
+    expect(await two.store.read(path)).toEqual({ asked: 1 });
+    await two.store.write(path, { asked: 3 });
+    await two.settle();
+    expect(two.state().takeover).toMatchObject({ from: "runtime one", dropped: 0 });
+    await two.close();
+
+    const back = keep(open(b));
+    expect(await back.store.read(path)).toEqual({ asked: 3 });
+    expect(back.state().takeover).toMatchObject({ from: "runtime two", dropped: 1 });
+    await back.settle();
+    // The write runtime one never sent was thrown away with its copy: it never lands over runtime two's.
+    expect(b.mirror.doc(path)).toEqual({ asked: 3 });
+    expect(b.mirror.took.filter((change) => change === `write ${path}`)).toHaveLength(2);
+    expect(b.mirror.doc("mirror.json")).toMatchObject({ owner: "runtime one" });
+    expect(b.logs.some((line) => line.level === "warn" && line.message.includes("is kept by another runtime (runtime two"))).toBe(true);
+  });
+
+  test("a runtime that finds another's mark while it runs stops sending, says so, and takes the mark back", async () => {
+    const path = "jobs/all.json";
+    const one = keep(open(b));
+    await one.store.write(path, { jobs: ["j1"] });
+    await one.settle();
+    const two = keep(open(b, { dir: elsewhere, owner: "runtime two" }));
+    await two.settle();
+    expect(b.mirror.doc("mirror.json")).toMatchObject({ owner: "runtime two" });
+
+    b.mirror.down = "the extension isn't linked";
+    await one.store.write(path, { jobs: ["j1", "j2"] });
+    await until(() => one.state().lastError !== null, "runtime one's try to fail");
+    b.mirror.down = null;
+    await expect(one.settle()).rejects.toThrow(TAKEN);
+    expect(b.mirror.doc(path)).toEqual({ jobs: ["j1"] });
+
+    await until(() => one.state().open, "runtime one to take the mark back");
+    expect(one.state().takeover).toMatchObject({ from: "runtime two", dropped: 1 });
+    expect(b.mirror.doc("mirror.json")).toMatchObject({ owner: "runtime one" });
+    expect(await one.store.read(path)).toEqual({ jobs: ["j1"] });
+  });
+
+  test("a mirror that lost its mark while this copy holds something: the copy is thrown away for the mirror's", async () => {
+    const path = "chats/c1/session.json";
+    const first = open(b);
+    await first.store.write(path, { asked: 1 });
+    await first.settle();
+    await first.close();
+    b.mirror.docs.delete("mirror.json");
+    b.mirror.docs.set(path, JSON.stringify({ asked: 9 }));
+
+    const again = keep(open(b));
+    expect(await again.store.read(path)).toEqual({ asked: 9 });
+    expect(again.state().takeover).toMatchObject({ from: null, dropped: 0 });
+  });
+
+  test("operations wait until the mirror has been reached once, and say why in plain words when it can't be", async () => {
+    b.mirror.down = "the extension isn't linked";
+    const s = keep(open(b));
+    const reading = s.store.read("workspace/user.json");
+    await until(() => s.state().lastError !== null, "the first try");
+    expect(s.state().open).toBe(false);
+    b.clock.advance(60_000);
+    await expect(reading).rejects.toThrow(
+      "The runtime's store hasn't reached the extension's storage since it started (the extension isn't linked), so it can't yet tell whether the copy it holds is still the one the extension keeps. Try again once the runtime is linked.",
+    );
+
+    b.mirror.down = null;
+    b.clock.advance(60_000);
+    await until(() => s.state().open, "the store to open");
+    expect(await s.store.read("workspace/user.json")).toBeNull();
+  });
+});
+
+describe("forgetting a chat", () => {
+  test("removes the chat's documents from the working copy and the mirror, and nothing of another chat's", async () => {
+    const stored: Record<string, unknown> = {
+      "chats/c1/learned.json": { v: 1 },
+      "chats/c1/area/root.json": { v: 1 },
+      "chats/c10/learned.json": { v: 1 },
+      "recall/vectors/space-1/chat/c1/0a.json": { vectors: 1 },
+      "recall/vectors/space-1/chat/c2/0a.json": { vectors: 1 },
+      "recall/vectors/space-1/book/c1/0a.json": { vectors: 1 },
+    };
+    for (const [path, doc] of Object.entries(stored)) b.mirror.docs.set(path, JSON.stringify(doc));
+    const s = keep(open(b));
+    // The working copy holds one of the chat's documents the mirror has lost since, and one the mirror hasn't had yet.
+    expect(await s.store.read("chats/c1/learned.json")).toEqual({ v: 1 });
+    b.mirror.docs.delete("chats/c1/learned.json");
+    const held = holding(b.mirror, (what) => what === "write chats/c1/approvals.json");
+    await s.store.write("chats/c1/approvals.json", { tools: ["web_search"] });
+    await held.reached;
+
+    const forgetting = s.forget("c1");
+    held.go();
+    expect(await forgetting).toEqual({ documents: 4 });
+    expect([...b.mirror.docs.keys()].sort()).toEqual(["chats/c10/learned.json", "mirror.json", "recall/vectors/space-1/book/c1/0a.json", "recall/vectors/space-1/chat/c2/0a.json"]);
+    expect((await files(b.dir)).filter((file) => file.includes("/docs/chats/c1/") || file.includes("/journal/"))).toEqual([]);
+    expect(await s.store.read("chats/c1/approvals.json")).toBeNull();
+    expect(await s.store.read("chats/c10/learned.json")).toEqual({ v: 1 });
+  });
+
+  test("while the mirror can't be reached, the chat leaves the working copy at once and the mirror once it is back", async () => {
+    b.mirror.docs.set("chats/c1/learned.json", "{}");
+    const s = keep(open(b));
+    expect(await s.store.read("chats/c1/learned.json")).toEqual({});
+    b.mirror.down = "the extension isn't linked";
+    await expect(s.forget("c1")).rejects.toThrow("the extension isn't linked");
+    expect(await s.store.read("chats/c1/learned.json")).toBeNull();
+
+    b.mirror.down = null;
+    await s.settle();
+    expect(b.mirror.doc("chats/c1/learned.json")).toBeNull();
+    expect(await s.forget("c1")).toEqual({ documents: 0 });
+  });
+});
+
+describe("closing", () => {
+  test("close finishes what was under way on the disk, begins nothing more, and leaves the rest for the next start", async () => {
+    const s = open(b);
+    await s.settle();
+    b.mirror.down = "the extension isn't linked";
+    await s.store.write("chats/c1/session.json", { asked: 1 });
+    // Their outcomes are taken as they come: each ends only once the store closes.
+    const waiting = outcome(s.settle());
+    const writing = outcome(s.store.write("jobs/all.json", { jobs: ["j1"] }));
+    await s.close();
+    expect(await waiting).toBe("The runtime's store closed before the extension's storage had everything: what it hadn't sent waits on the runtime's disk and goes there when the runtime starts again.");
+    expect(await writing).toBe("The runtime's store is closed: the runtime is stopping.");
+    await expect(s.store.read("chats/c1/session.json")).rejects.toThrow("The runtime's store is closed: the runtime is stopping.");
+
+    const onDisk = await files(b.dir);
+    expect(onDisk.filter((file) => file.includes("/tmp/"))).toEqual([]);
+    expect(onDisk.filter((file) => file.includes("/journal/"))).toHaveLength(1);
+    expect(onDisk.some((file) => file.endsWith("/docs/jobs/all.json"))).toBe(false);
+
+    b.mirror.down = null;
+    const again = keep(open(b));
+    await again.settle();
+    expect(b.mirror.doc("chats/c1/session.json")).toEqual({ asked: 1 });
+    expect(b.mirror.doc("jobs/all.json")).toBeNull();
+  });
+
+  test("close doesn't wait on a send the mirror holds, and changes nothing on the disk when it lands", async () => {
+    const path = "chats/c1/session.json";
+    const s = open(b);
+    await s.settle();
+    const held = holding(b.mirror, (what) => what === `write ${path}`);
+    await s.store.write(path, { asked: 1 });
+    await held.reached;
+    await s.close();
+    const before = await files(b.dir);
+    expect(before.filter((file) => file.includes("/journal/"))).toHaveLength(1);
+    held.go();
+    await until(() => b.mirror.took.includes(`write ${path}`), "the held send to land");
+    expect(await files(b.dir)).toEqual(before);
+
+    b.mirror.hold = null;
+    const again = keep(open(b));
+    await again.settle();
+    // Sent again: only the runtime that saw it land could have known it did.
+    expect(b.mirror.took.filter((change) => change === `write ${path}`)).toHaveLength(2);
+    expect((await files(b.dir)).filter((file) => file.includes("/journal/"))).toEqual([]);
+  });
+});
