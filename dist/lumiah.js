@@ -667,7 +667,7 @@ var SETTINGS_SCHEMA = {
         thinkingInToolLoops: flag2("Thinking in tool loops", "Let a model reason on calls that offer tools. Turn it off for a connection that fails when a reasoning model's thinking must be sent back after a tool call."),
         stream: flag2("Streaming", "Take every answer as the provider streams it, so a long answer's connection is never idle. The writer's reply streams either way."),
         charsPerToken: { title: "Characters per token", description: "For token estimates made before a provider reports its own count: budgets, and the length of the main agent's notes.", type: "number", minimum: 1, maximum: 8 },
-        retries: whole2("Retries", "A model call that fails in passing (a timeout, a rate limit, a provider error in the 500s, a stream that drops) is made again up to this many times, each shown in the live view. Never once part of the reply has reached you, and never a call one of your own limits stopped. 0 turns retries off.", 0, "retries"),
+        retries: whole2("Retries", "A model call that fails in passing (a timeout, a rate limit, a provider error in the 500s, a stream that drops, an answer that arrives garbled) is made again up to this many times, each shown in the live view. Never once part of the reply has reached you, and never a call one of your own limits stopped. 0 turns retries off.", 0, "retries"),
         retryWaitMs: whole2("Wait before a retry", "How long to wait before a failed call is made again. The agent's and the turn's time limits still run while it waits.", 0, "ms", TIMER_MAX_MS),
         answerFloor: whole2("Least answer room", "A call isn't made with less room for its answer than this. An agent whose answer tokens (its own, or its turn's) are that close to spent stops and says so, instead of writing an answer that would be cut.", 1, "tokens"),
         warnRounds: whole2("Rounds left warning", "An agent is told when it has this many rounds of tool calls left, so it can finish with what it has. 0 for never.", 0, "rounds"),
@@ -4532,7 +4532,8 @@ var TRANSIENT = [
   /\b(?:socket hang up|network error|connection error|fetch failed|unable to connect|other side closed|premature close|unexpected end of (?:stream|data|file|json input))\b/i,
   /\b(?:socket|connection)\b[^.\n]{0,30}\b(?:reset|closed|lost|refused|terminated|dropped)\b/i,
   /^\s*terminated\s*$/i,
-  /\bstream\b[^.\n]{0,40}\b(?:cut|dropped|ended|closed|interrupted|reset|lost|terminated|broke|broken)\b/i
+  /\bstream\b[^.\n]{0,40}\b(?:cut|dropped|ended|closed|interrupted|reset|lost|terminated|broke|broken)\b/i,
+  /\bJSON Parse error\b|\bis not valid JSON\b|\bin JSON at position\b/i
 ];
 function isTransient(error) {
   const texts = [errorText(error), error instanceof Error && error.cause !== undefined ? errorText(error.cause) : ""];
@@ -21556,7 +21557,7 @@ if (process.versions.bun === undefined) {
 `);
   process.exit(1);
 }
-var BUILD = "b00bf33d";
+var BUILD = "4353c1a7";
 var http = async (request) => {
   const response = await fetch(request.url, { method: request.method, headers: request.headers, ...request.body !== undefined ? { body: request.body } : {}, redirect: "manual" });
   const text3 = await response.text();
