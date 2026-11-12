@@ -26,7 +26,8 @@ export interface JobLent {
  * deep the job's own agent stands (`depth`: one deeper than its starter), which are what its agent
  * is started by whenever the job runs (§14); a job the user started has neither, and stands at 0
  * with its definition's tools. `lent`: what each job its agents started still holds of its
- * allowance, by that job's id.
+ * allowance, by that job's id. `planWords`: for a plan file whoever started the job keeps with tools
+ * of its own, what its agent is told of the plan in place of being asked to write one.
  */
 export interface JobDoc {
   v: 1;
@@ -37,6 +38,7 @@ export interface JobDoc {
   held?: string[];
   depth?: number;
   lent?: Record<string, JobLent>;
+  planWords?: string;
 }
 
 /**

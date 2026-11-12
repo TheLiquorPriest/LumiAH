@@ -22,7 +22,7 @@ import { cutShort, type RunWords } from "./loop";
 import { DOC } from "./paths";
 import type { AgentStopCode, AgentUsage, HarnessHost, JobAllowance, JobDue, JobLane, JobState, JobView, JobWhen, JsonObject, JsonValue, ModelMessage, RecordJob, TurnRecord } from "./ports";
 import { isRecord } from "./ports";
-import { AgentStop } from "./provider";
+import { AgentStop, isLasting } from "./provider";
 import { HarnessRefusal } from "./refusal";
 import { type Equipment, readSetup, Run, type Setup, type Shared } from "./run";
 import { pathTurns } from "./sessions";
@@ -77,6 +77,8 @@ export interface JobCreate {
   /** A job the user starts that may write the chat's own area too, and the plan file it is asked to keep there (an extension's prepared start). */
   area?: "chat";
   plan?: string;
+  /** For a plan file whoever starts the job keeps with tools of its own (`plan` names it): what its agent is told of the plan, in place of being asked to write one. */
+  planWords?: string;
 }
 
 /** What a job may spend: its allowance's members over Settings' limits for each job. */
@@ -123,6 +125,8 @@ interface Live {
 interface Outcome {
   state: JobState;
   reason?: string;
+  /** For a job that failed: running it again would fail the same way (`JobView.lasting`). */
+  lasting?: true;
   /** For a job that stopped at a limit: which. */
   stoppedAt?: JobView["stoppedAt"];
   report: string | null;
@@ -361,6 +365,7 @@ export class Jobs {
     let again: string | undefined;
     // Started again, a job is the same instance with the same reach and plan unless the call says otherwise.
     let kept: Pick<JobView, "as" | "area" | "plan"> = {};
+    let keptWords: string | undefined;
     // Run again by the user, it is the same job again: started as the first was, for the turn the first belongs to, so whatever answers that turn's jobs knows it for that turn's.
     let same: JobDoc | null = null;
     if ("again" in input.what) {
@@ -371,6 +376,7 @@ export class Jobs {
       task = old.task;
       again = old.job.id;
       kept = { ...(old.job.as !== undefined ? { as: old.job.as } : {}), ...(old.job.area !== undefined ? { area: old.job.area } : {}), ...(old.job.plan !== undefined ? { plan: old.job.plan } : {}) };
+      keptWords = old.planWords;
       if (input.by.who === "user") {
         // A turn's job works for that turn: once the turn's reply is off the chat's path it would work for none, so it isn't started at all.
         const basis = old.job.basis;
@@ -385,6 +391,8 @@ export class Jobs {
     // Only the user starts a job that writes the chat's own area: a turn's job writes it as its turn does already.
     const area = by.who === "user" ? (input.area ?? kept.area) : undefined;
     const plan = by.who === "user" ? (input.plan ?? kept.plan) : undefined;
+    // What the agent is told of a plan its starter keeps goes with that plan file, and only with it.
+    const planWords = plan !== undefined ? (input.planWords ?? keptWords) : undefined;
     // The user may give a job to any agent, the main agent among them (§22); an agent, to any but the main agent and the writer, whose work is a turn's reply.
     const may = by.who === "user" ? definitions.agents().filter((d) => d.id !== AGENT.writer) : definitions.workers();
     if (!may.some((d) => d.id === agent)) return { refused: definitions.without.has(agent) ? texts.render(TEXT.agents.notOffered, { agent: clip(agent, lineChars) }) : texts.render(TEXT.jobs.noAgent, { agent: clip(agent, lineChars), agents: may.map((d) => d.id).join(", ") }) };
@@ -425,7 +433,7 @@ export class Jobs {
     const { starter } = input;
     // Run again, its agent is given what the first run's was: the tools its starter held, and how deep it stands.
     const given = same ? { ...(same.held !== undefined ? { held: same.held } : {}), ...(same.depth !== undefined ? { depth: same.depth } : {}) } : starter ? { held: [...starter.held], depth: starter.depth + 1 } : {};
-    await this.put({ v: 1, kind: "job", job, task, ...given });
+    await this.put({ v: 1, kind: "job", job, task, ...given, ...(planWords !== undefined ? { planWords } : {}) });
     port.queued(job);
     return job;
   }
@@ -611,7 +619,7 @@ export class Jobs {
   }
 
   /** A job stops without having run here: written as it ends, listed on its turn's record, and the host told. */
-  private async stopped(doc: JobDoc, change: { state: JobState; reason: string }): Promise<JobView> {
+  private async stopped(doc: JobDoc, change: { state: JobState; reason: string; lasting?: true }): Promise<JobView> {
     const { paused: _held, ...rest } = doc.job;
     const job: JobView = { ...rest, ...change, endedAt: this.host.clock.now() };
     await this.changed({ ...doc, job });
@@ -663,9 +671,9 @@ export class Jobs {
       const { settings, texts } = setup;
       if (!settings.jobs.enabled) return await this.stopped(doc, { state: "cancelled", reason: texts.render(TEXT.jobs.whyOff) });
       // A chat that plays only in a runtime has none of its work done inside Lumiverse (§25): there the job fails, in words that say where it runs, and can be started again there.
-      if (setup.claim?.place === "runtime" && shared.options.place === "builtin") return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyRuntimeOnly) });
+      if (setup.claim?.place === "runtime" && shared.options.place === "builtin") return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyRuntimeOnly), lasting: true });
       const resolved = setup.definitions.resolve(doc.job.agent, settings);
-      if (!resolved) return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyGone, { agent: doc.job.agent }) });
+      if (!resolved) return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyGone, { agent: doc.job.agent }), lasting: true });
       if (!(await this.stands(doc.job, settings.jobs.recordWaitMs, signal).catch(() => true))) return await this.stopped(doc, { state: "off_path", reason: texts.render(this.ended.get(doc.job.basis ?? "")?.record === false ? TEXT.jobs.whyNoRecord : TEXT.jobs.whyOffPath) });
 
       const startedAt = host.clock.now();
@@ -676,9 +684,9 @@ export class Jobs {
       let session = doc.session;
       /** How the run came out is known: nothing that comes late (a hold, a session kept) writes the job after that. */
       let over = false;
-      // What the job was started with (the tools its starter held, how deep it stands) is kept with it through every write of the run.
-      const { held, depth } = doc;
-      const save = (): Promise<JobView> => this.changed({ v: 1, kind: "job", job, task: doc.task, ...(session !== undefined ? { session } : {}), ...(held !== undefined ? { held } : {}), ...(depth !== undefined ? { depth } : {}) });
+      // What the job was started with (the tools its starter held, how deep it stands, what it is told of a plan its starter keeps) is kept with it through every write of the run.
+      const { held, depth, planWords } = doc;
+      const save = (): Promise<JobView> => this.changed({ v: 1, kind: "job", job, task: doc.task, ...(session !== undefined ? { session } : {}), ...(held !== undefined ? { held } : {}), ...(depth !== undefined ? { depth } : {}), ...(planWords !== undefined ? { planWords } : {}) });
       const run = new Run(shared, setup, {
         info: { id: job.id, kind: "job", chatId: job.chatId },
         budget: jobBudget(job, settings),
@@ -742,14 +750,17 @@ export class Jobs {
             })
             .catch((error: unknown) => host.log("warn", `[LumiAH] job ${job.id}'s session couldn't be kept (${errorText(error)})`));
         };
-        // Only a job the user started is asked for a plan (§22), and only where its agent can write files: it is told what it can do, and nothing it has no tool for. A job started to write the chat's own area keeps its plan where it was told to.
+        // Only a job the user started is asked for a plan (§22), and only where its agent can write files: it is told what it can do, and nothing it has no tool for. A job started to write the chat's own area keeps its plan where it was told to; one whose starter keeps the plan with tools of its own is told the starter's words of it instead of being asked to write it.
         const plan = job.by.who === "user" && (started.held.has(TOOL.workspaceWrite) || started.held.has(TOOL.workspaceEdit)) ? (job.plan ?? planPath(job.id)) : null;
+        const kept = plan !== null && planWords !== undefined ? planWords : null;
         const allowance = allowanceText(run.left(), texts);
         // Run again, the job is told what its first run was told, and why that run stopped.
         const first = job.again !== undefined && !history ? await this.doc(job.again) : null;
         const ranAgain = first ? `\n\n${texts.render(TEXT.jobs.againNote, { why: first.job.reason ?? jobState(first.job, texts) })}` : "";
-        const opening = job.by.who === "user" ? texts.render(TEXT.jobs.objective, { task: doc.task, allowance, files: plan === null ? "" : texts.render(job.area === "chat" ? TEXT.jobs.objectiveChat : TEXT.jobs.objectiveFiles, { plan }) }) : texts.render(TEXT.jobs.task, { task: doc.task });
-        const message = history ? texts.render(TEXT.jobs.resumed, { allowance, plan: plan === null ? "" : texts.render(TEXT.jobs.resumedPlan, { plan }) }) : `${opening}${ranAgain}`;
+        const files = plan === null ? "" : kept !== null ? texts.render(job.area === "chat" ? TEXT.jobs.objectiveChatKept : TEXT.jobs.objectiveFilesKept, { plan, kept }) : texts.render(job.area === "chat" ? TEXT.jobs.objectiveChat : TEXT.jobs.objectiveFiles, { plan });
+        const opening = job.by.who === "user" ? texts.render(TEXT.jobs.objective, { task: doc.task, allowance, files }) : texts.render(TEXT.jobs.task, { task: doc.task });
+        const resumedPlan = plan === null ? "" : kept !== null ? texts.render(TEXT.jobs.resumedKept, { plan, kept }) : texts.render(TEXT.jobs.resumedPlan, { plan });
+        const message = history ? texts.render(TEXT.jobs.resumed, { allowance, plan: resumedPlan }) : `${opening}${ranAgain}`;
         const reply = await agent.send(lead === "" ? message : `${lead}\n\n${message}`, signal);
 
         const at = host.clock.now();
@@ -779,14 +790,14 @@ export class Jobs {
           if (run.agents.usage.calls > before.calls) await keep();
           return { state: "spent", ...(reply.reason !== undefined ? { reason: reply.reason } : {}), stoppedAt: day ? "day" : "allowance", report, at };
         }
-        // A cut answer is no report. One cut before it said anything ran out while its model was still thinking: the user is told so in those words.
-        if (!whole) return { state: "failed", reason: reply.status === "answered" && cutShort(reply.finish) ? texts.render(said === "" ? TEXT.jobs.whyCutThinking : TEXT.agents.cut) : (reply.reason ?? texts.render(TEXT.jobs.whyNoAnswer)), report: told, at };
+        // A cut answer is no report. One cut before it said anything ran out while its model was still thinking: the user is told so in those words. One that stopped on what it runs on (no connection to run on, a call its provider refused for its key, its model or its account) would stop the same way run again.
+        if (!whole) return { state: "failed", reason: reply.status === "answered" && cutShort(reply.finish) ? texts.render(said === "" ? TEXT.jobs.whyCutThinking : TEXT.agents.cut) : (reply.reason ?? texts.render(TEXT.jobs.whyNoAnswer)), report: told, at, ...(reply.code === "connection" || (reply.code === "failed" && isLasting(reply.reason ?? "")) ? { lasting: true as const } : {}) };
         // The moment it would report: its turn must still stand on the path, else the report is marked off the path.
         if (await this.stands(job, settings.jobs.recordWaitMs, hostSignal).catch(() => true)) return { state: "done", report: told, at };
         return { state: "off_path", reason: texts.render(TEXT.jobs.whyOffPath), report: told, at };
       };
       // Whatever breaks between the run's start and its end (a port that fails, a blob that can't be read) is the job's own failure, in the failure's own words: the run is closed and the job written all the same, and whoever ran it is given the job, never a rejection. A cancel that came meanwhile stands.
-      const { state, reason, stoppedAt, report, at } = await worked().catch((error: unknown): Outcome => ({ state: live.cancelled !== null ? "cancelled" : "failed", reason: live.cancelled ?? errorText(error), report: null, at: host.clock.now() }));
+      const { state, reason, lasting, stoppedAt, report, at } = await worked().catch((error: unknown): Outcome => ({ state: live.cancelled !== null ? "cancelled" : "failed", reason: live.cancelled ?? errorText(error), report: null, at: host.clock.now() }));
       over = true;
 
       const usage: AgentUsage = { ...run.agents.usage };
@@ -800,6 +811,7 @@ export class Jobs {
         usage,
         workedMs: workedBy(at),
         ...(reason !== undefined ? { reason } : {}),
+        ...(lasting ? { lasting } : {}),
         ...(stoppedAt !== undefined ? { stoppedAt } : {}),
       };
       try {

@@ -561,6 +561,22 @@ describe("what the extension lists and answers is outside data", () => {
     }
   });
 
+  test("a listed tool's answer reaches the model whole up to the length it says it gives whole; a length that isn't one is left off with a line in the log", async () => {
+    const long = "The tide table for the whole season, hour by hour. ".repeat(240);
+    for (const [wholeChars, whole] of [[20_000, true], [0, false], ["lots", false]] as const) {
+      const r = rig(calling(call(HARBOUR.tides, {}, "c1")));
+      r.host.tools = { list: async () => [{ ...TIDES, wholeChars }] as unknown as RemoteTool[], call: async () => ({ text: long }) };
+      const { result } = await r.turn(CLAIMED);
+      expect(result).toMatchObject({ status: "done", reply: REPLY });
+      const content = resultOf(r.host, "c1")?.content ?? "";
+      expect(content === long).toBe(whole);
+      if (whole) continue;
+      // Still offered, and clipped as any tool's answer is.
+      expect(content).toContain(`[Clipped: the first 6000 of ${long.length} characters.`);
+      expect(logged(r.host, HARBOUR.tides, "reads whole")).toBeDefined();
+    }
+  });
+
   test("a tool call the extension's port rejects is a failed result the model reads, not a failed turn", async () => {
     const r = rig(calling(call(HARBOUR.tides, {}, "c1")));
     r.host.tools = { list: r.sample.tools.list, call: () => Promise.reject(new Error("the tide gauge is offline")) };

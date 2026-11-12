@@ -286,7 +286,7 @@ describe("a claim that keeps a chat to the runtime, and what of the request the 
     expect(prepared).toMatchObject({ part: "none", pending: false, reason: renderDefault(TEXT.jobs.whyRuntimeOnly) });
     expect(prepared.messages).toBe(turn.messages);
     const { job } = await r.harness.jobs.start({ chatId: CHAT, agent: "voice", task: "Digest the beat.", when: "now" });
-    expect(await r.harness.jobs.run({ id: job.id }, never)).toMatchObject({ state: "failed", reason: renderDefault(TEXT.jobs.whyRuntimeOnly) });
+    expect(await r.harness.jobs.run({ id: job.id }, never)).toMatchObject({ state: "failed", reason: renderDefault(TEXT.jobs.whyRuntimeOnly), lasting: true });
     expect(r.host.calls).toHaveLength(0);
   });
 
@@ -319,6 +319,44 @@ describe("a job the user starts that writes the chat's own area (the prepared st
     expect(seen(second)).not.toContain(renderDefault(TEXT.jobs.noChatArea));
     expect(seen(third)).toContain("learned/plans/");
     expect(seen(fourth)).toContain(renderDefault(TEXT.jobs.noChatArea));
+  });
+
+  test("a plan its starter keeps: its agent is told the starter's words of it as it begins, as it is carried on and as it is run again, and never asked to write the plan or to fit it to its allowance", async () => {
+    const KEEPER = "You keep the story's notes.";
+    const keeper = def("keeper", KEEPER, ["workspace_write"]);
+    const WORDS = "This allowance is for this run only. author/prepare.md is the plan of the whole work, and the preparing tools keep it.";
+    const note = (n: number): Answer => ({ content: `Note ${n} written.`, toolCalls: [call("workspace_write", { path: `author/note-${n}.md`, content: "Mara saw the boat.", base: "new" })] });
+    // The first run uses its one round and stops at its allowance; granted more, it ends; a second job fails, and run again ends.
+    const steps: Answer[] = [note(1), note(2), "Done.", { error: "401: the key was refused" }, "Done."];
+    let at = 0;
+    const r = rig(() => steps[at++] ?? "Done.", { extension: { definitions: async () => ({ agents: [author, voice, keeper] }) } });
+    const start = { chatId: CHAT, agent: "keeper", task: "Prepare the story.", when: "now" as const, area: "chat" as const, plan: "author/prepare.md" };
+    const { job } = await r.harness.jobs.start({ ...start, planWords: `  ${WORDS}\n`, allowance: { toolTurns: 1 } });
+    expect(await r.harness.jobs.run({ id: job.id }, never)).toMatchObject({ state: "spent", stoppedAt: "allowance" });
+    await r.harness.jobs.grant({ id: job.id, allowance: { toolTurns: 5 } });
+    expect((await r.harness.jobs.run({ id: job.id }, never)).state).toBe("done");
+    const { job: second } = await r.harness.jobs.start({ ...start, planWords: WORDS });
+    expect(await r.harness.jobs.run({ id: second.id }, never)).toMatchObject({ state: "failed", lasting: true });
+    const { job: again } = await r.harness.jobs.again({ id: second.id });
+    expect(again).toMatchObject({ plan: "author/prepare.md", area: "chat" });
+    expect((await r.harness.jobs.run({ id: again.id }, never)).state).toBe("done");
+
+    const lastSaid = (request: ModelRequest | undefined): string => request?.messages.filter((m) => m.role === "user").at(-1)?.content ?? "";
+    const [opening, , carried, failed, ranAgain] = r.callsOf(KEEPER);
+    for (const told of [lastSaid(opening), lastSaid(failed), lastSaid(ranAgain)]) {
+      expect(told).toContain(`What this job may still spend:`);
+      expect(told).toContain(`never only in your head.\n\n${WORDS}\n\nYou may write the chat's own area (/)`);
+      expect(told).not.toContain("write your plan");
+      expect(told).not.toContain("narrower");
+    }
+    expect(lastSaid(ranAgain)).toContain("This is the same job run again.");
+    expect(lastSaid(carried)).toStartWith("This job was stopped and is carried on now, from where you left it. What this job may still spend:");
+    expect(lastSaid(carried)).toContain(` ${WORDS} Then go on.`);
+    expect(lastSaid(carried)).not.toContain("Read your plan");
+
+    // The words come with the plan file they are about, and are held to Task length as the task is.
+    await expect(r.harness.jobs.start({ chatId: CHAT, agent: "keeper", task: "Prepare the story.", when: "now", planWords: WORDS })).rejects.toMatchObject({ code: "invalid" });
+    await expect(r.harness.jobs.start({ ...start, planWords: "x ".repeat(2001) })).rejects.toMatchObject({ code: "invalid", message: "The plan's words are 4001 characters, and may be 4000 at most (Task length)." });
   });
 
   /** A chat whose main agent writes its replies, `replies` of them already played, and a job of the user's that writes two files to the chat's own area. Every model call is answered in turn from `script`. */

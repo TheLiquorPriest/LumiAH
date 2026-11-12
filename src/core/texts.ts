@@ -53,6 +53,8 @@ export const TEXT = {
     oneEnding: "runtime.one_ending",
     clippedLost: "runtime.clipped_lost",
     scratchLost: "runtime.scratch_lost",
+    windowCut: "runtime.window_cut",
+    scratchFull: "runtime.scratch_full",
   },
   stop: {
     cancelled: "stop.cancelled",
@@ -251,7 +253,7 @@ const RUNTIME_TEXTS: TextDef[] = [
   { id: TEXT.runtime.scratchRead, group: RUNTIME, label: "scratch_read: what it does", note: "The description of the built-in tool that reads the rest of a clipped tool result.", text: "Read more of a tool result that came back clipped. Give the scratch handle the clipped result names and where to start; you get the next part.", vars: [] },
   { id: TEXT.runtime.scratchHandle, group: RUNTIME, label: "scratch_read: handle", note: "The description of scratch_read's handle argument.", text: "The scratch handle the clipped result names, such as s1.", vars: [] },
   { id: TEXT.runtime.scratchOffset, group: RUNTIME, label: "scratch_read: offset", note: "The description of scratch_read's offset argument.", text: "The character to start from; 0 is the start.", vars: [] },
-  { id: TEXT.runtime.scratchLength, group: RUNTIME, label: "scratch_read: length", note: "The description of scratch_read's length argument.", text: "How many characters to read, at most {{max}}.", vars: [v("max", "the most one read returns: Tool results clipped past")] },
+  { id: TEXT.runtime.scratchLength, group: RUNTIME, label: "scratch_read: length", note: "The description of scratch_read's length argument.", text: "How many characters to read, at most {{max}}.", vars: [v("max", "the most one read returns: Tool results clipped past, or the most any of the agent's tools gives whole, where that is more")] },
   {
     id: TEXT.runtime.scratchPart,
     group: RUNTIME,
@@ -299,6 +301,15 @@ const RUNTIME_TEXTS: TextDef[] = [
   { id: TEXT.runtime.oneEnding, group: RUNTIME, label: "A second call that would end the work", note: "The result of a call to a tool whose result ends the agent's work (write_reply), where an earlier call of the same answer already does: only that first one is run.", text: "Not run: one answer may make one call that ends your work, and this answer's earlier call of {{first}} is that one. It stands, with what it was given. If its result says it failed, call {{name}} again in your next answer.", vars: [v("name", "the tool whose call wasn't run", true), v("first", "the tool whose earlier call stands")] },
   { id: TEXT.runtime.clippedLost, group: RUNTIME, label: "A clipped tool result whose rest couldn't be kept", note: "Follows the part of a long tool result that reaches the model when the whole couldn't be stored for scratch_read.", text: "[Clipped: the first {{shown}} of {{total}} characters. The rest couldn't be kept ({{error}}), so scratch_read can't give it. Call the tool again and ask for less at a time.]", vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("error", "why the whole couldn't be stored")] },
   { id: TEXT.runtime.scratchLost, group: RUNTIME, label: "scratch_read: the result is no longer stored", note: "scratch_read's answer to a handle whose whole result is gone from storage.", text: "Scratch {{handle}} is no longer stored, so it can't be read. Call the tool that gave it again for what you need.", vars: [v("handle", "the handle asked for")] },
+  {
+    id: TEXT.runtime.windowCut,
+    group: RUNTIME,
+    label: "A tool result cut to the room left",
+    note: "Follows the part of a tool result that reaches the model when the whole would take the agent's next call past Prompt per call.",
+    text: "[Cut to fit: your prompt has room for only the first {{shown}} of {{total}} characters of this result (Prompt per call). The rest is in scratch {{handle}}; scratch_read gives it from offset {{shown}}, as much as your prompt still has room for. Once there is no room left, answer with what you have.]",
+    vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("handle", "where the whole result waits", true)],
+  },
+  { id: TEXT.runtime.scratchFull, group: RUNTIME, label: "scratch_read: no room left", note: "scratch_read's answer when the agent's prompt has no room left for any more of a result (Prompt per call).", text: "Your prompt has no room left for more of scratch {{handle}} (Prompt per call). Answer with what you have.", vars: [v("handle", "the handle asked for", true)] },
 ];
 
 const STOP_TEXTS: TextDef[] = [

@@ -5,9 +5,11 @@
 // that the chat is the asking user's.
 //
 // Lumiverse has no read of a chat's messages without their text, so a path costs every message's
-// text once. It is kept (without the texts) until Lumiverse says the chat changed, so the several
-// path reads of one turn cost one; and when it is read again, a message whose text didn't change
-// keeps its fingerprint instead of being hashed again.
+// text once. It is kept (without the texts) until Lumiverse says the chat changed, or for as long as
+// the user's settings keep one at most, so the several path reads of one turn cost one; and when it
+// is read again, a message whose text didn't change keeps its fingerprint instead of being hashed
+// again. Lumiverse never gives a deleted message's number to another, so a chat's numbers have gaps,
+// while it reads a chat by place: a range of numbers is found by the path kept.
 
 import type { ChatInfo, ChatMessage, JsonObject, JsonValue, PathMessage, StoredAnchor } from "../../core/ports";
 import { textHash } from "../../core/hash";
@@ -105,6 +107,26 @@ interface KeptPath {
   fresh: boolean;
   /** Counts the changes Lumiverse told of, so a read under way when one came isn't kept as fresh. */
   changes: number;
+  /** When the read it was made from began. */
+  at: number;
+}
+
+/** What a user's settings keep of the chats' paths: of how many chats at most (0 keeps none), and for how long at most, in ms (0 answers no read from what is kept). */
+export interface PathKeeping {
+  chats: number;
+  ms: number;
+}
+
+/** The place in `rows` (sorted by number) of the first whose number is `index` or more; their count where none is. */
+function placeOf(rows: readonly PathMessage[], index: number): number {
+  let low = 0;
+  let high = rows.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if ((rows[mid] as PathMessage).index < index) low = mid + 1;
+    else high = mid;
+  }
+  return low;
 }
 
 export class Chats {
@@ -113,11 +135,13 @@ export class Chats {
   private readonly paths = new Map<string, KeptPath>();
 
   /**
-   * @param kept How many chats' paths a user's settings keep in memory between reads; 0 keeps none.
+   * @param kept What a user's settings keep of chats' paths: how many chats, and how long each.
+   * @param now The clock a kept path's age is read by.
    */
   constructor(
     private readonly host: Pick<BackendHost, "chats" | "granted">,
-    private readonly kept: (userId: string) => Promise<number>,
+    private readonly kept: (userId: string) => Promise<PathKeeping>,
+    private readonly now: () => number,
     private readonly codec: AnchorCodec = OWN_ANCHORS,
   ) {}
 
@@ -143,20 +167,23 @@ export class Chats {
 
   /**
    * `chat.path`: the chat's active path, oldest first. From memory while Lumiverse has said nothing
-   * of the chat since it was read and its last message is still the one kept (one small read, so a
-   * change Lumiverse told nobody of at the chat's end, where nearly all of them are, is still seen).
+   * of the chat since it was read, it was read no longer ago than the user's settings keep one, and
+   * its last message is still the one kept (one small read, so a change Lumiverse told nobody of at
+   * the chat's end, where nearly all of them are, is still seen).
    */
   async path(userId: string, chatId: string): Promise<PathMessage[]> {
     await this.own(userId, chatId);
+    const keeping = await this.kept(userId);
     const held = this.paths.get(chatId);
-    if (held?.fresh === true) {
+    if (held?.fresh === true && this.now() - held.at < keeping.ms) {
       const last = await this.last(chatId);
       const keptLast = held.rows.at(-1);
       const same = last === null ? keptLast === undefined : keptLast !== undefined && keptLast.id === last.id && keptLast.index === last.index && keptLast.swipeId === last.swipeId && keptLast.mark === contentMark(last.role, last.content);
       if (same) return held.rows.map(({ mark: _mark, ...row }) => row);
     }
     // Its place is held while it is read, so a change Lumiverse tells of meanwhile is counted.
-    const mine: KeptPath = held ?? { rows: [], fresh: false, changes: 0 };
+    const at = this.now();
+    const mine: KeptPath = held ?? { rows: [], fresh: false, changes: 0, at };
     if (held === undefined) this.paths.set(chatId, mine);
     const changes = mine.changes;
     const rows = await this.host.chats.messages(chatId);
@@ -170,14 +197,13 @@ export class Chats {
         return { id: m.id, index: m.index, role: m.role, name: m.name, swipeId: m.swipeId, chars: m.content.length, hash, anchor: this.codec.read(m.own, m.swipeId), mark };
       }),
     );
-    const most = await this.kept(userId);
-    // Fresh only when nothing was said of the chat while it was read.
+    // Fresh only when nothing was said of the chat while it was read, and the user keeps a list for some time. Kept for no time, it still says where each number stands for the reads of the chat's text that follow, which check it message by message.
     const unchanged = this.paths.get(chatId) === mine && mine.changes === changes;
     this.paths.delete(chatId);
-    if (most > 0) {
-      this.paths.set(chatId, { rows: read, fresh: unchanged, changes: mine.changes });
+    if (keeping.chats > 0) {
+      this.paths.set(chatId, { rows: read, fresh: unchanged && keeping.ms > 0, changes: mine.changes, at });
       for (const oldest of this.paths.keys()) {
-        if (this.paths.size <= most) break;
+        if (this.paths.size <= keeping.chats) break;
         this.paths.delete(oldest);
       }
     }
@@ -187,11 +213,31 @@ export class Chats {
   /** `chat.messages`: the path's messages whose index is `from` or more and less than `to`, with their text. */
   async messages(userId: string, chatId: string, from: number, to: number): Promise<ChatMessage[]> {
     await this.own(userId, chatId);
+    return (await this.range(chatId, from, to)).map((m) => ({ id: m.id, index: m.index, role: m.role, name: m.name, swipeId: m.swipeId, content: m.content }));
+  }
+
+  /**
+   * The chat's messages whose number is `from` or more and less than `to`, as Lumiverse gives them
+   * now. Lumiverse reads by place, and the path kept says where those numbers stand: its messages of
+   * the range, and past its end as many places as numbers were asked for, where messages added since
+   * stand. That one read is the range while each message read is where the path puts it; without a
+   * path kept, while the chat is numbered by place. Otherwise the chat changed since, or has gaps no
+   * path kept tells of, and the whole chat is read once.
+   */
+  async range(chatId: string, from: number, to: number): Promise<HostMessage[]> {
     if (to <= from) return [];
-    let rows = await this.host.chats.messages(chatId, { from, count: to - from });
-    // A message's index is its place in the chat; where a chat's indexes have a hole, the range read by place isn't the range asked for, and the whole chat is read instead.
-    if (rows.some((m, i) => m.index !== from + i)) rows = await this.host.chats.messages(chatId);
-    return rows.filter((m) => m.index >= from && m.index < to).map((m) => ({ id: m.id, index: m.index, role: m.role, name: m.name, swipeId: m.swipeId, content: m.content }));
+    const kept = this.paths.get(chatId)?.rows ?? [];
+    const last = kept.at(-1)?.index ?? -1;
+    const start = kept.length > 0 ? placeOf(kept, from) : from;
+    const count = kept.length > 0 && last >= to ? placeOf(kept, to) - start : to - from;
+    const rows = count > 0 ? await this.host.chats.messages(chatId, { from: start, count }) : [];
+    const placed = rows.every((m, i) => {
+      const held = kept[start + i];
+      if (kept.length === 0) return m.index === from + i;
+      return held !== undefined ? held.id === m.id : m.index > last;
+    });
+    if (placed) return rows.filter((m) => m.index >= from && m.index < to);
+    return (await this.host.chats.messages(chatId)).filter((m) => m.index >= from && m.index < to);
   }
 
   /** One message of a chat by its id; null when it isn't there. */

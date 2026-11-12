@@ -746,6 +746,25 @@ describe("a restart and a failure", () => {
     expect(await cancelling).toMatchObject({ job: { state: "cancelled" } });
     expect(r.host.calls).toHaveLength(1);
   });
+
+  test("a job that failed on what it runs on says it lasts, so whoever starts jobs knows a new run would only meet it again: a key or a model the provider refused, no connection to run on; a failure that may pass says nothing of the kind", async () => {
+    const r = rig(cast({ job: [{ error: "401: the key was refused" }, { error: "The model `model-9` does not exist or you do not have access to it." }, { error: "503: overloaded" }, "never reached"] }), (s) => (s.loop.retries = 0));
+    const ended = async () => {
+      const { job } = await r.harness.jobs.start({ chatId: CHAT, agent: "summarizer", task: TASK, when: "now" });
+      return r.harness.jobs.run({ id: job.id }, never);
+    };
+    expect(await ended()).toMatchObject({ state: "failed", reason: "401: the key was refused", lasting: true });
+    expect(await ended()).toMatchObject({ state: "failed", lasting: true });
+    const passing = await ended();
+    expect(passing).toMatchObject({ state: "failed", reason: "503: overloaded" });
+    expect(passing.lasting).toBeUndefined();
+    // No connection to run on: no call is made, and what the page lists says it lasts.
+    r.stored.values.agents.summarizer!.connectionId = "conn-gone";
+    const gone = await ended();
+    expect(gone).toMatchObject({ state: "failed", reason: "the connection conn-gone no longer exists: give this agent another in LumiAH's Settings", lasting: true });
+    expect((await r.harness.jobs.list({ chatId: CHAT, cursor: null, limit: 1 })).jobs[0]).toMatchObject({ id: gone.id, lasting: true });
+    expect(r.host.calls).toHaveLength(3);
+  });
 });
 
 describe("a long objective", () => {

@@ -220,8 +220,8 @@ export interface Harness {
   jobs: {
     list(input: { chatId: string | null; cursor: string | null; limit: number }): Promise<JobsPage>;
     read(input: { id: string }): Promise<JobRead>;
-    /** The user starts a job (§15, §22): it belongs to the chat and to no turn. `area: "chat"`: it may write the chat's own area too, at the latest reply on the path; `plan`: the plan file it is asked to keep, where not `learned/plans/<id>.md`. */
-    start(input: { chatId: string; agent: string; task: string; when: JobWhen; allowance?: JobAllowance; area?: "chat"; plan?: string }): Promise<{ job: JobView }>;
+    /** The user starts a job (§15, §22): it belongs to the chat and to no turn. `area: "chat"`: it may write the chat's own area too, at the latest reply on the path; `plan`: the plan file it is asked to keep, where not `learned/plans/<id>.md`; `planWords`: for a plan file whoever starts it keeps with tools of its own, what its agent is told of the plan, in place of being asked to write one. */
+    start(input: { chatId: string; agent: string; task: string; when: JobWhen; allowance?: JobAllowance; area?: "chat"; plan?: string; planWords?: string }): Promise<{ job: JobView }>;
     /** Runs a job that stopped short again, from the start, as a new job: the same job, with the same agent, task, `as`, lane and due, for the same turn (refused, in words for the user, once that turn's reply is off the chat's path). */
     again(input: { id: string }): Promise<{ job: JobView }>;
     cancel(input: { id: string }): Promise<{ job: JobView }>;
@@ -535,7 +535,11 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
         // The user's own start: the job belongs to the chat and to no turn (§22).
         const plan = typeof input.plan === "string" && input.plan.trim() !== "" ? input.plan.trim() : null;
         if (plan !== null && plan.length > setup.settings.workspace.pathChars) throw new HarnessRefusal("invalid", `The plan's path is ${plan.length} characters, and a path may be ${setup.settings.workspace.pathChars} at most (Path length).`);
-        const started = await shared.jobs.createJob({ chatId: input.chatId, when: input.when === "now" ? "now" : "after_reply", what: { agent: input.agent, task: input.task }, by: { who: "user" }, basis: null, ...(isRecord(input.allowance) ? { allowance: allowanceOf(input.allowance) } : {}), ...(input.area === "chat" ? { area: "chat" as const } : {}), ...(plan !== null ? { plan } : {}) }, setup);
+        // Words of a plan its starter keeps stand in place of the ask to write it, so they come with the plan file they are about, and are held to Task length as the task is.
+        const planWords = typeof input.planWords === "string" && input.planWords.trim() !== "" ? input.planWords.trim() : null;
+        if (planWords !== null && plan === null) throw new HarnessRefusal("invalid", "Words of a plan its starter keeps need the plan file they are about (plan).");
+        if (planWords !== null && planWords.length > setup.settings.jobs.taskChars) throw new HarnessRefusal("invalid", `The plan's words are ${planWords.length} characters, and may be ${setup.settings.jobs.taskChars} at most (Task length).`);
+        const started = await shared.jobs.createJob({ chatId: input.chatId, when: input.when === "now" ? "now" : "after_reply", what: { agent: input.agent, task: input.task }, by: { who: "user" }, basis: null, ...(isRecord(input.allowance) ? { allowance: allowanceOf(input.allowance) } : {}), ...(input.area === "chat" ? { area: "chat" as const } : {}), ...(plan !== null ? { plan } : {}), ...(planWords !== null ? { planWords } : {}) }, setup);
         if ("refused" in started) throw new HarnessRefusal("invalid", started.refused);
         return { job: started };
       },

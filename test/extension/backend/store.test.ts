@@ -73,7 +73,7 @@ describe("the store, as upkeep reads it", () => {
 describe("the chats, as the core reads them", () => {
   test("say what a chat is: its character, and the chat it was branched from", async () => {
     const host = new FakeHost();
-    const chats = new Chats(host, async () => 8);
+    const chats = new Chats(host, async () => ({ chats: 8, ms: 60_000 }), () => Date.now());
     const chat = host.addChat(USER, "Harbour light");
     expect(await chats.info(USER, chat.id)).toEqual({ id: chat.id, name: "Harbour light", characterId: null, characterName: null, branchedFrom: null });
 
@@ -87,7 +87,7 @@ describe("the chats, as the core reads them", () => {
 
   test("give every record on every swipe of every message, one chat a page", async () => {
     const host = new FakeHost();
-    const chats = new Chats(host, async () => 8);
+    const chats = new Chats(host, async () => ({ chats: 8, ms: 60_000 }), () => Date.now());
     const first = host.addChat(USER, "Harbour light");
     host.say(first.id, "user", "Who keeps the harbour light now?");
     const reply = host.say(first.id, "assistant", "Okoro keeps it now.");

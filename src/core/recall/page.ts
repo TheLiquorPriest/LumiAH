@@ -8,7 +8,7 @@
 
 import { baseAgents, resolveAgent } from "../agents";
 import type { Definitions } from "../definitions";
-import type { HarnessHost, PathMessage } from "../ports";
+import type { HarnessHost } from "../ports";
 import { HarnessRefusal } from "../refusal";
 import { AGENT, type Settings } from "../settings";
 import type { StorySource } from "../story";
@@ -129,9 +129,7 @@ export function recallPage(deps: RecallPageDeps): RecallPage {
   /** A view of the chat for one request, with the user's settings and texts as they stand. */
   const view = async (chatId: string): Promise<{ run: RecallRun; settings: Settings; texts: Texts }> => {
     const { settings, texts, story } = await deps.setup(chatId);
-    let read: Promise<PathMessage[]> | undefined;
-    const path = (): Promise<PathMessage[]> => (read ??= host.chat.path(chatId));
-    return { run: recallOf({ host, run: { id: `page-${++asked}`, kind: "side", chatId }, settings, texts, chat: { path }, story }), settings, texts };
+    return { run: recallOf({ host, run: { id: `page-${++asked}`, kind: "side", chatId }, settings, texts, story }), settings, texts };
   };
 
   const status = async (run: RecallRun, settings: Settings, start: boolean): Promise<EmbedStatus> => recall.meaning.status({ lore: await run.loreGroups(), chat: await run.chatGroup(), settings, start });

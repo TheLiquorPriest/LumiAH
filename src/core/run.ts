@@ -125,7 +125,7 @@ export async function askExtension<T>(shared: Pick<Shared, "host" | "options">, 
 
 const TIERS: readonly string[] = ["read", "write", "external"];
 
-/** The tools that run in the extension, as its port lists them now: outside data, so one that isn't a tool is left out, and a port that fails gives none. */
+/** The tools that run in the extension, as its port lists them now: outside data, so one that isn't a tool is left out, a length it reads whole that isn't one is left off, and a port that fails gives none. */
 async function remoteTools(host: Pick<HarnessHost, "tools" | "log">, chatId: string): Promise<RemoteTool[]> {
   if (!host.tools) return [];
   let listed: unknown;
@@ -137,8 +137,15 @@ async function remoteTools(host: Pick<HarnessHost, "tools" | "log">, chatId: str
   }
   return (Array.isArray(listed) ? listed : []).flatMap((tool: unknown): RemoteTool[] => {
     const ok = isRecord(tool) && typeof tool.name === "string" && tool.name !== "" && typeof tool.family === "string" && typeof tool.tier === "string" && TIERS.includes(tool.tier) && typeof tool.description === "string" && isRecord(tool.parameters) && (tool.source === "extension" || tool.source === "user");
-    if (!ok) host.log("warn", `[LumiAH] a tool the extension listed isn't one (${isRecord(tool) && typeof tool.name === "string" && tool.name !== "" ? tool.name : "no name"}): it isn't offered`);
-    return ok ? [tool as unknown as RemoteTool] : [];
+    if (!ok) {
+      host.log("warn", `[LumiAH] a tool the extension listed isn't one (${isRecord(tool) && typeof tool.name === "string" && tool.name !== "" ? tool.name : "no name"}): it isn't offered`);
+      return [];
+    }
+    if (tool.wholeChars === undefined || (Number.isSafeInteger(tool.wholeChars) && (tool.wholeChars as number) > 0)) return [tool as unknown as RemoteTool];
+    host.log("warn", `[LumiAH] the extension's tool ${tool.name} names a length it reads whole that isn't a whole number of characters: its answers are clipped as any tool's`);
+    const rest: Record<string, unknown> = { ...tool };
+    delete rest.wholeChars;
+    return [rest as unknown as RemoteTool];
   });
 }
 

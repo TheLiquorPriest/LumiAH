@@ -237,7 +237,15 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
   const connections = new Connections(host, { model: loopbackModel(identity.identifier), bases: (userId) => relays.bases(userId), serialTools: async (userId) => (await settings.transport(userId)).connections.oneToolAtATime });
   made.connections = connections;
   // Lumiverse keys an extension's entry on a message by its identifier: that key means the entry itself, any other a place inside it.
-  const chats = new Chats(host, async (userId) => (await settings.transport(userId)).sessions.pathsKept, options.anchor ?? (identity.anchorKey === identity.identifier ? OWN_ANCHORS : anchorsUnder(identity.anchorKey)));
+  const chats = new Chats(
+    host,
+    async (userId) => {
+      const { pathsKept, pathMs } = (await settings.transport(userId)).sessions;
+      return { chats: pathsKept, ms: pathMs };
+    },
+    now,
+    options.anchor ?? (identity.anchorKey === identity.identifier ? OWN_ANCHORS : anchorsUnder(identity.anchorKey)),
+  );
   // As many turns are kept across a restart as the account's own "Tags remembered" keeps in memory.
   const open = new OpenTurns(host, async (userId) => Math.min((await settings.transport(userId)).tags.held, CEILINGS.tagsHeld));
   /** The linked runtime a chat's replies reach: the one at the address of the loopback connection the chat generates on. Where no address matches (a connection kept by its model's name under another address), the one runtime linked, when there is just one. Null: that runtime isn't linked. */

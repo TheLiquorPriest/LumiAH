@@ -49,7 +49,7 @@ function rig() {
   let now = NOW;
   host.now = () => now;
   const activated = new Map<string, ActivatedInfo[]>();
-  const chats = new Chats(host, async () => 0);
+  const chats = new Chats(host, async () => ({ chats: 0, ms: 0 }), () => now);
   const lore = new Lore(host, { persona: () => undefined, activatedBooks: () => [] });
   const recall = new Recall(host, { chats, lore, activated: (userId, chatId, generationId) => activated.get(`${userId}/${chatId}/${generationId}`) ?? [], now: () => now });
   const chat = host.addChat(MARA, "Harbour light", "chat-harbour");

@@ -113,7 +113,7 @@ export interface Settings {
   loop: {
     /** The loop detector: the same tool call on the same state this many times in a row stops the agent. */
     repeats: number;
-    /** A tool result longer than this, in characters, reaches the model clipped; the rest waits in scratch. */
+    /** A tool result longer than this, in characters, reaches the model clipped; the rest waits in scratch. A tool that names a length it reads whole (`AgentTool.wholeChars`) is clipped there instead, where that is more. */
     clipChars: number;
     /** While off, a call that offers tools goes with reasoning off, for a connection that can't take a model's thinking back after a tool call. */
     thinkingInToolLoops: boolean;
@@ -464,7 +464,7 @@ const BUDGET_SCHEMA: JsonObject = {
   description: "What this agent may spend on one message it is sent. A limit that stops it says so in the live view.",
   type: "object",
   properties: {
-    callTokensIn: limit("Prompt per call", "The most one call may send, in tokens, as estimated before it is sent. A call past it isn't made.", "tokens"),
+    callTokensIn: limit("Prompt per call", "The most one call may send, in tokens, as estimated before it is sent. A call past it isn't made. A tool result that would take the next call past it reaches the model cut to the room left, and the rest waits for scratch_read.", "tokens"),
     callTokensOut: whole("Answer per call", "The most one call may write, its reasoning included (max_tokens). The writer's is the request's own where the request names one.", 1, "tokens"),
     callMs: limit("Time per call", "How long one call may take before it is given up.", "ms"),
     callTools: limit("Tool calls per answer", "The most tools one answer may call. Calls past it aren't run, and the model is told.", "calls"),
@@ -602,7 +602,7 @@ export const SETTINGS_SCHEMA: JsonObject = {
       type: "object",
       properties: {
         repeats: whole("Loop detector", "An agent that makes the same tool call, on the same state, this many times in a row is stopped.", 2, "calls"),
-        clipChars: whole("Tool results clipped past", "A tool result longer than this reaches the model clipped; scratch_read reads the rest.", 200, "characters"),
+        clipChars: whole("Tool results clipped past", "A tool result longer than this reaches the model clipped; scratch_read reads the rest. A tool that bounds its own answer by a setting of its own, meant to be read in one go, is clipped only past that instead.", 200, "characters"),
         thinkingInToolLoops: flag("Thinking in tool loops", "Let a model reason on calls that offer tools. Turn it off for a connection that fails when a reasoning model's thinking must be sent back after a tool call."),
         stream: flag("Streaming", "Take every answer as the provider streams it, so a long answer's connection is never idle. The writer's reply streams either way."),
         charsPerToken: { title: "Characters per token", description: "For token estimates made before a provider reports its own count: budgets, and the length of the main agent's notes.", type: "number", minimum: 1, maximum: 8 },

@@ -411,6 +411,8 @@ export interface RemoteTool {
   description: string;
   /** Its arguments' JSON Schema. */
   parameters: JsonObject;
+  /** How much of its answer, in characters, reaches the model whole, for a tool that bounds its own answer by a setting (`AgentTool.wholeChars`); absent: Tool results clipped past, as for any tool. */
+  wholeChars?: number;
   source: "extension" | "user";
 }
 
@@ -570,6 +572,12 @@ export interface JobView {
   opening?: string;
   /** Why it failed, was cancelled or interrupted, left the path or stopped at a limit, in plain words. */
   reason?: string;
+  /**
+   * For a job that failed: what it failed on lies outside it, in what it runs on (no connection to
+   * run on, a key or a model its provider refused, an account out of quota or credit, an agent that
+   * is gone), so running it again fails the same way until the user changes that.
+   */
+  lasting?: true;
   /**
    * For a job in state `spent`: the limit that stopped it. `allowance`: its own (Settings' limits
    * for each job, or the allowance it was given); granted more, it carries on. `day`: a limit on a

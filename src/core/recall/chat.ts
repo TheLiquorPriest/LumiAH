@@ -147,8 +147,9 @@ export class ChatRun {
 /**
  * The runs of numbers among `indices` (sorted), none longer than `most`: what is read from the host in
  * one request each. Numbers part only where something is between them that `passes` doesn't let a
- * read go over: a message the story leaves out is passed over in the batch it falls in, so a chat whose
- * story is every other message isn't read one message a request.
+ * read go over: a message the story leaves out, and a number no message of the chat holds (Lumiverse
+ * never gives a deleted message's number again), are passed over in the batch they fall in, so a
+ * chat whose story is every other message, or that had messages deleted, isn't read in small pieces.
  */
 function runsOf(indices: readonly number[], most: number, passes: (index: number) => boolean): [from: number, to: number][] {
   const runs: [number, number][] = [];
@@ -165,7 +166,8 @@ function runsOf(indices: readonly number[], most: number, passes: (index: number
 export class ChatCorpus {
   private index: LexicalIndex<string>;
   private docs = new Map<string, ChatDoc>();
-  private last: { run: string; done: Promise<ChatRun> } | null = null;
+  /** The last read: of which run, of which path (`pathKey`), and what it came to. */
+  private last: { run: string; path: string; done: Promise<ChatRun> } | null = null;
   /** How many messages were read from the host and indexed, since the corpus was made: what a test of "only what changed" counts. */
   indexed = 0;
 
@@ -178,18 +180,19 @@ export class ChatCorpus {
   }
 
   /**
-   * The chat as a run reads it, brought up to date once for each run. `path` is the run's own: the
-   * messages it may read, each with its hash; `story` says which of them count as the story. A read
-   * that fails is tried again by the next call.
+   * The chat as a run reads it, brought up to date for each run, and again whenever the run's path
+   * changed since. `path` is the run's own: the messages it may read, each with its hash; `story`
+   * says which of them count as the story. A read that fails is tried again by the next call.
    */
   sync(run: string, path: readonly PathMessage[], sizes: { pieceChars: number; chatBatch: number }, story: StorySource): Promise<ChatRun> {
-    if (this.last?.run === run) return this.last.done;
+    const key = pathKey(path);
+    if (this.last?.run === run && this.last.path === key) return this.last.done;
     const before = this.last?.done.then(
       () => undefined,
       () => undefined,
     );
     const done = (before ?? Promise.resolve()).then(() => this.read(path, sizes, story));
-    const held = { run, done };
+    const held = { run, path: key, done };
     this.last = held;
     done.catch(() => {
       if (this.last === held) this.last = null;
@@ -219,7 +222,8 @@ export class ChatCorpus {
     }
     const wanted = new Map(kept.map((m) => [m.id, m]));
     const stale = kept.filter((m) => this.docs.get(m.id)?.hash !== m.hash).map((m) => m.index);
-    for (const [from, to] of runsOf(stale, Math.max(1, sizes.chatBatch), (index) => left.has(index))) {
+    const numbers = new Set(path.map((m) => m.index));
+    for (const [from, to] of runsOf(stale, Math.max(1, sizes.chatBatch), (index) => left.has(index) || !numbers.has(index))) {
       const read = await this.texts(from, to);
       const given: { m: PathMessage; text: string; at: number | null }[] = [];
       for (const raw of Array.isArray(read) ? read : []) {
@@ -258,4 +262,9 @@ export class ChatCorpus {
     }
     return new ChatRun(messages, this.index, left);
   }
+}
+
+/** What makes one path another, as a run reads it: each message's id, number, who wrote it, hash and whether it is hidden. */
+function pathKey(path: readonly PathMessage[]): string {
+  return path.map((m) => `${m.id}\u0001${m.index}\u0001${m.role}\u0001${m.name}\u0001${m.hash}\u0001${m.hidden === true ? 1 : 0}`).join("\u0000");
 }

@@ -202,6 +202,8 @@ export interface TransportSettings {
     page: number;
     /** The most chats whose message list is kept in memory between reads; 0 keeps none. */
     pathsKept: number;
+    /** How long one such list is kept at most, in ms; 0 keeps none. */
+    pathMs: number;
   };
   runtime: RuntimeTuning;
 }
@@ -255,7 +257,8 @@ export const TRANSPORT_DEFAULTS: Readonly<TransportSettings> = Object.freeze({
   link: Object.freeze({ quietMs: 120_000, relays: 8, connectionMs: 15_000, joinMaxUnits: 32 * 1024 * 1024, partStaleMs: 60_000, joinFrames: 8, joinHeldUnits: 64 * 1024 * 1024 }),
   live: Object.freeze({ events: 20_000, page: 500, chats: 32, lostMs: 30_000 }),
   anchors: Object.freeze({ waitMs: 10 * 60_000, held: 64 }),
-  sessions: Object.freeze({ previewChars: 120, page: 50, pathsKept: 16 }),
+  // A chat's list is read again when Lumiverse says it changed, and its last message is checked at every read: five minutes is a backstop for a change in the middle that nobody told of.
+  sessions: Object.freeze({ previewChars: 120, page: 50, pathsKept: 16, pathMs: 5 * 60_000 }),
   runtime: RUNTIME_DEFAULTS,
 });
 
@@ -410,6 +413,7 @@ export const TRANSPORT_SCHEMA: JsonObject = {
         previewChars: whole("Reply preview", "How much of a reply's opening the Sessions page shows to find it by.", 0, 2_000, "characters"),
         page: whole("Turns per page", "The most turns one page of the Sessions list holds.", 1, 500, "turns"),
         pathsKept: whole("Chats kept in memory", "The most chats whose list of messages (without their text) is kept in memory until the chat changes, so a reply reads its chat once. 0 keeps none: every read asks Lumiverse again.", 0, 1024, "chats"),
+        pathMs: ms("Keep a chat's list for", "How long such a list is kept at most, even while Lumiverse says nothing of the chat changing. After that the chat is read again. 0 keeps none: every read asks Lumiverse again.", 0, DAY_MS),
       },
     },
     runtime: {

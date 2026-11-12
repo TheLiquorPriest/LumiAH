@@ -15,20 +15,22 @@
 // the one before found it: a tool whose arguments name something by where it stands now
 // (`AgentTool.state`) makes a new call once that changed. The same call made more than once in one
 // answer is run once, and of one answer's calls that would end the send only the first is run. A
-// tool result past a setting's length reaches the model clipped, the whole kept as a blob (in the
-// agent's own memory where it has no blob store) for the built-in `scratch_read`. Cancel goes
-// through the signals the host's calls take: the handle's own, a send's, and each deadline's. Once
-// one of them has ended a round, no call of it that had not begun is started.
+// tool result past a setting's length (or past the length its tool reads whole, `AgentTool.wholeChars`,
+// where that is more) reaches the model clipped, and one past the room left in the agent's next call
+// under Prompt per call is cut to that room; either way the whole is kept as a blob (in the agent's
+// own memory where it has no blob store) for the built-in `scratch_read`. Cancel goes through the
+// signals the host's calls take: the handle's own, a send's, and each deadline's. Once one of them
+// has ended a round, no call of it that had not begun is started.
 
 import { approvalAnswerOf } from "./approval";
 import type { Blobs } from "./blobs";
 import type { AgentStarted, AgentStatus, AgentStopCode, AgentUsage, ApprovalAnswer, ApprovalAsk, CallUsage, HarnessHost, JsonObject, ModelDelta, ModelEffort, ModelMessage, ModelRequest, ModelTool, SamplingParams, TranscriptEntry } from "./ports";
-import { type AgentAccounts, type AgentCall, AgentStop, type CallSpec, isTransient, type ModelReply, NATIVE_TURNS, type PreparedCall, ProviderSession, requestOf, TEXT_TURNS, type ToolResult, ToolsRefused } from "./provider";
+import { type AgentAccounts, type AgentCall, AgentStop, type CallSpec, isTransient, type ModelReply, NATIVE_TURNS, type PreparedCall, ProviderSession, requestOf, TEXT_TURNS, type ToolResult, ToolsRefused, type ToolTurnEncoding } from "./provider";
 import type { AgentBudget, Settings, ToolCalls, TurnBudget } from "./settings";
 import { SCRATCH_READ, TEXT, type Texts } from "./texts";
 import type { AgentTool, ToolOutcome } from "./tools";
-import { addCall, countedIn, emptyUsage, parseUsage, priced, toolTokens } from "./usage";
-import { cutAt, errorText, jsonEqual, type Limit, limitOf, timerMs, wholeArg } from "./util";
+import { addCall, countedIn, emptyUsage, messageText, parseUsage, priced, toolTokens } from "./usage";
+import { cutAt, errorText, jsonEqual, type Limit, limitOf, timerMs, tokensOf, wholeArg } from "./util";
 
 // ---------------------------------------------------------------- the contract
 
@@ -331,8 +333,10 @@ class Agent implements AgentHandle {
   private readonly conversation: ModelMessage[];
   private readonly entries: TranscriptEntry[] = [];
   private readonly total = emptyUsage();
-  /** The results that went to the model clipped, by handle: where the whole of each is kept. */
-  private readonly scratch = new Map<string, Whole>();
+  /** The results that went to the model clipped or cut, by handle: where the whole of each is kept, and how much of it one `scratch_read` gives (as much as its tool gives whole). */
+  private readonly scratch = new Map<string, { whole: Whole; per: number }>();
+  /** The room the round's results have left in the agent's next call, in characters, where Prompt per call limits it (`roomOf`); endless where it doesn't. */
+  private room = Number.POSITIVE_INFINITY;
   private startedAt: number | null = null;
   /** How long the run had been held when this agent started: time it was held before then isn't this agent's to subtract. */
   private heldBefore = 0;
@@ -609,6 +613,8 @@ class Agent implements AgentHandle {
       this.total.toolTurns += 1;
       used.toolTurns += 1;
       if (turn) turn.usage.toolTurns += 1;
+      const encoding = reply.written ? TEXT_TURNS : NATIVE_TURNS;
+      this.room = this.roomOf(prepared, encoding, reply);
       const tools = this.scope(signal, false);
       let round: RoundCall[];
       try {
@@ -616,7 +622,6 @@ class Agent implements AgentHandle {
       } finally {
         tools.clear();
       }
-      const encoding = reply.written ? TEXT_TURNS : NATIVE_TURNS;
       this.conversation.push(
         encoding.assistant(reply),
         encoding.results(
@@ -691,18 +696,45 @@ class Agent implements AgentHandle {
     return this.tools.size === 0 || !Number.isFinite(rounds) ? "" : `\n\n${this.text(TEXT.runtime.budget, { rounds: this.deps.texts.counted(rounds, TEXT.word.round) })}`;
   }
 
+  /** What a round's results end with once the agent has as few rounds left as Settings say: how many; null before then. */
+  private roundsNotice(): string | null {
+    const left = this.roundsLeft();
+    const { warnRounds } = this.deps.settings.loop;
+    if (warnRounds <= 0 || left > warnRounds) return null;
+    return left === 0 ? this.text(TEXT.runtime.roundsSpent) : this.text(TEXT.runtime.roundsLeft, { rounds: this.deps.texts.counted(left, TEXT.word.round) });
+  }
+
   /**
    * After a round: once it has as few rounds left as Settings say, it is told how many, with the
    * round's results, so its work ends in an answer instead of at the limit. The transcript holds
    * what it was told.
    */
   private warnRounds(): void {
-    const left = this.roundsLeft();
-    const { warnRounds } = this.deps.settings.loop;
-    if (warnRounds <= 0 || left > warnRounds) return;
-    const text = left === 0 ? this.text(TEXT.runtime.roundsSpent) : this.text(TEXT.runtime.roundsLeft, { rounds: this.deps.texts.counted(left, TEXT.word.round) });
+    const text = this.roundsNotice();
+    if (text === null) return;
     this.tell(text);
     this.record({ kind: "notice", text, at: this.now() });
+  }
+
+  /**
+   * The room a round's results have in the agent's next call, in characters, where Prompt per call
+   * limits its prompt: what is left once the prompt just sent, the answer that made the calls, the
+   * results' own framing and the line the round may end with (`roundsNotice`) are counted. Endless
+   * where Prompt per call is not limited. A result past what is left is cut to it (`clip`), so a
+   * long answer never leaves the next call one that isn't made.
+   */
+  private roomOf(p: PreparedCall, encoding: ToolTurnEncoding, reply: ModelReply): number {
+    const window = limitOf(this.spec.budget.callTokensIn);
+    if (!Number.isFinite(window)) return Number.POSITIVE_INFINITY;
+    const { charsPerToken } = this.deps.settings.loop;
+    // Framed as failures, the longer way a result goes back as text.
+    const framing = messageText(encoding.results(reply.calls.map((call) => ({ call, text: "", error: true })), this.deps.texts)).length;
+    // The line joins the results after a blank line.
+    const line = this.roundsNotice();
+    const notice = line === null ? 0 : line.length + 2;
+    // Each message's estimate is rounded up on its own: the answer and the results take a token each at most past their characters.
+    const after = p.estimate + tokensOf(messageText(encoding.assistant(reply)), charsPerToken) + 2;
+    return Math.max(0, Math.floor((window - after) * charsPerToken) - framing - notice);
   }
 
   /** The agent's or the run's time, run out before a call or a round; or, where the host writes the reply, the moment the reply is due, come. */
@@ -956,9 +988,10 @@ class Agent implements AgentHandle {
         outcome = stopped && !begun ? this.notBegun(call, stopped) : { text: this.text(TEXT.runtime.toolFailed, { name: call.name, error: stopped ? this.text(stopped.text.id, stopped.text.vars) : errorText(error) }), error: true };
       }
     }
-    // What ends the send is the answer, never a result the model reads on from: it isn't clipped.
+    // What ends the send is the answer, never a result the model reads on from: it isn't clipped, and takes no room. scratch_read's part is never more than one read, which it keeps within the room left.
     const ends = outcome.end === true && outcome.error !== true;
-    const kept = call.name === SCRATCH_READ || ends ? null : await this.clip(outcome.text, signal);
+    if (call.name === SCRATCH_READ) this.room = Math.max(0, this.room - outcome.text.length);
+    const kept = call.name === SCRATCH_READ || ends ? null : await this.clip(outcome.text, tool?.wholeChars, signal);
     const text = kept?.text ?? outcome.text;
     const error = outcome.error === true;
     const scratch = kept?.scratch !== undefined ? { scratch: kept.scratch } : {};
@@ -1027,17 +1060,32 @@ class Agent implements AgentHandle {
   }
 
   /**
-   * A result past Tool results clipped past: its start for the model, and the whole kept for
-   * `scratch_read`: as a blob where the agent has a blob store, so that no result stays in memory
-   * however long it is, else in the agent's own memory. A whole the store wouldn't take isn't kept
-   * at all: the model is told so with the start. The round's signal ends the wait for the store, as
-   * it ends a tool's run.
+   * A result past what reaches the model whole (Tool results clipped past, or what its tool gives
+   * whole where that is more), or past the room the round's results have left in the agent's next
+   * call (`roomOf`): its start for the model, in the words for whichever cut it, and the whole kept
+   * for `scratch_read`: as a blob where the agent has a blob store, so that no result stays in
+   * memory however long it is, else in the agent's own memory. A whole the store wouldn't take
+   * isn't kept at all: the model is told so with the start. The room is taken before the store is
+   * waited for, so calls of one round that end together never take the same room twice. The
+   * round's signal ends the wait for the store, as it ends a tool's run.
    */
-  private async clip(text: string, signal: AbortSignal): Promise<{ text: string; whole: Whole | null; scratch?: string } | null> {
-    const max = this.deps.settings.loop.clipChars;
-    if (text.length <= max) return null;
-    const shown = cutAt(text, max);
-    const sizes = { shown: String(shown), total: String(text.length) };
+  private async clip(text: string, wholeChars: number | undefined, signal: AbortSignal): Promise<{ text: string; whole: Whole | null; scratch?: string } | null> {
+    const max = Math.max(wholeChars ?? 0, this.deps.settings.loop.clipChars);
+    const room = this.room;
+    if (text.length <= max && text.length <= room) {
+      this.room = room - text.length;
+      return null;
+    }
+    const total = String(text.length);
+    // The words after the start take room too: measured as long as they can be, with a handle longer than any.
+    const words = (id: string): number => this.text(id, { shown: total, total, handle: "s000000" }).length + 1;
+    // Clipped at its own length where that and its words fit the room; else cut to the room, with the words that say so.
+    const fits = text.length > max && max + words(TEXT.runtime.clipped) <= room;
+    const id = fits ? TEXT.runtime.clipped : TEXT.runtime.windowCut;
+    const shown = cutAt(text, fits ? max : Math.max(0, room - words(TEXT.runtime.windowCut)));
+    this.room = Math.max(0, room - shown - words(id));
+    const sizes = { shown: String(shown), total };
+    const start = shown > 0 ? `${text.slice(0, shown)}\n` : "";
     const { blobs } = this.deps;
     let whole: Whole = { text };
     if (blobs) {
@@ -1047,18 +1095,22 @@ class Agent implements AgentHandle {
       } catch (error) {
         const stopped = signal.aborted ? this.why(error, signal) : null;
         if (!stopped) this.deps.host.log("warn", `[LumiAH] the whole of a clipped tool result couldn't be stored (${errorText(error)}): the model has its start alone`);
-        return { text: `${text.slice(0, shown)}\n${this.text(TEXT.runtime.clippedLost, { ...sizes, error: stopped ? this.text(stopped.text.id, stopped.text.vars) : errorText(error) })}`, whole: null };
+        return { text: `${start}${this.text(TEXT.runtime.clippedLost, { ...sizes, error: stopped ? this.text(stopped.text.id, stopped.text.vars) : errorText(error) })}`, whole: null };
       }
     }
     // The handle is taken in the same step as its whole is kept, after the store answered: two results clipped at once never share one.
     const handle = `s${this.scratch.size + 1}`;
-    this.scratch.set(handle, whole);
-    return { text: `${text.slice(0, shown)}\n${this.text(TEXT.runtime.clipped, { ...sizes, handle })}`, whole, scratch: "hash" in whole ? whole.hash : handle };
+    this.scratch.set(handle, { whole, per: max });
+    return { text: `${start}${this.text(id, { ...sizes, handle })}`, whole, scratch: "hash" in whole ? whole.hash : handle };
   }
 
-  /** The built-in `scratch_read`: the next part of a clipped result, at most Tool results clipped past at a time. */
+  /**
+   * The built-in `scratch_read`: the next part of a clipped or cut result, at most as much at a time
+   * as the tool it came from gives whole (Tool results clipped past, for most), and never more than
+   * the room the round's results have left.
+   */
   private scratchRead(): AgentTool {
-    const max = this.deps.settings.loop.clipChars;
+    const max = Math.max(this.deps.settings.loop.clipChars, ...[...this.tools.values()].map((tool) => tool.wholeChars ?? 0));
     return {
       name: SCRATCH_READ,
       description: this.text(TEXT.runtime.scratchRead),
@@ -1076,13 +1128,16 @@ class Agent implements AgentHandle {
         const kept = this.scratch.get(handle);
         if (kept === undefined) return { text: this.text(TEXT.runtime.scratchMissing, { handle, handles: [...this.scratch.keys()].join(", ") || this.text(TEXT.session.none) }), error: true };
         // A whole kept as a blob is read back from the store at each read: nothing of it stays with the agent between two.
-        const whole = "text" in kept ? kept.text : ((await this.deps.blobs?.get(kept.hash)) ?? null);
+        const whole = "text" in kept.whole ? kept.whole.text : ((await this.deps.blobs?.get(kept.whole.hash)) ?? null);
         if (whole === null) return { text: this.text(TEXT.runtime.scratchLost, { handle }), error: true };
         // An offset or length that isn't a whole number reads as none: the start, and as much as one read returns.
         const from = Math.min(Math.max(0, wholeArg(args.offset) ?? 0), whole.length);
-        const length = Math.min(Math.max(1, wholeArg(args.length) ?? max), max);
+        const total = String(whole.length);
+        const room = this.room - this.text(TEXT.runtime.scratchPart, { handle, from: total, to: total, total, text: "" }).length;
+        if (room < 1 && from < whole.length) return { text: this.text(TEXT.runtime.scratchFull, { handle }) };
+        const length = Math.min(Math.max(1, wholeArg(args.length) ?? kept.per), kept.per, room);
         const to = cutAt(whole, Math.min(whole.length, from + length));
-        return { text: this.text(TEXT.runtime.scratchPart, { handle, from: String(from), to: String(to), total: String(whole.length), text: whole.slice(from, to) }) };
+        return { text: this.text(TEXT.runtime.scratchPart, { handle, from: String(from), to: String(to), total, text: whole.slice(from, to) }) };
       },
     };
   }

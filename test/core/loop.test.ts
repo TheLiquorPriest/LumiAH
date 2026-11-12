@@ -349,6 +349,46 @@ describe("clipping and scratch_read", () => {
     const part = lastMessage(r.host.calls[1])?.parts?.[0];
     expect((part?.type === "tool_result" ? part.content : "").split("\n")[0]).toBe("a".repeat(299));
   });
+
+  test("a tool that names the length it gives whole is given it whole up to there and clipped past it; one that names none is clipped at the setting as before", async () => {
+    const reading = { ...tool("reading", (a) => (a.q === "short" ? "r".repeat(15_000) : `${"r".repeat(20_000)}TAIL${"t".repeat(4996)}`)), wholeChars: 20_000 };
+    const lookup = tool("lookup", () => "l".repeat(15_000));
+    const script: Script = [{ toolCalls: [call("reading", { q: "short" }, "c1")] }, { toolCalls: [call("reading", { q: "long" }, "c2")] }, { toolCalls: [call("lookup", {}, "c3")] }, { toolCalls: [call(SCRATCH_READ, { handle: "s1", offset: 20_000 }, "c4")] }, "done"];
+    const r = rig(script, (s) => (s.loop.clipChars = 6000));
+    expect(await r.start({ tools: [reading, lookup] }).send("go")).toMatchObject({ status: "answered", text: "done" });
+    const content = (at: number): string => {
+      const part = lastMessage(r.host.calls[at])?.parts?.[0];
+      return part?.type === "tool_result" ? part.content : "";
+    };
+    expect(content(1)).toBe("r".repeat(15_000));
+    expect(content(2)).toBe(`${"r".repeat(20_000)}\n[Clipped: the first 20000 of 25000 characters. The rest is in scratch s1; read it with scratch_read from offset 20000.]`);
+    expect(content(3)).toBe(`${"l".repeat(6000)}\n[Clipped: the first 6000 of 15000 characters. The rest is in scratch s2; read it with scratch_read from offset 6000.]`);
+    // The rest of the long read comes in one read, as much as its tool gives whole.
+    expect(content(4)).toBe(`[Scratch s1, characters 20000 to 25000 of 25000.]\nTAIL${"t".repeat(4996)}`);
+    expect(r.host.calls[0]?.tools?.find((t) => t.name === SCRATCH_READ)?.parameters).toMatchObject({ properties: { length: { maximum: 20_000 } } });
+  });
+
+  test("a result the room left under Prompt per call can't hold reaches the model cut to it, in plain words, and the next call is still made", async () => {
+    const book = "b".repeat(30_000);
+    const reading = { ...tool("reading", () => book), wholeChars: 50_000 };
+    const r = rig([{ toolCalls: [call("reading", {}, "c1")] }, "done"]);
+    const agent = r.start({ tools: [reading], budget: { ...r.spec().budget, callTokensIn: 3000 } });
+    expect(await agent.send("go")).toMatchObject({ status: "answered", text: "done" });
+    expect(r.host.calls).toHaveLength(2);
+    const part = lastMessage(r.host.calls[1])?.parts?.[0];
+    const text = part?.type === "tool_result" ? part.content : "";
+    const shown = Number(/room for only the first (\d+) of 30000 characters/.exec(text)?.[1] ?? 0);
+    // Most of the room is given to the result, and none of it past what the prompt holds.
+    expect(shown).toBeGreaterThan(5000);
+    expect(text.startsWith(`${book.slice(0, shown)}\n[Cut to fit: your prompt has room for only the first ${shown} of 30000 characters of this result (Prompt per call). The rest is in scratch s1; scratch_read gives it from offset ${shown}`)).toBe(true);
+    expect(part).not.toMatchObject({ isError: true });
+    expect(agent.transcript().entries.find((e) => e.kind === "result")).toMatchObject({ scratch: "s1", error: false });
+    // Without Prompt per call nothing is measured: the same result reaches the model whole.
+    const open = rig([{ toolCalls: [call("reading", {}, "c1")] }, "done"]);
+    await open.start({ tools: [reading] }).send("go");
+    const whole = lastMessage(open.host.calls[1])?.parts?.[0];
+    expect(whole?.type === "tool_result" ? whole.content : "").toBe(book);
+  });
 });
 
 describe("reasoning, caching and throttles", () => {

@@ -74,13 +74,13 @@ In a runtime the reply may be written by the agents themselves, with no writer. 
 - budgets per call, per agent and per turn (tokens in and out, rounds, time, revisions);
 - a loop detector for the same call made on the same state, with the same result, several times running; the same call written more than once in one answer is run once, and of one answer's calls that would end the agent's work (`write_reply`) only the first is run;
 - no call of a round begun once the turn was stopped or its time ran out;
-- clipping of long tool results, with the whole kept for `scratch_read`;
+- clipping of long tool results, with the whole kept for `scratch_read`: past *Tool results clipped past* (`loop.clipChars`), or past the length a tool says it gives whole (`wholeChars`, for a tool that bounds its own answer by a setting and is meant to be read in one go), where that is more; and, where *Prompt per call* limits an agent's prompt, a result that would take its next call past it is cut to the room left, in one editable line (`runtime.window_cut`), so the call is still made;
 - one more go for a call its answer room cut while it was all thinking (no text and no whole tool call came of it): the call is made again once, with its room times *More room after a cut answer* (`loop.cutRoomFactor`, 2) up to *Most room after a cut answer* (`loop.cutRoomTokens`, 64,000), and the model is told in one editable line (`runtime.cut_thinking`) to think briefly and act. The first call counts against every budget and shows in the live view as cut; the second shows as the same step again. Cut so again, it ends as a cut answer does (a job fails in words that say so). An answer cut after it wrote text or a whole tool call is handled as any cut answer is;
 - reasoning carried across tool calls where the provider needs it;
 - cache breakpoints on a stable prefix;
 - request and token throttles per connection.
 
-A tool is `{ name, description, parameters, state?, run(args, ctx) }`, with `parameters` a hand-written JSON Schema. Its outcome is `{ text, error?, end? }`; `end` finishes the send with that text.
+A tool is `{ name, description, parameters, state?, wholeChars?, run(args, ctx) }`, with `parameters` a hand-written JSON Schema. Its outcome is `{ text, error?, end? }`; `end` finishes the send with that text.
 
 ### 4.2 Ports
 Core reaches the world through one object, the host:
@@ -304,6 +304,7 @@ A job is an agent run that outlives the reply.
 - **A runtime restart** leaves a running job marked interrupted, with what it had done kept. The user or an agent may start it again.
 - **Run again** from the page starts the same job again: the same agent, `as`, task, lane and due, the same starter's tools, and the same turn it belongs to, so an extension knows it for that turn's job. It is told what its first run was told, and, in one line more, that it is run again and why its last run stopped. Once the reply it was started from is off the chat's path, it isn't run at all, and the user is told why. An agent's `job_start` with `again` starts the job again as its own, for its own turn.
 - **An answer cut while thinking.** A job whose agent's answer ran out of room before it wrote anything (its model spent the room thinking) fails in words that say so, and where to give it more room.
+- **A failure that lasts.** A job that failed on what it runs on is marked so (`lasting`): no connection to run on, a call its provider refused for its key, its model or its account, an agent that is gone, a chat that plays only in a runtime. Run again, it fails the same way until the user changes that. Whoever starts jobs (an extension carrying work on in new runs) can tell it from a failure that may pass.
 
 ## 16. MCP tools
 
@@ -356,7 +357,7 @@ LumiAH's own tests include a sample extension that supplies one of each, so this
 Some work is too long for a turn and ends in no reply: learning the story of a chat that already has thousands of messages, or putting a workspace in order. It is a job the user starts on the page.
 
 - **What the user gives:** the objective in their own words, the agent to do it (the main agent unless they pick another), and an allowance of tokens and time for this job alone.
-- **A plan first.** An agent that can write files is told its allowance and asked to say, before it works, what it will do with it: where it will read closely, where a summary is enough, and what it will leave out. The plan is a file in `learned/`, which it keeps true as it goes. A smaller allowance should give a narrower plan. An agent with no tool that writes files is told its allowance and its objective, and nothing about a plan or files: it is told only what it can do.
+- **A plan first.** An agent that can write files is told its allowance and asked to say, before it works, what it will do with it: where it will read closely, where a summary is enough, and what it will leave out. The plan is a file in `learned/`, which it keeps true as it goes. A smaller allowance should give a narrower plan. An agent with no tool that writes files is told its allowance and its objective, and nothing about a plan or files: it is told only what it can do. Whoever starts a job may keep its plan file with tools of their own (`plan` with `planWords`, as an extension's prepared start does, whose plan is of more than one run): the agent is then never asked to write the plan, nor told that its allowance shapes it. It is told the starter's words of the plan in that place, as it begins and as it is carried on, in texts the user can replace as they can the ask for a plan.
 - **Steering.** The user can say something to the job while it runs, and pause and resume it (§18 applies to a job as it does to a turn). A paused job stays paused across a runtime restart.
 - **When the allowance runs out** the job stops with a report of what it did and what is left. The user can grant more, and it carries on from its own session. A day's limit stops it the same way, and it is carried on with nothing more granted (§15).
 - **What it leaves:** files in `learned/`, among them a plain list of what it has not verified.

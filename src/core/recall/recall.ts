@@ -14,7 +14,7 @@ import type { Book } from "../book";
 import { textHash } from "../hash";
 import { wholeCut } from "../lexical";
 import { docKey } from "../paths";
-import type { HarnessHost, JsonValue, TurnRequest } from "../ports";
+import type { HarnessHost, JsonValue, PathMessage, TurnRequest } from "../ports";
 import { isRecord } from "../ports";
 import type { Settings } from "../settings";
 import type { StorySource } from "../story";
@@ -28,14 +28,14 @@ import type { ActivatedEntry, MemoryArc } from "./ports";
 import { type HeldDetail, type HeldLore, heldLore } from "./prompt";
 import type { HeldWhy, LoreChange } from "./shapes";
 
-/** What a run's view is made from: the host, the run, the generation it answers (none for a job's run and a side session's turn), the user's settings and texts, the run's own path of the chat, what counts as the chat's story, and the chat's book. A `ToolEnv` is one. */
+/** What a run's view is made from: the host, the run, the generation it answers (none for a job's run and a side session's turn), the user's settings and texts, a turn's own path of the chat (the messages before its reply; any other run reads the chat as it stands), what counts as the chat's story, and the chat's book. A `ToolEnv` is one. */
 export interface RunEnv {
   host: HarnessHost;
   run: RunInfo;
   turn?: TurnRequest;
   settings: Readonly<Settings>;
   texts: Texts;
-  chat: Pick<ChatView, "path">;
+  chat?: Pick<ChatView, "path">;
   story: StorySource;
   book?: Book;
 }
@@ -182,6 +182,8 @@ export class RecallRun {
   available: { memory: boolean; databanks: boolean; web: boolean } | null = null;
   private readied: Promise<void> | null = null;
   private readonly corpora: Corpora;
+  /** The chat's path being read for this run now: the calls made meanwhile share it. */
+  private pathRead: Promise<readonly PathMessage[]> | null = null;
   private heldRead: Promise<HeldLore | null> | null = null;
   private arcsRead: Promise<readonly MemoryArc[]> | null = null;
   /** Each entry's text as embedded, and its hash, by the entry as the corpus holds it: an entry that changed is another object, and is hashed again. */
@@ -230,10 +232,26 @@ export class RecallRun {
     return this.corpora.lore;
   }
 
-  /** The chat as the run's own path has it: the messages that count as the story with their text, the index a search of them uses, and the numbers of those it leaves out. */
+  /**
+   * The chat as the run's own path has it: the messages that count as the story with their text, the
+   * index a search of them uses, and the numbers of those it leaves out. A turn reads the messages
+   * before its reply, as its session walked them. Any other run reads the chat as it stands at each
+   * call: the host keeps its read of the chat until the chat changes, so a call on a chat that didn't
+   * change reads none of it again, and one after a change reads what changed.
+   */
   async chat(): Promise<ChatRun> {
     const { pieceChars, chatBatch } = this.env.settings.tools;
-    return this.corpora.chat.sync(this.env.run.id, await this.env.chat.path(), { pieceChars, chatBatch }, this.env.story);
+    return this.corpora.chat.sync(this.env.run.id, await this.path(), { pieceChars, chatBatch }, this.env.story);
+  }
+
+  private path(): Promise<readonly PathMessage[]> {
+    if (this.env.turn && this.env.chat) return this.env.chat.path();
+    if (this.pathRead) return this.pathRead;
+    const read = this.host.chat.path(this.chatId).finally(() => {
+      if (this.pathRead === read) this.pathRead = null;
+    });
+    this.pathRead = read;
+    return read;
   }
 
   /** How Lumiverse activated what it put in the generation's prompt: from the recall port where the host has one, else what `LorePort` says, which is the entries alone. */

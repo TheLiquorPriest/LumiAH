@@ -118,6 +118,32 @@ export function isTransient(error: unknown): boolean {
   return !texts.some((text) => LASTING.some((pattern) => pattern.test(text))) && texts.some((text) => TRANSIENT.some((pattern) => pattern.test(text)));
 }
 
+/**
+ * How a failure reads that lies in what the call runs on, so that the same work run again meets it
+ * again until the user changes that: a key its provider refused (401 and 403 where the error leads
+ * with them or names them as a status, an invalid or missing key, a permission denied), and a model
+ * it doesn't have (404 so named, a model not found or that doesn't exist). With `LASTING`'s account
+ * out of quota or credit. Not settings, as `TRANSIENT` isn't: a new provider's words are a fix here.
+ */
+const REFUSED: readonly RegExp[] = [
+  /(?:^\s*|\b(?:status(?: code)?|http(?:\/[\d.]+)?|error|code)[\s:=#(]*)(?:401|403|404)\b/i,
+  /\b(?:unauthori[sz]ed|forbidden|permission[ _-]denied|access[ _-]denied|authentication (?:failed|error|required))\b/i,
+  /\b(?:invalid|incorrect|missing|expired|revoked)[ _-](?:x-)?(?:api[ _-]?)?key\b/i,
+  /\bapi[ _-]?key\b[^.\n]{0,30}\b(?:invalid|incorrect|missing|not valid|expired|revoked)\b/i,
+  /\b(?:model[ _]not[ _]found|no such model|unknown model|invalid model)\b/i,
+  /\bmodel\b[^.\n]{0,80}\b(?:not found|does(?: not|n't) exist|is not available|isn't available)\b/i,
+];
+
+/**
+ * Whether a failed call's error lasts (`REFUSED`, `LASTING`), in its message or its cause's: it lies
+ * in the key, the model or the account the call runs on, so running the work again fails the same
+ * way until the user changes that.
+ */
+export function isLasting(error: unknown): boolean {
+  const texts = [errorText(error), error instanceof Error && error.cause !== undefined ? errorText(error.cause) : ""];
+  return texts.some((text) => LASTING.some((pattern) => pattern.test(text)) || REFUSED.some((pattern) => pattern.test(text)));
+}
+
 // ---------------------------------------------------------------- effort
 
 /**

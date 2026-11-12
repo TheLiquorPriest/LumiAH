@@ -21,7 +21,7 @@ import { isRecord } from "../../link/json";
 import type { Chats } from "./chat";
 import { LinkRefused } from "./errors";
 import type { Lore } from "./reads";
-import type { ActivatedInfo, BackendHost, HostChat, HostEntryRecord, HostMessage } from "./spindle";
+import type { ActivatedInfo, BackendHost, HostChat, HostEntryRecord } from "./spindle";
 
 export interface RecallDeps {
   chats: Chats;
@@ -267,18 +267,10 @@ export class Recall {
 
   // ---------------------------------------------------------------- the chat
 
-  /** The messages of a chat whose index is `from` or more and less than `to`, as the host gives them. A chat whose indexes have a hole is read whole: a range read by place isn't then the range asked for. */
-  private async rows(chatId: string, from: number, to: number): Promise<HostMessage[]> {
-    if (to <= from) return [];
-    let rows = await this.host.chats.messages(chatId, { from, count: to - from });
-    if (rows.some((m, i) => m.index !== from + i)) rows = await this.host.chats.messages(chatId);
-    return rows.filter((m) => m.index >= from && m.index < to);
-  }
-
   /** `RecallChatPort.messages`: as `Chats.messages`, each message with when it was sent. */
   private async messages(userId: string, chatId: string, from: number, to: number): Promise<TimedMessage[]> {
     await this.deps.chats.own(userId, chatId);
-    return (await this.rows(chatId, from, to)).map((m) => ({ id: m.id, index: m.index, role: m.role, name: m.name, swipeId: m.swipeId, content: m.content, at: m.at }));
+    return (await this.deps.chats.range(chatId, from, to)).map((m) => ({ id: m.id, index: m.index, role: m.role, name: m.name, swipeId: m.swipeId, content: m.content, at: m.at }));
   }
 
   // ---------------------------------------------------------------- embeddings
@@ -420,7 +412,7 @@ export class Recall {
     if (kept.length === 0) return [];
     const first = kept.reduce((least, k) => Math.min(least, k.index), Number.POSITIVE_INFINITY);
     const last = kept.reduce((most, k) => Math.max(most, k.index), 0);
-    const now = new Map((await this.rows(chatId, first, last + 1)).map((m) => [m.index, m]));
+    const now = new Map((await this.deps.chats.range(chatId, first, last + 1)).map((m) => [m.index, m]));
     const out: BookMessageHash[] = [];
     for (const k of kept) {
       const m = now.get(k.index);

@@ -212,6 +212,7 @@ function remoteDefinition(tool: RemoteTool, host: Pick<HarnessHost, "tools">): T
         description: tool.description,
         parameters: tool.parameters,
         tier: tool.tier,
+        ...(tool.wholeChars !== undefined ? { wholeChars: tool.wholeChars } : {}),
         async run(args, ctx) {
           const { main = false, above = [] } = env.standing ?? {};
           // What the port answers comes from outside the core, whatever its type says: an answer that holds no text is a tool that gave nothing, told in words the agent can go on from.

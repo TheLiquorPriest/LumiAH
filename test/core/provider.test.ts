@@ -7,7 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { excerptOf, LexicalIndex, tokenize } from "../../src/core/lexical";
 import { startAgent } from "../../src/core/loop";
 import type { JsonObject, ModelMessage, ModelRequest, ModelTool } from "../../src/core/ports";
-import { type AgentCall, AgentAccounts, assemble, type CallSpec, isToolRefusal, isTransient, type ModelReply, NATIVE_TURNS, ownBreakpoints, type PreparedCall, type ProviderDeps, ProviderSession, recoverToolCalls, requestOf, TEXT_TURNS, ToolsRefused } from "../../src/core/provider";
+import { type AgentCall, AgentAccounts, assemble, type CallSpec, isLasting, isToolRefusal, isTransient, type ModelReply, NATIVE_TURNS, ownBreakpoints, type PreparedCall, type ProviderDeps, ProviderSession, recoverToolCalls, requestOf, TEXT_TURNS, ToolsRefused } from "../../src/core/provider";
 import { defaultSettings, type Settings, type ToolCalls } from "../../src/core/settings";
 import { SCRATCH_READ, Texts } from "../../src/core/texts";
 import type { AgentTool } from "../../src/core/tools";
@@ -465,6 +465,24 @@ describe("a failure that passes", () => {
       "the connection conn-gone no longer exists: give this agent another in LumiAH's Settings",
     ];
     for (const words of lasting) expect({ words, passes: isTransient(new Error(words)) }).toEqual({ words, passes: false });
+  });
+
+  test("a failure that lasts lies in what the call runs on: a key or a model its provider refused, an account out of quota or credit; a failure that passes, or the call's own, doesn't last", () => {
+    const lasting = [
+      "401: the key was refused",
+      "Error: 403 Forbidden",
+      "invalid x-api-key",
+      "Incorrect API key provided: sk-abc. You can find your API key at the provider.",
+      "The model `gpt-9` does not exist or you do not have access to it.",
+      "404 model not found",
+      "unknown model: tide-1",
+      "429: You exceeded your current quota, please check your plan and billing details",
+      "402: payment required",
+    ];
+    for (const words of lasting) expect({ words, lasts: isLasting(new Error(words)) }).toEqual({ words, lasts: true });
+    expect(isLasting(new Error("the call failed", { cause: new Error("Unauthorized") }))).toBe(true);
+    const passing = ["503: overloaded", "Error: 429 Too Many Requests", "fetch failed", "This model's maximum context length is 8192 tokens, and you asked for 8500", "400: this model does not support tools", "content policy: the request was refused", "the tool lookup failed: no shelf"];
+    for (const words of passing) expect({ words, lasts: isLasting(new Error(words)) }).toEqual({ words, lasts: false });
   });
 });
 

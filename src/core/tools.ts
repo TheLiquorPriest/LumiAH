@@ -86,6 +86,15 @@ export interface AgentTool {
    * result, so the send is never ended by two calls or by a mix of what each was given.
    */
   ends?: true;
+  /**
+   * How much of its answer, in characters, reaches the model whole: for a tool that bounds its own
+   * answer by a setting and is meant to be read in one go (a long read the model asked for). Up to
+   * it the answer isn't clipped at Tool results clipped past, nor left in scratch; past it, it is
+   * clipped here, and `scratch_read` gives the rest as much at a time. Absent, or below Tool results
+   * clipped past: that setting, as for any tool. Either way an answer the room left in the agent's
+   * prompt (Prompt per call) can't hold is cut to that room, and says so.
+   */
+  wholeChars?: number;
   run(args: JsonObject, ctx: ToolCtx): Promise<ToolOutcome>;
 }
 
