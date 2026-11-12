@@ -20,7 +20,7 @@ import { AskDesk } from "./asks";
 import { bookOp, isBookOp } from "./book";
 import type { RuntimeConfig } from "./config";
 import type { OpenSocket } from "./connection";
-import { asked, linkExtension, linkHost, linkStorage, refusedForGood, unknownRuntime, withdrawn } from "./host";
+import { asked, linkExtension, linkHost, linkStorage, refusedForGood, superseded, unknownRuntime, withdrawn } from "./host";
 import { LinkClient, LOST_WAIT } from "./link";
 import type { Http, StoredLogin } from "./lumiverse";
 import { addConnectionProfile, connectionProfiles, loopbackProfile, setConnectionKey, stopGeneration, timedHttp } from "./lumiverse";
@@ -237,6 +237,7 @@ export function createRuntime(config: RuntimeConfig, deps: RuntimeDeps): Runtime
     limits: () => ({ waitMs: tuning().storeWaitMs }),
     waitsOwner: () => linkedBackendOf(link.hello?.backend),
     refusedForGood,
+    superseded,
     withdrawn,
     // The extension no longer knows this runtime (forgotten, or registered anew), or its link is refused: nobody will take what it sends, and its stop doesn't wait for anybody.
     disowned: (error) => link.refused !== null || unknownRuntime(error),

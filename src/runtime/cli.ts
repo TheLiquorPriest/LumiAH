@@ -723,11 +723,11 @@ const WAITING = "waiting.json";
 
 /**
  * What serves on this config's address now, asked by the road's probe (link/road.ts), which carries
- * no secret: a copy of this runtime, whose answer is a proof made with the config's secret; nothing,
- * where nothing takes the request; or something else, which answered without that proof, or not
- * within `WAIT_MS`.
+ * no secret: a copy of this runtime, whose answer is a proof made with `secret`; nothing, where
+ * nothing takes the request; or something else, which answered without that proof, or not within
+ * `WAIT_MS`.
  */
-async function servingThere(config: RuntimeConfig, io: RuntimeIO): Promise<"this runtime" | "nothing" | "something else"> {
+async function servingThere(config: RuntimeConfig, io: RuntimeIO, secret: string): Promise<"this runtime" | "nothing" | "something else"> {
   const nonce = [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
   const late = AbortSignal.timeout(WAIT_MS);
   const reply = await io.http({ method: "POST", url: `${runtimeBase(config.listen, config.port).replace(/\/v1$/, "")}${ASK_PATH}`, headers: { [PROBE_HEADER]: nonce, "Content-Type": "application/json" }, body: "{}", signal: late }).catch(() => null);
@@ -739,7 +739,7 @@ async function servingThere(config: RuntimeConfig, io: RuntimeIO): Promise<"this
     // Not JSON: no proof below.
   }
   const proof = isRecord(said) && typeof said.proof === "string" ? said.proof : "";
-  return reply.status === 200 && (await sameSecret(proof, await roadProof(config.secret, config.relay, nonce))) ? "this runtime" : "something else";
+  return reply.status === 200 && (await sameSecret(proof, await roadProof(secret, config.relay, nonce))) ? "this runtime" : "something else";
 }
 
 /**
@@ -749,15 +749,17 @@ async function servingThere(config: RuntimeConfig, io: RuntimeIO): Promise<"this
  * it serves nothing and links to nothing, waits until that one stops, and meanwhile keeps a mark in
  * the runtime's folder, which the one that serves shows on the Runtime page. Only a copy of this
  * runtime is waited for: whatever else holds the port could keep it waiting for as long as it
- * liked, so then it doesn't start, in words that say why. Resolves null once the port is this
- * one's to take; with the signal's name when it is asked to stop while it waits.
+ * liked, so then it doesn't start, in words that say why. The proof is checked against `secret()`,
+ * the config's secret as it stands at each look: the copy that serves writes there a secret the
+ * Runtime page rotated. Resolves null once the port is this one's to take; with the signal's name
+ * when it is asked to stop while it waits.
  */
-async function waitForPort(config: RuntimeConfig, io: RuntimeIO, dir: string, log: (text: string) => void, stopping: Promise<string>): Promise<string | null> {
+async function waitForPort(config: RuntimeConfig, io: RuntimeIO, dir: string, log: (text: string) => void, stopping: Promise<string>, secret: () => string): Promise<string | null> {
   const mark = `${dir}/${WAITING}`;
   let since: number | null = null;
   try {
     for (;;) {
-      const there = await servingThere(config, io);
+      const there = await servingThere(config, io, secret());
       if (there === "nothing") return null;
       if (there === "something else") throw new Error(`Something other than this runtime holds ${config.listen}:${config.port}: what answers there can't prove it holds this runtime's secret, so the runtime doesn't wait for it. Stop what holds the port (another program, or a runtime set up there before under another registration), or set this runtime up again on another port with --port.`);
       const now = io.now();
@@ -791,7 +793,7 @@ export async function serve(config: SavedConfig, path: string, io: RuntimeIO): P
   const start = io.serve;
   if (start === null) throw new UsageError("LumiAH's runtime runs on Bun (Bun.serve, idleTimeout 0): run it with Bun.");
   const log = (text: string): void => io.err(`[lumiah ${config.name}] ${text}`);
-  // The session is read from the file again whenever it is needed; the secret, the limits and how the runtime is kept are this process's own to change.
+  // The session is read from the file again whenever it is needed, and the secret while another copy serves (`secretOnFile`); once this one serves, the secret, the limits and how the runtime is kept are this process's own to change.
   let current = config;
   const session = (): StoredLogin => {
     try {
@@ -800,6 +802,15 @@ export async function serve(config: SavedConfig, path: string, io: RuntimeIO): P
       // The file went or broke under it: the sign-in it started with stands.
     }
     return current.session;
+  };
+  // While another copy serves, the secret is that copy's to change: the Runtime page may rotate it, and that copy writes the new one to the file. So it is read from there before each look at the port, and this copy serves with the one it read last.
+  const secretOnFile = (): string => {
+    try {
+      current = { ...current, secret: configOf(io.files.read(path), path).secret };
+    } catch {
+      // The file went or broke under it: the secret it had stands.
+    }
+    return current.secret;
   };
   // The one writer of the config while the runtime runs: it writes the whole of `current`, so every change (a secret rotated, the limits, the Runtime page's settings) goes through it.
   const keep = (change: Partial<SavedConfig>): void => {
@@ -817,7 +828,7 @@ export async function serve(config: SavedConfig, path: string, io: RuntimeIO): P
   // The runtime's own folder: its connections, its keys and its working store go in it, so no one but its owner may enter it.
   const dir = io.files.folder(runtimeDir(dataDir(io.env, io.home), config.name), RUNTIME_DIR_MODE);
   const stopping = io.stopped();
-  const stoppedFirst = await waitForPort(config, io, dir, log, stopping);
+  const stoppedFirst = await waitForPort(config, io, dir, log, stopping, secretOnFile);
   if (stoppedFirst !== null) {
     log(`stopping (${stoppedFirst}) before it served`);
     return 0;
@@ -962,9 +973,11 @@ async function status(a: Args, io: RuntimeIO): Promise<number> {
   let healthy = false;
   try {
     const body = await healthOf(config, io);
-    if (isRecord(body) && typeof body.link === "string") {
+    const backend = isRecord(body) && typeof body.backend === "string" && body.backend !== "" ? body.backend : "LumiAH";
+    if (isRecord(body) && body.stopping === true) io.out(`It answers, but is stopping: once ${backend}'s storage has what it saved (the Storage wait at most), its link closes and it lets go of its port.`);
+    else if (isRecord(body) && typeof body.link === "string") {
       healthy = body.ok === true && body.link === "up";
-      io.out(`It answers: link to ${typeof body.backend === "string" && body.backend !== "" ? body.backend : "LumiAH"} ${body.link}, ${String(body.turns)} turn(s) under way${typeof body.problem === "string" ? `. ${body.problem}` : ""}.`);
+      io.out(`It answers: link to ${backend} ${body.link}, ${String(body.turns)} turn(s) under way${typeof body.problem === "string" ? `. ${body.problem}` : ""}.`);
     } else io.out(`Something answers on ${config.listen}:${config.port}, but not as the runtime this config is for: another runtime serves there, or this one was set up again and hasn't been restarted since.`);
   } catch (error) {
     io.out(`It doesn't answer on ${config.listen}:${config.port} (${error instanceof Error ? error.message : String(error)}).`);

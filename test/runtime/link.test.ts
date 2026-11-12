@@ -1,7 +1,8 @@
 // The link's handshake (DESIGN §6: "the link is versioned"): each end says its version on hello, and
 // a mismatch is refused in plain words that name which side to update, wherever it is noticed: by
 // the extension (an older or newer runtime), or by the runtime (an extension that answers another
-// version). A runtime the extension doesn't know is refused too.
+// version). A runtime the extension doesn't know is refused too. And a request asked while the link
+// is down, which goes once it is back, with what it says worked out as it leaves.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { isRecord } from "../../src/core/ports";
@@ -9,7 +10,7 @@ import { LINK, LINK_VERSION, type LinkRequests, type RuntimeReport, versionWords
 import type { Runtime } from "../../src/runtime/runtime";
 import { FakeHost } from "../support/fake-host";
 import { FakeLumiverse } from "../support/fake-lumiverse";
-import { BUILD, PORT, type Rig, rig, runtimeFor, USER } from "../support/rig";
+import { BUILD, PORT, type Rig, rig, runtimeFor, until, USER } from "../support/rig";
 
 let r: Rig | null = null;
 let alone: Runtime | null = null;
@@ -93,5 +94,43 @@ describe("the connection's model list", () => {
     expect(good).toMatchObject({ object: "list", data: [{ id: "lumiah" }] });
     const bad = await ask("lah_wrong");
     expect(bad.status).toBe(401);
+  });
+});
+
+describe("a request asked while the link is down", () => {
+  test("waits for the link, and its fields, given as a function, are worked out as it leaves (a document's age counts to then), not when it was asked", async () => {
+    let unreachable = false;
+    let tries = 0;
+    const it = (r = await rig({
+      wire: (lumiverse) => ({
+        http: lumiverse.http,
+        openSocket: (url, events) => {
+          if (unreachable) {
+            tries += 1;
+            throw new Error("Lumiverse can't be reached");
+          }
+          return lumiverse.openSocket(url, events);
+        },
+      }),
+    }));
+    await it.runtime.link.connect();
+    unreachable = true;
+    it.lumiverse.dropSockets();
+    await until(() => !it.runtime.link.up, "the link to go down");
+    const worked: boolean[] = [];
+    const before = tries;
+    const read = it.runtime.link.request(
+      "doc.get",
+      () => {
+        worked.push(it.runtime.link.up);
+        return { path: "chats/c1/session.json" };
+      },
+      10_000,
+    );
+    await until(() => tries > before, "the link to try to come back");
+    expect(worked).toEqual([]);
+    unreachable = false;
+    expect(await read).toMatchObject({ doc: null });
+    expect(worked).toEqual([true]);
   });
 });

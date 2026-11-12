@@ -71,7 +71,7 @@ export const REDIRECT_REFUSED = /\bUnexpectedRedirect\b/;
 /** The words for it: the runtime follows no redirect, since a call's key and headers would go with it to an address nobody gave them for. */
 export const REDIRECT_WORDS = "the server answered with a redirect to another address, which the runtime doesn't follow, so that the connection's key and headers never go with it: give the connection the address it moved to.";
 
-/** The shortest secret worth looking for: shorter ones would match ordinary words. So the book refuses to keep a key or a header's value any shorter (book.ts). */
+/** The shortest secret worth looking for: shorter ones would match ordinary words. So a save refuses a key any shorter (book.ts); a header's value may be shorter, and is then not looked for. */
 export const SECRET_FLOOR = 8;
 /** What stands where a secret was. */
 const HIDDEN = "[secret]";

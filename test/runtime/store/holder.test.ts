@@ -97,9 +97,10 @@ describe("one runtime at a time keeps a copy", () => {
     expect(warnings()).toEqual([]);
   });
 
-  test("review finding 1: a runtime silent past the link's allowance loses the mirror to the next one that says hello; back, what it saved and hadn't sent reaches the storage first, but for a path the other saved after it (dropped, named, counted, and a settle told), and it works straight on the storage, never asking for the mirror again", async () => {
+  test("review finding 1: a runtime silent past the link's allowance loses the mirror to the next one that says hello; back, what it saved and hadn't sent reaches the storage first, but for a path the other saved after it (dropped, named, counted, and a settle told) and one the storage refuses by its own rule (dropped and named, not counted), and it works straight on the storage, never asking for the mirror again", async () => {
     const path = "chats/c1/session.json";
     const own = "chats/c1/learned.json";
+    const big = "chats/c1/big.json";
     const a = run(await linked(b, "relay-a"));
     await a.store.store.write(path, { turns: 1 });
     await a.store.settle();
@@ -107,6 +108,8 @@ describe("one runtime at a time keeps a copy", () => {
     a.drop();
     await a.store.store.write(path, { turns: 2 });
     await a.store.store.write(own, { learned: 1 });
+    await a.store.store.write(big, { pages: 900 });
+    b.mirror.refuses = (what) => (what === `write ${big}` ? "That document is larger than the extension takes." : null);
 
     // Not yet past the allowance: another runtime that says hello now works without a copy.
     b.clock.advance(60_000);
@@ -131,7 +134,7 @@ describe("one runtime at a time keeps a copy", () => {
     expect(await two.store.store.read(own)).toEqual({ learned: 1 });
     expect(await a.store.store.read(path)).toEqual({ turns: 3 });
     expect(a.store.state()).toMatchObject({ mode: "direct", holder: "relay-b", waiting: 0, lost: { to: "relay-b", dropped: 1 } });
-    expect(a.store.state().refused.map((one) => one.name)).toEqual([path]);
+    expect(a.store.state().refused.map((one) => one.name).sort()).toEqual([big, path]);
     expect(warnings().filter((line) => line.includes(path) && line.includes("dropped"))).toHaveLength(1);
     expect(warnings().filter((line) => line.includes(own) && line.includes("dropped"))).toEqual([]);
     expect(await outcome(a.store.settle())).toBe("done");
@@ -206,6 +209,46 @@ describe("one runtime at a time keeps a copy", () => {
     expect(a.store.state().refused.map((one) => one.name)).toEqual([path]);
     expect(warnings().filter((line) => line.includes(path) && line.includes("dropped"))).toHaveLength(1);
     expect(await outcome(a.store.settle())).toBe("done");
+  });
+
+  test("review finding 2, a request the link holds: the holder's save made while its link was down goes once the link is back, with the age it has then, and gives way to another runtime's save made meanwhile", async () => {
+    const path = "chats/c1/session.json";
+    const a = run(await linked(b, "relay-a"));
+    const two = run(await linked(b, "relay-b", { dir: elsewhere }));
+    await a.store.store.write(path, { n: 1 });
+    await a.store.settle();
+    // Its link drops, and holds what it is asked to send until it is back.
+    a.drop(true);
+    await a.store.store.write(path, { n: 2 });
+    await until(() => a.held === 1, "its save to wait on its link");
+    const waited = outcome(a.store.settle());
+    b.clock.advance(30_000);
+    await two.store.store.write(path, { n: 3 });
+    b.clock.advance(30_000);
+    expect(await a.hello()).toMatchObject({ held: true });
+    expect(await waited).toContain(path);
+    expect(b.mirror.doc(path)).toEqual({ n: 3 });
+    expect(await a.store.store.read(path)).toEqual({ n: 3 });
+    expect(a.store.state()).toMatchObject({ mode: "held", waiting: 0, lost: null });
+    expect(a.store.state().refused.map((one) => one.name)).toEqual([path]);
+  });
+
+  test("review finding 2, after a restart: a save made after another runtime's save of the same path, unsent when its runtime stopped, goes with the time it was made, read from the disk, and stands", async () => {
+    const path = "chats/c1/session.json";
+    const a = run(await linked(b, "relay-a"));
+    const two = run(await linked(b, "relay-b", { dir: elsewhere }));
+    a.drop();
+    await a.store.store.write(path, { n: 1 });
+    b.clock.advance(30_000);
+    await two.store.store.write(path, { n: 2 });
+    b.clock.advance(30_000);
+    await a.store.store.write(path, { n: 3 });
+    await a.store.close();
+
+    const again = run(await linked(b, "relay-a"));
+    await again.store.settle();
+    expect(b.mirror.doc(path)).toEqual({ n: 3 });
+    expect(again.store.state()).toMatchObject({ mode: "held", waiting: 0, refused: [] });
   });
 
   test("a runtime on its own never gives way to itself: its saves of one path made while its link was down, and one made while the first was being sent, reach the storage in the order made, the last standing, and nothing is refused", async () => {

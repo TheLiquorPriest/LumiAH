@@ -16,10 +16,10 @@
 // straight to the mirror, as before working copies, once what its journal names has gone there
 // first, as its own writes. One that loses it stops using its copy at once, sends what it hadn't sent
 // straight so, then throws the copy away, and never asks for the mirror again in the same process.
-// Each change sent says how long ago it was made: the extension refuses one older than another
-// runtime's later write of the path (`superseded`), and that change gives way, said as one refused
-// for good. The holder is told of each path another runtime changed, and drops what its copy holds of
-// it: its next read is the mirror's.
+// Each change sent says how long ago it was made, counted as its request leaves: the extension
+// refuses one older than another runtime's later write of the path (`superseded`), and that change
+// gives way, said as one refused for good. The holder is told of each path another runtime changed,
+// and drops what its copy holds of it: its next read is the mirror's.
 //
 // The mirror carries a mark: the working copy it mirrors, and how many changes it took from it. A
 // copy is used, when its runtime is given the mirror, only when it is the mark's and not behind the
@@ -34,7 +34,8 @@
 //                        how many of its changes the mirror took, and the extension's count of what
 //                        a holder may have missed that the copy last took (`MirrorWord.gen`)
 //   docs/<path>          each document's JSON text, as the mirror keeps it; an empty file is a removal
-//                        the mirror hasn't had yet
+//                        the mirror hasn't had yet. A changed one's time on the disk is its change's
+//                        own (set before it is renamed into place), so a restart sends it with its age
 //   blobs/<xx>/<hash>    each blob's text, as the mirror keeps it
 //   journal/             a file for each path the mirror doesn't hold as it stands here: `b.<hash>`,
 //                        or `d.<sha256 of the path>` holding the path
@@ -103,9 +104,9 @@ export const STORE_DEFAULTS: StoreLimits = {
   absent: 10_000,
 };
 
-/** The extension's storage as the store reaches it: the core's ports, a document's write and removal saying how long ago (ms) the change they carry was made (`ago`; absent: now), so the extension keeps the later of two runtimes' writes of a path. */
+/** The extension's storage as the store reaches it: the core's ports, a document's write and removal given when the change they carry was made (`made`, by `WorkingStoreDeps.now`; absent: now), whose age the port says as each request leaves, so the extension keeps the later of two runtimes' writes of a path. */
 export interface StoragePorts {
-  store: Omit<Required<StorePort>, "write" | "remove"> & { write(path: string, value: JsonValue, ago?: number): Promise<void>; remove(path: string, ago?: number): Promise<void> };
+  store: Omit<Required<StorePort>, "write" | "remove"> & { write(path: string, value: JsonValue, made?: number): Promise<void>; remove(path: string, made?: number): Promise<void> };
   blobs: Required<BlobsPort>;
 }
 
@@ -145,6 +146,8 @@ export interface WorkingStoreDeps {
    * failure is taken as one that passes, and tried again.
    */
   refusedForGood?(error: unknown): boolean;
+  /** Whether such a refusal is the mirror's `superseded`: another runtime's later write of the path stands. Once this runtime lost the mirror, each of what it hadn't sent that is refused so is counted (`state().lost.dropped`). Absent: none is. */
+  superseded?(error: unknown): boolean;
   /** Whether the mirror refused a write of the working copy's because this runtime doesn't hold the mirror (another does now): the copy ends, as when the extension says so. Neither a failure that passes nor a refusal of the change itself. */
   withdrawn?(error: unknown): boolean;
   /**
@@ -171,7 +174,7 @@ export interface WorkingStoreState {
   mode: StoreMode;
   /** The runtime that holds the mirror, as the extension said, when this one doesn't; null when none does, or it isn't known. */
   holder: string | null;
-  /** When this runtime lost the mirror to another (null: it hasn't, in this process), to whom (null: the extension didn't say), and how many of the changes it hadn't sent the mirror refused for good since (another runtime's later write of the path stands). */
+  /** When this runtime lost the mirror to another (null: it hasn't, in this process), to whom (null: the extension didn't say), and how many of the changes it hadn't sent gave way since to another runtime's later write of the path (`superseded`). */
   lost: { at: number; to: string | null; dropped: number } | null;
   /** How many paths (documents and blobs) the mirror doesn't hold as they stand here. */
   waiting: number;
@@ -225,7 +228,7 @@ interface Entry {
   sending: number | null;
   /** The first change made while it was being sent, and when: what the mirror lacks first once that send lands. */
   again: { change: number; at: number } | null;
-  /** When the last change was made (one read from the journal: its first), which the extension weighs against another runtime's write of the path. */
+  /** When the last change was made: what the extension weighs against another runtime's write of the path. Read again at a start from the document's time on the disk, which its change set. */
   made: number;
 }
 
@@ -452,10 +455,11 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     return promise;
   }
 
-  /** Puts `text` at `path` at once: written whole beside it, then renamed into its place. Its folder is made again where a removal left it empty and took it away meanwhile (`prune`). */
-  async function place(path: string, text: string): Promise<void> {
+  /** Puts `text` at `path` at once: written whole beside it (given the time `at`, when one is given), then renamed into its place, so the time comes with the text. Its folder is made again where a removal left it empty and took it away meanwhile (`prune`). */
+  async function place(path: string, text: string, at?: number): Promise<void> {
     const temp = `${TMP}/${deps.id()}`;
     await disk.write(temp, text);
+    if (at !== undefined) await disk.touch(temp, at);
     const folder = path.slice(0, path.lastIndexOf("/"));
     for (let tries = 0; ; tries++) {
       if (!made.has(folder)) {
@@ -545,7 +549,8 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
 
   /**
    * Reads the journal into the queue. A file whose path has nothing on the disk names a write cut off
-   * before its text was in place, and goes, as does anything else found there. Blobs come first, then
+   * before its text was in place, and goes, as does anything else found there. A document's last
+   * change was made when its file's time says (`place` sets it with the text). Blobs come first, then
    * documents, each in the order they were first changed, so a document reaches the mirror after the
    * blobs it names.
    */
@@ -559,10 +564,12 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
         let entry: Entry | null = null;
         if (!folder && name.startsWith("b.") && BLOB_HASH.test(name.slice(2))) entry = fresh(`b:${name.slice(2)}`, false, name.slice(2), 0, since);
         else if (isRecord(held) && typeof held.path === "string" && DOC_PATH.test(held.path) && held.path !== MARK_PATH && name === `d.${sha256(held.path)}`) entry = fresh(`d:${held.path}`, true, held.path, 0, since);
-        if (entry === null || (await disk.stat(fileOf(entry))) === null) {
+        const onDisk = entry === null ? null : await disk.stat(fileOf(entry));
+        if (entry === null || onDisk === null) {
           await disk.removeAll(file);
           continue;
         }
+        if (entry.doc) entry.made = onDisk.at;
         found.push(entry);
       } catch (error) {
         // A change the disk can't show is one nothing can send: it goes, rather than keep the store from opening.
@@ -930,20 +937,20 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     return { key, doc, name, first: change, since, last: change, sending: null, again: null, made: since };
   }
 
-  /** Notes a change of a path in the journal before it is made (its file first when it has none), and moves the path behind every other in the queue. True when the path had no change waiting: `unenter` takes the note back when the change can't be made. */
-  async function enter(key: string, doc: boolean, name: string, change: number): Promise<boolean> {
+  /** Notes a change of a path, made at `made`, in the journal before it is made (its file first when it has none), and moves the path behind every other in the queue. True when the path had no change waiting: `unenter` takes the note back when the change can't be made. */
+  async function enter(key: string, doc: boolean, name: string, change: number, made = deps.now()): Promise<boolean> {
     entered += 1;
     if (watched.count > 0) watched.changes.set(key, entered);
     const entry = queue.get(key);
     if (entry === undefined) {
-      const added = fresh(key, doc, name, change, deps.now());
+      const added = fresh(key, doc, name, change, made);
       await place(markerOf(added), JSON.stringify(doc ? { path: name, at: added.since } : { at: added.since }));
       queue.set(key, added);
       return true;
     }
-    if (entry.sending !== null && entry.again === null) entry.again = { change, at: deps.now() };
+    if (entry.sending !== null && entry.again === null) entry.again = { change, at: made };
     entry.last = change;
-    entry.made = deps.now();
+    entry.made = made;
     queue.delete(key);
     queue.set(key, entry);
     return false;
@@ -971,14 +978,15 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     return done;
   }
 
-  /** A document's new text (empty: it is removed), on the disk and in the journal; the sender takes it to the mirror. */
+  /** A document's new text (empty: it is removed), on the disk with the time it was made, and in the journal; the sender takes it to the mirror. */
   async function change(at: number, number: number, path: string, text: string): Promise<void> {
     const key = `d:${path}`;
     await serial(key, async () => {
       check(at);
-      const noted = await enter(key, true, path, number);
+      const made = deps.now();
+      const noted = await enter(key, true, path, number, made);
       try {
-        await place(docFile(path), text);
+        await place(docFile(path), text, made);
       } catch (error) {
         if (noted) await unenter(key);
         throw error;
@@ -1135,8 +1143,8 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     }
     await disk.remove(markerOf(entry));
     queue.delete(entry.key);
-    // What the runtime hadn't sent as it lost the mirror, and the storage refused: counted with the loss.
-    if (lost !== null) lost.dropped += 1;
+    // What the runtime hadn't sent as it lost the mirror, given way to another runtime's later write: counted with the loss.
+    if (lost !== null && deps.superseded?.(error) === true) lost.dropped += 1;
     await disk.remove(fileOf(entry));
     if (entry.doc) {
       docs.drop(entry.name);
@@ -1144,7 +1152,7 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     } else dropBlob(entry.name);
   }
 
-  /** Sends a path's text to the mirror (a document's saying how long ago it was made); false when there is nothing that can be sent (cut off before it was in place, or damaged on the disk: said in the log), and the mirror keeps what it had. */
+  /** Sends a path's text to the mirror (a document's with when its change was made, whose age the port counts as the request leaves); false when there is nothing that can be sent (cut off before it was in place, or damaged on the disk: said in the log), and the mirror keeps what it had. */
   async function deliver(entry: Entry, text: string | null, ports: StoragePorts, made: number): Promise<boolean> {
     if (text === null) return false;
     if (!entry.doc) {
@@ -1156,7 +1164,7 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
       return true;
     }
     if (text === "") {
-      await ports.store.remove(entry.name, Math.max(0, deps.now() - made));
+      await ports.store.remove(entry.name, made);
       return true;
     }
     const value = parseJson(text);
@@ -1164,7 +1172,7 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
       deps.log("warn", `the runtime's copy of ${entry.name} isn't JSON any more, so it isn't sent`);
       return false;
     }
-    await ports.store.write(entry.name, value as JsonValue, Math.max(0, deps.now() - made));
+    await ports.store.write(entry.name, value as JsonValue, made);
     return true;
   }
 

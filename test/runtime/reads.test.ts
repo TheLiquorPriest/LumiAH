@@ -425,7 +425,7 @@ describe("the database reader", () => {
     expect(it.data.state(MEMORY).chats.find((c) => c.id === third.chatId)?.from).toBe("http");
   });
 
-  test("isn't opened by a runtime that reaches Lumiverse at an address other than loopback, though it is given the file: on another machine the same path could hold an old copy of Lumiverse's data", async () => {
+  test("isn't opened by a runtime that reaches Lumiverse at an address other than loopback, though it is given the file: on another machine the same path could hold an old copy of Lumiverse's data; the page says what sets the runtime up to read it", async () => {
     const lumiverse = new Lumiverse();
     const one = harbour(lumiverse);
     const rows = createHttpSource({ fetch: lumiverse.session(USER), identifier: LUMIAH, sleep: async () => undefined });
@@ -456,6 +456,8 @@ describe("the database reader", () => {
     const state = it.data.state(MEMORY);
     expect(state.chats.find((c) => c.id === one.chatId)?.from).toBe("http");
     expect(state.reader).toBeNull();
+    // What to do, where the runtime runs on Lumiverse's own machine.
+    expect(state.sourceWhy).toContain("lumiah up --url http://127.0.0.1:");
   });
 });
 

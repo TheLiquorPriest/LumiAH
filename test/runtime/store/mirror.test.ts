@@ -9,7 +9,7 @@ import { cp, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WorkingStore } from "../../../src/runtime/store/index";
-import { type Bench, bench, cleanUp, files, holding, markCount, open, outcome, until } from "./rig";
+import { type Bench, bench, cleanUp, files, holding, linked, markCount, open, outcome, until } from "./rig";
 
 let b: Bench;
 /** Another machine's folder: a second runtime of the same user keeps its copy there. */
@@ -47,31 +47,37 @@ describe("the mark", () => {
     expect(b.mirror.doc("mirror.json")).toMatchObject({ v: 1, kind: "mirror", owner: "runtime one" });
   });
 
-  test("a runtime that finds another's mark throws its copy away, reads the mirror afresh and takes the mark; what it hadn't sent goes to the mirror", async () => {
+  test("a runtime that finds another's mark throws its copy away, reads the mirror afresh and takes the mark; what it hadn't sent goes to the mirror, but an older change of a path the other runtime saved after it never lands over that save", async () => {
     const path = "chats/c1/session.json";
+    const jobs = "jobs/all.json";
     const unsent = "chats/c1/learned.json";
-    const one = open(b);
-    await one.store.write(path, { asked: 1 });
-    await one.settle();
-    b.mirror.down = "the extension isn't linked";
-    await one.store.write(unsent, { learned: 1 });
-    await one.close();
-    b.mirror.down = null;
+    const one = await linked(b, "relay-a");
+    await one.store.store.write(path, { asked: 1 });
+    await one.store.store.write(jobs, { jobs: ["j1"] });
+    await one.store.settle();
+    // Its link goes, and it stops with two changes unsent: one of a path the next runtime saves after it.
+    one.drop();
+    await one.store.store.write(path, { asked: 2 });
+    await one.store.store.write(unsent, { learned: 1 });
+    await one.store.close();
+    b.clock.advance(120_001);
 
-    const two = open(b, { dir: elsewhere, owner: "runtime two" });
-    expect(await two.store.read(path)).toEqual({ asked: 1 });
-    await two.store.write(path, { asked: 3 });
-    await two.settle();
-    expect(two.state().takeover).toMatchObject({ from: "runtime one", dropped: 0 });
-    await two.close();
+    const two = await linked(b, "relay-b", { dir: elsewhere, owner: "runtime two" });
+    keep(two.store);
+    expect(await two.store.store.read(path)).toEqual({ asked: 1 });
+    await two.store.store.write(path, { asked: 3 });
+    await two.store.store.write(jobs, { jobs: ["j2"] });
+    await two.store.settle();
+    expect(two.store.state().takeover).toMatchObject({ from: "runtime one", dropped: 0 });
+    await two.store.release();
 
-    const back = keep(open(b));
-    // What its copy held of the mirror is gone: it reads runtime two's save.
-    expect(await back.store.read(path)).toEqual({ asked: 3 });
-    expect(back.state().takeover).toMatchObject({ from: "runtime two", dropped: 0 });
-    await back.settle();
-    expect(b.mirror.doc(unsent)).toEqual({ learned: 1 });
-    expect(b.mirror.doc(path)).toEqual({ asked: 3 });
+    const back = await linked(b, "relay-a");
+    keep(back.store);
+    expect(await outcome(back.store.settle())).toContain(path);
+    expect(back.store.state().takeover).toMatchObject({ from: "runtime two", dropped: 0 });
+    expect([b.mirror.doc(path), b.mirror.doc(unsent)]).toEqual([{ asked: 3 }, { learned: 1 }]);
+    // What its copy held of the mirror is gone: it reads runtime two's saves.
+    expect([await back.store.store.read(path), await back.store.store.read(jobs)]).toEqual([{ asked: 3 }, { jobs: ["j2"] }]);
     expect(b.mirror.doc("mirror.json")).toMatchObject({ owner: "runtime one" });
     expect(b.logs.some((line) => line.level === "warn" && line.message.includes("is kept by another runtime (runtime two"))).toBe(true);
   });

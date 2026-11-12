@@ -54,6 +54,14 @@ describe("a runtime's store on the Runtime page", () => {
     expect(storeLead(null, "LumiAH")).toContain("on its own disk first");
   });
 
+  test("without a copy of its own and still sending what it saved with one, says how many changes wait to go out", () => {
+    const sending = storeLines({ ...settled, mode: "direct", open: false, holder: "mara (laptop)", lost: { at: NOW - 60_000, to: "mara (laptop)", dropped: 0 }, waiting: 2, behindSince: NOW - 120_000, bytes: 0 }, NOW, "LumiAH");
+    const waiting = sending.filter((line) => line.text.startsWith("2 changes"));
+    expect(waiting).toHaveLength(1);
+    expect(waiting[0]?.tone).toBe("warn");
+    expect(waiting[0]?.text).toContain("LumiAH's storage");
+  });
+
   test("sizes read as a person reads them", () => {
     expect([sizeOf(512), sizeOf(2048), sizeOf(5 * 1024 * 1024), sizeOf(3 * 1024 ** 3)]).toEqual(["512 B", "2.0 KB", "5.0 MB", "3.0 GB"]);
   });

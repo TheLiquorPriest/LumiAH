@@ -98,8 +98,8 @@ function letGo<T>(work: () => Promise<T>, signal: AbortSignal | undefined): Prom
   return promise;
 }
 
-/** One request, asked again while its socket closes under it and the link's allowance (Extension lost after, which its words name when it runs out) lasts. */
-export async function asked<T extends AskType>(deps: Pick<HostDeps, "link" | "now" | "tuning">, type: T, fields: Asked<T>): Promise<LinkRequests[T]["result"]> {
+/** One request, asked again while its socket closes under it and the link's allowance (Extension lost after, which its words name when it runs out) lasts. Fields given as a function are worked out anew for each sending, as the frame leaves. */
+export async function asked<T extends AskType>(deps: Pick<HostDeps, "link" | "now" | "tuning">, type: T, fields: Asked<T> | (() => Asked<T>)): Promise<LinkRequests[T]["result"]> {
   const first = deps.now();
   for (;;) {
     const wait = deps.tuning().lostMs;
@@ -117,11 +117,13 @@ export async function asked<T extends AskType>(deps: Pick<HostDeps, "link" | "no
  * The extension's storage, over the link (`doc.*`, `blob.*`): where the core's documents and blobs
  * are kept for good. The runtime's working store (store/) keeps its own copy and mirrors it here, its
  * writes naming the process that holds the mirror (`mirror`), which the extension takes only from
- * that one, and how long ago each document's change was made (`ago`); without `mirror`, they are the
- * runtime's own, as a runtime that keeps no copy writes.
+ * that one; without `mirror`, they are the runtime's own, as a runtime that keeps no copy writes. A
+ * document's change given the time it was made (`made`, by `deps.now`) says how long ago that was
+ * (`ago`), counted as its request leaves: a request the link holds while it is down, or sends again,
+ * says the age it has then.
  */
 export function linkStorage(deps: Pick<HostDeps, "link" | "now" | "tuning">, mirror?: string): StoragePorts {
-  const ask = <T extends AskType>(type: T, fields: Asked<T>): Promise<LinkRequests[T]["result"]> => asked(deps, type, fields);
+  const ask = <T extends AskType>(type: T, fields: Asked<T> | (() => Asked<T>)): Promise<LinkRequests[T]["result"]> => asked(deps, type, fields);
   const as = mirror === undefined ? {} : { mirror };
   return {
     blobs: {
@@ -139,11 +141,13 @@ export function linkStorage(deps: Pick<HostDeps, "link" | "now" | "tuning">, mir
     },
     store: {
       read: async (path) => (await ask("doc.get", { path })).doc,
-      write: async (path, value, ago) => {
-        await ask("doc.put", { path, doc: value, ...as, ...(ago === undefined ? {} : { ago }) });
+      write: async (path, value, made) => {
+        const fields = { path, doc: value, ...as };
+        await ask("doc.put", made === undefined ? fields : () => ({ ...fields, ago: Math.max(0, deps.now() - made) }));
       },
-      remove: async (path, ago) => {
-        await ask("doc.remove", { path, ...as, ...(ago === undefined ? {} : { ago }) });
+      remove: async (path, made) => {
+        const fields = { path, ...as };
+        await ask("doc.remove", made === undefined ? fields : () => ({ ...fields, ago: Math.max(0, deps.now() - made) }));
       },
       list: async (prefix) => (await ask("doc.list", { prefix })).paths,
     },
@@ -166,6 +170,12 @@ export function withdrawn(error: unknown): boolean {
 export function refusedForGood(error: unknown): boolean {
   const cause: unknown = error instanceof Error ? error.cause : undefined;
   return cause instanceof LinkError && (cause.code === "bad_request" || cause.code === "too_large" || cause.code === "superseded");
+}
+
+/** Whether the extension refused a working copy's change of a document because another runtime's later write of it stands (`superseded`): one of the refusals for good, which the store counts apart once it lost the mirror. */
+export function superseded(error: unknown): boolean {
+  const cause: unknown = error instanceof Error ? error.cause : undefined;
+  return cause instanceof LinkError && cause.code === "superseded";
 }
 
 /**

@@ -38,6 +38,7 @@ export function storeLines(state: StoreStateView, now: number, name: string): St
       if (lost.dropped > 0) lines.push({ text: `${counted(lost.dropped, "change")} it hadn't sent to the storage gave way there to another runtime's later save of the same file (its log names each).`, tone: "neg" });
     } else if (state.holder !== null) lines.push({ text: `It runs without a copy of its own: ${state.holder} keeps ${name}'s storage, and one runtime at a time keeps a copy. It reads and saves straight in the storage, which is slower.`, tone: "neutral" });
     else lines.push({ text: `It runs without a copy of its own: ${name} gave it none, so it reads and saves straight in the storage, which is slower.`, tone: "neutral" });
+    if (state.waiting > 0 && state.behindSince !== null) lines.push({ text: `${counted(state.waiting, "change")} it saved with its own copy wait to reach ${name}'s storage, the oldest from ${ago(now, state.behindSince)}: they go there first, and it reads and saves nothing else there until they have. Nothing is lost: they are on its disk.`, tone: "warn" });
     if (state.lastError !== null && (state.lastSent === null || state.lastError.at >= state.lastSent)) lines.push({ text: `The storage last failed ${ago(now, state.lastError.at)}: ${state.lastError.words}`, tone: "warn" });
     for (const refused of state.refused) lines.push({ text: `${ago(now, refused.at)}: ${refused.words}`, tone: "neg" });
     return lines;

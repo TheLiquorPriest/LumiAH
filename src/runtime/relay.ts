@@ -11,8 +11,9 @@
 // config asks). The key each request carries is checked for its form before any of the request's
 // body is read, and the extension says whether it is the user's own (with the turn, or before
 // anything of a request passed through is told or sent); it is never kept. Once the runtime begins
-// to stop, everything but the road's probe is refused: it keeps its port until its link has closed
-// (cli.ts), and nothing meant for it is answered meanwhile.
+// to stop, everything is refused but the road's probe and `GET /healthz`, which then says it is
+// stopping: it keeps its port until its link has closed (cli.ts), and nothing meant for it is
+// answered meanwhile.
 //
 // The handler takes and gives the web's Request and Response, so Bun.serve runs it (main.ts) and the
 // tests call it directly. Time comes from `now()`, and `tick()` (every second) keeps the answers'
@@ -105,7 +106,7 @@ export class Relay {
     () => this.env.secret(),
     () => this.env.now(),
   );
-  /** Set by `shutdown()`: from then on every request but the road's probe is refused (`fetch`). */
+  /** Set by `shutdown()`: from then on every request but the road's probe and `GET /healthz` is refused (`fetch`), and `GET /healthz` says the runtime is stopping. */
   private stopping = false;
 
   constructor(
@@ -129,7 +130,7 @@ export class Relay {
     for (const call of this.calls.values()) if (call.answer instanceof SseAnswer) call.answer.keepAlive(now, alive, tuning);
   }
 
-  /** The runtime is stopping: every request under way ends with words the chat shows, and every one that comes after is refused but the road's probe. */
+  /** The runtime is stopping: every request under way ends with words the chat shows, and every one that comes after is refused but the road's probe and `GET /healthz`. */
   shutdown(): void {
     this.stopping = true;
     for (const call of [...this.calls.values()]) {
@@ -144,12 +145,13 @@ export class Relay {
     // Lumiverse's own request sends no Origin; a page in a browser always does, so it never drives the runtime.
     if (req.headers.get("origin") !== null) return json(403, errorJson("LumiAH's runtime answers Lumiverse's server, not a browser.", "forbidden"));
     if (!this.hostAllowed(req.headers.get("host"))) return json(421, errorJson(`This is LumiAH's runtime at ${this.settings.listen}:${this.settings.port}; it answers requests addressed to it alone.`, "misdirected"));
-    // Stopping: the runtime keeps its port until its link has closed, since LumiAH sends the road's asks, the relay's secret with them, to the port for as long as it holds the link, and another program that took the port would be sent them. Nothing is answered meanwhile but the road's probe, by which a copy of this runtime that starts now knows it (cli.ts); the road takes the refusal for a failure, and asks over the link.
-    if (this.stopping && (url.pathname !== ASK_PATH || req.headers.get(PROBE_HEADER) === null)) return json(503, errorJson("The runtime is restarting. Press Retry in a moment.", "unavailable"));
+    const path = url.pathname.replace(/\/+$/, "").replace(/^\/v1(?=\/)/, "");
+    const healthz = path === "/healthz" && req.method === "GET";
+    // Stopping: the runtime keeps its port until its link has closed, since LumiAH sends the road's asks, the relay's secret with them, to the port for as long as it holds the link, and another program that took the port would be sent them. Nothing is answered meanwhile but the road's probe, by which a copy of this runtime that starts now knows it (cli.ts), and `GET /healthz`, which says it is stopping (`lumiah status`): neither carries a secret. The road takes the refusal for a failure, and asks over the link.
+    if (this.stopping && !healthz && (url.pathname !== ASK_PATH || req.headers.get(PROBE_HEADER) === null)) return json(503, errorJson("The runtime is restarting. Press Retry in a moment.", "unavailable"));
     // The asks' own road, reached through Lumiverse's proxy: its words are its own, and never say back what was asked.
     if (url.pathname === ASK_PATH && this.env.ask !== undefined) return this.env.ask(req);
-    const path = url.pathname.replace(/\/+$/, "").replace(/^\/v1(?=\/)/, "");
-    if (path === "/healthz" && req.method === "GET") return this.health(req);
+    if (healthz) return this.health(req);
     if (path === "/models" && req.method === "GET") return this.models(req);
     if (path === "/chat/completions" && req.method === "POST") return this.completions(req);
     return json(404, errorJson(`LumiAH's runtime has no ${req.method} ${url.pathname}: it serves POST /v1/chat/completions and GET /v1/models.`, "not_found"));
@@ -168,12 +170,14 @@ export class Relay {
   }
 
   /**
-   * `GET /healthz`. On the machine's own loopback address it says how the runtime is to whoever
-   * asks, since only that machine can. On any other address the same answer would tell every
-   * machine that reaches the port whether the user is writing now (the replies under way) and what
-   * is wrong with their setup (the link's state, a refusal's words), with no key asked. So there it
-   * says that it is up and nothing else, unless the request shows it holds this runtime's config
-   * (`healthProof`), as `lumiah status` and `up` do.
+   * `GET /healthz`. On the machine's own loopback address it says how the runtime is to whoever asks
+   * there: a program on that machine, or Lumiverse's proxy, which hands its caller nothing of this
+   * answer (it hands back images, audio and fonts alone). On any other address the same answer would
+   * tell every machine that reaches the port whether the user is writing now (the replies under
+   * way) and what is wrong with their setup (the link's state, a refusal's words), with no key
+   * asked. So there it says that it is up and nothing else, unless the request shows it holds this
+   * runtime's config (`healthProof`), as `lumiah status` and `up` do. A runtime that is stopping
+   * says so (`stopping`).
    */
   private async health(req: Request): Promise<Response> {
     const listen = this.settings.listen.toLowerCase();
@@ -184,7 +188,7 @@ export class Relay {
     }
     // `link`: up, or why the extension is out of reach (down, silent, stopped, crashed), or refused.
     const out = this.link.out;
-    return json(200, { ok: this.link.refused === null, link: this.link.refused !== null ? "refused" : (out?.why ?? (this.link.up ? "up" : "down")), backend: this.link.backendName ?? "LumiAH", turns: this.turns.count, requests: this.calls.size, ...(this.link.refused !== null ? { problem: this.link.refused } : {}) });
+    return json(200, { ok: this.link.refused === null, link: this.link.refused !== null ? "refused" : (out?.why ?? (this.link.up ? "up" : "down")), backend: this.link.backendName ?? "LumiAH", turns: this.turns.count, requests: this.calls.size, ...(this.link.refused !== null ? { problem: this.link.refused } : {}), ...(this.stopping ? { stopping: true } : {}) });
   }
 
   /** The bearer a request carries, as it came; null when it carries none. */

@@ -526,6 +526,30 @@ describe("lumiah status", () => {
       await runtime.close();
     }
   });
+
+  test("says that a runtime that is stopping is stopping, not that something else answers on its port", async () => {
+    const host = new FakeHost();
+    createBackend(host, ENV);
+    const lumiverse = new FakeLumiverse(host, USER);
+    const m = machineOn(lumiverse);
+    expect(await lumiah(UP, m.io)).toBe(0);
+    const config = configOf(m.files.get(CONFIG)?.text ?? null, CONFIG);
+    const runtime = runtimeFrom(config, lumiverse, [], { harness: m.io.harness });
+    try {
+      await runtime.link.connect();
+      // It has begun to stop, and holds its port until its link has closed.
+      runtime.shutdown();
+      m.out.length = 0;
+
+      expect(await lumiah(["status"], { ...m.io, http: reaching(m, runtime, config.port) })).toBe(1);
+
+      const said = m.out.join("\n");
+      expect(said).toContain("stopping");
+      expect(said).not.toContain("Something answers");
+    } finally {
+      await runtime.close();
+    }
+  });
 });
 
 describe("lumiah serve", () => {
@@ -559,6 +583,51 @@ describe("lumiah serve", () => {
       expect(m.err.join("\n")).toContain("another copy of this runtime serves on 127.0.0.1:7871: this one waits, and serves once that one stops");
       expect(JSON.parse(marks[0] ?? "null")).toMatchObject({ pid: 4242 });
       expect(m.err.at(-1)).toContain("stopping (SIGTERM) before it served");
+    } finally {
+      await first.close();
+    }
+  });
+
+  test("waits for a copy of itself whose secret the Runtime page rotated after this one read its config, and serves with the secret the config holds then", async () => {
+    const host = new FakeHost();
+    createBackend(host, ENV);
+    const lumiverse = new FakeLumiverse(host, USER);
+    const m = machineOn(lumiverse);
+    expect(await lumiah(UP, m.io)).toBe(0);
+    const config = configOf(m.files.get(CONFIG)?.text ?? null, CONFIG);
+    const rotated = { ...config, secret: "b".repeat(64) };
+    // The copy that serves, its secret rotated: it writes the new one to the config just after this copy read it.
+    const first = runtimeFrom(rotated, lumiverse, [], { harness: m.io.harness });
+    let firstServes = true;
+    const port: { fetch: ((req: Request) => Promise<Response>) | null } = { fetch: null };
+    const stop = Promise.withResolvers<string>();
+    const io: RuntimeIO = {
+      ...m.io,
+      // While the first copy serves, the port is its own; once it has stopped, nothing answers there.
+      http: (request) => (firstServes ? reaching(m, first, config.port)(request) : m.io.http(request)),
+      stopped: () => {
+        m.files.set(CONFIG, { text: configText(rotated), mode: 0o600, dirMode: 0o700 });
+        return stop.promise;
+      },
+      // The first copy stops while this one waits.
+      sleep: async () => {
+        firstServes = false;
+      },
+      serve: (options) => {
+        port.fetch = options.fetch;
+        return { stop: () => undefined };
+      },
+    };
+    try {
+      const serving = lumiah(["serve"], io);
+      await until(() => port.fetch !== null, "this copy to serve once the first has stopped");
+      expect(m.err.join("\n")).toContain("another copy of this runtime serves on 127.0.0.1:7871");
+      // Its own answer to the probe is made with the rotated secret: the one it links with too.
+      const nonce = "0123456789abcdef0123456789abcdef";
+      const probe = await port.fetch?.(new Request(`http://127.0.0.1:${config.port}/x/ask`, { method: "POST", headers: { host: `127.0.0.1:${config.port}`, "content-type": "application/json", [PROBE_HEADER]: nonce }, body: "{}" }));
+      expect(await probe?.json()).toEqual({ proof: await roadProof(rotated.secret, config.relay, nonce) });
+      stop.resolve("SIGTERM");
+      expect(await serving).toBe(0);
     } finally {
       await first.close();
     }
@@ -599,7 +668,7 @@ describe("lumiah serve", () => {
     expect(m.served).toHaveLength(served);
   }, 15_000);
 
-  test("stopping, it keeps its port until its link has closed, and meanwhile answers nothing there but the road's probe", async () => {
+  test("stopping, it keeps its port until its link has closed, and meanwhile answers nothing there but the road's probe and GET /healthz, which says it is stopping", async () => {
     const m = machine();
     expect(await lumiah(UP, m.io)).toBe(0);
     const config = configOf(m.files.get(CONFIG)?.text ?? null, CONFIG);
@@ -647,6 +716,11 @@ describe("lumiah serve", () => {
       if (port.fetch === null) throw new Error("the runtime serves nothing");
       return port.fetch(new Request(`http://127.0.0.1:${config.port}/x/ask`, { method: "POST", headers: { host: `127.0.0.1:${config.port}`, "content-type": "application/json", ...headers }, body }));
     };
+    // Any other request at the runtime's port, as Lumiverse or a program on the machine sends one.
+    const at = (method: string, path: string): Promise<Response> => {
+      if (port.fetch === null) throw new Error("the runtime serves nothing");
+      return port.fetch(new Request(`http://127.0.0.1:${config.port}${path}`, { method, headers: { host: `127.0.0.1:${config.port}` } }));
+    };
     let asks = 0;
     const storeState = (): Promise<Response> => onRoad({ authorization: `Bearer ${config.secret}` }, JSON.stringify({ ask: (asks++).toString(16).padStart(16, "0"), op: "store.state", args: {} }));
     // What `up` logged as it served and stopped is behind: what follows is this serve's.
@@ -676,7 +750,7 @@ describe("lumiah serve", () => {
 
     stop.resolve("SIGTERM");
     await until(() => m.err.some((line) => line.includes("stopping (SIGTERM)")), "the runtime to begin stopping");
-    // It waits for the storage to take the save, its link open: the port is still its own, an ask with its secret is refused there (the road then asks over the link), and the probe is answered with the proof its secret makes.
+    // It waits for the storage to take the save, its link open: the port is still its own, an ask with its secret is refused there (the road then asks over the link), and so is every other request but the probe, answered with the proof its secret makes, and `GET /healthz`, which says it is stopping.
     expect(port.held).toBe(true);
     expect(open).toBe(1);
     expect((await storeState()).status).toBe(503);
@@ -684,6 +758,9 @@ describe("lumiah serve", () => {
     const probe = await onRoad({ [PROBE_HEADER]: nonce }, "{}");
     expect(probe.status).toBe(200);
     expect(await probe.json()).toEqual({ proof: await roadProof(config.secret, config.relay, nonce) });
+    expect((await at("GET", "/v1/models")).status).toBe(503);
+    expect((await at("POST", "/healthz")).status).toBe(503);
+    expect(await (await at("GET", "/healthz")).json()).toMatchObject({ stopping: true });
 
     holding = false;
     for (const text of held.splice(0)) send(text);

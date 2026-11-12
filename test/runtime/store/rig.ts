@@ -3,19 +3,24 @@
 // whose timers run when a test moves it on, and a disk that stops for good part way, as the disk is
 // left when the process dies there. A store opened alone (`open`) is given the mirror at once; the
 // runtimes of a test about who holds it (`linked`) say hello to the extension's own part that decides
-// it (backend/mirror.ts), and their writes to the mirror go through it, as over the link.
+// it (backend/mirror.ts), and reach the storage as the runtime does (host.ts `linkStorage`), over a
+// link of the bench's whose requests that part and the made-up mirror answer.
 
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type BlobInfo, type BlobsPort, isRecord, type JsonValue, type LogLevel, type StorePort } from "../../../src/core/ports";
+import { type BlobInfo, isRecord, type JsonValue, type LogLevel, type StorePort } from "../../../src/core/ports";
 import { Mirrors } from "../../../src/extension/backend/mirror";
 import type { Caller } from "../../../src/extension/backend/relays";
 import { LinkRefused } from "../../../src/host/refused";
 import type { MirrorWord } from "../../../src/link/contract";
 import { mirrorWordOf } from "../../../src/link/frames";
+import { RUNTIME_DEFAULTS } from "../../../src/link/settings";
+import { LinkError } from "../../../src/runtime/connection";
+import { asked, linkStorage, refusedForGood, superseded, withdrawn } from "../../../src/runtime/host";
+import type { AskType, RuntimeLink } from "../../../src/runtime/link";
 import { type Disk, nodeDisk } from "../../../src/runtime/store/disk";
-import { createWorkingStore, type StoragePorts, type WorkingStore, type WorkingStoreDeps } from "../../../src/runtime/store/index";
+import { createWorkingStore, type WorkingStore, type WorkingStoreDeps } from "../../../src/runtime/store/index";
 
 /** A clock that stands still: its timers run, in order, when a test moves it on. */
 export class Clock {
@@ -227,21 +232,39 @@ export function open(b: Bench, over: Partial<WorkingStoreDeps> & { word?: Mirror
   return s;
 }
 
-/** A refusal as the extension's link sends it, as the runtime's link hands it on: the cause carries the code. */
-function refusedOverLink(error: unknown): unknown {
-  return error instanceof LinkRefused ? new Error(error.message, { cause: error }) : error;
-}
-
-/** Whether the extension refused a working copy's write because its runtime doesn't hold the mirror (host.ts `withdrawn`, over the bench's link). */
-export function withdrawnHere(error: unknown): boolean {
-  const cause: unknown = error instanceof Error ? error.cause : undefined;
-  return cause instanceof LinkRefused && cause.code === "conflict";
-}
-
-/** Whether the extension refused a change for good, as host.ts `refusedForGood` reads it over the bench's link: another runtime's later write of the document stands (`superseded`), or a rule of its own. */
-export function refusedHere(error: unknown): boolean {
-  const cause: unknown = error instanceof Error ? error.cause : undefined;
-  return cause instanceof LinkRefused && (cause.code === "superseded" || cause.code === "bad_request" || cause.code === "too_large");
+/** A request as the extension takes it from a runtime of the bench's (server.ts, over the arbiter and the made-up mirror): its answer, or the arbiter's refusal. */
+async function answer(b: Bench, caller: Caller, type: AskType, fields: Record<string, unknown>): Promise<unknown> {
+  const { mirrors } = b.arbiter;
+  const path = String(fields.path);
+  const hash = String(fields.hash);
+  switch (type) {
+    case "doc.get":
+      return { doc: await b.mirror.store.read(path) };
+    case "doc.list":
+      return { paths: await b.mirror.store.list(String(fields.prefix)) };
+    case "doc.put":
+      await mirrors.write(caller, fields.mirror, { docs: [path], blobs: [] }, () => b.mirror.store.write(path, fields.doc as JsonValue), fields.ago);
+      return { written: true };
+    case "doc.remove":
+      await mirrors.write(caller, fields.mirror, { docs: [path], blobs: [] }, () => b.mirror.store.remove(path), fields.ago);
+      return { removed: true };
+    case "blob.get":
+      return { text: await b.mirror.blobs.get(hash) };
+    case "blob.put":
+      await mirrors.write(caller, fields.mirror, { docs: [], blobs: [] }, () => b.mirror.blobs.put(hash, String(fields.text)));
+      return { stored: true };
+    case "blob.list":
+      return b.mirror.blobs.list(typeof fields.cursor === "string" ? fields.cursor : undefined);
+    case "blob.remove": {
+      const hashes = fields.hashes as string[];
+      await mirrors.write(caller, fields.mirror, { docs: [], blobs: [...hashes] }, () => b.mirror.blobs.remove(hashes));
+      return { removed: true };
+    }
+    case "mirror.release":
+      return { released: await mirrors.release(caller, fields.mirror) };
+    default:
+      throw new Error(`The bench's link carries no ${type}.`);
+  }
 }
 
 /**
@@ -294,63 +317,82 @@ export interface Linked {
   store: WorkingStore;
   relay: string;
   session: string;
+  /** How many requests its link holds now (`drop(true)`). */
+  readonly held: number;
   hello(): Promise<MirrorWord>;
-  /** Its link goes down: the extension hears its session close, nothing reaches it, and what it sends fails, until its next hello. */
-  drop(): void;
+  /**
+   * Its link goes down: the extension hears its session close, and nothing reaches it until its next
+   * hello. What it sends fails at once (the link given up on), or, `holds`, waits and goes once that
+   * hello is answered, as the runtime's link holds a request for Extension lost after.
+   */
+  drop(holds?: boolean): void;
 }
 
 /**
- * A runtime started on the bench, linked to the arbiter as the real link links one: its store's
- * writes to the mirror go through the arbiter (those of its copy named by its holding), and it says
- * hello once its store can say what its copy is. `relay`: its registration (another runtime of the
- * user's has its own; the same one started again, on its folder or another, has the same).
+ * A runtime started on the bench, linked to the arbiter as the real link links one: its store
+ * reaches the storage as the runtime's does (host.ts `linkStorage`, its refusals read by host.ts), a
+ * request's fields worked out as it leaves, and a refusal crossing with its code as the extension's
+ * link sends one (the made-up mirror's own rule, `Refused`, as a request the extension doesn't
+ * take). It says hello once its store can say what its copy is. `relay`: its registration (another
+ * runtime of the user's has its own; the same one started again, on its folder or another, has the
+ * same).
  */
 export async function linked(b: Bench, relay: string, over: Partial<WorkingStoreDeps> = {}): Promise<Linked> {
   const { arbiter } = b;
   const holding = (b.ids++).toString(16).padStart(32, "0");
   let session = `session-${b.ids++}`;
-  let down = false;
+  /** Null while the link is up; while it is down, what a request it holds waits on (null: it holds none, and a request fails). */
+  let down: { held: PromiseWithResolvers<void> | null } | null = null;
+  let held = 0;
   const caller = (): Caller => ({ userId: IDENTITY.user, relay: { id: relay, name: relay, secret: "", build: "", host: "", listen: "127.0.0.1", port: 1, registeredAt: 0, report: null }, session });
-  const through = (mark: string | undefined): StoragePorts => {
-    const write = <T>(changed: { docs: string[]; blobs: string[] }, apply: () => Promise<T>, ago?: number): Promise<T> => {
-      if (down) return Promise.reject(new Error("the extension isn't linked"));
-      let out: T | undefined;
-      return arbiter.mirrors
-        .write(
-          caller(),
-          mark,
-          changed,
-          async () => {
-            out = await apply();
-          },
-          ago,
-        )
-        .then(
-          () => out as T,
-          (error: unknown) => Promise.reject(refusedOverLink(error)),
-        );
-    };
-    return {
-      store: { ...b.mirror.store, read: (path) => (down ? Promise.reject(new Error("the extension isn't linked")) : b.mirror.store.read(path)), list: (prefix) => (down ? Promise.reject(new Error("the extension isn't linked")) : b.mirror.store.list(prefix)), write: (path, value, ago) => write({ docs: [path], blobs: [] }, () => b.mirror.store.write(path, value), ago), remove: (path, ago) => write({ docs: [path], blobs: [] }, () => b.mirror.store.remove(path), ago) },
-      blobs: { ...b.mirror.blobs, get: (hash) => (down ? Promise.reject(new Error("the extension isn't linked")) : b.mirror.blobs.get(hash)), put: (hash, text) => write({ docs: [], blobs: [] }, () => b.mirror.blobs.put(hash, text)), remove: (hashes) => write({ docs: [], blobs: [...hashes] }, () => b.mirror.blobs.remove(hashes)) },
-    };
+  const link: RuntimeLink = {
+    get up() {
+      return down === null;
+    },
+    out: null,
+    refused: null,
+    request: (async (type: AskType, given: unknown) => {
+      if (down !== null) {
+        if (down.held === null) throw new Error("the extension isn't linked");
+        held += 1;
+        await down.held.promise.finally(() => {
+          held -= 1;
+        });
+      }
+      // As LinkClient sends a request: fields given as a function are worked out as the frame leaves.
+      const fields = (typeof given === "function" ? given() : given) as Record<string, unknown>;
+      try {
+        return await answer(b, caller(), type, fields);
+      } catch (error) {
+        if (error instanceof LinkRefused) throw new LinkError(error.code, error.message);
+        throw error instanceof Refused ? new LinkError("bad_request", error.message) : error;
+      }
+    }) as RuntimeLink["request"],
+    notify: () => undefined,
   };
-  const store = open(b, { word: "none", holding, remote: through(holding), direct: through(undefined), withdrawn: withdrawnHere, refusedForGood: refusedHere, release: async () => void (await arbiter.mirrors.release(caller(), holding)), ...over });
+  const viaLink = { link, now: b.clock.now, tuning: () => RUNTIME_DEFAULTS };
+  const store = open(b, { word: "none", holding, remote: linkStorage(viaLink, holding), direct: linkStorage(viaLink), withdrawn, refusedForGood, superseded, release: async () => void (await asked(viaLink, "mirror.release", { mirror: holding })), ...over });
   const runtime: Linked = {
     store,
     relay,
     get session() {
       return session;
     },
+    get held() {
+      return held;
+    },
     async hello() {
-      down = false;
       arbiter.sessions.set(session, store);
       const word = await arbiter.mirrors.hello(caller(), await store.ask(), null);
       store.heard(word);
+      // Up once the hello is answered: what the link held goes now.
+      const was = down;
+      down = null;
+      was?.held?.resolve();
       return word;
     },
-    drop() {
-      down = true;
+    drop(holds = false) {
+      down ??= { held: holds ? Promise.withResolvers<void>() : null };
       arbiter.sessions.delete(session);
       arbiter.mirrors.sessionClosed(session);
       session = `session-${b.ids++}`;

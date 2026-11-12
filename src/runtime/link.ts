@@ -62,11 +62,13 @@ export interface RuntimeLink {
   readonly owner?: SettingsOwner;
   /**
    * One request, sent once the link is up (waiting `waitMs` at most), with the relay's secret.
-   * `waited`: the transport setting `waitMs` is, by its place in the transport's section
-   * (`LOST_WAIT`, `["runtime", "modelsWaitMs"]`): when that wait runs out with the link still
-   * down, the request fails with a `WaitError` in words that name it and where it is changed.
+   * `fields` given as a function are worked out as the frame leaves, after that wait: what counts
+   * time to the sending (a document's age, `ago`) counts it to then. `waited`: the transport setting
+   * `waitMs` is, by its place in the transport's section (`LOST_WAIT`, `["runtime", "modelsWaitMs"]`):
+   * when that wait runs out with the link still down, the request fails with a `WaitError` in words
+   * that name it and where it is changed.
    */
-  request<T extends AskType>(type: T, fields: Asked<T>, waitMs: number, waited?: readonly string[]): Promise<LinkRequests[T]["result"]>;
+  request<T extends AskType>(type: T, fields: Asked<T> | (() => Asked<T>), waitMs: number, waited?: readonly string[]): Promise<LinkRequests[T]["result"]>;
   /** A notice, sent now when the link is up and dropped when it isn't: nothing waits for it. */
   notify(notice: Omit<LinkNotice, "link">): void;
 }
@@ -305,7 +307,7 @@ export class LinkClient implements RuntimeLink {
     return { name, build, runtime, host, listen, port, scheduler: this.scheduler, session: this.session, turns: this.handlers?.turns().length ?? 0 };
   }
 
-  async request<T extends AskType>(type: T, fields: Asked<T>, waitMs: number, waited?: readonly string[]): Promise<LinkRequests[T]["result"]> {
+  async request<T extends AskType>(type: T, fields: Asked<T> | (() => Asked<T>), waitMs: number, waited?: readonly string[]): Promise<LinkRequests[T]["result"]> {
     const deadline = this.options.now() + waitMs;
     const pause = async (): Promise<void> => {
       const { promise, resolve } = Promise.withResolvers<void>();
@@ -336,8 +338,9 @@ export class LinkClient implements RuntimeLink {
         await pause();
       }
     }
-    // The secret is the link's to add: the parts' fields never carry it.
-    return this.ask(type, { ...fields, secret: this.options.secret() } as LinkRequests[T]["fields"]);
+    // The secret is the link's to add: the parts' fields never carry it. Fields given as a function are worked out now, as the frame leaves.
+    const sent = typeof fields === "function" ? fields() : fields;
+    return this.ask(type, { ...sent, secret: this.options.secret() } as LinkRequests[T]["fields"]);
   }
 
   notify(notice: Omit<LinkNotice, "link">): void {

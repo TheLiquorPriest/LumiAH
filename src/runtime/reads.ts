@@ -467,7 +467,7 @@ export function createChatData(deps: ChatDataDeps): ChatData {
     const db = reader?.db.describe() ?? null;
     if (db !== null && db.on) return "The operator switched the database reader on for this runtime: the copy reads Lumiverse's own file, the runtime's user's rows alone.";
     if (db !== null) return `The copy reads Lumiverse as the runtime's signed-in user: the database reader is off (${db.why ?? "it was closed"}).`;
-    if (offer !== null && offer.database !== null && !besideLumiverse) return `The copy reads Lumiverse as the runtime's signed-in user: the operator switched the database reader on, but this runtime reaches Lumiverse at ${new URL(deps.base).host}, not at a loopback address, and the reader opens Lumiverse's file only where the runtime runs on Lumiverse's own machine.`;
+    if (offer !== null && offer.database !== null && !besideLumiverse) return `The copy reads Lumiverse as the runtime's signed-in user: the operator switched the database reader on, but this runtime reaches Lumiverse at ${new URL(deps.base).host}, not at a loopback address, and the reader opens Lumiverse's file only where the runtime runs on Lumiverse's own machine. Where it does, set it up with Lumiverse's loopback address: lumiah up --url http://127.0.0.1:<Lumiverse's port> (with --name, where you named the runtime). That registers the runtime anew.`;
     return "The copy reads Lumiverse as the runtime's signed-in user: the database reader isn't switched on for this runtime.";
   }
 

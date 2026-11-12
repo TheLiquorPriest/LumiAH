@@ -93,7 +93,7 @@ describe("the book of connections", () => {
 
   test("reads its connections back when the runtime starts again", async () => {
     const r = kept(rig());
-    await r.layer.book.save({ name: "Claude", provider: "anthropic", auth: "key", model: "claude-sonnet-4-5", effort: "low", headers: { "x-team": "harbour-crew" } }, KEY);
+    await r.layer.book.save({ name: "Claude", provider: "anthropic", auth: "key", model: "claude-sonnet-4-5", effort: "low", headers: { "x-team": "harbour" } }, KEY);
     await r.layer.close();
     const again = kept(rig({ dir: r.dir }));
     expect((await again.layer.book.list()).connections).toEqual([
@@ -133,20 +133,43 @@ describe("the book of connections", () => {
     expect((await r.layer.book.list()).connections).toEqual([]);
   });
 
-  test("keeps no key and no header's value shorter than 8 characters, which nothing a server says back could be cleaned of; 8 are kept, and taken out of a Test's words", async () => {
-    // A server that refuses every call and says back the key and the header it was sent, as some do.
-    const r = kept(rig({ script: (sent) => failed(401, { error: { message: `Unknown key ${sent.headers.authorization ?? ""} with token ${sent.headers["x-gateway-token"] ?? ""}.`, type: "invalid_request_error" } }) }));
+  test("refuses a key shorter than 8 characters, which nothing a server says back could be cleaned of, naming what serves a server that takes any key; takes a header's value of any length; what it keeps of 8 characters or more is taken out of a Test's words", async () => {
+    // A server that refuses every call and says back the key and the headers it was sent, as some do.
+    const r = kept(rig({ script: (sent) => failed(401, { error: { message: `Unknown key ${sent.headers.authorization ?? ""} with token ${sent.headers["x-gateway-token"] ?? ""} for ${sent.headers["x-portkey-provider"] ?? ""}.`, type: "invalid_request_error" } }) }));
     const fields = { name: "Proxy", provider: "openai-compatible", auth: "key", baseUrl: "https://proxy.example.com/v1", model: "served-model" } as const;
-    await expect(r.layer.book.save(fields, "sk-0123")).rejects.toThrow();
-    await expect(r.layer.book.save({ ...fields, headers: { "x-gateway-token": "gw-0123" } }, SERVER_KEY)).rejects.toThrow();
+    await expect(r.layer.book.save(fields, "sk-0123")).rejects.toThrow("No key");
     expect((await r.layer.book.list()).connections).toEqual([]);
     expect(existsSync(join(r.dir, "secrets.json"))).toBe(false);
-    const saved = await r.layer.book.save({ ...fields, headers: { "x-gateway-token": "gw-01234" } }, "sk-01234");
+    // A gateway's route is no secret, and as short as the gateway wants it.
+    const saved = await r.layer.book.save({ ...fields, headers: { "x-portkey-provider": "openai", "x-gateway-token": "gw-01234" } }, "sk-01234");
     const tested = await r.layer.book.test(saved.id);
-    expect(r.sent.map((s) => [s.headers.authorization, s.headers["x-gateway-token"]])).toEqual([["Bearer sk-01234", "gw-01234"]]);
+    expect(r.sent.map((s) => [s.headers.authorization, s.headers["x-gateway-token"], s.headers["x-portkey-provider"]])).toEqual([["Bearer sk-01234", "gw-01234", "openai"]]);
     expect(tested.ok).toBe(false);
     expect(JSON.stringify(tested)).not.toContain("sk-01234");
     expect(JSON.stringify(tested)).not.toContain("gw-01234");
+  });
+
+  test("a connection kept with a key and header values shorter than 8 characters loads whole: reading changes no file, its calls send what it holds, and the save of another keeps it", async () => {
+    const connections = bookFile({ id: "c1", name: "Gateway", provider: "openai-compatible", auth: "key", baseUrl: "https://gateway.example/v1", model: "served-model", headers: { "x-portkey-provider": "openai", "x-api-key": "abc123" } });
+    const secrets = JSON.stringify({ lumiah: 1, keys: { c1: "sk-0123" }, signins: {} });
+    const dir = folder({ "connections.json": connections, "secrets.json": secrets });
+    const r = kept(rig({ dir, script: () => json({ data: [{ id: "served-model" }] }) }));
+    expect((await r.layer.book.list()).connections.map((c) => [c.id, c.headers, c.key?.set])).toEqual([
+      [
+        "c1",
+        [
+          { name: "x-portkey-provider", set: true },
+          { name: "x-api-key", set: true },
+        ],
+        true,
+      ],
+    ]);
+    expect([readFileSync(join(dir, "connections.json"), "utf8"), readFileSync(join(dir, "secrets.json"), "utf8")]).toEqual([connections, secrets]);
+    await r.layer.modelsOf("c1");
+    expect(r.sent.map((s) => [s.headers.authorization, s.headers["x-portkey-provider"], s.headers["x-api-key"]])).toEqual([["Bearer sk-0123", "openai", "abc123"]]);
+    await r.layer.book.save({ name: "Local", provider: "openai-compatible", auth: "none", baseUrl: "http://127.0.0.1:8080/v1" });
+    expect(JSON.parse(readFileSync(join(dir, "connections.json"), "utf8"))).toMatchObject({ default: "c1", connections: [{ id: "c1", headers: { "x-portkey-provider": "openai", "x-api-key": "abc123" } }, { name: "Local", auth: "none" }] });
+    expect(JSON.parse(readFileSync(join(dir, "secrets.json"), "utf8"))).toMatchObject({ keys: { c1: "sk-0123" } });
   });
 
   test("stops at a file it can't read, in words that name it, and never writes over it", async () => {
@@ -223,16 +246,16 @@ describe("a connection's headers", () => {
   test("the pages see each header's name and whether it has a value, never the value; a save keeps, changes or takes each away as it says", async () => {
     const r = kept(rig({ script: () => eventStream(anthropicStream(anthropicTurn({ text: "At the quay." }))) }));
     const fields = { name: "Claude", provider: "anthropic", auth: "key", model: "claude-sonnet-4-5" } as const;
-    const saved = await r.layer.book.save({ ...fields, headers: { "x-gateway-token": GATEWAY, "x-team": "harbour-crew" } }, KEY);
+    const saved = await r.layer.book.save({ ...fields, headers: { "x-gateway-token": GATEWAY, "x-team": "harbour" } }, KEY);
     expect(saved.headers).toEqual([
       { name: "x-gateway-token", set: true },
       { name: "x-team", set: true },
     ]);
     expect(JSON.stringify(await r.layer.book.list())).not.toContain(GATEWAY);
     // Null keeps the value stored under a name; a text changes it.
-    await r.layer.book.save({ ...fields, id: saved.id, headers: { "x-gateway-token": null, "x-team": "quay-watch" } });
+    await r.layer.book.save({ ...fields, id: saved.id, headers: { "x-gateway-token": null, "x-team": "quay" } });
     await r.layer.models.call(request({ messages: [{ role: "user", content: "Where is Ilse?" }] }), forever());
-    expect([r.sent[0]?.headers["x-gateway-token"], r.sent[0]?.headers["x-team"]]).toEqual([GATEWAY, "quay-watch"]);
+    expect([r.sent[0]?.headers["x-gateway-token"], r.sent[0]?.headers["x-team"]]).toEqual([GATEWAY, "quay"]);
     // A name left out is taken away, and null takes them all.
     expect((await r.layer.book.save({ ...fields, id: saved.id, headers: { "x-team": null } })).headers).toEqual([{ name: "x-team", set: true }]);
     expect((await r.layer.book.save({ ...fields, id: saved.id, headers: null })).headers).toBeUndefined();
@@ -373,7 +396,7 @@ describe("a connection's models, for the pickers", () => {
 
   test("a compatible server's come from the server, asked with the connection's key and headers, and no redirect followed", async () => {
     const r = kept(rig({ script: (sent) => (sent.url.startsWith("https://proxy.example.com/") ? json({ data: [{ id: "claude-proxy", display_name: "Claude via the proxy" }] }) : json({ object: "list", data: [{ id: "served-model" }, { id: "other-model" }] })) }));
-    const open = await r.layer.book.save({ name: "Local", provider: "openai-compatible", auth: "key", baseUrl: "http://127.0.0.1:8080/v1", model: "served-model", headers: { "x-team": "harbour-crew" } }, SERVER_KEY);
+    const open = await r.layer.book.save({ name: "Local", provider: "openai-compatible", auth: "key", baseUrl: "http://127.0.0.1:8080/v1", model: "served-model", headers: { "x-team": "harbour" } }, SERVER_KEY);
     const proxy = await r.layer.book.save({ name: "Proxy", provider: "anthropic-compatible", auth: "key", baseUrl: "https://proxy.example.com" }, SERVER_KEY);
     expect(await r.layer.modelsOf(open.id)).toEqual([
       { id: "served-model", name: "served-model" },
@@ -381,7 +404,7 @@ describe("a connection's models, for the pickers", () => {
     ]);
     expect(await r.layer.modelsOf(proxy.id)).toEqual([{ id: "claude-proxy", name: "Claude via the proxy" }]);
     expect(r.sent.map((s) => [s.url, s.headers.authorization ?? s.headers["x-api-key"], s.headers["x-team"] ?? "none", s.redirect])).toEqual([
-      ["http://127.0.0.1:8080/v1/models", `Bearer ${SERVER_KEY}`, "harbour-crew", "error"],
+      ["http://127.0.0.1:8080/v1/models", `Bearer ${SERVER_KEY}`, "harbour", "error"],
       ["https://proxy.example.com/v1/models", SERVER_KEY, "none", "error"],
     ]);
   });

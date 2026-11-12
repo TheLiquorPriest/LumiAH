@@ -10,8 +10,9 @@
 // What was stored for one server goes to no other. A connection's key and its headers' values stay
 // only while its provider and its address's origin do: a change of either keeps only what comes
 // with it. A connection that signs in goes to its provider's own address, and an address holds no
-// name or password. A key or a header's value shorter than `SECRET_FLOOR` is never kept: what a
-// server says back can't be cleaned of one so short (words.ts).
+// name or password. A save refuses a key shorter than `SECRET_FLOOR`: what a server says back can't
+// be cleaned of one so short (words.ts). A header's value may be any length; a shorter one is then
+// not taken out of a server's words.
 //
 // The sign-ins' tokens are pi-ai's to keep fresh: they reach it through a `CredentialStore` over
 // the same secrets, whose `modify` runs one change of a provider's sign-in at a time and saves it
@@ -21,8 +22,9 @@
 //
 // A file that can't be read stops the book with words that name it, rather than being written over
 // with nothing: a hand edit gone wrong costs the user a fix, not their connections. A connection in
-// it that a save would refuse is left out, with a line in the log that says why; and a folder or a
-// file other accounts could read is made its owner's alone as it is read, and the log says so.
+// it that a save would refuse is left out, with a line in the log that says why, though never for a
+// key's length, which only a save checks; and a folder or a file other accounts could read is made
+// its owner's alone as it is read, and the log says so.
 
 import * as nodeFiles from "node:fs/promises";
 import type { Credential, CredentialStore, ModelThinkingLevel, OAuthCredential } from "@earendil-works/pi-ai";
@@ -185,7 +187,6 @@ function headersOf(given: ConnectionInput["headers"], had: StoredConnection["hea
       continue;
     }
     if (/[\r\n\0]/.test(value)) throw new Error(`The header "${name}" can't hold a line break.`);
-    if (value.trim().length < SECRET_FLOOR) throw new Error(`The value of "${name}" needs ${SECRET_FLOOR} characters at least: the runtime takes a header's value out of whatever a server says back, as it does a key, and a shorter one can't be told from ordinary words.`);
     headers[name] = value;
   }
   return Object.keys(headers).length > 0 ? headers : undefined;
@@ -388,7 +389,7 @@ export class Book {
     if (!create && input.id !== undefined && at === -1) throw new Error("That connection is no longer there: reload the page.");
     const connection = checked(input, input.id ?? newId());
     if (key !== undefined && key !== null && (typeof key !== "string" || key.trim() === "")) throw new Error("A key can't be empty: leave it out to keep the one there is.");
-    if (typeof key === "string" && key.trim().length < SECRET_FLOOR) throw new Error(`A key needs ${SECRET_FLOOR} characters at least: the runtime takes a key out of whatever a server says back (some repeat a key they refuse), and a shorter one can't be told from ordinary words.`);
+    if (typeof key === "string" && key.trim().length < SECRET_FLOOR) throw new Error(`A key needs ${SECRET_FLOOR} characters at least: the runtime takes a key out of whatever a server says back (some repeat a key they refuse), and a shorter one can't be told from ordinary words. For a server that takes any key, choose No key: its calls then send "none".`);
     const before = at === -1 ? undefined : s.connections[at];
     const carried = before !== undefined && before.provider === connection.provider && originOf(before.baseUrl) === originOf(connection.baseUrl);
     const headers = headersOf(input.headers, before?.headers, carried);
