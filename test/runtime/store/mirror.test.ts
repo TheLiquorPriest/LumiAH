@@ -1,14 +1,15 @@
 // The working store and its mirror (PI-BUILD-PLAN §4.4): the mark in the extension's storage that
-// says whose working copy it mirrors, so two runtimes never write over each other unseen; the
-// forgetting of a deleted chat, from the working copy and from the mirror; and closing, which leaves
-// nothing half done and the rest for the next start.
+// says whose working copy it mirrors and how many changes it took from it, checked when the runtime
+// is given the mirror (who holds it, and what happens around that: holder.test.ts); the forgetting
+// of a deleted chat, from the working copy and from the mirror; and closing, which leaves nothing
+// half done and the rest for the next start.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { cp, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WorkingStore } from "../../../src/runtime/store/index";
-import { type Bench, bench, cleanUp, files, holding, open, outcome, until } from "./rig";
+import { type Bench, bench, cleanUp, files, holding, markCount, open, outcome, until } from "./rig";
 
 let b: Bench;
 /** Another machine's folder: a second runtime of the same user keeps its copy there. */
@@ -29,8 +30,6 @@ afterEach(async () => {
   await cleanUp(b);
   await rm(elsewhere, { recursive: true, force: true });
 });
-
-const TAKEN = "Another runtime (runtime two) keeps the extension's storage now, so this runtime threw its own copy away, with what it hadn't sent there yet.";
 
 describe("the mark", () => {
   test("a runtime that finds its own mark carries on with its copy, and sends what it hadn't", async () => {
@@ -76,26 +75,22 @@ describe("the mark", () => {
     expect(b.logs.some((line) => line.level === "warn" && line.message.includes("is kept by another runtime (runtime two"))).toBe(true);
   });
 
-  test("a runtime that finds another's mark while it runs stops sending, says so, and takes the mark back", async () => {
-    const path = "jobs/all.json";
-    const one = keep(open(b));
-    await one.store.write(path, { jobs: ["j1"] });
-    await one.settle();
-    const two = keep(open(b, { dir: elsewhere, owner: "runtime two" }));
-    await two.settle();
-    expect(b.mirror.doc("mirror.json")).toMatchObject({ owner: "runtime two" });
+  test("a copy the mirror took more from than the copy holds (a backup, or a copy elsewhere) is thrown away for the mirror's, under a new id", async () => {
+    const path = "chats/c1/session.json";
+    const first = open(b, { limits: () => ({ markMs: 0 }) });
+    await first.store.write(path, { asked: 1 });
+    await first.settle();
+    await cp(b.dir, elsewhere, { recursive: true });
+    await first.store.write(path, { asked: 2 });
+    await first.settle();
+    await until(() => markCount(b) === 2, "the mark to count both changes");
+    await first.close();
 
-    b.mirror.down = "the extension isn't linked";
-    await one.store.write(path, { jobs: ["j1", "j2"] });
-    await until(() => one.state().lastError !== null, "runtime one's try to fail");
-    b.mirror.down = null;
-    await expect(one.settle()).rejects.toThrow(TAKEN);
-    expect(b.mirror.doc(path)).toEqual({ jobs: ["j1"] });
-
-    await until(() => one.state().open, "runtime one to take the mark back");
-    expect(one.state().takeover).toMatchObject({ from: "runtime two", dropped: 1 });
-    expect(b.mirror.doc("mirror.json")).toMatchObject({ owner: "runtime one" });
-    expect(await one.store.read(path)).toEqual({ jobs: ["j1"] });
+    const copied = keep(open(b, { dir: elsewhere, owner: "runtime two" }));
+    expect(await copied.store.read(path)).toEqual({ asked: 2 });
+    expect(copied.state().takeover).toMatchObject({ from: "runtime one", dropped: 0 });
+    expect(b.logs.some((line) => line.message.includes("has taken more from this runtime's copy than the copy holds"))).toBe(true);
+    expect(b.mirror.doc("mirror.json")).toMatchObject({ owner: "runtime two", count: 0 });
   });
 
   test("a mirror that lost its mark while this copy holds something: the copy is thrown away for the mirror's", async () => {
@@ -120,7 +115,7 @@ describe("the mark", () => {
     expect(s.state().open).toBe(false);
     b.clock.advance(60_000);
     await expect(reading).rejects.toThrow(
-      "The runtime's store hasn't reached the extension's storage since it started (the extension isn't linked), so it can't yet tell whether the copy it holds is still the one the extension keeps. Try again once the runtime is linked.",
+      "The runtime's store hasn't reached the extension's storage since it was given it (the extension isn't linked), so it can't yet tell whether the copy it holds is still the one the extension keeps. Try again once the runtime is linked.",
     );
 
     b.mirror.down = null;

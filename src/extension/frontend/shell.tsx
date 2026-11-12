@@ -33,7 +33,7 @@ import { TalkPage } from "./pages/talk";
 import { ToolsPage } from "./pages/tools";
 import { UpkeepPage } from "./pages/upkeep";
 import { WorkspacePage } from "./pages/workspace";
-import { scrollParent } from "./scroll";
+import { barMeasured, scrollParent } from "./scroll";
 import { useSelect } from "./store";
 
 /** Each page's view. An extension that builds LumiAH into itself mounts these same components in its own drawer (DESIGN §21). */
@@ -101,11 +101,14 @@ export function Shell(props: { pages?: readonly PageId[] }) {
     };
     relayout.current = apply;
     apply();
+    // The bar's height is known from here on: a reveal a page asked for as it mounted lands under it.
+    barMeasured(app).set(true);
     observer.observe(el);
     if (bar.current) observer.observe(bar.current);
     // The host slides the drawer in with a transform, which no ResizeObserver sees: measure again when it settles.
     document.addEventListener("transitionend", apply, true);
     return () => {
+      barMeasured(app).set(false);
       observer.disconnect();
       document.removeEventListener("transitionend", apply, true);
     };

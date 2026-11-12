@@ -1,10 +1,9 @@
-// The sending end of the link's streams (DESIGN §6: "Streams are numbered"): one per model call or
-// passthrough the runtime asked for, named by the runtime. A stream's text is held back a moment to
-// go with what follows it, every chunk is numbered and kept until the runtime acknowledges it, and a
-// runtime that reconnects gets what it missed. The bookkeeping itself is src/link/stream.ts, shared
-// with the runtime's reading end.
+// The sending end of the link's streams (DESIGN §6: "Streams are numbered"): one per tool that runs
+// here or tool call held for the user's word that the runtime asked for, named by the runtime. Its
+// one chunk, the outcome, is numbered and kept until the runtime acknowledges it, and a runtime that
+// reconnects gets it again. The bookkeeping itself is src/link/stream.ts.
 
-import type { JsonValue, ModelDelta, ModelResult } from "../../core/ports";
+import type { JsonValue } from "../../core/ports";
 import type { ChunkPush, OpenStream, StreamChunk } from "../../link/contract";
 import { LINK } from "../../link/contract";
 import { CEILINGS } from "../../link/settings";
@@ -19,29 +18,21 @@ interface Sent {
   turn: string | null;
   sender: StreamSender;
   abort: AbortController;
-  /** Text held back to go with what follows it. */
-  held: { kind: "content" | "reasoning"; text: string } | null;
-  unhold: (() => void) | null;
-  coalesceMs: number;
   keepMs: number;
-  /** When its terminal chunk was numbered; null while it runs. */
+  /** When its chunk was numbered; null while it runs. */
   endedAt: number | null;
 }
 
-/** What a call writes its answer to: a model call its deltas and its whole answer (`done`); anything else that takes its time, its outcome (`value`). */
+/** What a call writes its outcome to: a tool's run in the extension, the user's word on a held call (`value`), or its failure (`error`). */
 export interface StreamWriter {
   /** Ends when the runtime cancels the stream, or its turn is stopped. */
   signal: AbortSignal;
-  delta(delta: ModelDelta): void;
-  done(result: ModelResult): void;
   value(value: JsonValue): void;
   error(message: string, code: string): void;
 }
 
 export interface StreamsEnv {
   now(): number;
-  /** Runs `fn` once after `ms`; what it returns cancels that. */
-  later(ms: number, fn: () => void): () => void;
   /** Pushes a chunk to a runtime's session; false while it has none. */
   push(userId: string, relay: string, push: ChunkPush): boolean;
 }
@@ -67,30 +58,8 @@ export class StreamRegistry {
     this.env.push(sent.userId, sent.relay, { link: LINK, type: "chunk", stream: sent.stream, seq: numbered.seq, chunk });
   }
 
-  private flush(sent: Sent): void {
-    sent.unhold?.();
-    sent.unhold = null;
-    const held = sent.held;
-    sent.held = null;
-    if (held !== null) this.emit(sent, held);
-  }
-
-  private text(sent: Sent, kind: "content" | "reasoning", text: string): void {
-    if (text === "" || sent.endedAt !== null) return;
-    // Reasoning and text stay in the order they were written.
-    if (sent.held !== null && sent.held.kind !== kind) this.flush(sent);
-    sent.held = { kind, text: (sent.held?.text ?? "") + text };
-    if (sent.coalesceMs <= 0) this.flush(sent);
-    else if (sent.unhold === null)
-      sent.unhold = this.env.later(sent.coalesceMs, () => {
-        sent.unhold = null;
-        this.flush(sent);
-      });
-  }
-
   private end(sent: Sent, chunk: StreamChunk): void {
     if (sent.endedAt !== null || this.streams.get(key(sent.userId, sent.stream)) !== sent) return;
-    this.flush(sent);
     this.emit(sent, chunk);
     sent.endedAt = this.env.now();
   }
@@ -104,22 +73,17 @@ export class StreamRegistry {
    * or all of them together, the request is refused aloud: a null here would tell its caller the
    * call is under way, and the runtime would wait for an answer nothing is writing.
    */
-  open(userId: string, relay: string, stream: string, turn: string | null, tuning: { coalesceMs: number; keepMs: number }): StreamWriter | null {
+  open(userId: string, relay: string, stream: string, turn: string | null, tuning: { keepMs: number }): StreamWriter | null {
     const k = key(userId, stream);
     if (this.streams.has(k)) return null;
     const own = this.held.get(userId) ?? 0;
     if (own >= CEILINGS.streams) throw new LinkRefused("unavailable", `This account already has ${own} calls on LumiAH's link that are under way or whose answers its runtimes haven't acknowledged, the most one account may have at once. Try again once some have ended.`);
     if (this.streams.size >= CEILINGS.streamsTotal) throw new LinkRefused("unavailable", "LumiAH is busy: its link holds as many calls' answers as it does at once, for every account together. Try again in a moment.");
-    const sent: Sent = { userId, relay, stream, turn, sender: new StreamSender(), abort: new AbortController(), held: null, unhold: null, coalesceMs: tuning.coalesceMs, keepMs: Math.min(tuning.keepMs, CEILINGS.streamKeepMs), endedAt: null };
+    const sent: Sent = { userId, relay, stream, turn, sender: new StreamSender(), abort: new AbortController(), keepMs: Math.min(tuning.keepMs, CEILINGS.streamKeepMs), endedAt: null };
     this.streams.set(k, sent);
     this.held.set(userId, own + 1);
     return {
       signal: sent.abort.signal,
-      delta: (delta) => {
-        if (delta.reasoning !== undefined) this.text(sent, "reasoning", delta.reasoning);
-        if (delta.content !== undefined) this.text(sent, "content", delta.content);
-      },
-      done: (result) => this.end(sent, { kind: "done", result }),
       value: (value) => this.end(sent, { kind: "value", value }),
       error: (message, code) => this.end(sent, { kind: "error", message, code }),
     };
@@ -131,9 +95,6 @@ export class StreamRegistry {
   }
 
   private drop(sent: Sent): void {
-    sent.unhold?.();
-    sent.unhold = null;
-    sent.held = null;
     if (!this.streams.delete(key(sent.userId, sent.stream))) return;
     const left = (this.held.get(sent.userId) ?? 1) - 1;
     if (left > 0) this.held.set(sent.userId, left);
@@ -147,14 +108,6 @@ export class StreamRegistry {
     if (!sent.sender.ack(seq)) return false;
     this.drop(sent);
     return true;
-  }
-
-  /** `stream.resend`: pushes the stream's chunks again from `from`. The last chunk held; null when the stream isn't. */
-  resend(userId: string, relay: string, stream: string, from: number): number | null {
-    const sent = this.of(userId, relay, stream);
-    if (sent === null) return null;
-    for (const { seq, chunk } of sent.sender.from(from)) this.env.push(userId, relay, { link: LINK, type: "chunk", stream, seq, chunk });
-    return sent.sender.last;
   }
 
   /** `stream.cancel`: the runtime gave the stream up, so its call ends and nothing more is sent. False when the stream wasn't held. */

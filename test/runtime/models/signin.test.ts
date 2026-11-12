@@ -2,7 +2,8 @@
 // can finish: the flow's address to open, then what the provider gave back pasted in. Against a
 // scripted token endpoint: the code is exchanged, the tokens are kept for the owner alone, a call
 // on the sign-in carries them, an expired token is renewed once however many calls find it so, a
-// flow left open expires, and signing out forgets the tokens.
+// flow left open expires, a flow that ends without signing in says why for a while, and signing
+// out forgets the tokens.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync, statSync } from "node:fs";
@@ -53,6 +54,12 @@ async function signIn(made: Rig): Promise<void> {
   await made.layer.signIn.finish(start.flow, `code-from-the-page#${state}`);
 }
 
+/** Until when the sign-in kept for `provider` holds, as its file says. */
+function expiresOf(made: Rig, provider: string): number {
+  const secrets = JSON.parse(readFileSync(join(made.dir, "secrets.json"), "utf8")) as { signins: Record<string, { expires: number }> };
+  return secrets.signins[provider]?.expires ?? Number.NaN;
+}
+
 describe("signing in to Anthropic", () => {
   test("starts on the page that shows a code, says how requests on it are sent, and keeps the tokens for the owner alone", async () => {
     const tokens = tokenEndpoint(anthropicTokens(3600));
@@ -62,10 +69,12 @@ describe("signing in to Anthropic", () => {
     expect(url.host).toBe("claude.ai");
     expect(url.searchParams.get("redirect_uri")).toBe("https://platform.claude.com/oauth/code/callback");
     expect(start.note).toContain("the way Claude Code sends them");
-    expect(await r.layer.signIn.state("anthropic")).toEqual({ provider: "anthropic", signedIn: false, flow: start.flow });
+    expect(await r.layer.signIn.state("anthropic")).toEqual({ provider: "anthropic", signedIn: false, until: null, flow: start.flow, ended: null });
 
     const state = url.searchParams.get("state");
-    expect(await r.layer.signIn.finish(start.flow, `code-from-the-page#${state}`)).toEqual({ provider: "anthropic", signedIn: true, flow: null });
+    const finished = await r.layer.signIn.finish(start.flow, `code-from-the-page#${state}`);
+    expect(finished).toEqual({ provider: "anthropic", signedIn: true, until: expiresOf(r, "anthropic"), flow: null, ended: null });
+    expect(finished.until).toBeGreaterThan(Date.now());
     expect(tokens.map((t) => [t.url, bodyOf(t).grant_type, bodyOf(t).code])).toEqual([["https://platform.claude.com/v1/oauth/token", "authorization_code", "code-from-the-page"]]);
     const secrets = join(r.dir, "secrets.json");
     expect(readFileSync(secrets, "utf8")).toContain("sk-ant-ort01-refresh-1");
@@ -105,6 +114,8 @@ describe("signing in to Anthropic", () => {
     const kept = readFileSync(join(r.dir, "secrets.json"), "utf8");
     expect(kept).toContain("sk-ant-ort01-renewed");
     expect(kept).not.toContain("sk-ant-ort01-first");
+    // The page is told until when the renewed token holds.
+    expect((await r.layer.signIn.state("anthropic")).until).toBe(expiresOf(r, "anthropic"));
   });
 
   test("a code from another flow is refused in words, and the flow must start again", async () => {
@@ -124,6 +135,19 @@ describe("signing in to Anthropic", () => {
     await expect(r.layer.signIn.finish(start.flow, `stale-code#${state}`)).rejects.toThrow("The Anthropic sign-in didn't finish: 400: Invalid authorization code (invalid_grant). Start it again.");
   });
 
+  test("an answer of the token endpoint that isn't JSON is never quoted: the tokens it may hold stay out of the words", async () => {
+    tokenEndpoint(() => new Response("access_token=sk-ant-oat01-unread-0123456789&refresh_token=sk-ant-ort01-unread-0123456789", { status: 200, headers: { "content-type": "text/plain" } }));
+    const { r } = await signInRig();
+    const start = await r.layer.signIn.start("anthropic");
+    const state = new URL(start.url).searchParams.get("state");
+    const words = await r.layer.signIn.finish(start.flow, `code-from-the-page#${state}`).then(
+      () => "signed in",
+      (error: unknown) => (error instanceof Error ? error.message : String(error)),
+    );
+    expect(words).toBe("The Anthropic sign-in didn't finish: Token exchange returned invalid JSON. Start it again.");
+    expect((await r.layer.signIn.state("anthropic")).ended).toBe(words);
+  });
+
   test("a flow left open expires, one cancelled ends, and signing out forgets the tokens", async () => {
     tokenEndpoint(anthropicTokens(3600));
     const { r } = await signInRig();
@@ -138,9 +162,38 @@ describe("signing in to Anthropic", () => {
     await signIn(r);
     expect((await r.layer.signIn.state("anthropic")).signedIn).toBe(true);
     await r.layer.signIn.out("anthropic");
-    expect(await r.layer.signIn.state("anthropic")).toEqual({ provider: "anthropic", signedIn: false, flow: null });
+    expect(await r.layer.signIn.state("anthropic")).toEqual({ provider: "anthropic", signedIn: false, until: null, flow: null, ended: null });
     expect(readFileSync(join(r.dir, "secrets.json"), "utf8")).not.toContain("sk-ant-");
     await expect(r.layer.models.call(request({ messages: [{ role: "user", content: "Hello?" }] }), forever())).rejects.toThrow("The runtime isn't signed in to Anthropic");
+  });
+
+  test("a flow that ends without signing in says why for a while: cancelled, left open too long, refused; a new flow or a sign-in clears it", async () => {
+    let asked = 0;
+    tokenEndpoint((sent) => {
+      asked += 1;
+      return asked === 1 ? failed(400, { error: "invalid_grant", error_description: "Invalid authorization code" }) : anthropicTokens(3600)(sent);
+    });
+    const { r } = await signInRig();
+    const endedNow = async (): Promise<string | null> => (await r.layer.signIn.state("anthropic")).ended;
+
+    const cancelled = await r.layer.signIn.start("anthropic");
+    await r.layer.signIn.cancel(cancelled.flow);
+    expect(await endedNow()).toBe("The Anthropic sign-in didn't finish: The sign-in was cancelled. Start it again.");
+    // Ten minutes on, it is no longer said.
+    r.advance(10 * 60_000);
+    expect(await endedNow()).toBeNull();
+
+    await r.layer.signIn.start("anthropic");
+    r.timers.fireAll();
+    expect(await endedNow()).toBe("The Anthropic sign-in didn't finish: The sign-in was left open too long. Start it again.");
+    const refused = await r.layer.signIn.start("anthropic");
+    // A new flow clears the last one's words.
+    expect(await r.layer.signIn.state("anthropic")).toMatchObject({ flow: refused.flow, ended: null });
+    await expect(r.layer.signIn.finish(refused.flow, `stale-code#${new URL(refused.url).searchParams.get("state")}`)).rejects.toThrow("400: Invalid authorization code");
+    expect(await endedNow()).toBe("The Anthropic sign-in didn't finish: 400: Invalid authorization code (invalid_grant). Start it again.");
+
+    await signIn(r);
+    expect(await r.layer.signIn.state("anthropic")).toMatchObject({ signedIn: true, flow: null, ended: null });
   });
 });
 
@@ -154,9 +207,22 @@ describe("signing in to OpenAI", () => {
     expect([url.searchParams.get("ext_agent_host_id"), url.searchParams.get("agent_name_hint")]).toEqual([`urn:uuid:${DEVICE}`, "LumiAH"]);
     expect(start.note).toContain("http://127.0.0.1:1455/");
     const pasted = `http://127.0.0.1:1455/auth/callback?code=code-1&state=${url.searchParams.get("state")}&client_id=issued-client`;
-    expect(await r.layer.signIn.finish(start.flow, pasted)).toEqual({ provider: "openai", signedIn: true, flow: null });
+    expect(await r.layer.signIn.finish(start.flow, pasted)).toEqual({ provider: "openai", signedIn: true, until: expiresOf(r, "openai"), flow: null, ended: null });
     const form = new URLSearchParams(tokens[0]?.text);
     expect([tokens[0]?.url, form.get("grant_type"), form.get("code"), form.get("client_id")]).toEqual(["https://auth.openai.com/api/accounts/oauth/token", "authorization_code", "code-1", "issued-client"]);
     expect(readFileSync(join(r.dir, "secrets.json"), "utf8")).toContain("chatgpt-refresh-1");
+  });
+
+  test("a flow another program on this machine ended at the callback says why", async () => {
+    const made = rig();
+    r = made;
+    const start = await made.layer.signIn.start("openai");
+    // What any program on the machine can do while the flow listens on its port.
+    await fetch("http://127.0.0.1:1455/auth/callback?error=access_denied");
+    // From here no request reaches a provider: the token endpoint is scripted.
+    tokenEndpoint(() => failed(500, { error: "not_reached" }));
+    // A paste after it finds the flow ended, or ends with it: either way the page is told why it ended.
+    await made.layer.signIn.finish(start.flow, "http://127.0.0.1:1455/auth/callback?code=late&state=another-flow").catch(() => undefined);
+    expect(await made.layer.signIn.state("openai")).toEqual({ provider: "openai", signedIn: false, until: null, flow: null, ended: "The OpenAI sign-in didn't finish: ChatGPT authorization failed: access_denied. Start it again." });
   });
 });

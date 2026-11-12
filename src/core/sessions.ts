@@ -186,6 +186,12 @@ export interface SessionRefs {
   rolledBack: string | null;
   /** When that rollback was made. */
   rolledBackAt: number | null;
+  /**
+   * Whether that rollback is news: no record on the path was made since it, so no turn has read past
+   * it yet. The first turn that does is told of it, and no later one, as with `fresh`: a rollback is
+   * made once, and the turns after it go on reading past it until a summary stands again.
+   */
+  rollbackFresh: boolean;
 }
 
 /**
@@ -198,6 +204,9 @@ export function sessionAt(turns: readonly PathTurn[]): SessionRefs {
   let fresh: number[] | null = null;
   let rolledBack: string | null = null;
   let rolledBackAt: number | null = null;
+  let rollbackFresh = false;
+  // The latest record on the path the walk has passed so far: one made after a rollback was a turn that read past it.
+  let latest = 0;
   for (let i = turns.length - 1; i >= 0; i--) {
     const turn = turns[i] as PathTurn;
     if (!turn.onPath) {
@@ -207,17 +216,19 @@ export function sessionAt(turns: readonly PathTurn[]): SessionRefs {
     fresh ??= [...dropped];
     const { record } = turn;
     segments.unshift(record.segment);
+    latest = Math.max(latest, record.at);
     if (record.summary === undefined) continue;
     if (record.rolledBack !== undefined) {
       if (rolledBack === null) {
         rolledBack = record.summary;
         rolledBackAt = record.rolledBack;
+        rollbackFresh = latest <= record.rolledBack;
       }
       continue;
     }
-    return { summary: record.summary, segments: [...(record.kept ?? []), ...segments], dropped, fresh, rolledBack, rolledBackAt };
+    return { summary: record.summary, segments: [...(record.kept ?? []), ...segments], dropped, fresh, rolledBack, rolledBackAt, rollbackFresh };
   }
-  return { summary: null, segments, dropped, fresh: fresh ?? [...dropped], rolledBack, rolledBackAt };
+  return { summary: null, segments, dropped, fresh: fresh ?? [...dropped], rolledBack, rolledBackAt, rollbackFresh };
 }
 
 // ---------------------------------------------------------------- reading a session
@@ -286,8 +297,8 @@ export class Sessions {
     const shown = target ? recordOf(target.anchor) : null;
     const again = shown && shown.path === hashes[at] ? shown : null;
     const held = again && again.summary !== undefined && again.rolledBack !== undefined ? { summary: again.summary, kept: again.kept ?? [], folded: again.folded ?? 0, rolledBack: again.rolledBack } : null;
-    // It is later than any the walk passed, so it is the one the session says it read past.
-    const refs: SessionRefs = held ? { ...walked, rolledBack: held.summary, rolledBackAt: held.rolledBack } : walked;
+    // It is later than any the walk passed, so it is the one the session says it read past: news while the reply's own record is the one it was made on, not one a turn since made carrying it on.
+    const refs: SessionRefs = held && again ? { ...walked, rolledBack: held.summary, rolledBackAt: held.rolledBack, rollbackFresh: again.at <= held.rolledBack } : walked;
     let missing = 0;
     const summary = refs.summary === null ? null : await this.blobs.get(refs.summary);
     if (refs.summary !== null && summary === null) missing++;

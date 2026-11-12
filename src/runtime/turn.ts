@@ -30,7 +30,7 @@ import type { StopBy, StopPush, TurnFacts } from "../link/contract";
 import type { RuntimeTuning } from "../link/settings";
 import type { WorkHarness } from "../link/work";
 import type { RuntimeLink } from "./link";
-import { refusedReply } from "./link";
+import { LOST_WAIT, refusedReply } from "./link";
 import { LiveError } from "./lumiverse";
 import { maxTokensOf, modelMessages, samplingOf, withSources } from "./openai";
 import type { TaggedRequest, TurnRunner } from "./relay";
@@ -59,6 +59,12 @@ export interface TurnsEnv {
   replied(chatId: string): void;
   /** Asks Lumiverse to stop a generation as its own Stop does; false when it had none such running. Rejects when it can't be asked (no session, Lumiverse out of reach). */
   stopGeneration(generation: string, chat: string): Promise<boolean>;
+  /** Resolves once the extension's storage holds everything the runtime saved before the call (its working store's `settle`); rejects in words that say why it doesn't. */
+  settle(): Promise<void>;
+  /** A reply's turn begins on a chat (the extension answered its `turn.begin`): the runtime's copy checks the chat before the turn's first read of it. */
+  began?(chatId: string): void;
+  /** The extension wrote the turn's record on a message now (`turn.commit` answered `now`), on that swipe: the runtime's copy of the chat waits for Lumiverse's word of that write, unless it holds the record already. `messageId` null: the reply's own message, which the turn didn't know. */
+  committed?(chatId: string, messageId: string | null, swipe: number, record: NonNullable<TurnResult["record"]>): void;
 }
 
 /** The user stopped the turn: its words say where, and are what the turn's end says. `by` is null for an extension from before it said where. */
@@ -180,6 +186,7 @@ export class Turns implements TurnRunner {
     let facts: TurnFacts;
     try {
       facts = await this.begin(request);
+      this.env.began?.(facts.chat);
     } catch (error) {
       // A link refused while the tag was checked is said as a request that found it refused is (relay.ts).
       const refused = refusedReply(this.link);
@@ -258,13 +265,13 @@ export class Turns implements TurnRunner {
     }
   }
 
-  /** The tag checked and spent (DESIGN §2 step 4). Asked again after a socket that closed under it: the extension answers a request it already took as before. */
+  /** The tag checked and spent (DESIGN §2 step 4). Asked again after a socket that closed under it: the extension answers a request it already took as before. While the link is down it waits as long as Extension lost after says, which its words name when it runs out. */
   private async begin(request: TaggedRequest): Promise<TurnFacts> {
     const first = this.env.now();
     for (;;) {
       const wait = this.env.tuning().lostMs;
       try {
-        return await this.link.request("turn.begin", { key: request.key, tag: request.tag, request: request.request }, wait);
+        return await this.link.request("turn.begin", { key: request.key, tag: request.tag, request: request.request }, wait, LOST_WAIT);
       } catch (error) {
         if (error instanceof LiveError && error.problem === "closed" && !request.signal.aborted && this.env.now() - first < wait) continue;
         throw error;
@@ -304,14 +311,21 @@ export class Turns implements TurnRunner {
     this.env.log(`turn ${running.turn.slice(0, 8)} hadn't stopped ${waited} after its chat's next reply was asked for: it was let go, so the next reply could start`);
   }
 
-  /** Hands the turn's record to the extension (DESIGN §2 step 8). */
+  /**
+   * Hands the turn's record to the extension (DESIGN §2 step 8), once the extension's storage holds
+   * what the turn saved: the record names its blobs, and whoever reads it there must find them. When
+   * the storage doesn't take them in time, the record goes all the same: the runtime's own copy holds
+   * them, and they follow as soon as the storage can be reached.
+   */
   private async commit(facts: TurnFacts, record: NonNullable<TurnResult["record"]>): Promise<void> {
     const { turn } = facts;
+    await this.env.settle().catch((error: unknown) => this.env.log(`turn ${turn.slice(0, 8)}: ${error instanceof Error ? error.message : String(error)}`));
     const first = this.env.now();
     for (;;) {
       const wait = this.env.tuning().lostMs;
       try {
-        const { anchoring } = await this.link.request("turn.commit", { turn, chat: facts.chat, target: facts.target, record }, wait);
+        const { anchoring } = await this.link.request("turn.commit", { turn, chat: facts.chat, target: facts.target, record }, wait, LOST_WAIT);
+        if (anchoring === "now") this.env.committed?.(facts.chat, facts.target.message, facts.target.swipe, record);
         if (anchoring === "never") this.env.log(`turn ${turn.slice(0, 8)}: its record wasn't anchored (the reply's message is gone)`);
         return;
       } catch (error) {

@@ -1,76 +1,34 @@
-// The link's own machinery, both ends in one process (DESIGN §6): a stream's numbering, its
-// acknowledgements and its recovery from a gap; a frame too large to cross whole, cut and put together
-// again; and the words for a version mismatch.
+// The link's own machinery, both ends in one process (DESIGN §6): a stream's one chunk, numbered,
+// kept until acknowledged and sent again after a reconnect; a frame too large to cross whole, cut and
+// put together again; and the words for a version mismatch.
 
 import { describe, expect, test } from "bun:test";
 import { type StreamChunk, FRAME_LIMIT, LINK, versionWords } from "../../src/link/contract";
 import { chunkOf, pushOf, requestOf } from "../../src/link/frames";
 import { PartJoiner, needsParts, partOf, splitFrame } from "../../src/link/parts";
 import { checkTransport, TRANSPORT_DEFAULTS, transportOf } from "../../src/link/settings";
-import { StreamReceiver, StreamSender } from "../../src/link/stream";
+import { StreamSender } from "../../src/link/stream";
 
-const text = (t: string): StreamChunk => ({ kind: "content", text: t });
-const done: StreamChunk = { kind: "done", result: { content: "Mara waits at the quay.", finishReason: "stop" } };
+const outcome: StreamChunk = { kind: "value", value: { text: "Okoro keeps the light." } };
 
 describe("a stream", () => {
-  test("round trips in order, acknowledged every few chunks and at its end", () => {
+  test("carries one chunk, numbered 1, and takes nothing after it", () => {
     const sender = new StreamSender();
-    const receiver = new StreamReceiver();
-    const got: StreamChunk[] = [];
-    const acks: number[] = [];
-    for (const chunk of [text("Mara "), text("waits "), text("at "), text("the "), text("quay."), done]) {
-      const numbered = sender.push(chunk);
-      if (numbered === null) throw new Error("the stream took a chunk after its end");
-      const received = receiver.take(numbered.seq, numbered.chunk, 2);
-      got.push(...received.deliver);
-      if (received.ack !== null) acks.push(received.ack);
-    }
-    expect(got.map((c) => (c.kind === "content" ? c.text : c.kind))).toEqual(["Mara ", "waits ", "at ", "the ", "quay.", "done"]);
-    // Every second chunk, and always the terminal one.
-    expect(acks).toEqual([2, 4, 6]);
-    expect(sender.ack(4)).toBe(false);
-    expect(sender.kept).toBe(2);
-    // Acknowledged to its end, the stream can be forgotten; nothing follows a terminal chunk.
-    expect(sender.ack(6)).toBe(true);
-    expect(sender.push(text("more"))).toBeNull();
-    expect(receiver.ended).toBe(true);
+    expect(sender.push(outcome)).toEqual({ seq: 1, chunk: outcome });
+    expect(sender.push({ kind: "error", message: "late", code: "internal" })).toBeNull();
   });
 
-  test("with a gap holds what came after it, names the missing chunk, and is whole once that is sent again", () => {
+  test("keeps its chunk for a runtime that reconnects until the chunk is acknowledged, and is then over", () => {
     const sender = new StreamSender();
-    const receiver = new StreamReceiver();
-    const sent = [text("Joss "), text("lit "), text("the "), text("lamp."), done].map((chunk) => sender.push(chunk));
-    const got: StreamChunk[] = [];
-    let missing: number | null = null;
-    for (const numbered of sent) {
-      // The second chunk is lost on the way.
-      if (numbered === null || numbered.seq === 2) continue;
-      const received = receiver.take(numbered.seq, numbered.chunk, 64);
-      got.push(...received.deliver);
-      missing = received.missing;
-    }
-    expect(got.map((c) => (c.kind === "content" ? c.text : c.kind))).toEqual(["Joss "]);
-    expect(missing).toBe(2);
-    expect(receiver.seq).toBe(1);
-
-    // `stream.resend` from the missing chunk: the sender still holds everything unacknowledged.
-    let acked: number | null = null;
-    for (const numbered of sender.from(2)) {
-      const received = receiver.take(numbered.seq, numbered.chunk, 64);
-      got.push(...received.deliver);
-      acked = received.ack ?? acked;
-    }
-    expect(got.map((c) => (c.kind === "content" ? c.text : c.kind))).toEqual(["Joss ", "lit ", "the ", "lamp.", "done"]);
-    // The chunks that came twice were counted once, and the end is acknowledged.
-    expect(acked).toBe(5);
-    expect(receiver.missing).toBeNull();
-  });
-
-  test("resumes after a reconnect from the chunk after the last one held", () => {
-    const sender = new StreamSender();
-    for (const chunk of [text("a"), text("b"), text("c")]) sender.push(chunk);
-    sender.ack(1);
-    expect(sender.from(2).map((n) => n.seq)).toEqual([2, 3]);
+    // Asked for before it has its chunk: nothing to send again yet, and nothing to let go.
+    expect(sender.from(1)).toEqual([]);
+    expect(sender.ack(1)).toBe(false);
+    sender.push(outcome);
+    // A runtime that held nothing of it when it reconnected is sent it again; one that held it, nothing.
+    expect(sender.from(1)).toEqual([{ seq: 1, chunk: outcome }]);
+    expect(sender.from(2)).toEqual([]);
+    expect(sender.ack(1)).toBe(true);
+    expect(sender.from(1)).toEqual([]);
   });
 });
 
@@ -119,9 +77,11 @@ describe("what crosses the link", () => {
     expect(requestOf({ lah: 1, type: "lah.hello", reqId: "r1" })).toBeNull();
     expect(requestOf({ link: LINK, type: "ping", id: "7", secret: "s" })).toMatchObject({ request: { type: "ping", id: "7" } });
     expect(requestOf({ link: LINK, type: "launch", id: "8" })).toMatchObject({ id: "8", malformed: expect.stringContaining("There is no link request launch") });
-    expect(pushOf({ link: LINK, type: "chunk", stream: "s", seq: 0, chunk: { kind: "content", text: "x" } })).toBeNull();
+    expect(pushOf({ link: LINK, type: "chunk", stream: "s", seq: 0, chunk: outcome })).toBeNull();
     expect(pushOf({ link: LINK, type: "stop", turn: "t1", why: "You stopped the reply in Lumiverse." })).toMatchObject({ type: "stop", turn: "t1" });
-    expect(chunkOf({ kind: "done", result: { content: 1 } })).toBeNull();
+    expect(chunkOf({ kind: "error", message: "The tool failed." })).toBeNull();
+    // What a model's answer crossed as before its calls left the link is no chunk now.
+    expect(chunkOf({ kind: "content", text: "Okoro" })).toBeNull();
   });
 
   test("a version mismatch is said in words that name which side to update", () => {
@@ -140,10 +100,10 @@ describe("the transport's settings", () => {
   });
 
   test("read as the defaults under what the user set, a refused value left out", () => {
-    const read = transportOf({ history: { keep: "all", count: 0 }, runtime: { ackEvery: 8 } });
+    const read = transportOf({ history: { keep: "all", count: 0 }, runtime: { stallMs: 60_000 } });
     expect(read.history).toEqual({ keep: "all", count: TRANSPORT_DEFAULTS.history.count });
-    expect(read.runtime.ackEvery).toBe(8);
-    expect(read.runtime.resendMs).toBe(TRANSPORT_DEFAULTS.runtime.resendMs);
+    expect(read.runtime.stallMs).toBe(60_000);
+    expect(read.runtime.lostMs).toBe(TRANSPORT_DEFAULTS.runtime.lostMs);
     expect(read.tags).toEqual(TRANSPORT_DEFAULTS.tags);
   });
 });

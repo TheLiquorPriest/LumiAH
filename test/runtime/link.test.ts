@@ -13,10 +13,10 @@ import { BUILD, PORT, type Rig, rig, runtimeFor, USER } from "../support/rig";
 
 let r: Rig | null = null;
 let alone: Runtime | null = null;
-afterEach(() => {
-  r?.close();
+afterEach(async () => {
+  await r?.close();
   r = null;
-  alone?.close();
+  await alone?.close();
   alone = null;
 });
 

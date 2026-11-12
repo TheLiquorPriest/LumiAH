@@ -22,8 +22,8 @@ const ELSEWHERE = "chat-elsewhere";
 const HOMES: Readonly<Record<string, string>> = { [AWAY]: "relay-1", [FURTHER]: "relay-2" };
 const NONE_LINKED = "LumiAH needs its runtime for this, and none is linked now. Start it (its line is on LumiAH's Runtime page) and try again.";
 
-/** Asks over the runtimes `linked`, the first of them heard from last. */
-function rig(linked: string[] = ["relay-1"]) {
+/** Asks over the runtimes `linked`, the first of them heard from last, by an extension that names itself as `who` says; a page waits `askMs` where given, else the default. */
+function rig(linked: string[] = ["relay-1"], who: { name: string; settingsAt?: string } = { name: "LumiAH" }, askMs?: number) {
   const pushed: { relay: string; push: LinkPush }[] = [];
   const timers: { ms: number; fn(): void; cancelled: boolean }[] = [];
   const up = new Set(linked);
@@ -40,7 +40,7 @@ function rig(linked: string[] = ["relay-1"]) {
       },
       isLinked: (_userId, relay) => up.has(relay),
     },
-    settings: { transport: async () => TRANSPORT_DEFAULTS },
+    settings: { transport: async () => (askMs === undefined ? TRANSPORT_DEFAULTS : { ...TRANSPORT_DEFAULTS, pages: { ...TRANSPORT_DEFAULTS.pages, askMs } }) },
     onLoopback: async (_userId, chatId) => chatId in HOMES,
     runtimeOf: async (_userId, chatId) => {
       const home = HOMES[chatId];
@@ -49,7 +49,8 @@ function rig(linked: string[] = ["relay-1"]) {
     userRuntime: async () => [...up][0] ?? null,
     runOf: (_userId, _stream, turn) => runs.get(turn) ?? null,
     jobOf: (_userId, job) => jobs.get(job) ?? null,
-    name: "LumiAH",
+    ...who,
+    now: () => 0,
     later: (ms, fn) => {
       const timer = { ms, fn, cancelled: false };
       timers.push(timer);
@@ -142,17 +143,32 @@ describe("something a page asks of the core about a chat on a loopback connectio
   });
 
   test("is given up when the runtime doesn't answer in the time Settings give, unless it is something that takes as long as it takes", async () => {
-    const { asks, timers } = rig();
+    // The Runtime wait set short.
+    const { asks, timers } = rig(["relay-1"], { name: "LumiAH" }, 2_000);
     const slow = refusal(asks.ask(USER, "jobs.list", {}, { chat: AWAY }));
     await settled();
+    expect(timers.map((t) => t.ms)).toEqual([2_000]);
     timers[0]?.fn();
-    expect(await slow).toMatchObject({ code: "unavailable", message: `The runtime didn't answer within ${TRANSPORT_DEFAULTS.pages.askMs / 1000} seconds. It may be busy or restarting: try again in a moment.` });
+    expect(await slow).toMatchObject({ code: "unavailable", message: "The runtime didn't answer within 2 seconds. It may be busy or restarting: try again in a moment. Runtime wait (LumiAH's Settings → Timeouts → Waiting for the runtime) says how long a page waits for it." });
     // What takes as long as it takes is waited for while its runtime stays linked: no clock is set on it.
     const long = asks.ask(USER, "workspace.list", {}, { chat: AWAY, patient: true });
     await settled();
     expect(timers).toHaveLength(1);
     asks.answered(USER, "relay-1", "ask-2", { files: [] }, null);
     expect(await long).toEqual({ files: [] });
+  });
+
+  test("a timeout's words say where the Settings are that hold the wait: the extension's own, or where an extension that builds LumiAH in says they are shown", async () => {
+    const words = async (who: { name: string; settingsAt?: string }): Promise<string> => {
+      const { asks, timers } = rig(["relay-1"], who);
+      const slow = refusal(asks.ask(USER, "jobs.list", {}, { chat: AWAY }));
+      await settled();
+      timers[0]?.fn();
+      return (await slow).message;
+    };
+    const start = `The runtime didn't answer within ${TRANSPORT_DEFAULTS.pages.askMs / 1000} seconds. It may be busy or restarting: try again in a moment.`;
+    expect(await words({ name: "LumiRPEngine" })).toBe(`${start} Runtime wait (LumiRPEngine's Settings → Timeouts → Waiting for the runtime) says how long a page waits for it.`);
+    expect(await words({ name: "LumiRPEngine", settingsAt: "LumiRPEngine's Harness tab → System → Settings" })).toBe(`${start} Runtime wait (LumiRPEngine's Harness tab → System → Settings → Timeouts → Waiting for the runtime) says how long a page waits for it.`);
   });
 
   test("fails at once when the runtime it was asked of goes away", async () => {

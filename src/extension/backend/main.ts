@@ -9,6 +9,14 @@ import { createSpindleHost } from "./spindle";
 const BUILD: string = process.env.LAH_BUILD_ID ?? "dev";
 
 /**
+ * The runtime this build ships beside its backend (`dist/lumiah.js`): its sha256 and its size, which
+ * `bun run build` writes into this bundle beside the build id. A runtime on another build is offered
+ * it. A backend built without them (development) offers none.
+ */
+const RUNTIME_SHA256: string = process.env.LAH_RUNTIME_SHA256 ?? "";
+const RUNTIME_SIZE: string = process.env.LAH_RUNTIME_SIZE ?? "";
+
+/**
  * How often the backend looks at what waits on time alone. Every such timing is a setting of its
  * user's (how long a runtime may stay quiet, a record wait, a stream be kept); this is only the grain
  * they are checked at, one timer for every user, so it is none.
@@ -23,6 +31,7 @@ const backend = createBackend(host, {
     return () => clearTimeout(timer);
   },
   build: BUILD,
+  runtime: { sha256: RUNTIME_SHA256, size: Number(RUNTIME_SIZE) },
 });
 
 setInterval(() => {

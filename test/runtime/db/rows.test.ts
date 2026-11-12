@@ -3,11 +3,11 @@
 // file, read by the reader, and the two reads are held against each other whole. The messages carry
 // what Lumiverse keeps on a message: swipes with the shown one's text, per-swipe extras, hidden, the
 // system role, times in seconds and in milliseconds, entries of several extensions, rows from older
-// Lumiverses, bad JSON, a shown swipe out of range, gaps in the places and two messages at one place.
-// Every chat, book, name and text here is invented.
+// Lumiverses, bad JSON, JSON of shapes Lumiverse never writes but reads all the same, a shown swipe out
+// of range, gaps in the places and two messages at one place. A row Lumiverse itself can't read fails
+// both ways. Every chat, book, name and text here is invented.
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { type EntryRow, entryFrom, type MessageRow, messageFrom } from "../../../src/runtime/db/rows";
 import { Lumiverse } from "../copy/lumiverse";
 import { bookRows, chatRows, httpSource, LUMIAH, lumiverseFile, mirror, reader, removeFiles, USER } from "./rig";
 
@@ -60,6 +60,24 @@ function quay(lumiverse: Lumiverse) {
   return { chat, rows, twin };
 }
 
+/**
+ * The tide tables: rows whose JSON Lumiverse never writes in these shapes but reads all the same.
+ * Swipes stored as JSON text (Lumiverse's lean form makes a slot of each letter, the shown one holding
+ * its letter), as a JSON object, or as a number; and extras stored as a JSON list.
+ */
+function tables(lumiverse: Lumiverse) {
+  const chat = lumiverse.newChat(USER, { id: "chat-tables", name: "The tide tables" });
+  const lettered = lumiverse.say(chat.id, "The ebb leaves the boats aground.");
+  Object.assign(lettered, { swipes: '"Ebb"', swipe_id: 1 });
+  const shapeless = lumiverse.say(chat.id, "The flood lifts them again.");
+  shapeless.swipes = '{"0": "The flood lifts them again."}';
+  const counted = lumiverse.say(chat.id, "Seven bells.");
+  counted.swipes = "7";
+  const listed = lumiverse.say(chat.id, "The keeper writes the tide table.");
+  listed.extra = '["hidden"]';
+  return { chat, lettered, shapeless, counted, listed };
+}
+
 describe("one Lumiverse row comes out of the file as it comes over HTTP", () => {
   test("every message of a chat, whole: swipes, shown text, hidden, role, times, own entry, and Lumiverse's fallbacks for bad rows", async () => {
     const lumiverse = new Lumiverse();
@@ -98,6 +116,27 @@ describe("one Lumiverse row comes out of the file as it comes over HTTP", () => 
     expect(fromFile?.messages.map((m) => m.revision)).toEqual(overHttp?.messages.map((m) => m.revision) ?? []);
   });
 
+  test("rows whose JSON is of shapes Lumiverse never writes: swipes as JSON text, an object or a number, extras as a list", async () => {
+    const lumiverse = new Lumiverse();
+    const { chat, lettered, shapeless, counted, listed } = tables(lumiverse);
+    const file = lumiverseFile();
+    mirror(lumiverse, file);
+
+    const fromFile = await reader(file.path).db.readChat(chat.id);
+
+    expect(chatRows(fromFile)).toEqual(chatRows(await httpSource(lumiverse).readChat(chat.id)));
+    const sent = lumiverse.now * 1000;
+    expect(fromFile?.messages.map((m) => m.row)).toEqual([
+      { id: lettered.id, index: 0, role: "assistant", name: "Joss", swipeId: 1, swipes: 3, content: "The ebb leaves the boats aground.", hidden: false, own: null, at: sent },
+      { id: shapeless.id, index: 1, role: "assistant", name: "Joss", swipeId: 0, swipes: 1, content: "The flood lifts them again.", hidden: false, own: null, at: sent },
+      { id: counted.id, index: 2, role: "assistant", name: "Joss", swipeId: 0, swipes: 1, content: "Seven bells.", hidden: false, own: null, at: sent },
+      { id: listed.id, index: 3, role: "assistant", name: "Joss", swipeId: 0, swipes: 1, content: "The keeper writes the tide table.", hidden: false, own: null, at: sent },
+    ]);
+    // What a letter in the shown slot stands for is the copy's own rule (held against HTTP's above): here, only that there are three slots. Swipes of no list give no texts.
+    expect(fromFile?.messages[0]?.texts).toHaveLength(3);
+    expect(fromFile?.messages.slice(1).map((m) => m.texts)).toEqual([[], [], ["The keeper writes the tide table."]]);
+  });
+
   test("an extension LumiAH is built into reads its own entry, not LumiAH's", async () => {
     const lumiverse = new Lumiverse();
     const story = harbour(lumiverse);
@@ -123,7 +162,7 @@ describe("one Lumiverse row comes out of the file as it comes over HTTP", () => 
     expect(fromFile?.messages.map((m) => m.row.id).slice(2, 4)).toEqual([rows[3]?.id, twin.id]);
   });
 
-  test("a chat's cheap signature names the newest message and the count as HTTP does", async () => {
+  test("a chat's cheap signature: the count, the newest message and the chat's own row, as HTTP gives them, and a fingerprint besides", async () => {
     const lumiverse = new Lumiverse();
     const story = harbour(lumiverse);
     const file = lumiverseFile();
@@ -132,15 +171,16 @@ describe("one Lumiverse row comes out of the file as it comes over HTTP", () => 
     const fromFile = await reader(file.path).db.chatSignature(story.chat.id);
     const overHttp = await httpSource(lumiverse).chatSignature(story.chat.id);
 
-    expect({ count: fromFile?.count, last: fromFile?.last }).toEqual({ count: overHttp?.count, last: overHttp?.last });
+    expect(fromFile).toEqual(overHttp === null ? null : { ...overHttp, fingerprint: expect.any(String) });
     expect(fromFile?.last?.id).toBe(story.legacy.id);
+    expect(fromFile?.chat?.metadata).toEqual({ chat_world_book_ids: ["book-quay"], pinned: { by: "Mara" } });
   });
 
-  test("a world book and its entries, in the book's order across pages, with the fields Lumiverse splits out of an entry's extensions", async () => {
+  test("a world book and its entries, in the book's order across pages, with the fields Lumiverse splits out of an entry's extensions under either spelling", async () => {
     const lumiverse = new Lumiverse();
     const book = lumiverse.newBook(USER, { id: "book-quay", name: "The quay", description: "Stones and tides.", metadata: { lumibooks_summary: { messages: [] } } });
     lumiverse.addEntry(book.id, { comment: "Spring tide", content: "The quay floods at spring tide.", key: ["tide", "flood"], order: 50, extensions: { outlet_name: "weather", wi_marker: "after", lumibooks: { tier: 1 } } });
-    const keeper = lumiverse.addEntry(book.id, { comment: "The keeper", content: "Ilse keeps the light.", order: 100 });
+    const keeper = lumiverse.addEntry(book.id, { comment: "The keeper", content: "Ilse keeps the light.", order: 100, extensions: { outletName: "keepers", wiMarker: "world_info_before", wiMarkerSide: "Before", wi_marker_side: "after", kept: { by: "Ilse" } } });
     Object.assign(keeper, { role: "assistant", use_regex: 1, vectorized: 1, disabled: 1, constant: 1, keysecondary: '["lamp"]' });
     // Four at one order, told apart by their ids as text ("entry-11" before "entry-5"), one of them stamped by Lumiverse in milliseconds.
     for (const name of ["Bollard", "Capstan", "Anchor"]) lumiverse.addEntry(book.id, { comment: name, content: `The ${name.toLowerCase()} on the quay.`, order: 70 });
@@ -156,83 +196,56 @@ describe("one Lumiverse row comes out of the file as it comes over HTTP", () => 
     expect(fromFile?.book).toEqual({ id: "book-quay", name: "The quay", description: "Stones and tides.", metadata: { lumibooks_summary: { messages: [] } }, updatedAt: lumiverse.now * 1000 });
     expect(fromFile?.entries.map((e) => e.row.title)).toEqual(["Spring tide", "Lantern", "Bollard", "Capstan", "Anchor", "The keeper"]);
     expect(fromFile?.entries[0]?.row.extensions).toEqual({ lumibooks: { tier: 1 } });
+    expect(fromFile?.entries.at(-1)?.row.extensions).toEqual({ kept: { by: "Ilse" } });
     expect(fromFile?.entries.at(-1)?.row).toMatchObject({ role: "assistant", regex: true, vectorized: true, enabled: false, constant: true, secondaryKeys: ["lamp"] });
     expect(fromFile?.entries[1]?.row.updatedAt).toBe(Date.UTC(2026, 10, 12, 8, 0, 0));
   });
 });
 
-/** A message row as the reader selects one, Lumiverse's defaults where a test says nothing. */
-function messageRow(row: Partial<MessageRow>): MessageRow {
-  return {
-    at: 1,
-    id: "msg-1",
-    index_in_chat: 0,
-    is_user: 0,
-    name: "Joss",
-    content: "The light turns.",
-    send_date: 1_700_000_000,
-    swipe_id: 0,
-    swipes: '["The light turns."]',
-    extra: "{}",
-    created_at: 1_700_000_000,
-    revision: 1,
-    content_bytes: 16,
-    swipes_bytes: 20,
-    extra_bytes: 2,
-    ...row,
-  };
-}
+describe("a row Lumiverse itself can't read", () => {
+  test("fails its chat's or its book's read over HTTP and from the file alike; the file's words name the row, and the reader stays on", async () => {
+    const lumiverse = new Lumiverse();
+    const chats: { id: string; why: string }[] = [];
+    const nulled = lumiverse.newChat(USER, { id: "chat-nulled" });
+    lumiverse.say(nulled.id, "The lamp is lit.");
+    const gutters = lumiverse.say(nulled.id, "The lamp gutters.");
+    gutters.swipes = "null";
+    chats.push({ id: nulled.id, why: `Lumiverse itself can't read message ${gutters.id} of chat ${nulled.id} (its swipes are null), so the chat isn't read from its database either.` });
+    // Swipes stored as an object that claims more slots than any list may hold.
+    const boasting = lumiverse.newChat(USER, { id: "chat-boasting" });
+    const boast = lumiverse.say(boasting.id, "Every swipe the sea ever made.");
+    boast.swipes = '{"length": 5000000000}';
+    chats.push({ id: boasting.id, why: `Lumiverse itself can't read message ${boast.id} of chat ${boasting.id} (its swipes claim a length no list of them can have), so the chat isn't read from its database either.` });
+    const books: { id: string; why: string }[] = [];
+    for (const [field, stored, said] of [
+      ["key", "[tide", "its keys aren't JSON"],
+      ["keysecondary", "lamp", "its secondary keys aren't JSON"],
+      ["extensions", "{", "its extensions aren't JSON"],
+    ] as const) {
+      const book = lumiverse.newBook(USER);
+      lumiverse.addEntry(book.id, { comment: "Sound", content: "An entry Lumiverse reads." });
+      const broken = lumiverse.addEntry(book.id, { comment: "Broken", content: "An entry it can't." });
+      Object.assign(broken, { [field]: stored });
+      books.push({ id: book.id, why: `Lumiverse itself can't read entry ${broken.id} of world book ${book.id} (${said}), so the book isn't read from its database either.` });
+    }
+    const unlabelled = lumiverse.newBook(USER);
+    unlabelled.metadata = "{";
+    books.push({ id: unlabelled.id, why: `Lumiverse itself can't read world book ${unlabelled.id} (its metadata isn't JSON), so the book isn't read from its database either.` });
+    const file = lumiverseFile();
+    mirror(lumiverse, file);
+    const { db } = reader(file.path);
+    const http = httpSource(lumiverse);
 
-function entryRow(row: Partial<EntryRow>): EntryRow {
-  return {
-    id: "entry-1",
-    world_book_id: "book-1",
-    key: '["tide"]',
-    keysecondary: "[]",
-    content: "The quay floods.",
-    comment: "Tide",
-    role: null,
-    order_value: 100,
-    constant: 0,
-    disabled: 0,
-    use_regex: 0,
-    vectorized: 0,
-    extensions: "{}",
-    revision: 1,
-    updated_at: 1_700_000_000,
-    content_bytes: 16,
-    extensions_bytes: 2,
-    ...row,
-  };
-}
-
-describe("rows the made-up Lumiverse has no shape for, read as Lumiverse's own mappers read them", () => {
-  test("an entry's outlet and marker under their other spellings are taken out of its extensions too", () => {
-    const entry = entryFrom(entryRow({ extensions: JSON.stringify({ outletName: "weather", wiMarker: "after", wiMarkerSide: "before", wi_marker_side: "after", kept: 1 }) }));
-    expect(entry.row.extensions).toEqual({ kept: 1 });
-  });
-
-  test("swipes stored as a JSON text count its letters, as Lumiverse's lean form does", () => {
-    const message = messageFrom(messageRow({ swipes: '"abc"', swipe_id: 1 }), LUMIAH);
-    expect(message.row).toMatchObject({ swipes: 3, swipeId: 1, content: "The light turns." });
-    expect(message.texts).toEqual([null, "b", null]);
-  });
-
-  test("swipes stored as a JSON object, or a number, make a message of one swipe", () => {
-    expect(messageFrom(messageRow({ swipes: '{"first": "x"}' }), LUMIAH).row.swipes).toBe(1);
-    expect(messageFrom(messageRow({ swipes: "7" }), LUMIAH).row.swipes).toBe(1);
-  });
-
-  test("extras that are JSON but no object say nothing of a message", () => {
-    expect(messageFrom(messageRow({ extra: '["hidden"]' }), LUMIAH).row).toMatchObject({ hidden: false, role: "assistant", own: null });
-    expect(messageFrom(messageRow({ extra: "true" }), LUMIAH).row).toMatchObject({ hidden: false, own: null });
-  });
-
-  test("rows Lumiverse's own mappers fail on are refused, each saying why", () => {
-    expect(() => messageFrom(messageRow({ swipes: "null" }), LUMIAH)).toThrow("its swipes are null");
-    expect(() => messageFrom(messageRow({ swipes: '{"length": 4000000000}' }), LUMIAH)).toThrow("its swipes claim a length no list of them can have");
-    expect(() => entryFrom(entryRow({ key: "[tide" }))).toThrow("its keys aren't JSON");
-    expect(() => entryFrom(entryRow({ keysecondary: "lamp" }))).toThrow("its secondary keys aren't JSON");
-    expect(() => entryFrom(entryRow({ extensions: "{" }))).toThrow("its extensions aren't JSON");
+    for (const { id, why } of chats) {
+      expect(await http.readChat(id).catch((error: unknown) => error)).toBeInstanceOf(Error);
+      expect(await http.chatSignature(id).catch((error: unknown) => error)).toBeInstanceOf(Error);
+      expect(await db.readChat(id).catch((error: unknown) => error)).toMatchObject({ message: why });
+      expect(await db.chatSignature(id).catch((error: unknown) => error)).toMatchObject({ message: why });
+    }
+    for (const { id, why } of books) {
+      expect(await http.readBook(id, null).catch((error: unknown) => error)).toBeInstanceOf(Error);
+      expect(await db.readBook(id, null).catch((error: unknown) => error)).toMatchObject({ message: why });
+    }
+    expect(db.describe()).toMatchObject({ on: true, why: null });
   });
 });

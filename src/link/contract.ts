@@ -15,31 +15,31 @@
 //   the secret its runtime already holds: it then keeps the registration and binds no session.
 // - `hello` says the link version both ways; a mismatch is refused in words that name which side
 //   to update (`versionWords`).
-// - A stream (a model call's answer, a passthrough's) is named by the runtime before it asks, so no
-//   chunk can arrive for a stream it doesn't know. Its chunks are numbered from 1 with no gap; the
-//   extension keeps them until they are acknowledged; the runtime reorders, drops duplicates, asks
-//   `stream.resend` after a gap, and acknowledges in batches and always the terminal chunk
-//   (stream.ts holds both ends' bookkeeping).
-// - A stream ends with exactly one terminal chunk: `done` (the whole answer) or `error`.
+// - A stream (a tool's run in the extension, a tool call held for the user's word) is named by the
+//   runtime before it asks, so no chunk can arrive for a stream it doesn't know. It carries one
+//   chunk, its outcome (`value` or `error`), numbered 1; the extension keeps it until the runtime
+//   acknowledges it, and sends it again to a runtime that reconnected (stream.ts).
 // - A runtime carries only its own account's turns: a loopback key or a turn's tag of another user
 //   is refused.
 // - A frame too large for Lumiverse's socket crosses in parts (parts.ts), either way.
 // - The reads and writes of the core's ports (`blob.*`, `doc.*`, `chat.*`, `lore.*`, `preset.*`,
-//   `connections.*`, `model.call`, `trace.push`, `recall.*`, `book.read`) carry the ports' own
-//   shapes (src/core/ports.ts, src/core/recall/ports.ts), so the two can't drift apart.
+//   `trace.push`, `recall.*`, `book.read`) carry the ports' own shapes (src/core/ports.ts,
+//   src/core/recall/ports.ts), so the two can't drift apart. The core's model calls and connections
+//   are the runtime's own (runtime/models): none of them crosses the link.
 // - A notice is what the runtime tells the extension without waiting for an answer: a model's
 //   answer as it arrives, for the live view. It has no id and no secret. The extension takes one
 //   only from a session a hello bound to a runtime, in the order they were sent; one that is lost
 //   is not sent again.
 
-import type { ActivatedLore, ApprovalAsk, BlobInfo, ChatBook, ChatInfo, ChatMessage, ConnectionInfo, ConnectionProfile, JobView, LoreBook, LoreEntry, ModelRequest, ModelResult, PathMessage, PresetBlock, RemoteTool, RemoteToolCall, RequestSource, StoredAnchor, TraceDelta, TraceRecord, TurnKind, TurnRecord } from "../core/ports";
+import type { ActivatedLore, ApprovalAsk, BlobInfo, ChatBook, ChatInfo, ChatMessage, JobView, LoreBook, LoreEntry, PathMessage, PresetBlock, RemoteTool, RemoteToolCall, RequestSource, StoredAnchor, TraceDelta, TraceRecord, TurnKind, TurnRecord } from "../core/ports";
 import type { ActivatedEntry, Databank, DatabankDocument, EmbedderInfo, LoreBookRead, MemoryArc, MemoryEntity, MemoryEntityBrief, MemoryHit, TimedMessage, WebResult } from "../core/recall/ports";
 import type { JsonObject, JsonValue } from "./json";
+import type { ActivatedInfo } from "../host/rows";
 
 export type { TurnKind } from "../core/ports";
 
-/** The level of this contract: `hello` says it both ways, and each end refuses another. */
-export const LINK_VERSION = 1;
+/** The level of this contract: `hello` says it both ways, and each end refuses another. 2: the model calls, the passthrough and the connections left the link for the runtime's own model layer. */
+export const LINK_VERSION = 2;
 
 /** The key every frame of the link carries, with this value. */
 export const LINK = "lumiah-link";
@@ -101,6 +101,48 @@ export const STREAM_ID = /^[0-9a-f]{32}$/;
 
 /** A blob's key: the core's hash of its text (SHA-256, lower-case hex). */
 export const BLOB_HASH = /^[0-9a-f]{64}$/;
+
+/** A document's path in the extension's storage: names of letters, digits, `.`, `_` and `-`, joined by `/`, none of them `.` or `..`. A format, not a limit: a path is a name the code gives, and no name it gives grows with use. The extension refuses any other, and so does the runtime's working copy, which never keeps what the extension would refuse. */
+export const DOC_PATH = /^(?!.*(?:^|\/)\.{1,2}(?:\/|$))[A-Za-z0-9._-]{1,128}(?:\/[A-Za-z0-9._-]{1,128}){0,7}$/;
+
+/** A prefix of documents' paths: as a path's names, and it may end with `/` or inside a name; empty for every document. */
+export const DOC_PREFIX = /^(?!.*(?:^|\/)\.{1,2}(?:\/|$))(?:[A-Za-z0-9._-]{1,128}\/){0,7}[A-Za-z0-9._-]{0,128}$/;
+
+/** Where the mirror's mark is kept in the extension's storage: a document of the runtime's working store beside the core's, at a path none of the core's can be (`docs/mirror.json`). It names the working copy the mirror mirrors and how many changes it took from it; the extension takes no runtime's own write there. */
+export const MARK_PATH = "mirror.json";
+
+/** A working copy's id, and a process's own as it holds the mirror: 128 random bits as hex. */
+export const MIRROR_ID = /^[0-9a-f]{32}$/;
+
+/**
+ * What a runtime says of its working copy on `hello`: the copy's id (its folder for this user and
+ * extension), this process's own id as it would hold the mirror (what its writes to the mirror
+ * carry), whether it asks to hold the mirror (a process that lost it never asks again), and the
+ * last of the extension's counts of what a holder may have missed (`MirrorWord.gen`) its copy took.
+ */
+export interface MirrorAsk {
+  copy: string;
+  process: string;
+  asks: boolean;
+  seen: number;
+}
+
+/**
+ * The extension's word on who holds the mirror, to one runtime: on each hello's answer, and pushed
+ * (`mirror`) whenever it changes for that runtime or another runtime changed the storage under the
+ * holder. Only the runtime that holds the mirror keeps a working copy; any other reads and writes the
+ * storage directly. `gen`: how many times the holder may have missed being told of another runtime's
+ * change (its link was down); a holder whose copy took fewer drops what the storage holds of it.
+ */
+export interface MirrorWord {
+  /** Whether this runtime holds the mirror now. */
+  held: boolean;
+  /** The runtime that does, as a person knows it (its name and machine), when another does; null when none does, or this one does. */
+  holder: string | null;
+  gen: number;
+  /** To the holder: what of its copy to drop, so its next read is the storage's: the documents and blobs another runtime wrote or removed, or `all` (every one the storage holds; what it hasn't had yet stays). */
+  dropped?: { docs: string[]; blobs: string[]; all: boolean };
+}
 
 /**
  * The largest frame either end sends whole. Lumiverse's socket closes on a larger one from a client
@@ -201,63 +243,11 @@ export type Anchoring = "now" | "on_save" | "never";
 // ---------------------------------------------------------------- stream chunks
 
 /**
- * A piece of a stream: the answer's text and the model's reasoning as they are written, then exactly
- * one terminal chunk: `done` with the whole answer as Lumiverse's generation API gave it; `value`
- * with the outcome of something else that takes its time (a tool that ran in the extension, the
- * user's answer to an approval), which rides a stream so it survives a reconnect and can be given
- * up like a call; or `error` with the provider's, the tool's or Lumiverse's own words.
+ * A stream's one chunk: `value` with the outcome of something that takes its time (a tool that ran
+ * in the extension, the user's answer to an approval), which rides a stream so it survives a
+ * reconnect and can be given up like a call; or `error` with the tool's or Lumiverse's own words.
  */
-export type StreamChunk =
-  | { kind: "content"; text: string }
-  | { kind: "reasoning"; text: string }
-  | { kind: "done"; result: ModelResult }
-  | { kind: "value"; value: JsonValue }
-  | { kind: "error"; message: string; code: string };
-
-/** Whether a chunk ends its stream. */
-export function terminal(chunk: StreamChunk): boolean {
-  return chunk.kind === "done" || chunk.kind === "value" || chunk.kind === "error";
-}
-
-// ---------------------------------------------------------------- a request passed through
-
-/**
- * A part of a passed-through message, as Lumiverse's generation call carries one: text, media as
- * its data (an image, audio or video, base64), a tool call the model made, or a tool's result
- * going back. `cacheControl` is the part's cache breakpoint, as the request gave it.
- */
-export type PassedPart =
-  | { type: "text"; text: string; cacheControl?: JsonObject }
-  | { type: "media"; media: "image" | "audio" | "video"; data: string; mimeType: string; cacheControl?: JsonObject }
-  | { type: "tool_use"; id: string; name: string; input: JsonObject }
-  | { type: "tool_result"; toolUseId: string; content: string; cacheControl?: JsonObject };
-
-/**
- * A message of a request passed through (one with no tag): everything of it that Lumiverse's
- * generation call has a place for. Its content is its text as it came, or its parts where the
- * request gave parts, tool calls or tool results. `name` is the participant's name; `prefix` marks
- * an assistant message the model is to continue (`prefix: true` or `partial: true` in the request,
- * `partial` to Lumiverse); `reasoning` and `reasoningDetails` are an assistant turn's reasoning,
- * sent back as the model gave it (`reasoning_content`, `reasoning_details`). What a request holds
- * beyond these the runtime refuses the request for (runtime/openai.ts): nothing is dropped.
- */
-export interface PassedMessage {
-  role: "system" | "user" | "assistant";
-  content: string | PassedPart[];
-  name?: string;
-  prefix?: true;
-  cacheControl?: JsonObject;
-  reasoning?: string;
-  reasoningDetails?: JsonObject[];
-}
-
-/** A tool a passed-through request offers: a function, its parameters as a JSON Schema, and `strict` where the request said it. */
-export interface PassedTool {
-  name: string;
-  description: string;
-  parameters: JsonObject;
-  strict?: boolean;
-}
+export type StreamChunk = { kind: "value"; value: JsonValue } | { kind: "error"; message: string; code: string };
 
 // ---------------------------------------------------------------- requests and their results
 
@@ -274,9 +264,9 @@ export interface LinkRequests {
    */
   register: { fields: { name: string; build: string; host: string; listen: string; port: number; secret?: string }; result: { relay: string; secret: string; model: string; user: string; backend?: LinkedBackend } };
   /** On every socket the runtime opens: binds its pushes to this session and resumes its open streams from the chunk after `seq`. `lost`: the streams the extension no longer holds (it restarted). `settings`: the user's settings' revision now. `backend`: who it is linked to. */
-  hello: { fields: { secret: string; version: number; build: string; report: RuntimeReport; open: OpenStream[] }; result: { relay: string; version: number; build: string; lost: string[]; settings: number; extension?: ExtensionOffer | null; backend?: LinkedBackend } };
+  hello: { fields: { secret: string; version: number; build: string; report: RuntimeReport; open: OpenStream[]; mirror?: MirrorAsk | null }; result: { relay: string; version: number; build: string; lost: string[]; settings: number; extension?: ExtensionOffer | null; backend?: LinkedBackend; copy?: CopyOffer; mirror?: MirrorWord } };
   /** The heartbeat, naming the streams the runtime reads and the turns it answers: the streams the extension no longer holds end at once, and a turn its runtime no longer names is over. */
-  ping: { fields: { secret: string; report: RuntimeReport; streams: string[]; turns: string[] }; result: { lost: string[] } };
+  ping: { fields: { secret: string; report: RuntimeReport; streams: string[]; turns: string[] }; result: { lost: string[]; told?: number } };
   /** `GET /v1/models` (the connection's model list and its Test): whether the key is the user's loopback key. */
   models: { fields: { secret: string; key: string }; result: { models: { id: string }[] } };
   /** A tagged request: the tag checked and spent, answered with the turn. `request` is the runtime's own id for it: asked again (after a reconnect), it answers as before; another request with the same tag is refused. */
@@ -287,20 +277,9 @@ export interface LinkRequests {
    * record finds its message even when the extension started again while the turn ran.
    */
   "turn.commit": { fields: { secret: string; turn: string; chat: string; target: { message: string | null; swipe: number }; record: TurnRecord }; result: { anchoring: Anchoring } };
-  /**
-   * An untagged request: run as given on `connection` (the writer's; null: the user's default),
-   * answered on `stream`. Its messages and tools are whole (`PassedMessage`, `PassedTool`);
-   * `parameters` is every field of the request's body but its messages, tools, model and stream
-   * flags, as Lumiverse sent them.
-   */
-  passthrough: { fields: { secret: string; key: string; stream: string; connection: string | null; messages: PassedMessage[]; tools: PassedTool[]; parameters: JsonObject }; result: { accepted: true } };
-  /** One model call of an agent, answered on `stream`. `turn` names the turn it serves, so Lumiverse's Stop ends it; null outside one. `chat`: the chat of the run it serves (absent or `""`: none); a call that names no connection goes on the one that chat lends its agents (`connections.get`). */
-  "model.call": { fields: { secret: string; stream: string; turn: string | null; request: ModelRequest; chat?: string }; result: { accepted: true } };
-  /** The runtime holds every chunk of `stream` through `seq`. `done`: the stream is over and forgotten. */
+  /** The runtime holds the chunk of `stream` (`seq`, 1). `done`: the stream is over and forgotten. */
   "stream.ack": { fields: { secret: string; stream: string; seq: number }; result: { done: boolean } };
-  /** A gap: push the stream's chunks again from `from`. `last`: the last chunk the extension holds; null when it holds none. */
-  "stream.resend": { fields: { secret: string; stream: string; from: number }; result: { last: number | null } };
-  /** The runtime gave a stream up before its terminal chunk (its caller cancelled it). */
+  /** The runtime gave a stream up before its chunk came (its caller cancelled it). */
   "stream.cancel": { fields: { secret: string; stream: string; reason: string }; result: { cancelled: boolean } };
   /** The user's settings and texts now. */
   "settings.get": { fields: { secret: string }; result: SettingsSnapshot };
@@ -308,11 +287,16 @@ export interface LinkRequests {
   "trace.push": { fields: { secret: string; records: TraceRecord[] }; result: { taken: number } };
   /** What became of a `connection` push: the loopback connection the runtime made or put the key in, or why it couldn't. */
   "setup.connection": { fields: { secret: string; ref: string; connection: { id: string; name: string } | null; problem: string | null }; result: { taken: true } };
+  // The extension's storage, the core's documents and blobs (`docs/`, `blobs/`). A write that names
+  // `mirror` comes from a runtime's working copy as the process that holds the mirror (the hello's
+  // `MirrorAsk.process`): the extension takes it only from the runtime it lets hold the mirror, and
+  // refuses any other with `conflict`, for good. One without is a runtime's own (it keeps no copy):
+  // taken from any runtime of the user's, and the holder is told of the path (a `mirror` push).
   "blob.get": { fields: { secret: string; hash: string }; result: { text: string | null } };
-  "blob.put": { fields: { secret: string; hash: string; text: string }; result: { stored: true } };
+  "blob.put": { fields: { secret: string; hash: string; text: string; mirror?: string }; result: { stored: true } };
   "doc.get": { fields: { secret: string; path: string }; result: { doc: JsonValue | null } };
-  "doc.put": { fields: { secret: string; path: string; doc: JsonValue }; result: { written: true } };
-  "doc.remove": { fields: { secret: string; path: string }; result: { removed: true } };
+  "doc.put": { fields: { secret: string; path: string; doc: JsonValue; mirror?: string }; result: { written: true } };
+  "doc.remove": { fields: { secret: string; path: string; mirror?: string }; result: { removed: true } };
   /** The chat's active path, oldest first, each message with its anchor for the swipe it shows. */
   "chat.path": { fields: { secret: string; chat: string }; result: { messages: PathMessage[] } };
   /** The active path's messages whose index is `from` or more and less than `to`, with their text. */
@@ -326,9 +310,6 @@ export interface LinkRequests {
   "lore.activated": { fields: { secret: string; chat: string; generation: string }; result: { entries: ActivatedLore[] } };
   /** A preset's blocks, in order, each switched on or off as it is for `chat` (a chat's preset binding may set its own over the preset's); null: as the preset has them. */
   "preset.blocks": { fields: { secret: string; preset: string; chat: string | null }; result: { blocks: PresetBlock[] } };
-  "connections.list": { fields: { secret: string }; result: { connections: ConnectionInfo[] } };
-  /** One connection (null: the user's default). `chat`: the chat of the run that asks (absent or `""`: none). Asked for none in a run of a chat, which plays in a runtime, it is the connection that chat was on before it was pinned to the loopback, else the one the user has selected in Lumiverse, else the default; never a loopback, and null when there is none of these (DESIGN §25). */
-  "connections.get": { fields: { secret: string; connection: string | null; chat?: string }; result: { profile: ConnectionProfile | null } };
   /** The tools that run in the extension, as they stand for a chat (`""`: none): the extension's own, and those of the MCP servers the user left on (DESIGN §13, §16). */
   "tools.list": { fields: { secret: string; chat: string }; result: { tools: RemoteTool[] } };
   /** Runs one of them, answered on `stream` with one `value` chunk: `{ text, error? }`. `turn` is the run it serves, so the run's stop ends it. */
@@ -339,7 +320,9 @@ export interface LinkRequests {
   "extension.call": { fields: { secret: string; member: ExtensionMember; arg: JsonValue }; result: { supplied: boolean; value: JsonValue } };
   /** Every blob stored, a page at a time, for upkeep (§20). `cursor`: the `next` of the page before; null for the first. */
   "blob.list": { fields: { secret: string; cursor: string | null }; result: { blobs: BlobInfo[]; next: string | null } };
-  "blob.remove": { fields: { secret: string; hashes: string[] }; result: { removed: true } };
+  "blob.remove": { fields: { secret: string; hashes: string[]; mirror?: string }; result: { removed: true } };
+  /** The process that holds the mirror lets it go (its runtime is stopping, and the mirror holds everything it saved): the next runtime to say hello may hold it at once. `released` false when that process doesn't hold it. */
+  "mirror.release": { fields: { secret: string; mirror: string }; result: { released: boolean } };
   /** The path of every document under a prefix, at any depth. */
   "doc.list": { fields: { secret: string; prefix: string }; result: { paths: string[] } };
   /** The chat itself; null when the user has no such chat. */
@@ -348,8 +331,8 @@ export interface LinkRequests {
   "chat.anchors": { fields: { secret: string; cursor: string | null }; result: { anchors: StoredAnchor[]; next: string | null } };
   /** A job was queued, or changed (it began, was paused or resumed, or ended): for the pages' lists, and to tell the user when one finishes or needs them (§15). */
   "job.changed": { fields: { secret: string; job: JobView }; result: { taken: true } };
-  /** What the runtime answered to an `ask` push: its value (null where the op gives none), or what refused it: one of the pages' error codes (`internal` for a failure of the runtime's own), words the page shows, and what was wrong with a value where the core says. */
-  "ask.answer": { fields: { secret: string; ask: string; value: JsonValue; refusal: { code: string; message: string; problems?: JsonValue } | null }; result: { taken: true } };
+  /** What the runtime answered to an `ask` push: its value (null where the op gives none), or what refused it: one of the pages' error codes (`internal` for a failure of the runtime's own), words the page shows, and what was wrong with a value where the core says. `took`: how long the runtime worked on it, in ms, for the timing log (absent from a runtime from before it). */
+  "ask.answer": { fields: { secret: string; ask: string; value: JsonValue; refusal: { code: string; message: string; problems?: JsonValue } | null; took?: number }; result: { taken: true } };
   // What the lore and history tools read beyond `lore.*` and `chat.*` (DESIGN §24): each member of
   // the core's `RecallPorts`, and a chat's book (§23), for the runtime's own user. A backend from
   // before them knows none of these requests and says so; the runtime then reads what the older
@@ -383,6 +366,25 @@ export interface LinkRequests {
   "recall.web.search": { fields: { secret: string; query: string; count: number; pages: boolean }; result: { results: WebResult[] } };
   /** The chat's LumiBooks book; null when it has none. */
   "book.read": { fields: { secret: string; chat: string }; result: { book: ChatBook | null } };
+  // What the runtime's copy of chat and lore asks of the extension (PI-BUILD-PLAN §4.5): the reads it
+  // can't vouch for or doesn't keep, a mounting extension's records kept elsewhere, and what only the
+  // extension heard of a chat's latest generation.
+  /**
+   * One read of the extension's own host (`chats` or `lore`, host/rows.ts), answered as the host
+   * answers it for the runtime's own user: `args` are the member's arguments without the user, whom
+   * the extension puts in. A read by a chat's id alone is answered only for a chat of that user's.
+   */
+  "host.read": { fields: { secret: string; port: "chats" | "lore"; method: string; args: JsonValue[] }; result: { value: JsonValue } };
+  /** What the extension LumiAH is built into keeps of LumiAH's records on a chat's messages, elsewhere than on the messages (`CopyOffer.ownElsewhere`): each message's entry, by its id; a message it doesn't name has none. */
+  "own.read": { fields: { secret: string; chat: string }; result: { entries: Record<string, JsonValue> } };
+  /**
+   * The persona the chat's latest generation that LumiAH heard was assembled for (absent: none heard
+   * since the extension started; null: it had none), the World Info entries Lumiverse activated for
+   * it, and the lists of world books the chat's lore is read with (`books`), so that none of them
+   * crosses on its own: `character` names the chat's character, whose books are one of them. A backend
+   * from before `books` gives none, and the runtime asks each list as it needs it (`host.read`).
+   */
+  "turn.lore": { fields: { secret: string; chat: string; character?: string }; result: { persona?: string | null; activated: ActivatedInfo[]; books?: TurnBooks } };
 }
 
 export type LinkRequestType = keyof LinkRequests;
@@ -400,6 +402,8 @@ export interface LinkResultFrame {
   type: "result";
   id: string;
   body: unknown;
+  /** How long the extension worked on the request, in ms, for the runtime's timing log (absent from an extension from before it). */
+  took?: number;
 }
 
 export interface LinkErrorFrame {
@@ -408,6 +412,7 @@ export interface LinkErrorFrame {
   id: string;
   code: LinkErrorCode;
   message: string;
+  took?: number;
 }
 
 // ---------------------------------------------------------------- pushes
@@ -481,7 +486,64 @@ export interface AskPush {
   args: JsonObject;
 }
 
-export type LinkPush = ChunkPush | StopPush | SettingsPush | SecretPush | ConnectionPush | AskPush;
+/**
+ * The extension's own copy of the runtime, offered to a runtime that said hello on another build:
+ * the build, where the file is, and its sha256 (hex). The extension sends only its own (the file
+ * beside its backend, and the hash its build wrote in), and the runtime takes it only from the file
+ * it was set up from, when the bytes there hash as offered (runtime/update).
+ */
+export interface UpdatePush {
+  link: typeof LINK;
+  type: "update";
+  build: string;
+  path: string;
+  sha256: string;
+}
+
+/** The extension started anew and knows no runtime's session: a runtime linked to it says hello again now, rather than at its next ping. */
+export interface GreetPush {
+  link: typeof LINK;
+  type: "greet";
+}
+
+/** The extension's word on who holds the mirror changed for this runtime, or another runtime changed the storage under it (it holds the mirror): `MirrorWord`. */
+export interface MirrorPush extends MirrorWord {
+  link: typeof LINK;
+  type: "mirror";
+}
+
+/**
+ * One of Lumiverse's events about the user's chats and world books (`COPY_EVENTS`), as the extension
+ * heard it, for the runtime's copy of chat and lore: its name, its payload untouched, and whose it is
+ * (only that user's runtimes are sent it). `seq` numbers it with the `own` and `copy` pushes this
+ * runtime is sent: a gap says one was lost, and the copy reads again what it holds.
+ */
+export interface EventPush {
+  link: typeof LINK;
+  type: "event";
+  seq: number;
+  name: string;
+  payload: JsonValue;
+  userId: string;
+}
+
+/** The extension LumiAH is built into changed what it keeps of LumiAH's records on a chat's messages (`own.read`). Numbered as `EventPush` is. */
+export interface OwnPush {
+  link: typeof LINK;
+  type: "own";
+  seq: number;
+  chat: string;
+}
+
+/** What the runtime's copy may read changed (a permission granted or revoked, the database reader switched): the offer as it stands now. Numbered as `EventPush` is. */
+export interface CopyPush {
+  link: typeof LINK;
+  type: "copy";
+  seq: number;
+  offer: Omit<CopyOffer, "told">;
+}
+
+export type LinkPush = ChunkPush | StopPush | SettingsPush | SecretPush | ConnectionPush | AskPush | UpdatePush | GreetPush | EventPush | OwnPush | CopyPush | MirrorPush;
 
 // ---------------------------------------------------------------- the extension LumiAH is built into
 
@@ -511,10 +573,54 @@ export interface LinkedBackend {
   name: string;
   /** The name the runtime gives the loopback connection it makes. */
   connection: string;
+  /** Where its Settings are shown, where that isn't "<name>'s Settings" (`BackendIdentity.settingsAt`): what a timeout's words name. */
+  settingsAt?: string;
 }
 
 /** LumiAH's own, which a runtime takes where a backend doesn't say who it is (one from before it could). */
 export const OWN_BACKEND: LinkedBackend = { name: "LumiAH", connection: "LumiAH" };
+
+// ---------------------------------------------------------------- the runtime's copy of chat and lore
+
+/** Lumiverse's events the extension forwards to the user's runtimes (`EventPush`): every change to a chat, its messages or a world book that Lumiverse tells of. */
+export const COPY_EVENTS = ["MESSAGE_SENT", "MESSAGE_EDITED", "MESSAGE_DELETED", "MESSAGE_SWIPED", "SWIPE_EDITED", "CHAT_CHANGED", "CHAT_DELETED", "CHAT_FORKED", "WORLD_BOOK_CHANGED", "WORLD_BOOK_DELETED", "WORLD_BOOK_ENTRY_CHANGED", "WORLD_BOOK_ENTRY_DELETED", "WORLD_BOOK_LIBRARY_CHANGED"] as const;
+
+/** The permissions the copy's reads rest on, as the extension's host has them (`CopyOffer.granted`): a read the extension couldn't make, the copy doesn't either. */
+export const COPY_PERMISSIONS = ["chats", "chat_mutation", "world_books"] as const;
+
+/** What the runtime's copy of chat and lore is told of the extension on every hello, and again (`CopyPush`) when it changes. */
+export interface CopyOffer {
+  /** The extension whose entry in a message's extension metadata is its own: LumiAH's, or that of the extension LumiAH is built into. */
+  identifier: string;
+  /** Which of `COPY_PERMISSIONS` the extension holds now. */
+  granted: string[];
+  /** The extension LumiAH is built into keeps LumiAH's records elsewhere than on the messages: they are read with `own.read`, and an `own` push says when a chat's changed. */
+  ownElsewhere: boolean;
+  /** The extension LumiAH is built into gives LumiAH no lore: the copy keeps none either. */
+  declinesLore: boolean;
+  /** Where LumiAH's record for a swipe is in the extension's entry on a message, where it is one of LumiAH's own forms (`AnchorCodec.reads`): the entry itself (`under` null) or its member `under`. Null: a form only the extension's backend reads, so a chat's path is read over the link. */
+  records: { under: string | null } | null;
+  /** Lumiverse's database file, for the runtime to read itself where it can: given only to a runtime of the instance's operator, while the operator has the reader switched on; null otherwise. */
+  database: string | null;
+  /** How many numbered pushes (`event`, `own`, `copy`) the extension has sent this runtime: the next is numbered one more. */
+  told: number;
+}
+
+/**
+ * The lists of world books that attach books to a chat, as the extension's host answered them with
+ * `turn.lore` (`LoreReads`, host/rows.ts): a list it couldn't read is none, as the shared lore logic
+ * takes a failed one.
+ */
+export interface TurnBooks {
+  /** The books switched on for every chat. */
+  global: string[];
+  /** The book of the user's active persona. */
+  active: string | null;
+  /** The book of the persona the chat's latest generation was assembled for (`persona`), where that names one. */
+  persona?: string | null;
+  /** The books of the character the request named; none where it named none. */
+  character: string[];
+}
 
 // ---------------------------------------------------------------- notices
 

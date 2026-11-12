@@ -10,6 +10,7 @@ import { dirname, join } from "node:path";
 import { RUNTIME_DEFAULTS } from "../../../src/link/settings";
 import type { RuntimeSetup, SavedConfig } from "../../../src/runtime/config";
 import { nodeFiles } from "../../../src/runtime/update/files";
+import type { Ran } from "../../../src/runtime/update/programs";
 import type { Successor } from "../../../src/runtime/update/restart";
 import { unitText } from "../../../src/runtime/update/service";
 import type { UpdateDeps, UpdateFiles } from "../../../src/runtime/update/update";
@@ -54,11 +55,17 @@ export interface Installed {
   config: SavedConfig;
   /** Each change saved, in order. */
   saved: Partial<RuntimeSetup>[];
-  /** Every program run, as one line, and the environment it was given. */
+  /** Every program run, as one line, and the environment it was given; but a new build's version, which is in `checked`. */
   ran: string[];
   envs: Readonly<Record<string, string>>[];
+  /** Each build checked for whether it starts here, as `<bun> <file>`. */
+  checked: string[];
+  /** How a build answers `--version`: a whole one's words unless a test says it can't start. */
+  version: { code: number; out: string; err: string };
+  /** Another copy of the runtime that waits to serve on its port; none unless a test says so. */
+  waiting: { pid: number; since: number } | null;
   /** What a program answers, by the verb it was run with (`restart`, `daemon-reload`); 0 and nothing else unless a test says so. */
-  answers: Map<string, { code: number; out: string; err: string }>;
+  answers: Map<string, Ran>;
   /** Each successor the runtime left for. */
   left: Successor[];
   logs: string[];
@@ -117,6 +124,9 @@ export function installed(setting: Setting = {}): Installed {
     saved: [],
     ran: [],
     envs: [],
+    checked: [],
+    version: { code: 0, out: "lumiah 0.0.2 (build 2222bbbb)\n", err: "" },
+    waiting: null,
     answers: new Map(),
     left: [],
     logs: [],
@@ -149,6 +159,10 @@ export function installed(setting: Setting = {}): Installed {
     uid: 1000,
     files: { ...nodeFiles, ...setting.files },
     async run(command, args, env) {
+      if (args.at(-1) === "--version") {
+        at.checked.push(`${command} ${args.slice(0, -1).join(" ")}`);
+        return at.version;
+      }
       at.ran.push([command, ...args].join(" "));
       at.envs.push(env ?? {});
       const verb = args.find((word) => !word.startsWith("--")) ?? "";
@@ -159,6 +173,8 @@ export function installed(setting: Setting = {}): Installed {
     now: () => 1_700_000_000_000,
     log: (text) => void at.logs.push(text),
     name: () => ext.name,
+    handedOver: false,
+    waitingCopy: () => at.waiting,
   };
   return at;
 }

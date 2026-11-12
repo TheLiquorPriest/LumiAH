@@ -1,19 +1,12 @@
 // What the backend refuses, in words a person can act on. A link request's handler throws
-// `LinkRefused` (its code goes back to the runtime as the error frame's); a page's request throws
-// `UiRefused`. Anything else thrown is the backend's own failure and is answered `internal`.
+// `LinkRefused` (its code goes back to the runtime as the error frame's; the reads it shares with the
+// runtime throw it too: host/refused.ts); a page's request throws `UiRefused`. Anything else thrown
+// is the backend's own failure and is answered `internal`.
 
-import type { LinkErrorCode } from "../../link/contract";
+import { LinkRefused } from "../../host/refused";
 import type { UiErrorCode, UiProblem } from "../../shared/ui";
 
-export class LinkRefused extends Error {
-  constructor(
-    readonly code: LinkErrorCode,
-    message: string,
-  ) {
-    super(message);
-    this.name = "LinkRefused";
-  }
-}
+export { LinkRefused } from "../../host/refused";
 
 export class UiRefused extends Error {
   constructor(

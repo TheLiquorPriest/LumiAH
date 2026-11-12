@@ -7,7 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { excerptOf, LexicalIndex, tokenize } from "../../src/core/lexical";
 import { startAgent } from "../../src/core/loop";
 import type { JsonObject, ModelMessage, ModelRequest, ModelTool } from "../../src/core/ports";
-import { type AgentCall, AgentAccounts, assemble, type CallSpec, isLasting, isToolRefusal, isTransient, type ModelReply, NATIVE_TURNS, ownBreakpoints, type PreparedCall, type ProviderDeps, ProviderSession, recoverToolCalls, requestOf, TEXT_TURNS, ToolsRefused } from "../../src/core/provider";
+import { type AgentCall, AgentAccounts, assemble, type CallSpec, isLasting, isToolRefusal, isTransient, type ModelReply, NATIVE_TURNS, type PreparedCall, type ProviderDeps, ProviderSession, recoverToolCalls, requestOf, TEXT_TURNS, ToolsRefused } from "../../src/core/provider";
 import { defaultSettings, type Settings, type ToolCalls } from "../../src/core/settings";
 import { SCRATCH_READ, Texts } from "../../src/core/texts";
 import type { AgentTool } from "../../src/core/tools";
@@ -121,7 +121,7 @@ describe("how an agent's tools are offered", () => {
     const deps: ProviderDeps = { host, settings, texts: new Texts(), accounts: new AgentAccounts(host) };
     /** A session on `model` (null: the connection's own), its tools offered as `toolCalls` says. */
     const session = (model: string | null, toolCalls?: ToolCalls) => {
-      const spec: CallSpec = { connectionId: MAIN, model, effort: "medium", system: "You look things up.", prefix: [], cache: settings.cache, ...(toolCalls !== undefined ? { toolCalls } : {}) };
+      const spec: CallSpec = { connectionId: MAIN, model, effort: "medium", system: "You look things up.", prefix: [], cache: { ...settings.cache, session: "agent_test" }, ...(toolCalls !== undefined ? { toolCalls } : {}) };
       const made = new ProviderSession(deps, spec);
       const prepare = (): Promise<PreparedCall> => made.prepare([{ role: "user", content: "Where is Ilse?" }], [LOOKUP]);
       return { made, prepare, send: async (p: PreparedCall) => made.send(p, requestOf(spec, p, 500, settings), open) };
@@ -227,7 +227,7 @@ describe("tool names on the wire", () => {
     host.script = script;
     const settings = defaultSettings();
     const texts = new Texts();
-    const spec: CallSpec = { connectionId: options.connectionId ?? MAIN, model: null, effort: "medium", system: "You read tide tables.", prefix: [], cache: settings.cache, ...(options.toolCalls !== undefined ? { toolCalls: options.toolCalls } : {}) };
+    const spec: CallSpec = { connectionId: options.connectionId ?? MAIN, model: null, effort: "medium", system: "You read tide tables.", prefix: [], cache: { ...settings.cache, session: "agent_test" }, ...(options.toolCalls !== undefined ? { toolCalls: options.toolCalls } : {}) };
     const session = new ProviderSession({ host, settings, texts, accounts: new AgentAccounts(host) }, spec);
     const tools = names.map(described);
     const conversation: ModelMessage[] = [{ role: "user", content: "When is high water?" }];
@@ -413,13 +413,6 @@ describe("tool names on the wire", () => {
     expect(refused.host.calls[0]?.tools).toBeUndefined();
     expect(carried(refused.host.calls[0]?.messages)).toEqual(["mcp_tides_table"]);
   });
-
-  test("a breakpoint after the last tool stays on it under the name it goes by", async () => {
-    const r = rig(["lookup", TABLE], ["Read."], { connectionId: "conn-cache" });
-    r.host.profiles.push({ id: "conn-cache", name: "Cache", provider: "anthropic", model: "m", loopback: false, cache: { limit: 4, system: false, lastMessage: false, tools: false, automatic: false }, parallelTools: true });
-    await r.round();
-    expect(r.host.calls[0]?.tools).toEqual([described("lookup"), { ...described(TABLE), name: "mcp_tides_table", cache: true }]);
-  });
 });
 
 describe("a failure that passes", () => {
@@ -566,16 +559,11 @@ describe("a connection's calls at once", () => {
   });
 });
 
-describe("a prompt's order and its breakpoints", () => {
+describe("a prompt's order", () => {
   test("the opening goes first as one system message; with no opening the conversation goes as it came", () => {
     const conversation = [{ role: "user" as const, content: "Hello?" }];
-    expect(assemble({ nonce: null, prefix: ["Guidance."], system: "Instructions.", tools: null }, conversation, 0)).toEqual([{ role: "system", content: "Guidance.\n\nInstructions." }, ...conversation]);
-    expect(assemble({ nonce: null, prefix: [], system: "", tools: null }, conversation, 4)).toEqual(conversation);
-  });
-
-  test("a connection's own caching counts against the provider's limit", () => {
-    expect(ownBreakpoints({ limit: 4, system: true, lastMessage: true, tools: true, automatic: false }, 3)).toBe(3);
-    expect(ownBreakpoints({ limit: 4, system: true, lastMessage: false, tools: true, automatic: false }, 0)).toBe(1);
+    expect(assemble({ nonce: null, prefix: ["Guidance."], system: "Instructions.", tools: null }, conversation)).toEqual([{ role: "system", content: "Guidance.\n\nInstructions." }, ...conversation]);
+    expect(assemble({ nonce: null, prefix: [], system: "", tools: null }, conversation)).toEqual(conversation);
   });
 });
 

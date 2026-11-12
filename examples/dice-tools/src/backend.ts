@@ -4,8 +4,11 @@
 import { createBackend, createSpindleHost } from "lumi-ah/extension/backend";
 import { diceTools, IDENTIFIER } from "./dice";
 
-/** This build of the extension. A runtime linked to it says which build it is, and the Runtime page says when the two differ. */
-const BUILD = "dice-tools-0.1.0";
+/** This build of the extension (`build.ts` puts it in). A runtime linked to it says which build it is, and the Runtime page says when the two differ. */
+const BUILD: string = process.env.LAH_BUILD_ID ?? "dev";
+
+/** The runtime this build ships beside its backend (`dist/lumiah.js`): its sha256 and size, which `build.ts` puts in. A runtime on another build is offered that file, and updates itself from it. */
+const RUNTIME = { sha256: process.env.LAH_RUNTIME_SHA256 ?? "", size: Number(process.env.LAH_RUNTIME_SIZE ?? "0") };
 
 const host = createSpindleHost(IDENTIFIER);
 const backend = createBackend(
@@ -17,6 +20,7 @@ const backend = createBackend(
       return () => clearTimeout(timer);
     },
     build: BUILD,
+    runtime: RUNTIME,
   },
   diceTools({ random: Math.random, log: (line) => host.log("info", line) }),
 );

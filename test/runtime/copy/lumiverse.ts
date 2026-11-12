@@ -94,16 +94,23 @@ const parse = (text: string, otherwise: unknown): unknown => {
   }
 };
 const isObj = (v: unknown): v is Obj => typeof v === "object" && v !== null && !Array.isArray(v);
+/** Two ids in the order SQLite sorts text by default (`BINARY`: their bytes in UTF-8), as Lumiverse's `ORDER BY ..., id` lists them. */
+const byBytes = (a: string, b: string): number => Buffer.compare(Buffer.from(a, "utf8"), Buffer.from(b, "utf8"));
+
+/** What a message's `swipes` parses to: a list nearly always, but whatever the JSON holds, as Lumiverse keeps it (a row stored as JSON text gives a string). */
+type Swipes = { length: number } & Record<number, unknown>;
 
 /** Lumiverse's `rowToMessage`: the row, its JSON parsed, its extra projected for the shown swipe. */
 export function rowToMessage(row: MessageRow): Obj {
-  const swipes = parse(row.swipes, [row.content]) as unknown[];
+  const swipes = parse(row.swipes, [row.content ?? ""]) as Swipes;
+  // Lumiverse sizes the per-swipe extras by the count before anything else, so a row whose swipes are JSON `null` fails here, as it fails there.
+  const count = swipes.length;
   const extra = { ...((parse(row.extra, {}) as Obj | null) ?? {}) };
   const bag = extra.spindle_metadata;
   // Saved preset contexts are kept one per swipe (`normalizeSpindleMessageMetadata`).
   if (isObj(bag) && Array.isArray(bag.preset_contexts)) {
     const contexts = bag.preset_contexts as unknown[];
-    extra.spindle_metadata = { ...bag, preset_contexts: Array.from({ length: Math.max(1, swipes.length) }, (_, i) => contexts[i] ?? null) };
+    extra.spindle_metadata = { ...bag, preset_contexts: Array.from({ length: Math.max(1, count) }, (_, i) => contexts[i] ?? null) };
   }
   for (const [array, key] of Object.entries(PER_SWIPE)) {
     const value = Array.isArray(extra[array]) ? (extra[array] as unknown[])[row.swipe_id] : null;
@@ -113,13 +120,15 @@ export function rowToMessage(row: MessageRow): Obj {
   return { ...row, is_user: !!row.is_user, swipes, swipe_dates: parse(row.swipe_dates || "[]", []), extra, parent_message_id: row.parent_message_id || null, branch_id: row.branch_id || null };
 }
 
-/** Lumiverse's `rowToMessageLight`: the other swipes' slots null, the per-swipe arrays gone. */
+/** Lumiverse's `rowToMessageLight`: as many slots as the swipes have, null but the shown one, the per-swipe arrays gone. Swipes stored as JSON text become a list of that many slots, the shown one holding one letter. */
 export function rowToMessageLight(row: MessageRow): Obj {
   const message = rowToMessage(row);
-  const swipes = message.swipes as unknown[];
+  const swipes = message.swipes as Swipes;
   if (swipes.length > 1) {
     const shown = row.swipe_id >= 0 && row.swipe_id < swipes.length ? row.swipe_id : 0;
-    message.swipes = swipes.map((text, i) => (i === shown ? text : null));
+    const light: unknown[] = new Array(swipes.length).fill(null);
+    light[shown] = swipes[shown] ?? null;
+    message.swipes = light;
   }
   const extra = message.extra as Obj;
   for (const key of SWIPE_ARRAYS) delete extra[key];
@@ -154,24 +163,34 @@ export function spindleMessage(m: Obj, options: { includeExtra: boolean; ownKey?
   };
 }
 
-const rowToChat = (row: ChatRow): Obj => ({ ...row, metadata: { ...row.metadata } });
+/** Lumiverse's `rowToChat`. */
+export const rowToChat = (row: ChatRow): Obj => ({ ...row, metadata: { ...row.metadata } });
 
-const rowToBook = (row: BookRow): Obj => ({ id: row.id, name: row.name, description: row.description, folder: row.folder ?? "", metadata: JSON.parse(row.metadata) as unknown, created_at: row.created_at, updated_at: row.updated_at });
+/** Lumiverse's `rowToBook`. */
+export const rowToBook = (row: BookRow): Obj => ({ id: row.id, name: row.name, description: row.description, folder: row.folder ?? "", metadata: JSON.parse(row.metadata) as unknown, created_at: row.created_at, updated_at: row.updated_at });
 
-/** Lumiverse's `rowToEntry`: JSON parsed, flags as booleans, the managed keys taken out of `extensions`. */
+/** The prompt markers an entry may be pinned beside (Lumiverse's `VALID_WI_MARKERS`): any other names none. */
+const WI_MARKERS: Record<string, true> = { chat_history: true, world_info_before: true, world_info_after: true, char_description: true, char_personality: true, persona_description: true, scenario: true, dialogue_examples: true, main_prompt: true, enhance_definitions: true, jailbreak: true, nsfw_prompt: true };
+
+/** A string trimmed, or null for anything else and for an empty one. */
+const trimmed = (value: unknown): string | null => (typeof value === "string" && value.trim() !== "" ? value.trim() : null);
+
+/** Lumiverse's `rowToEntry`: JSON parsed, flags as booleans, and the keys it manages itself taken out of `extensions` under either of their spellings (`splitManagedEntryExtensions`). */
 export function rowToEntry(row: EntryRow): Obj {
-  const extensions = { ...(JSON.parse(row.extensions) as Obj) };
-  const outlet = typeof extensions.outlet_name === "string" ? extensions.outlet_name : null;
-  delete extensions.outlet_name;
-  delete extensions.wi_marker;
-  delete extensions.wi_marker_side;
+  const stored = JSON.parse(row.extensions) as unknown;
+  const extensions = (stored === null || typeof stored !== "object" ? {} : JSON.parse(JSON.stringify(stored))) as Obj;
+  const outlet = trimmed(extensions.outlet_name ?? extensions.outletName);
+  const marker = trimmed(extensions.wi_marker ?? extensions.wiMarker)?.toLowerCase() ?? null;
+  const side = trimmed(extensions.wi_marker_side ?? extensions.wiMarkerSide)?.toLowerCase() ?? null;
+  for (const key of ["outlet_name", "outletName", "wi_marker", "wiMarker", "wi_marker_side", "wiMarkerSide"]) delete extensions[key];
+  const tags = parse(row.tags, []);
   return {
     ...row,
     folder: row.folder.trim(),
-    tags: parse(row.tags, []),
+    tags: Array.isArray(tags) ? [...new Set(tags.map(trimmed).filter((tag): tag is string => tag !== null))] : [],
     outlet_name: outlet,
-    wi_marker: null,
-    wi_marker_side: null,
+    wi_marker: marker !== null && WI_MARKERS[marker] === true ? marker : null,
+    wi_marker_side: side === "before" || side === "after" ? side : null,
     key: JSON.parse(row.key) as unknown,
     keysecondary: JSON.parse(row.keysecondary) as unknown,
     role: row.role || null,
@@ -241,9 +260,12 @@ export class Lumiverse {
   now = Date.UTC(2026, 10, 12, 9, 0, 0) / 1000;
   /** Moves with every change Lumiverse makes, told of or not, as a database's own change counter does. */
   version = 0;
+  /** The paths of the requests the asker gave up on (their signal aborted them), in order. */
+  readonly aborted: string[] = [];
   private atOnce = 0;
   private n = 0;
   private readonly failing: { match: RegExp; left: number; how: number | "network" }[] = [];
+  private readonly hanging: { match: RegExp; left: number }[] = [];
   private readonly before: { match: RegExp; run: () => void }[] = [];
 
   private id(kind: string): string {
@@ -262,6 +284,11 @@ export class Lumiverse {
     this.failing.push({ match, left: times, how });
   }
 
+  /** The next `times` requests whose path matches never answer: only the asker's giving up on them (their signal) ends them. */
+  hang(match: RegExp, times = 1): void {
+    this.hanging.push({ match, left: times });
+  }
+
   /** Runs once, just before the first request whose path matches is answered: a change made while a read is under way. */
   whileAsked(match: RegExp, run: () => void): void {
     this.before.push({ match, run });
@@ -276,6 +303,17 @@ export class Lumiverse {
       try {
         // Every request takes a moment, so the ones sent together are under way together.
         await Bun.sleep(1);
+        const hang = this.hanging.find((h) => h.left > 0 && h.match.test(path));
+        if (hang !== undefined) {
+          hang.left--;
+          const { promise, reject } = Promise.withResolvers<never>();
+          const gaveUp = (): void => {
+            this.aborted.push(path);
+            reject(new DOMException("The operation was aborted.", "AbortError"));
+          };
+          init.signal?.addEventListener("abort", gaveUp, { once: true });
+          await promise;
+        }
         const failure = this.failing.find((f) => f.left > 0 && f.match.test(path));
         if (failure !== undefined) {
           failure.left--;
@@ -284,7 +322,12 @@ export class Lumiverse {
         }
         const hook = this.before.findIndex((b) => b.match.test(path));
         if (hook >= 0) this.before.splice(hook, 1)[0]?.run();
-        return this.route(userId, path, init.headers);
+        try {
+          return this.route(userId, path, init.headers);
+        } catch {
+          // A row Lumiverse's own mapper fails on fails the whole route, as an error its server answers 500 for.
+          return json({ error: "Internal Server Error" }, 500);
+        }
       } finally {
         this.atOnce--;
       }
@@ -305,7 +348,7 @@ export class Lumiverse {
         const rows = this.rowsOf(chat.id);
         if (url.searchParams.get("tail") === "true") {
           const limit = Math.min(Math.max(Number.parseInt(url.searchParams.get("limit") ?? "50", 10) || 50, 1), 1000);
-          const tail = [...rows].sort((a, b) => b.index_in_chat - a.index_in_chat || (b.id < a.id ? -1 : 1)).slice(0, limit).reverse();
+          const tail = [...rows].sort((a, b) => b.index_in_chat - a.index_in_chat || byBytes(b.id, a.id)).slice(0, limit).reverse();
           return json({ data: tail.map(map), total: rows.length, limit, offset: Math.max(0, rows.length - tail.length) });
         }
         return json(page(rows, map, url));
@@ -331,7 +374,7 @@ export class Lumiverse {
   }
 
   entriesOf(bookId: string): EntryRow[] {
-    return [...this.entries.values()].filter((e) => e.world_book_id === bookId).sort((a, b) => a.order_value - b.order_value || (a.id < b.id ? -1 : 1));
+    return [...this.entries.values()].filter((e) => e.world_book_id === bookId).sort((a, b) => a.order_value - b.order_value || byBytes(a.id, b.id));
   }
 
   // ---------------------------------------------------------------- Spindle, as an extension's worker reaches it
@@ -366,7 +409,7 @@ export class Lumiverse {
           const rows = this.rowsOf(chatId);
           const picked =
             options.tail !== undefined
-              ? [...rows].sort((a, b) => b.index_in_chat - a.index_in_chat || (b.id < a.id ? -1 : 1)).slice(0, options.tail).reverse()
+              ? [...rows].sort((a, b) => b.index_in_chat - a.index_in_chat || byBytes(b.id, a.id)).slice(0, options.tail).reverse()
               : options.limit !== undefined
                 ? rows.slice(options.offset ?? 0, (options.offset ?? 0) + options.limit)
                 : rows;
@@ -694,6 +737,44 @@ export class Lumiverse {
   indexed(entryId: string): void {
     const row = this.entries.get(entryId);
     if (row !== undefined) row.vector_index_status = "indexed";
+    this.version++;
+  }
+
+  /** An extension's namespace in an entry's extensions written (`setEntityExtensionNamespace`: REST, Spindle `setExtension`, a batch): no stamp, no revision, no event. */
+  setExtension(entryId: string, namespace: string, value: unknown): void {
+    const row = this.entries.get(entryId);
+    if (row === undefined) throw new Error(`no entry ${entryId}`);
+    row.extensions = JSON.stringify({ ...(JSON.parse(row.extensions) as Obj), [namespace]: value });
+    this.version++;
+  }
+
+  /** The book's entries made vectorized (`convertToVectorized`): each one converted and the book stamped, a new revision, and no event. */
+  convertToVectorized(bookId: string): void {
+    const book = this.book(bookId);
+    for (const row of this.entriesOf(bookId)) {
+      if (row.constant === 1 || row.disabled === 1 || row.content.trim() === "" || row.vectorized === 1) continue;
+      row.vectorized = 1;
+      row.vector_index_status = "pending";
+      row.updated_at = this.now;
+      row.revision++;
+    }
+    book.updated_at = this.now;
+    this.version++;
+  }
+
+  /** The book renamed (`updateWorldBook`): stamped now, and `WORLD_BOOK_CHANGED`. */
+  renameBook(bookId: string, name: string): void {
+    const book = this.book(bookId);
+    book.name = name;
+    book.updated_at = this.now;
+    this.emit("WORLD_BOOK_CHANGED", { id: bookId, worldBook: rowToBook(book) }, book.user_id);
+  }
+
+  /** One key of the chat's metadata written in place (the chat memory's config hash, the memory cortex's rebuild state, a databank's bindings): no stamp, no event. */
+  stampChat(chatId: string, key: string, value: unknown): void {
+    const chat = this.chats.get(chatId);
+    if (chat === undefined) throw new Error(`no chat ${chatId}`);
+    chat.metadata = { ...chat.metadata, [key]: value };
     this.version++;
   }
 }

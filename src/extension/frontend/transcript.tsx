@@ -13,6 +13,7 @@ import type { ComponentChildren, RefObject } from "preact";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
 import { type CallPrompt, isReply, type LiveView, replyDid } from "../../shared/ui";
 import { errorWords, useApp } from "./app";
+import { useRuntimeConnections } from "./connections";
 import { Badge, Button, Chip, CopyButton, Disclosure, IconButton, SearchField, Seg, Select, type Tone, useBusy } from "./components";
 import type { FileChange } from "../../shared/ui";
 import { clock, compact, count, counted, dateTime, duration, elapsed } from "./format";
@@ -50,6 +51,7 @@ import {
   matchCounts,
   matchTotal,
   NO_FILTER,
+  onConnection,
   promptHashes,
   roleLabel,
   sessionWords,
@@ -214,8 +216,8 @@ function ToolAfter(props: { item: Extract<FeedItem, { kind: "tool" }>; folds: Fo
   );
 }
 
-/** One item of an agent's feed. */
-function Item(props: { item: FeedItem; folds: Folds; now: number; thinkingOpen: boolean; toolsOpen: boolean }) {
+/** One item of an agent's feed; `connection` names a connection as the runtime that plays the turn's chat lists it. */
+function Item(props: { item: FeedItem; folds: Folds; now: number; thinkingOpen: boolean; toolsOpen: boolean; connection(id: string): string }) {
   const { item, folds } = props;
   const now = folds.current !== null && folds.current.key === item.key ? folds.current.nth : -1;
   switch (item.kind) {
@@ -281,7 +283,7 @@ function Item(props: { item: FeedItem; folds: Folds; now: number; thinkingOpen: 
             {e.offered ? <span class="lah-dim">{`offered ${counted(e.offered.tools, "tool")} (≈${count(e.offered.tokens)} tokens)`}</span> : null}
             {e.prompt ? null : <span class="lah-dim">prompt not kept</span>}
           </div>
-          {e.prompt ? <PromptBlock hash={e.prompt} item={`p:${item.seq}`} folds={folds} /> : null}
+          {e.prompt ? <PromptBlock hash={e.prompt} item={`p:${item.seq}`} folds={folds} connection={props.connection} /> : null}
         </>
       );
     }
@@ -307,7 +309,7 @@ function Item(props: { item: FeedItem; folds: Folds; now: number; thinkingOpen: 
               <Marked text={item.text} query={folds.query} now={now} />
             </span>
           </p>
-          {item.entry.prompt ? <PromptBlock hash={item.entry.prompt} item={`p:${item.seq}`} folds={folds} /> : null}
+          {item.entry.prompt ? <PromptBlock hash={item.entry.prompt} item={`p:${item.seq}`} folds={folds} connection={props.connection} /> : null}
         </>
       );
     case "retry":
@@ -319,7 +321,7 @@ function Item(props: { item: FeedItem; folds: Folds; now: number; thinkingOpen: 
               <Marked text={item.text} query={folds.query} now={now} />
             </span>
           </p>
-          {item.entry.prompt ? <PromptBlock hash={item.entry.prompt} item={`p:${item.seq}`} folds={folds} /> : null}
+          {item.entry.prompt ? <PromptBlock hash={item.entry.prompt} item={`p:${item.seq}`} folds={folds} connection={props.connection} /> : null}
         </>
       );
     case "stop":
@@ -331,7 +333,7 @@ function Item(props: { item: FeedItem; folds: Folds; now: number; thinkingOpen: 
               <Marked text={item.text} query={folds.query} now={now} />
             </span>
           </p>
-          {item.entry.prompt ? <PromptBlock hash={item.entry.prompt} item={`p:${item.seq}`} folds={folds} /> : null}
+          {item.entry.prompt ? <PromptBlock hash={item.entry.prompt} item={`p:${item.seq}`} folds={folds} connection={props.connection} /> : null}
         </>
       );
     case "activity":
@@ -372,7 +374,7 @@ function AgentBlock(props: { feed: AgentFeed; turn: TurnView; spent: AgentTotals
       </div>
       <p class="lah-agent-meta">
         <span class="lah-model">{agentModel(a) ?? "the connection's model"}</span>
-        <span>{a.start.connectionId ? `on ${props.connection(a.start.connectionId)}` : "on the default connection"}</span>
+        <span>{onConnection(a.start, props.connection)}</span>
         <span>{`effort ${a.start.effort}`}</span>
         <span>{duration(agentMs(a, props.now))}</span>
         {props.spent && props.spent.calls > 0 ? <span>{`${totalTokensWords(props.spent)} · ${totalCostWords(props.spent)}`}</span> : null}
@@ -381,7 +383,7 @@ function AgentBlock(props: { feed: AgentFeed; turn: TurnView; spent: AgentTotals
         <div class="lah-agent-body">
           {props.feed.hidden > 0 ? <p class="lah-line lah-dim">{`${counted(props.feed.hidden, "earlier step")} not shown.`}</p> : null}
           {props.feed.items.map((item) => (
-            <Item key={item.key} item={item} folds={props.folds} now={props.now} thinkingOpen={props.thinkingOpen} toolsOpen={props.toolsOpen} />
+            <Item key={item.key} item={item} folds={props.folds} now={props.now} thinkingOpen={props.thinkingOpen} toolsOpen={props.toolsOpen} connection={props.connection} />
           ))}
         </div>
       ) : null}
@@ -485,7 +487,8 @@ export function TurnFeed(props: TurnFeedProps) {
   const app = useApp();
   const { view } = props;
   const prefs = useSelect(app.prefs, (p) => p);
-  const connections = useSelect(app.client.state, (s) => s?.connections);
+  // The agents ran on the connections of the runtime that plays the turn's chat: each by the name the trace kept, else (a transcript kept before names were, a call's exact prompt) as that runtime lists it (the list last read stays while the runtime is away), else by its id.
+  const known = useRuntimeConnections(view.chatId);
   const running = view.ended === null;
   const now = useNow(running);
   // The turn as it was folded last: a delta of a call in flight leaves its events' fold standing (live-model's turnView says why).
@@ -631,7 +634,7 @@ export function TurnFeed(props: TurnFeedProps) {
     if (total > 0) setMatchIndex((i) => (((i + (back ? -1 : 1)) % total) + total) % total);
   };
   const tools = toolsCalled(turn);
-  const connection = (id: string): string => connections?.find((c) => c.id === id)?.name ?? id;
+  const connection = (id: string): string => known.view?.connections.find((c) => c.id === id)?.name ?? id;
   const t = totals.turn;
   // How long and how much, where a cost is known: "Finished in 12.4 s, $0.0018".
   const priced = t.calls > 0 && !(t.unpriced >= t.calls && t.cost === 0);

@@ -14,9 +14,11 @@ import { Chats } from "../../../src/extension/backend/chat";
 import { Lore } from "../../../src/extension/backend/reads";
 import { KEEP_CHARS } from "../../../src/runtime/copy";
 import { createHttpSource } from "../../../src/runtime/copy/http";
+import { linkedBackendOf } from "../../../src/link/frames";
+import { transportWait } from "../../../src/link/waits";
 import { INSERTED } from "../../../src/runtime/copy/kept";
 import type { CopySource } from "../../../src/runtime/copy/source";
-import { Lumiverse } from "./lumiverse";
+import { Lumiverse, type MessageRow } from "./lumiverse";
 import { type CopyRig, LUMIAH, OTHER, restoreSpindle, rigCopy, USER } from "./rig";
 
 afterEach(restoreSpindle);
@@ -109,7 +111,7 @@ describe("a chat is read whole once, then kept by Lumiverse's events", () => {
     const rows = lumiverse.imported(chat.id, lines(1500));
     const third = rows[2]?.id ?? "";
     // While the second page is read, the first page's third message is edited twice and hidden: the first page holds none of it.
-    lumiverse.whileAsked(/offset=1000/, () => {
+    lumiverse.whileAsked(/offset=999/, () => {
       lumiverse.edit(third, "Edited once.");
       lumiverse.edit(third, "Edited twice.");
       lumiverse.hide([third], true);
@@ -216,13 +218,63 @@ describe("a chat is read again, never patched by guess", () => {
     expect(rig.copy.state().chats[0]?.read.why).toBe("the check before use found the newest message changed with no word from Lumiverse");
   });
 
-  test("a check that finds the chat as held costs one small request, and no read", async () => {
+  test("a check that finds the chat as held costs two small requests at once, and no read", async () => {
     const rig = await harbour();
     rig.clock.now += 5_000;
 
     await same(rig, rig.chat.id);
     expect(checks(rig.lumiverse, rig.chat.id)).toBe(1);
+    expect(rig.lumiverse.asked.filter((p) => p === `/api/v1/chats/${rig.chat.id}?messages=false`)).toHaveLength(2);
     expect(wholeReads(rig.lumiverse, rig.chat.id)).toBe(1);
+  });
+
+  test("when the check before use finds the chat's own fields changed with no word of them: Lumiverse writes some of its metadata with no event", async () => {
+    const rig = await harbour();
+    rig.lumiverse.stampChat(rig.chat.id, "ltcm_config_hash", "b2");
+
+    // Within the check's time, the chat is used as held.
+    expect((await rig.copy.chats.get(rig.chat.id, USER))?.metadata).toEqual({ chat_world_book_ids: ["book-quay"] });
+    rig.clock.now += 1_000;
+    await same(rig, rig.chat.id);
+    expect((await rig.copy.chats.get(rig.chat.id, USER))?.metadata).toEqual({ chat_world_book_ids: ["book-quay"], ltcm_config_hash: "b2" });
+    expect(rig.copy.state().chats[0]?.read.why).toBe("the check before use found the chat's own fields changed with no word from Lumiverse");
+  });
+});
+
+describe("two messages at one place", () => {
+  /** A chat of nine messages whose last two share a place: the later stored sorts first by id ("msg-10" before "msg-9"). */
+  function twins(rig: CopyRig) {
+    const chat = rig.lumiverse.newChat(USER);
+    const rows = rig.lumiverse.imported(chat.id, lines(9));
+    const [ninth, tenth] = [rows[7], rows[8]] as [MessageRow, MessageRow];
+    tenth.index_in_chat = ninth.index_in_chat;
+    return { chat, ninth, tenth };
+  }
+
+  test("come as the host gives them: a whole chat or a range as Lumiverse stored them, a tail by id", async () => {
+    const rig = rigCopy();
+    const { chat, ninth, tenth } = twins(rig);
+    expect(tenth.id < ninth.id).toBe(true);
+
+    await same(rig, chat.id);
+    for (const tail of [1, 2, 3, 9, 20]) expect(await rig.copy.chats.messages(chat.id, { tail })).toEqual(await rig.host.chats.messages(chat.id, { tail }));
+    for (const [from, count] of [[6, 2], [7, 1], [8, 1], [0, 9]] as const) expect(await rig.copy.chats.messages(chat.id, { from, count })).toEqual(await rig.host.chats.messages(chat.id, { from, count }));
+    // What those orders are, so the sameness isn't of two empty lists.
+    expect((await rig.copy.chats.messages(chat.id, { tail: 2 })).map((m) => m.id)).toEqual([tenth.id, ninth.id]);
+    expect((await rig.copy.chats.messages(chat.id)).slice(-2).map((m) => m.id)).toEqual([ninth.id, tenth.id]);
+  });
+
+  test("at the newest place, the check before use agrees with the copy whichever of the two the source names: no read again", async () => {
+    const rig = rigCopy();
+    const { chat } = twins(rig);
+    await rig.copy.chats.messages(chat.id);
+
+    for (let i = 0; i < 3; i++) {
+      rig.clock.now += 1_000;
+      await same(rig, chat.id);
+    }
+    expect(checks(rig.lumiverse, chat.id)).toBe(3);
+    expect(wholeReads(rig.lumiverse, chat.id)).toBe(1);
   });
 });
 
@@ -307,7 +359,7 @@ describe("changes Lumiverse makes without an event", () => {
     expect(await rig.copy.chats.swipe(rig.chat.id, rig.reply.id, 0)).toBeNull();
   });
 
-  test("an entry's vector index written with no event leaves the book's rows as they were", async () => {
+  test("an entry's vector index written with no event leaves the book's rows as they were, though the book is read again once the check's time has passed", async () => {
     const rig = rigCopy();
     const book = rig.lumiverse.newBook(USER);
     const tide = rig.lumiverse.addEntry(book.id, { comment: "Tide", content: "The quay floods at spring tide." });
@@ -316,7 +368,7 @@ describe("changes Lumiverse makes without an event", () => {
     rig.clock.now += 5_000;
 
     expect(await rig.copy.lore.records(book.id, USER)).toEqual(await rig.host.lore.records(book.id, USER));
-    expect(bookReads(rig.lumiverse, book.id)).toBe(1);
+    expect(bookReads(rig.lumiverse, book.id)).toBe(2);
   });
 });
 
@@ -358,7 +410,7 @@ describe("a world book", () => {
     expect(await rig.copy.lore.entry(rig.tide.id, USER)).toBeNull();
   });
 
-  test("the library changed: every book is asked again, and one still as held costs an empty answer", async () => {
+  test("the library changed: every book is read again", async () => {
     const rig = await quay();
     rig.lumiverse.library(USER, () => undefined);
     rig.forward();
@@ -376,6 +428,37 @@ describe("a world book", () => {
     expect(rig.copy.state().books).toEqual([]);
     expect(await rig.copy.lore.book(rig.book.id, USER)).toBeNull();
     expect(await rig.copy.lore.entries(rig.book.id, USER)).toEqual([]);
+  });
+
+  test("changed by Lumiverse with no event (an extension's namespace in an entry, the book made vectorized): read whole again once the check's time has passed", async () => {
+    const rig = await quay();
+    rig.lumiverse.setExtension(rig.tide.id, "lumibooks", { tier: 2 });
+
+    // Within the check's time, the book is used as held.
+    expect((await rig.copy.lore.records(rig.book.id, USER))[0]?.extensions).toEqual({});
+    rig.clock.now += 1_000;
+    await sameBook(rig, rig.book.id);
+    expect((await rig.copy.lore.records(rig.book.id, USER))[0]?.extensions).toEqual({ lumibooks: { tier: 2 } });
+    expect(rig.copy.state().books[0]?.read.why).toBe("Lumiverse changes some of a book's rows with no event, and the source can't say whether it did without reading the book");
+
+    rig.lumiverse.now += 1;
+    rig.lumiverse.convertToVectorized(rig.book.id);
+    rig.clock.now += 1_000;
+    await sameBook(rig, rig.book.id);
+    expect((await rig.copy.lore.records(rig.book.id, USER)).map((e) => e.vectorized)).toEqual([true, true]);
+    expect(bookReads(rig.lumiverse, rig.book.id)).toBe(3);
+  });
+
+  test("renamed twice in one second: the second rename is read too, though Lumiverse's ETag can't tell the two apart", async () => {
+    const rig = await quay();
+    rig.lumiverse.renameBook(rig.book.id, "The old quay");
+    rig.forward();
+    expect((await rig.copy.lore.book(rig.book.id, USER))?.name).toBe("The old quay");
+
+    rig.lumiverse.renameBook(rig.book.id, "The new quay");
+    rig.forward();
+    await sameBook(rig, rig.book.id);
+    expect((await rig.copy.lore.book(rig.book.id, USER))?.name).toBe("The new quay");
   });
 });
 
@@ -489,6 +572,70 @@ describe("whatever the copy can't vouch for goes to the extension's host, and is
     await same(rig, rig.chat.id);
     expect(rig.fellBack).toEqual([]);
   });
+
+  test("a read Lumiverse never answers holds no reader for ever: once its deadline passed, every reader waiting on it goes to the extension's host", async () => {
+    // A short deadline on the real clock: the request never answers, so nothing races it.
+    const rig = rigCopy({ requestMs: 30 });
+    const chat = rig.lumiverse.newChat(USER);
+    rig.lumiverse.imported(chat.id, lines(4));
+    rig.lumiverse.hang(/messages\?limit=1000&offset=0/);
+
+    const [all, last] = await Promise.all([rig.copy.chats.messages(chat.id), rig.copy.chats.messages(chat.id, { tail: 1 })]);
+
+    expect(all).toEqual(await rig.host.chats.messages(chat.id));
+    expect(last).toEqual(await rig.host.chats.messages(chat.id, { tail: 1 }));
+    const why = `reading it failed: Lumiverse didn't answer within 30 ms when it was asked for chat ${chat.id}'s messages, so the runtime gave up on it. ${transportWait(["runtime", "copyReadMs"], linkedBackendOf(undefined))} says how long each of the runtime's reads of chat data waits.`;
+    expect(rig.fellBack).toEqual([`chats.messages ${chat.id}`, `chats.messages ${chat.id}`]);
+    expect(rig.copy.state().fallbacks.latest.map((f) => f.why)).toEqual([why, why]);
+    expect(rig.lumiverse.aborted).toEqual([`/api/v1/chats/${chat.id}/messages?limit=1000&offset=0`]);
+
+    // Read afresh when next wanted, and kept.
+    await same(rig, chat.id);
+    expect(rig.copy.state().chats.map((c) => c.id)).toEqual([chat.id]);
+  });
+});
+
+describe("the link to the extension going down", () => {
+  test("everything kept is read again first, and while the link stays down a chat is read whole whenever its check is due: no event tells of a change before its newest message", async () => {
+    const rig = await harbour();
+    rig.copy.closed();
+    await same(rig, rig.chat.id);
+    expect(wholeReads(rig.lumiverse, rig.chat.id)).toBe(2);
+    expect(rig.copy.state().chats[0]?.read.why).toBe("the link to the extension went down, so events may have been missed");
+
+    // An edit in the middle of the chat, whose event never comes while the link is down.
+    rig.lumiverse.edit(rig.asked.id, "Who keeps the light, now that the storm is over?");
+    rig.lose();
+    rig.clock.now += 1_000;
+    await same(rig, rig.chat.id);
+    expect(wholeReads(rig.lumiverse, rig.chat.id)).toBe(3);
+    expect(checks(rig.lumiverse, rig.chat.id)).toBe(0);
+    expect(rig.copy.state().chats[0]?.read.why).toBe("the link to the extension is down, so nothing tells of a change the check before use can't see");
+
+    // Up again: read once more for what was missed meanwhile, then kept by events and checked as before.
+    rig.copy.reopened();
+    await same(rig, rig.chat.id);
+    rig.clock.now += 1_000;
+    await same(rig, rig.chat.id);
+    expect(wholeReads(rig.lumiverse, rig.chat.id)).toBe(4);
+    expect(checks(rig.lumiverse, rig.chat.id)).toBe(1);
+  });
+
+  test("a source whose check sees the whole chat is still checked, not read, while the link is down, and sees an edit in the middle", async () => {
+    const rig = await harbour(rigCopy({ source: ({ lumiverse }) => databaseLike(lumiverse) }));
+    rig.copy.closed();
+    await same(rig, rig.chat.id);
+    rig.clock.now += 1_000;
+    await same(rig, rig.chat.id);
+    expect(wholeReads(rig.lumiverse, rig.chat.id)).toBe(2);
+    expect(checks(rig.lumiverse, rig.chat.id)).toBe(1);
+
+    rig.lumiverse.edit(rig.asked.id, "Who keeps the light, now that the storm is over?");
+    rig.lose();
+    rig.clock.now += 1_000;
+    await same(rig, rig.chat.id);
+    expect(rig.copy.state().chats[0]?.read.why).toBe("the check before use found the chat changed since it was read");
+  });
 });
 
 describe("the mounting extension's own entries kept elsewhere than on the message", () => {
@@ -588,7 +735,7 @@ describe("one user's rows only", () => {
     expect((await rig.copy.chats.messages(rig.chat.id)).map((m) => m.id)).toContain(rig.reply.id);
   });
 
-  test("another user's chat is none of the copy's, and a chat whose owner isn't the session's user is never kept", async () => {
+  test("another user's chat is none of the copy's, and a chat whose owner isn't the session's user is never kept: the extension's host answers for both", async () => {
     const lumiverse = new Lumiverse();
     const theirs = lumiverse.newChat(OTHER);
     lumiverse.imported(theirs.id, lines(2));
@@ -603,10 +750,45 @@ describe("one user's rows only", () => {
       },
     });
 
+    // Lumiverse's route says 404 for another user's chat, which says nothing of the chat: the extension's host says there is none.
     expect(await rig.copy.chats.get(theirs.id, USER)).toBeNull();
-    expect(await rig.copy.chats.get(mine.id, USER)).toBeNull();
+    expect(await rig.copy.chats.get(mine.id, USER)).toEqual(await rig.host.chats.get(mine.id, USER));
+    expect(rig.fellBack).toEqual([`chats.get ${theirs.id}`, `chats.get ${mine.id}`]);
     expect(rig.copy.state().chats).toEqual([]);
-    expect(rig.copy.state().reads.map((r) => r.outcome)).toEqual(["the user has none such", "not kept: it isn't the chat of the user the runtime is signed in as"]);
+    const [unanswered, refused] = rig.copy.state().reads.map((r) => r.outcome);
+    expect(unanswered).toStartWith(`failed: Lumiverse answered 404 when it was asked for chat ${theirs.id}`);
+    expect(refused).toBe("not kept: it isn't the chat of the user the runtime is signed in as");
+    expect(rig.copy.state().routes).toMatchObject({ total: 1, latest: [{ what: "chat", id: theirs.id, status: 404, until: null }] });
+    expect(rig.copy.state().fallbacks).toMatchObject({ total: 1, latest: [{ what: "chat", id: mine.id, why: "it isn't the chat of the user the runtime is signed in as" }] });
+  });
+});
+
+describe("a route of the source that doesn't answer as expected", () => {
+  test("a chat it says isn't there is the extension's to answer: nothing is kept as gone, the state counts those reads apart with the route and what it answered, the log says so once, and the chat is kept once the route answers", async () => {
+    const rig = rigCopy();
+    const chat = rig.lumiverse.newChat(USER);
+    rig.lumiverse.imported(chat.id, lines(2));
+    // The chat's own row "not found" twice, while its messages are served.
+    rig.lumiverse.fail(/\?messages=false$/, 2, 404);
+
+    expect(await rig.copy.chats.get(chat.id, USER)).toEqual(await rig.host.chats.get(chat.id, USER));
+    expect(await rig.copy.chats.messages(chat.id)).toEqual(await rig.host.chats.messages(chat.id));
+    expect(rig.fellBack).toEqual([`chats.get ${chat.id}`, `chats.messages ${chat.id}`]);
+    const state = rig.copy.state();
+    expect(state.chats).toEqual([]);
+    expect(state.fallbacks.total).toBe(0);
+    expect(state.routes.total).toBe(2);
+    expect(state.routes.latest.map((n) => [n.what, n.id, n.route, n.status, n.until])).toEqual([
+      ["chat", chat.id, "GET /api/v1/chats/:id", 404, null],
+      ["chat", chat.id, "GET /api/v1/chats/:id", 404, null],
+    ]);
+    expect(state.routes.latest[0]?.why).toBe(`reading it failed: Lumiverse answered 404 when it was asked for chat ${chat.id}, which the runtime doesn't take for an answer of GET /api/v1/chats/:id, so the extension is asked instead`);
+    expect(rig.logs.filter((line) => line.includes("which the copy doesn't take for an answer"))).toHaveLength(1);
+
+    // Answered as expected again: read whole and kept, and answered from the copy from then on.
+    await same(rig, chat.id);
+    expect(rig.copy.state().chats.map((c) => c.id)).toEqual([chat.id]);
+    expect(rig.fellBack).toHaveLength(2);
   });
 });
 
@@ -625,8 +807,8 @@ test("its state says what is kept, where from, the last read and why, and the fa
   const state = rig.copy.state();
 
   expect(state.source).toBe("http");
-  expect(state.chats).toEqual([{ id: rig.chat.id, from: "http", rows: 4, chars: expect.any(Number), read: { at: rig.clock.now, why: INSERTED }, checkedAt: rig.clock.now, stale: null }]);
-  expect(state.books).toEqual([{ id: book.id, from: "http", rows: 1, chars: expect.any(Number), read: { at: rig.clock.now - 10, why: "it wasn't kept" }, checkedAt: rig.clock.now - 10, stale: null }]);
+  expect(state.chats).toEqual([{ id: rig.chat.id, from: "http", rows: 4, chars: expect.any(Number), read: { at: rig.clock.now, why: INSERTED }, checkedAt: rig.clock.now, check: { saw: "all of it, read whole", missed: null }, stale: null }]);
+  expect(state.books).toEqual([{ id: book.id, from: "http", rows: 1, chars: expect.any(Number), read: { at: rig.clock.now - 10, why: "it wasn't kept" }, checkedAt: rig.clock.now - 10, check: { saw: "all of it, read whole", missed: null }, stale: null }]);
   expect(state.chars.kept).toBe((state.chats[0]?.chars ?? 0) + (state.books[0]?.chars ?? 0));
   expect(state.reads.map((r) => [r.what, r.why, r.outcome.startsWith("failed") ? "failed" : r.outcome])).toEqual([
     ["chat", "it wasn't kept", "kept"],
@@ -635,6 +817,28 @@ test("its state says what is kept, where from, the last read and why, and the fa
     ["chat", INSERTED, "kept"],
   ]);
   expect(state.fallbacks.total).toBe(1);
+});
+
+test("its state says of each chat what its last check before use saw, and what that check could not see", async () => {
+  const rig = await harbour();
+  expect(rig.copy.state().chats[0]?.check).toEqual({ saw: "all of it, read whole", missed: null });
+  rig.clock.now += 1_000;
+  await rig.copy.chats.messages(rig.chat.id);
+  expect(rig.copy.state().chats[0]).toMatchObject({
+    checkedAt: rig.clock.now,
+    check: {
+      saw: "the number of messages, the newest message and the chat's own fields",
+      missed: "a change Lumiverse makes with no event to a message before the newest (user messages renamed in bulk by persona, an extension's entry or hidden written in place) isn't seen until the chat is read again",
+    },
+  });
+
+  const db = await harbour(rigCopy({ source: ({ lumiverse }) => databaseLike(lumiverse) }));
+  db.clock.now += 1_000;
+  await db.copy.chats.messages(db.chat.id);
+  expect(db.copy.state().chats[0]?.check).toEqual({ saw: "the number of messages, the newest message and the source's fingerprint of the whole chat", missed: null });
+  db.clock.now += 1_000;
+  await db.copy.chats.messages(db.chat.id);
+  expect(db.copy.state().chats[0]?.check).toEqual({ saw: "the source's word that nothing it reads changed since its last check", missed: null });
 });
 
 test("the backend's own chat and lore logic runs over the copy unchanged, and answers as over the extension's host", async () => {

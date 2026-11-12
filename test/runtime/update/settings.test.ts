@@ -39,6 +39,8 @@ describe("the runtime's settings", () => {
       updating: false,
       problem: null,
       line: null,
+      handedOver: false,
+      waitingCopy: null,
     });
   });
 

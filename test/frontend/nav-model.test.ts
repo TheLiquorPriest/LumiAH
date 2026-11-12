@@ -79,7 +79,7 @@ describe("marks on the page bar", () => {
   });
 
   test("a permission LumiAH can't answer without marks Home, where it is granted; one only a part of it rests on marks nothing", () => {
-    const need = (over: Partial<PermissionNeed>): PermissionNeed => ({ id: "generation", what: "make its agents' model calls", without: "no agent can think", todo: "Grant it in Lumiverse.", needed: true, ...over });
+    const need = (over: Partial<PermissionNeed>): PermissionNeed => ({ id: "generation", what: "hear when a reply starts, ends or is stopped", without: "no reply is worked on", todo: "Grant it in Lumiverse.", needed: true, ...over });
     expect(pageMarks({ ...base, permissions: [need({})] })).toEqual({ home: "needs" });
     expect(groupMark("home", pageMarks({ ...base, permissions: [need({})] }))).toBe("needs");
     expect(pageMarks({ ...base, permissions: [need({ id: "mcp_servers", needed: false })] })).toEqual({});

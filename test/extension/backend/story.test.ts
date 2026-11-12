@@ -9,8 +9,8 @@ import { isRecord } from "../../../src/link/json";
 import { type Rig, rig, USER } from "../../support/rig";
 
 let it: Rig | undefined;
-afterEach(() => {
-  it?.close();
+afterEach(async () => {
+  await it?.close();
   it = undefined;
 });
 

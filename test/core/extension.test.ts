@@ -12,6 +12,7 @@ import { recordOf } from "../../src/core/sessions";
 import { defaultSettings, type Settings } from "../../src/core/settings";
 import { renderDefault, TEXT, Texts } from "../../src/core/texts";
 import { directedNote } from "../../src/core/turn";
+import { timeoutPlace } from "../../src/shared/timeouts";
 import { call, idle, MemoryHost, runTurn, type Script, until } from "./support/host";
 import { HARBOUR, KEEPER, LOG_SKILL, READER, type SampleOptions, SEARCH, sampleExtension, TIDES } from "./support/sample-extension";
 
@@ -32,11 +33,18 @@ function rig(script: Script, change: (s: Settings) => void = () => undefined, op
   }
   const stored: { values: Settings; texts: Record<string, string>; definitions?: StoredDefinitions } = { values: defaultSettings(), texts: {} };
   change(stored.values);
-  const harness = createHarness(host, { settings: async () => structuredClone(stored), extension: sample.extension, ...(options.userId !== undefined ? { userId: options.userId } : {}) });
+  // Where the user changes a wait of the core's, as the runtime says it for an extension that names no place of its own.
+  const harness = createHarness(host, { settings: async () => structuredClone(stored), extension: sample.extension, place: (path, title) => timeoutPlace(["core", ...path], title, { name: HARBOUR.name }), ...(options.userId !== undefined ? { userId: options.userId } : {}) });
   return { host, harness, stored, sample, turn: (chatId = CLAIMED) => runTurn(host, harness, chatId) };
 }
 
 const started = (host: MemoryHost) => host.traced.flatMap(({ event }) => (event.kind === "agent_started" ? [event.agent] : []));
+/** How the live view was told the turn ended. */
+const ended = (host: MemoryHost) => host.traced.flatMap(({ event }) => (event.kind === "turn_ended" ? [{ status: event.status, reason: event.reason }] : [])).at(-1);
+/** What the live view was told beside the agents' own steps. */
+const notices = (host: MemoryHost): string[] => host.traced.flatMap(({ event }) => (event.kind === "notice" ? [event.text] : []));
+/** Where Wait for the extension is changed, as the user reads it here. */
+const WAIT_SETTING = `Wait for the extension (${HARBOUR.name}'s Settings → Timeouts → Tools and approvals)`;
 const offered = (request: ModelRequest | undefined): string[] => request?.tools?.map((t) => t.name) ?? [];
 const system = (request: ModelRequest | undefined): string => request?.messages[0]?.content ?? "";
 
@@ -438,29 +446,62 @@ describe("an extension that is slow or broken never holds a turn", () => {
     return sent;
   }
 
-  test("a claim that never answers costs Settings' wait and no more: the chat is answered as one the extension doesn't claim", async () => {
+  test("a claim that never answers costs Settings' wait and no more, and the turn doesn't start: no model is called, the user is told whose word is missing and where the wait is set, and the next turn works once it answers", async () => {
     const r = rig(quick, slow);
+    const claims = r.sample.extension.claim;
     r.sample.extension.claim = never;
     const before = r.host.clock.slept.length;
     const running = r.turn(CLAIMED);
     // A run asks for the definitions and the claim together: the claim's is the second wait.
     expect(await waitOut(r.host, before, 2)).toBe(0);
-    const { result } = await running;
-    expect(result).toMatchObject({ status: "done", reply: REPLY });
-    expect(started(r.host).map((a) => a.role)).toEqual(["main", "writer"]);
-    expect(offered(r.host.calls[0])).toContain(HARBOUR.withdrawn);
+    const { result, sink } = await running;
+    expect(r.host.calls).toHaveLength(0);
+    expect(started(r.host)).toEqual([]);
+    expect(result).toMatchObject({ status: "failed", reply: "" });
+    for (const fact of [HARBOUR.name, "whether it answers this chat itself", "within 4 seconds", WAIT_SETTING]) expect(result.reason).toContain(fact);
+    // Where a failed turn says why: the reply's error and the live view.
+    expect(sink.failed?.message).toBe(result.reason ?? "");
+    expect(ended(r.host)).toEqual({ status: "failed", reason: result.reason });
     expect(logged(r.host, HARBOUR.name, "gave no answer for the chat", `no answer in ${WAIT} ms`)).toBeString();
+    r.sample.extension.claim = claims;
+    expect((await r.turn(CLAIMED)).result).toMatchObject({ status: "done", reply: REPLY });
+    expect(started(r.host).map((a) => a.role)).toEqual([HARBOUR.keeper, "writer"]);
   });
 
-  test("definitions that are refused cost nothing: the run goes on with LumiAH's own and the user's", async () => {
+  test("a claim that fails doesn't start the turn either: no model is called, the user is told the extension's own error, and the next turn works once it answers", async () => {
+    const r = rig(quick, slow);
+    const claims = r.sample.extension.claim;
+    r.sample.extension.claim = () => Promise.reject(new Error("the harbour office is shut"));
+    const { result, sink } = await r.turn(CLAIMED);
+    expect(r.host.calls).toHaveLength(0);
+    expect(started(r.host)).toEqual([]);
+    expect(result).toMatchObject({ status: "failed", reply: "" });
+    for (const fact of [HARBOUR.name, "whether it answers this chat itself", "the harbour office is shut"]) expect(result.reason).toContain(fact);
+    expect(sink.failed?.message).toBe(result.reason ?? "");
+    r.sample.extension.claim = claims;
+    expect((await r.turn(CLAIMED)).result).toMatchObject({ status: "done", reply: REPLY });
+    expect(started(r.host).map((a) => a.role)).toEqual([HARBOUR.keeper, "writer"]);
+  });
+
+  test("definitions that are refused cost a chat the extension doesn't claim nothing: LumiAH's main agent answers it, and the live view says the extension's agents and skills are missing, and why", async () => {
     const r = rig(quick, slow);
     r.sample.extension.definitions = () => Promise.reject(new Error("the harbour office is shut"));
-    const { result } = await r.turn(CLAIMED);
+    const { result } = await r.turn(PLAIN);
     expect(result).toMatchObject({ status: "done", reply: REPLY });
-    // The agent its claim names isn't there to answer, so LumiAH's own does; the rest of the claim holds.
     expect(started(r.host).map((a) => a.role)).toEqual(["main", "writer"]);
-    expect(offered(r.host.calls[0])).not.toContain(HARBOUR.withdrawn);
+    expect(notices(r.host)).toContain(`${HARBOUR.name}'s agents and skills are missing from this run: they couldn't be had (the harbour office is shut)`);
     expect(logged(r.host, HARBOUR.name, "gave no definitions", "the harbour office is shut")).toBeString();
+  });
+
+  test("definitions that come late cost a chat the extension doesn't claim Settings' wait and no more: its live view says how long they were waited for and where that is set", async () => {
+    const r = rig(quick, slow);
+    r.sample.extension.definitions = never;
+    const before = r.host.clock.slept.length;
+    const running = r.turn(PLAIN);
+    expect(await waitOut(r.host, before, 1)).toBe(0);
+    expect((await running).result).toMatchObject({ status: "done", reply: REPLY });
+    expect(started(r.host).map((a) => a.role)).toEqual(["main", "writer"]);
+    expect(notices(r.host)).toContain(`${HARBOUR.name}'s agents and skills are missing from this run: it didn't give them within 4 seconds. If it keeps happening, give it longer with ${WAIT_SETTING}`);
   });
 
   test("a writer's request that throws leaves the writer the messages as the core built them", async () => {
@@ -528,6 +569,113 @@ describe("an extension that is slow or broken never holds a turn", () => {
     began.resolve();
     expect((await running).result).toMatchObject({ status: "done", reply: REPLY });
     expect(r.host.logs).toEqual([]);
+  });
+});
+
+describe("nothing stands in for the agent a claim names to lead the chat's replies", () => {
+  const WAIT = 4000;
+  const slow = (s: Settings): void => void (s.extension.waitMs = WAIT);
+
+  test("its definitions came late: the turn doesn't start, no model is called, the user is told which agent, why and where the wait is set, and the next turn is its once they come in time", async () => {
+    const r = rig(quick, slow);
+    const supplied = r.sample.extension.definitions;
+    r.sample.extension.definitions = () => new Promise<never>(() => undefined);
+    const before = r.host.clock.slept.length;
+    const running = r.turn(CLAIMED);
+    // A run asks for the definitions and the claim together: the definitions' is the first wait. Nothing is sent while it runs.
+    await until(() => r.host.clock.slept.length >= before + 1);
+    await idle();
+    r.host.clock.advance(WAIT);
+    const { result, sink } = await running;
+    expect(r.host.calls).toHaveLength(0);
+    // LumiAH's own main agent never stood in for the keeper.
+    expect(started(r.host)).toEqual([]);
+    expect(result).toMatchObject({ status: "failed", reply: "" });
+    for (const fact of [HARBOUR.name, HARBOUR.keeper, "isn't in this run", "didn't give its agents within 4 seconds", WAIT_SETTING]) expect(result.reason).toContain(fact);
+    expect(sink.failed?.message).toBe(result.reason ?? "");
+    expect(ended(r.host)).toEqual({ status: "failed", reason: result.reason });
+    r.sample.extension.definitions = supplied;
+    expect((await r.turn(CLAIMED)).result).toMatchObject({ status: "done", reply: REPLY });
+    expect(started(r.host).map((a) => a.role)).toEqual([HARBOUR.keeper, "writer"]);
+  });
+
+  test("its definitions failed: the turn doesn't start, and the user is told which agent and the extension's own error", async () => {
+    const r = rig(quick, slow);
+    r.sample.extension.definitions = () => Promise.reject(new Error("the harbour office is shut"));
+    const { result, sink } = await r.turn(CLAIMED);
+    expect(r.host.calls).toHaveLength(0);
+    expect(started(r.host)).toEqual([]);
+    expect(result).toMatchObject({ status: "failed", reply: "" });
+    for (const fact of [HARBOUR.name, HARBOUR.keeper, "the harbour office is shut"]) expect(result.reason).toContain(fact);
+    expect(sink.failed?.message).toBe(result.reason ?? "");
+  });
+
+  test("it is switched off: the turn doesn't start, no model is called, the user is told which agent and where to switch it on, and once it is on the next turn is its", async () => {
+    const r = rig(quick);
+    r.stored.definitions = { off: { agents: [HARBOUR.keeper] } };
+    const { result, sink } = await r.turn(CLAIMED);
+    expect(r.host.calls).toHaveLength(0);
+    expect(started(r.host)).toEqual([]);
+    expect(result).toMatchObject({ status: "failed", reply: "" });
+    for (const fact of [HARBOUR.name, `${KEEPER.name} (${HARBOUR.keeper})`, "switched off", "Switch it on on the Agents page"]) expect(result.reason).toContain(fact);
+    expect(sink.failed?.message).toBe(result.reason ?? "");
+    expect(ended(r.host)).toEqual({ status: "failed", reason: result.reason });
+    r.stored.definitions = {};
+    expect((await r.turn(CLAIMED)).result).toMatchObject({ status: "done", reply: REPLY });
+    expect(started(r.host).map((a) => a.role)).toEqual([HARBOUR.keeper, "writer"]);
+  });
+
+  test("the extension supplies no agent of that id: the turn doesn't start, and the user is told it is the extension's to supply", async () => {
+    const r = rig(quick);
+    r.sample.extension.claim = async () => ({ mainAgent: "harbour_pilot" });
+    const { result } = await r.turn(CLAIMED);
+    expect(r.host.calls).toHaveLength(0);
+    expect(started(r.host)).toEqual([]);
+    expect(result).toMatchObject({ status: "failed", reply: "" });
+    for (const fact of [HARBOUR.name, "harbour_pilot", "there is no such agent"]) expect(result.reason).toContain(fact);
+  });
+});
+
+describe("a job or a conversation about a chat the extension claims, when its asks get no answer", () => {
+  const sink = () => {
+    const told = { error: "", text: "" };
+    return { told, sink: { progress: () => undefined, reasoning: () => undefined, content: (text: string) => void (told.text += text), done: () => undefined, error: (message: string) => void (told.error = message) } };
+  };
+
+  test("a job whose agent is the extension's fails while the extension's definitions fail, with why, and isn't taken for gone: started again once they come, it runs", async () => {
+    const r = rig(() => "The tide turns at six.");
+    const supplied = r.sample.extension.definitions;
+    const { job } = await r.harness.jobs.start({ chatId: CLAIMED, agent: HARBOUR.reader, task: "Read the log.", when: "now" });
+    r.sample.extension.definitions = () => Promise.reject(new Error("the harbour office is shut"));
+    const failed = await r.harness.jobs.run({ id: job.id }, new AbortController().signal);
+    expect(r.host.calls).toHaveLength(0);
+    expect(failed).toMatchObject({ state: "failed" });
+    expect(failed.lasting).toBeUndefined();
+    for (const fact of [HARBOUR.name, "agents and skills are missing", "the harbour office is shut"]) expect(failed.reason).toContain(fact);
+    r.sample.extension.definitions = supplied;
+    const { job: again } = await r.harness.jobs.start({ chatId: CLAIMED, agent: HARBOUR.reader, task: "Read the log.", when: "now" });
+    expect(await r.harness.jobs.run({ id: again.id }, new AbortController().signal)).toMatchObject({ state: "done" });
+  });
+
+  test("a job's run and a conversation's turn don't start where the claim gave no answer, and say why; once it answers, both go on", async () => {
+    const r = rig(() => "The tide turns at six.");
+    const claims = r.sample.extension.claim;
+    const { job } = await r.harness.jobs.start({ chatId: CLAIMED, agent: HARBOUR.reader, task: "Read the log.", when: "now" });
+    const { side } = await r.harness.sides.start({ chatId: CLAIMED });
+    r.sample.extension.claim = () => Promise.reject(new Error("the link dropped"));
+    const failed = await r.harness.jobs.run({ id: job.id }, new AbortController().signal);
+    expect(failed).toMatchObject({ state: "failed" });
+    for (const fact of [HARBOUR.name, "whether it answers this chat itself", "the link dropped"]) expect(failed.reason).toContain(fact);
+    const talk = sink();
+    expect(await r.harness.side({ session: side.id, generationId: "side-turn-1", text: "When does the tide turn?" }, talk.sink, new AbortController().signal)).toMatchObject({ status: "failed" });
+    for (const fact of [HARBOUR.name, "whether it answers this chat itself", "the link dropped"]) expect(talk.told.error).toContain(fact);
+    expect(r.host.calls).toHaveLength(0);
+    r.sample.extension.claim = claims;
+    const { job: again } = await r.harness.jobs.start({ chatId: CLAIMED, agent: HARBOUR.reader, task: "Read the log.", when: "now" });
+    expect(await r.harness.jobs.run({ id: again.id }, new AbortController().signal)).toMatchObject({ state: "done" });
+    const next = sink();
+    expect(await r.harness.side({ session: side.id, generationId: "side-turn-2", text: "When does the tide turn?" }, next.sink, new AbortController().signal)).toMatchObject({ status: "done" });
+    expect(next.told.text).toBe("The tide turns at six.");
   });
 });
 

@@ -33,10 +33,12 @@ import {
   type SessionView,
   type SettingPath,
   type SetupStepId,
+  type SignInProvider,
   type StreamId,
   type TextDef,
   type TurnRow,
   type UiProblem,
+  type ServiceView,
   type UiRequest,
   type UiRequests,
   type UiRequestType,
@@ -46,11 +48,16 @@ import {
   URL_SLOT,
 } from "../../src/shared/ui";
 import { causeOf } from "../../src/extension/backend/cause";
-import { briefedTurn, CHATS, CONNECTIONS, failedTurn, fakeHash, type HeldWord, longTurn, MODELS, OTHER_CHAT, type PlayStep, playedTurn, storedTurns, SUMMARY, THEIR_CHAT, Trace, workedTurn, workingTurn } from "./fixtures";
+import { LINK_VERSION, versionWords } from "../../src/link/contract";
+import { briefedTurn, CHATS, CONNECTIONS, failedTurn, fakeHash, type HeldWord, longTurn, OTHER_CHAT, type PlayStep, playedTurn, storedTurns, SUMMARY, THEIR_CHAT, Trace, workedTurn, workingTurn } from "./fixtures";
+import { chatDataMock } from "./mock/chatdata";
 import { chronicleMock } from "./mock/chronicle";
+import { connectionsMock } from "./mock/connections";
 import { type Handlers, hashOf, type HomeCtx, type PlayedCall, type PlayOptions, Refusal, type StoryCtx } from "./mock/ctx";
 import { defsMock } from "./mock/defs";
 import { homeMock, missingPermissions } from "./mock/home";
+import { storeMock } from "./mock/store";
+import { previewRoad, timingsMock } from "./mock/timings";
 import { jobsMock } from "./mock/jobs";
 import { loreMock } from "./mock/lore";
 import { spendMock } from "./mock/spend";
@@ -188,6 +195,8 @@ export class MockBackend {
   /** The job started as the learning of each chat's story (`lah.job.start` with `story`), by chat. */
   private readonly story = new Map<string, string>();
   private readonly handlers: Handlers<UiRequestType>;
+  /** Finishes the open sign-in to a provider as if the browser ran on the runtime's machine, where it finishes by itself: for the preview's console. */
+  readonly finishSignIn: (provider: SignInProvider) => void;
   private starting = true;
 
   constructor(
@@ -218,18 +227,19 @@ export class MockBackend {
     });
     const relays =
       options.scenario === "ready"
-        ? [relay({})]
+        ? // On the build before the extension's: the extension offered its own, which waits for the reply under way (the Runtime page's update and settings show it).
+          [relay({ build: "1f0a6c33", update: true })]
         : options.scenario === "trouble"
           ? [
               relay({ link: "quiet", seenAt: now - 26 * 60_000, update: true, build: "3b7d2e15", session: { valid: false, endsAt: new Date(now - 3_600_000).toISOString() }, scheduler: "missing", problem: "Not heard from for 26 minutes. It may have stopped, or its Lumiverse session has ended." }),
-              relay({ id: "relay-2", name: "mara-old", link: "refused", seenAt: now - 90_000, unit: null, build: "1f0a6c33", update: true, problem: "This runtime speaks link version 0 and LumiAH 1: update the runtime by running its start line on LumiAH's Runtime page again.", scheduler: "unknown", session: { valid: null, endsAt: null } }),
+              relay({ id: "relay-2", name: "mara-old", link: "refused", seenAt: now - 90_000, unit: null, build: "1f0a6c33", update: true, problem: versionWords(LINK_VERSION - 1, LINK_VERSION), scheduler: "unknown", session: { valid: null, endsAt: null } }),
             ]
           : [];
     const permissions = missingPermissions(options.scenario);
     const steps: Readonly<Record<SetupStepId, boolean>> = { permissions: !permissions.some((p) => p.needed), chat: ready, reply: ready };
     this.state = {
       rev: 1,
-      runtime: { build: BUILD, link: 1, model: "lumiah", relays, start: { service: START_SERVICE, foreground: START_FOREGROUND, missing: [] }, issues: [], ready: false },
+      runtime: { build: BUILD, link: LINK_VERSION, model: "lumiah", relays, start: { service: START_SERVICE, foreground: START_FOREGROUND, missing: [] }, issues: [], ready: false, selfUpdate: true, road: previewRoad(options.scenario === "ready", relays, now) },
       setup: { steps: (["permissions", "chat", "reply"] as const).map((id) => ({ id, done: steps[id] })) },
       key: ready ? { set: true, print: "9f2c·41d0", at: now - 9 * 86_400_000 } : { set: false, print: null, at: null },
       chats: ready ? clone(CHATS) : [],
@@ -244,6 +254,7 @@ export class MockBackend {
       permissions,
     };
     this.state.runtime.ready = this.readyOf(this.state);
+    this.state.chats = this.state.chats.map((c) => this.withRuntime(c));
     this.state.settings = this.settingsView();
     // The jobs' part is made after the context it takes, so what reads its list is bound once it is there.
     let jobsOf: (chatId: string) => JobView[] = () => [];
@@ -281,6 +292,8 @@ export class MockBackend {
     };
     const workspace = workspaceMock(ctx);
     const chronicle = chronicleMock(ctx);
+    const { finishByItself, ...connections } = connectionsMock(ctx);
+    this.finishSignIn = finishByItself;
     const jobs = jobsMock(ctx);
     jobsOf = (chatId) => {
       const page = jobs["lah.jobs.list"]({ lah: UI_VERSION, type: "lah.jobs.list", reqId: "story", chatId, cursor: null, limit: 1000 });
@@ -301,8 +314,15 @@ export class MockBackend {
       ...spendMock(ctx),
       ...talkMock(ctx),
       ...homeMock(ctx),
+      ...storeMock(() => this.options.now()),
+      ...chatDataMock(() => this.options.now()),
+      ...timingsMock(
+        () => this.options.now(),
+        () => this.state.runtime.relays,
+      ),
       ...loreMock(ctx),
       ...chronicle.handlers,
+      ...connections,
       "lah.ws.read": (r) => chronicle.read(r) ?? workspace["lah.ws.read"](r),
       "lah.ws.list": (r) => {
         const view = workspace["lah.ws.list"](r);
@@ -313,6 +333,8 @@ export class MockBackend {
         stories.set(r.chatId, { ...r.story });
         return { story: storyAt(r.chatId) };
       },
+      // No extension answers the preview's chats: LumiAH's own main agent leads each.
+      "lah.chat.lead.get": () => ({ lead: null }),
     };
     if (ready) {
       this.stored.set("chat-mara", storedTurns(now));
@@ -365,7 +387,16 @@ export class MockBackend {
 
   /** The requests this file answers itself: the state, chats, live views and what the user does to a run, sessions, settings, texts, the key and the runtime. */
   private ownHandlers() {
-    type Own = "lah.hello" | "lah.chat.get" | "lah.chat.set" | "lah.chat.takeover" | "lah.live.open" | "lah.live.events" | "lah.live.close" | "lah.turn.stop" | "lah.turn.say" | "lah.turn.pause" | "lah.approval.answer" | "lah.approvals.kept" | "lah.approval.forget" | "lah.turns.list" | "lah.transcript.get" | "lah.prompt.get" | "lah.blob.get" | "lah.session.rollback" | "lah.session.summarize" | "lah.settings.set" | "lah.models.list" | "lah.text.set" | "lah.text.reset" | "lah.key" | "lah.relay" | "lah.drawer.close";
+    type Own = "lah.hello" | "lah.chat.get" | "lah.chat.set" | "lah.chat.takeover" | "lah.live.open" | "lah.live.events" | "lah.live.close" | "lah.turn.stop" | "lah.turn.say" | "lah.turn.pause" | "lah.approval.answer" | "lah.approvals.kept" | "lah.approval.forget" | "lah.turns.list" | "lah.transcript.get" | "lah.prompt.get" | "lah.blob.get" | "lah.session.rollback" | "lah.session.summarize" | "lah.settings.set" | "lah.text.set" | "lah.text.reset" | "lah.key" | "lah.relay" | "lah.drawer.close" | "lah.runtime.service.get" | "lah.runtime.service.set" | "lah.runtime.update.apply";
+    // How each linked runtime of the preview is run and kept, as it would say itself: a systemd service on a build behind the extension's, with that build waiting for the reply under way.
+    const services = new Map<string, ServiceView>();
+    const service = (relay: string): ServiceView => {
+      const r = this.state.runtime.relays.find((x) => x.id === relay);
+      if (r === undefined || r.link !== "linked") throw new Refusal("unavailable", "That runtime isn't linked now. Start it (its line is on LumiAH's Runtime page) and try again.");
+      const made = services.get(relay) ?? { build: r.build ?? BUILD, memory: "1G", memoryNote: null, autoUpdate: true, runs: "systemd", unit: r.unit, source: "/srv/lumiverse/extensions/lumi_ah/dist/lumiah.js", installed: "/home/mara/.local/share/lumiah/lumiah.js", waiting: r.update ? { build: BUILD, since: this.options.now() } : null, busy: r.turns > 0, restartNeeded: false, updating: false, problem: null, line: null, handedOver: false, waitingCopy: null, underWay: { replies: r.turns, requests: r.turns, jobs: 0, sides: 0 } };
+      services.set(relay, made);
+      return made;
+    };
     const handlers: { [K in Own]: (r: Extract<UiRequest, { type: K }>) => UiRequests[K]["result"] } = {
       "lah.hello": () => this.state,
       "lah.chat.get": (r) => ({ chat: this.chat(r.chatId) }),
@@ -376,7 +407,7 @@ export class MockBackend {
         if (r.on && loopback === undefined) throw new Refusal("unavailable", NO_RUNTIME);
         // Switched on, a chat is pinned to the loopback connection, so the runtime answers it; switched off, it gets its own back.
         const connection = r.on && loopback ? { id: loopback.id, name: loopback.name, loopback: true } : { id: "conn-deepseek", name: "Deepseek", loopback: false };
-        const chat: ChatView = { ...before, on: r.on, since: r.on ? (before.on && before.since !== null ? before.since : this.options.now()) : null, connection };
+        const chat: ChatView = this.withRuntime({ ...before, on: r.on, since: r.on ? (before.on && before.since !== null ? before.since : this.options.now()) : null, connection });
         const chats = this.state.chats.some((c) => c.chatId === chat.chatId) ? this.state.chats.map((c) => (c.chatId === chat.chatId ? chat : c)) : [...this.state.chats, chat];
         this.push({ chats: chats.filter((c) => c.on || chatAnswered(c)), ...(r.on ? { setup: this.stepDone("chat") } : {}) });
         return { chat };
@@ -388,7 +419,7 @@ export class MockBackend {
         if (loopback === undefined) throw new Refusal("unavailable", NO_RUNTIME);
         // The other's mark goes, and the chat is switched on here: pinned to the loopback connection, so the runtime answers it.
         const { other: _mark, ...mine } = before;
-        const chat: ChatView = { ...mine, on: true, since: this.options.now(), connection: { id: loopback.id, name: loopback.name, loopback: true } };
+        const chat: ChatView = this.withRuntime({ ...mine, on: true, since: this.options.now(), connection: { id: loopback.id, name: loopback.name, loopback: true } });
         const chats = this.state.chats.some((c) => c.chatId === chat.chatId) ? this.state.chats.map((c) => (c.chatId === chat.chatId ? chat : c)) : [...this.state.chats, chat];
         this.push({ chats });
         return { chat };
@@ -485,11 +516,6 @@ export class MockBackend {
         return { session: this.session(r.chatId) };
       },
       "lah.settings.set": (r) => ({ settings: this.setSettings(r.set, r.reset) }),
-      "lah.models.list": (r) => {
-        const models = MODELS[r.connectionId ?? ""];
-        if (!models) throw new Refusal("unavailable", "its provider lists no models");
-        return { models };
-      },
       "lah.text.set": (r) => {
         if (!this.options.texts.defs.some((d) => d.id === r.id)) throw new Refusal("not_found", `There is no text ${r.id}.`);
         const refused = this.options.texts.check(r.id, r.text);
@@ -521,13 +547,26 @@ export class MockBackend {
       "lah.relay": (r) => {
         if (!this.state.runtime.relays.some((x) => x.id === r.relay)) throw new Refusal("not_found", "There is no such runtime.");
         const runtime = r.op === "forget" ? { ...this.state.runtime, relays: this.state.runtime.relays.filter((x) => x.id !== r.relay) } : this.state.runtime;
-        if (r.op === "forget") this.push({ runtime });
+        if (r.op === "forget") this.push({ runtime, chats: this.state.chats.map((c) => this.withRuntime(c, runtime.relays)) });
         return { runtime };
       },
       "lah.drawer.close": () => {
         const close = this.options.closeDrawer;
         close?.();
         return { closed: close !== undefined };
+      },
+      "lah.runtime.service.get": (r) => ({ service: service(r.relay) }),
+      "lah.runtime.service.set": (r) => {
+        const before = service(r.relay);
+        const after: ServiceView = { ...before, ...(r.memory !== undefined ? { memory: r.memory, restartNeeded: r.memory !== "1G" } : {}), ...(r.autoUpdate !== undefined ? { autoUpdate: r.autoUpdate } : {}) };
+        services.set(r.relay, r.restart === true && after.restartNeeded ? { ...after, updating: true } : after);
+        return { service: service(r.relay), restart: r.restart === true && after.restartNeeded ? "restarting" : after.restartNeeded ? "needed" : "none" };
+      },
+      "lah.runtime.update.apply": (r) => {
+        const before = service(r.relay);
+        if (before.waiting === null) throw new Refusal("unavailable", "There is no update to take: this runtime is on the build LumiAH offered, or LumiAH hasn't offered one since it started.");
+        services.set(r.relay, { ...before, waiting: null, updating: true });
+        return { service: service(r.relay), cut: before.underWay };
       },
     };
     return handlers;
@@ -539,7 +578,7 @@ export class MockBackend {
   linkRuntime(): void {
     const now = this.options.now();
     const linked: RelayView = { id: "relay-1", name: "mara", build: BUILD, host: "harbour", url: "http://127.0.0.1:7861/v1", registeredAt: now, seenAt: now, link: "linked", problem: null, update: false, turns: 0, unit: "lumiah-mara.service", session: { valid: true, endsAt: new Date(now + 7 * 86_400_000).toISOString() }, scheduler: "excluded", lines: { update: null, login: null } };
-    this.push({ runtime: { ...this.state.runtime, relays: [linked] } });
+    this.push({ runtime: { ...this.state.runtime, relays: [linked], road: previewRoad(this.state.runtime.road.granted, [linked], now) }, chats: this.state.chats.map((c) => this.withRuntime(c, [linked])) });
   }
 
   /** Lumiverse grants LumiAH permissions, as after the user agreed in its confirmation: first-time setup's first step is done once none it needs is missing. */
@@ -773,6 +812,13 @@ export class MockBackend {
   }
 
   // ---------------------------------------------------------------- inside
+
+  /** A chat as the backend fills it in: the runtime that plays it while it is switched on, pinned to the loopback and a runtime is linked (the one heard from last); none else. */
+  private withRuntime(chat: ChatView, relays: readonly RelayView[] = this.state.runtime.relays): ChatView {
+    const { runtime: _was, ...rest } = chat;
+    const plays = relays.filter((r) => r.link === "linked").sort((a, b) => (b.seenAt ?? 0) - (a.seenAt ?? 0))[0];
+    return rest.on && chatAnswered(rest) && plays !== undefined ? { ...rest, runtime: { id: plays.id, name: plays.name } } : rest;
+  }
 
   /** A chat as the backend has it: as the state lists it, else as Lumiverse knows it (its name, switched off, on its own connection). */
   private chat(chatId: string): ChatView {

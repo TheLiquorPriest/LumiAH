@@ -28,8 +28,10 @@ const USAGE: AgentUsage = { calls: 1, toolTurns: 0, in: 10, cachedIn: 0, out: 5,
 const answering: RuntimeDeps["harness"] = (host) => ({
   async answer(turn, sink, signal) {
     const said = await host.models.call({ messages: [{ role: "user", content: "Answer the chat's latest message." }], maxTokens: 64, connectionId: null, model: null }, signal);
-    const segment = await textHash(`${turn.generationId}\n${said.content}`);
-    await host.blobs.put(segment, said.content);
+    // Kept as the core keeps a blob: under the hash of its own text.
+    const text = `${turn.generationId}\n${said.content}`;
+    const segment = await textHash(text);
+    await host.blobs.put(segment, text);
     sink.content(said.content);
     sink.done("stop", USAGE);
     return { status: "done", record: { v: 1, generationId: turn.generationId, kind: turn.kind, at: 2, path: "", segment, usage: USAGE }, reply: said.content, usage: USAGE };
@@ -62,9 +64,9 @@ interface Both {
   generate(chatId: string): Promise<Generated>;
 }
 
-const closers: (() => void)[] = [];
-afterEach(() => {
-  for (const close of closers.splice(0)) close();
+const closers: (() => Promise<void>)[] = [];
+afterEach(async () => {
+  for (const close of closers.splice(0)) await close();
 });
 
 /** The user's Custom connections, as their Connections list shows them. */
@@ -80,10 +82,8 @@ async function both(): Promise<Both> {
   lumiverse.host.addConnection({ id: "conn-main", name: "Main", provider: "openai", model: "model-main", isDefault: true });
 
   const install = async (host: FakeHost, options: BackendOptions, configName: string): Promise<Installed> => {
-    // Nothing here waits on a backend's own timers (a key that goes unanswered, text held back), so it is given none.
+    // Nothing here waits on a backend's own timers (a key that goes unanswered), so it is given none.
     const backend = createBackend(host, { now: () => Date.now(), later: () => () => undefined, build: "test-build" }, options);
-    // The stream's text isn't held back, so a reply is read as it is written.
-    await backend.settings.change(USER, [{ path: ["transport", "streams", "coalesceMs"], value: 0 }], []);
     const page = new FakePage(host, USER);
 
     // The line its own Runtime page shows, run as it stands on the machine Lumiverse runs on: the extension's own Bun and copy of the runtime, then `up` and its options.
@@ -94,11 +94,11 @@ async function both(): Promise<Both> {
     const path = `${HOME}/.config/lumiah/${configName}.json`;
     const config = configOf(m.files.get(path)?.text ?? null, path);
 
-    // What `lumiah serve` then runs from that config. Its clockwork (pings, a gap asked about again) is left unrun: nothing here goes quiet or gets lost.
+    // What `lumiah serve` then runs from that config. Its clockwork (pings, a stalled call given up) is left unrun: nothing here goes quiet or gets lost.
     const runtime = runtimeFrom(config, lumiverse, [], { harness: answering });
-    closers.push(() => {
+    closers.push(async () => {
       runtime.shutdown();
-      runtime.close();
+      await runtime.close();
     });
     await runtime.link.connect();
     const minted = await page.request("lah.key", { op: "mint" });
@@ -179,9 +179,13 @@ describe("LumiAH and an extension that has LumiAH built in, installed together",
     await it.lantern.backend.settings.change(USER, [{ path: ["transport", "history", "count"], value: 1 }], []);
     const chatId = await it.chat(it.lumiah, "Who keeps the harbour light now?", "Ilse did, last I heard.", "And this spring?");
     it.lumiah.host.script = ["Okoro keeps it now."];
+    // What each runtime keeps reaches its own extension's storage behind it: each is looked at once its runtime's store has sent it everything.
+    const mirrored = (): Promise<unknown> => Promise.all([it.lumiah.runtime.store.settle(), it.lantern.runtime.store.settle()]);
+    await mirrored();
     const kept = [...it.lantern.host.files.keys()];
 
     const out = await it.generate(chatId);
+    await mirrored();
 
     expect(out).toMatchObject({ status: 200, error: null, content: "Okoro keeps it now." });
     expect(it.lumiah.backend.turns.ofChat(USER, chatId)?.turn).toBe(out.generationId);
@@ -192,6 +196,8 @@ describe("LumiAH and an extension that has LumiAH built in, installed together",
     expect({ lumiah: it.lumiah.requests, lantern: it.lantern.requests }).toEqual({ lumiah: 1, lantern: 0 });
     expect(it.lantern.host.calls).toEqual([]);
     expect([...it.lantern.host.files.keys()]).toEqual(kept);
+    // The record goes on the reply once the extension's storage holds what it names.
+    await until(() => it.lumiah.host.message(chatId, out.messageId ?? "").metadata.lumi_ah !== undefined, "LumiAH's record on the reply");
     expect([...it.lumiah.host.files.keys()].some((path) => path.startsWith(`${USER}/blobs/`))).toBe(true);
 
     const reply = it.lumiah.host.message(chatId, out.messageId ?? "");
@@ -204,9 +210,12 @@ describe("LumiAH and an extension that has LumiAH built in, installed together",
     await it.lumiah.backend.settings.change(USER, [{ path: ["transport", "history", "count"], value: 1 }], []);
     const chatId = await it.chat(it.lantern, "Who sells Okoro his lamp oil?", "Brann used to.", "And now?");
     it.lantern.host.script = ["Brann still does, every market day."];
+    const mirrored = (): Promise<unknown> => Promise.all([it.lumiah.runtime.store.settle(), it.lantern.runtime.store.settle()]);
+    await mirrored();
     const kept = [...it.lumiah.host.files.keys()];
 
     const out = await it.generate(chatId);
+    await mirrored();
 
     expect(out).toMatchObject({ status: 200, error: null, content: "Brann still does, every market day." });
     expect(it.lantern.backend.turns.ofChat(USER, chatId)?.turn).toBe(out.generationId);
@@ -216,6 +225,7 @@ describe("LumiAH and an extension that has LumiAH built in, installed together",
     expect({ lumiah: it.lumiah.requests, lantern: it.lantern.requests }).toEqual({ lumiah: 0, lantern: 1 });
     expect(it.lumiah.host.calls).toEqual([]);
     expect([...it.lumiah.host.files.keys()]).toEqual(kept);
+    await until(() => it.lantern.host.message(chatId, out.messageId ?? "").metadata.other_ext !== undefined, "the extension's record on the reply");
     expect([...it.lantern.host.files.keys()].some((path) => path.startsWith(`${USER}/blobs/`))).toBe(true);
 
     const reply = it.lantern.host.message(chatId, out.messageId ?? "");

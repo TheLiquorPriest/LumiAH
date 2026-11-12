@@ -14,5 +14,5 @@
     // In a project of your own, delete `paths`: `lumi-ah` is then the dependency in package.json.
     "paths": { "lumi-ah/*": ["../../src/*/index.ts"] }
   },
-  "include": ["src"]
+  "include": ["src", "build.ts"]
 }

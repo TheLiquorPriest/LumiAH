@@ -17,8 +17,8 @@ import { FakeHost, toolCall } from "../../support/fake-host";
 import { type Rig, rig, until, USER } from "../../support/rig";
 
 let r: Rig | null = null;
-afterEach(() => {
-  r?.close();
+afterEach(async () => {
+  await r?.close();
   r = null;
 });
 

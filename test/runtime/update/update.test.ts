@@ -225,12 +225,96 @@ describe("restarting onto the new build", () => {
     expect(update.get()).toMatchObject({ updating: false, line: "systemctl --user restart lumiah-mara.service" });
   });
 
-  test("where the runtime can't start its successor, it says so, with the line that starts it", async () => {
+  test("systemctl ended by the very stop it asked for had queued the restart: the update is on its way, and nothing is said to have failed", async () => {
+    const at = setUp({ unit: true });
+    // The stop reaches every process of the unit, and systemctl is one of them until it has gone.
+    at.answers.set("restart", { code: 127, out: "", err: "Command failed: /usr/bin/systemctl --user restart --no-block lumiah-mara.service", signal: "SIGTERM" });
+    const update = createUpdate(at.deps);
+
+    expect(await update.offer(offerOf(at))).toEqual({ taken: "updating" });
+    expect(at.text(at.copy)).toBe(NEW);
+    expect(update.get().line).toBeNull();
+  });
+
+  test("where no Bun is known to run the new build with, it can't be checked, so the copy stays as it was and the page says why", async () => {
     const at = setUp({ runs: "copy", bun: null });
     const update = createUpdate(at.deps);
 
-    expect(await update.offer(offerOf(at))).toEqual({ refused: "Build 2222bbbb is in place, but the runtime can't restart itself here. Stop it, then start it again with:" });
-    expect(update.get()).toMatchObject({ updating: false, line: `bun ${at.copy} serve --config ${at.configPath}` });
+    expect(await update.offer(offerOf(at))).toEqual({ refused: "Build 2222bbbb can't start here (no Bun is known to run it with), so the runtime stays on build 1111aaaa. Update Bun, or the extension, and it is offered again." });
+    expect(update.get()).toMatchObject({ updating: false, waiting: null, problem: expect.stringContaining("can't start here") });
+    expect(at.text(at.copy)).toBe(OLD);
     expect(at.left).toEqual([]);
+  });
+});
+
+describe("what the extension offers and how the runtime words it", () => {
+  test("an offer naming a path with a control character is no offer, and no word the runtime logs or shows carries one", async () => {
+    const at = setUp({ unit: true });
+    const update = createUpdate(at.deps);
+    for (const path of [`${at.source}\n[lumiah] forged line`, `${at.source}\u001b[2J`, `${at.source}\u009b31m`, `${at.source}\u2028`]) {
+      expect(await update.offer(offerOf(at, { path }))).toEqual({ refused: "LumiAH offered an update this runtime can't read: run the update line on LumiAH's Runtime page." });
+    }
+    expect(at.text(at.copy)).toBe(OLD);
+    expect(at.checked).toEqual([]);
+    for (const words of [...at.logs, update.get().problem ?? ""]) expect(words).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
+  });
+
+  test("a path of the runtime's own that holds a control character is shown escaped in its words", async () => {
+    const at = setUp({ unit: true });
+    const update = createUpdate({ ...at.deps, name: () => "Lantern\u001b[31m" });
+    const elsewhere = join(at.dir, "elsewhere/lumiah.js");
+    const outcome = await update.offer(offerOf(at, { path: elsewhere }));
+    expect(outcome).toEqual({ refused: expect.stringContaining("Lantern\\u001b[31m offers the runtime at") });
+    expect(JSON.stringify(outcome)).not.toContain("\u001b");
+  });
+});
+
+describe("a new build that can't start here", () => {
+  test("never takes the place of the copy that runs: the copy stays, nothing restarts, the offer is let go and the page says why", async () => {
+    const at = setUp({ unit: true });
+    at.version = { code: 1, out: "", err: "SyntaxError: Unexpected token '??='\n    at <parse> (lumiah.js:1:1)\n" };
+    const update = createUpdate(at.deps);
+
+    const outcome = await update.offer(offerOf(at));
+    // Checked with the Bun its unit runs it with, where it was written beside the copy.
+    expect(at.checked).toEqual([`${BUN} ${at.copy}.mara.tmp`]);
+    expect(outcome).toEqual({ refused: `Build 2222bbbb can't start here (${BUN} ${at.copy}.mara.tmp --version ended with 1: SyntaxError: Unexpected token '??=' at <parse> (lumiah.js:1:1)), so the runtime stays on build 1111aaaa. Update Bun, or the extension, and it is offered again.` });
+    expect(at.text(at.copy)).toBe(OLD);
+    expect(readdirSync(dirname(at.copy))).toEqual(["lumiah.js"]);
+    expect(at.ran).toEqual([]);
+    expect(at.left).toEqual([]);
+    expect(update.get()).toMatchObject({ waiting: null, updating: false, problem: expect.stringContaining("can't start here") });
+    // The button has nothing to take; the next hello offers it again.
+    await expect(update.applyNow()).rejects.toMatchObject({ code: "unavailable", message: expect.stringContaining("can't start here") });
+  });
+
+  test("one that answers without a version is no runtime either", async () => {
+    const at = setUp({ runs: "copy" });
+    at.version = { code: 0, out: "Welcome to Bun\n", err: "" };
+    const update = createUpdate(at.deps);
+    expect(await update.offer(offerOf(at))).toEqual({ refused: expect.stringContaining("--version said no version: Welcome to Bun") });
+    expect(at.text(at.copy)).toBe(OLD);
+    expect(at.left).toEqual([]);
+  });
+
+  test("running from the extension's own file, it isn't restarted onto a new build there that can't start", async () => {
+    const at = setUp({ runs: "source" });
+    at.version = { code: 127, out: "", err: "error: Cannot find module" };
+    // It started on the build before; then the extension was updated, and its file holds the new one.
+    writeFileSync(at.source, OLD);
+    const update = createUpdate(at.deps);
+    writeFileSync(at.source, NEW);
+    expect(await update.offer(offerOf(at))).toEqual({ refused: expect.stringContaining(`${BUN} ${at.source} --version ended with 127`) });
+    expect(at.checked).toEqual([`${BUN} ${at.source}`]);
+    expect(at.left).toEqual([]);
+  });
+
+  test("a build that starts is checked the same way before it is put in place", async () => {
+    const at = setUp({ runs: "copy" });
+    const update = createUpdate(at.deps);
+    expect(await update.offer(offerOf(at))).toEqual({ taken: "updating" });
+    expect(at.checked).toEqual([`${BUN} ${at.copy}.mara.tmp`]);
+    expect(at.text(at.copy)).toBe(NEW);
+    expect(at.left).toEqual([{ command: BUN, args: [at.copy, "serve", "--config", at.configPath] }]);
   });
 });

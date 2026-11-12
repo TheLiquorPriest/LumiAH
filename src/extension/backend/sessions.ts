@@ -4,6 +4,14 @@
 // rollback of a compaction. And what the first screen says of a chat's latest turn (§8 Home), which
 // is read from the same records. Everything here is read with the core's own functions, so the page
 // shows what the main agent would resume from, worked out the same way.
+//
+// The core's documents and blobs are written by the user's runtime, on its own disk first, and reach
+// this extension's storage behind (the runtime's working store). So before a read the runtime is
+// asked to finish sending what it saved (`store.settle`), for a short while (Settings → Transport →
+// Pages): a session, whose documents change, is read once it has; a stored text, named by its hash
+// and so the same wherever it is found, is asked about only when the storage doesn't have it. With
+// no runtime linked the storage is read as it is; with one that doesn't say in time, the page is
+// told it sees the storage's last state.
 
 import { Blobs } from "../../core/blobs";
 import type { ChatPort, ModelRequest, PathMessage, TurnRecord } from "../../core/ports";
@@ -18,7 +26,7 @@ import { BLOB_HASH } from "../../link/contract";
 import type { LastTurn, LiveView, RollbackState, SessionView, TurnRow, TurnsPage } from "../../shared/ui";
 import { isReply } from "../../shared/ui";
 import type { Chats } from "./chat";
-import { UiRefused } from "./errors";
+import { UiRefused, wordsOf } from "./errors";
 import type { Storage } from "./reads";
 import type { SettingsStore } from "./settings";
 import { lastOfLive, lastOfRecord } from "./views";
@@ -28,6 +36,17 @@ export interface SessionsDeps {
   storage: Storage;
   settings: SettingsStore;
   now(): number;
+  /** The extension as its pages name it. */
+  name: string;
+  /**
+   * Asks the user's runtime to finish sending what it saved to this extension's storage
+   * (`store.settle`), for a read about `chatId` (null: about none): true once it has; false when no
+   * runtime of the user's is linked, so the storage is all there is. Rejects in the runtime's or the
+   * link's words.
+   */
+  settle(userId: string, chatId: string | null): Promise<boolean>;
+  /** Runs `fn` once after `ms`; what it returns cancels that. */
+  later(ms: number, fn: () => void): () => void;
 }
 
 function hashOf(raw: string, what: string): string {
@@ -71,13 +90,43 @@ export class SessionsPage {
   }
 
   /**
+   * Asks the user's runtime to finish sending what it saved to the storage, and waits for its answer
+   * as long as Settings say (`pages.settleMs`). Null when the storage is as current as it can be
+   * made (the runtime said so, or none is linked to ask); else why it may not be, in a sentence.
+   */
+  private async caughtUp(userId: string, chatId: string | null): Promise<string | null> {
+    const waitMs = (await this.deps.settings.transport(userId)).pages.settleMs;
+    const { promise, resolve } = Promise.withResolvers<string | null>();
+    const cancel = this.deps.later(waitMs, () => resolve(`Your runtime didn't say within ${Math.round(waitMs / 100) / 10} s that it had sent ${this.deps.name} everything it saved.`));
+    this.deps
+      .settle(userId, chatId)
+      .then(
+        () => resolve(null),
+        (error: unknown) => resolve(wordsOf(error)),
+      )
+      .finally(cancel);
+    return promise;
+  }
+
+  /** A stored text by its hash: from the storage, and asked about again once the runtime has sent what it saved when the storage didn't have it. Null when it still doesn't, with why the storage may be behind. */
+  private async text(userId: string, hash: string): Promise<{ text: string | null; behind: string | null }> {
+    const text = await this.deps.storage.blob(userId, hash);
+    if (text !== null) return { text, behind: null };
+    const behind = await this.caughtUp(userId, null);
+    return { text: await this.deps.storage.blob(userId, hash), behind };
+  }
+
+  /**
    * The session as the main agent would resume it for a reply after every message of the path: read
-   * with the core's own resume and measured as it measures what it carries. Whether the user's ask
-   * for a summary still stands, and whether a rollback holds the notes, are the core's own verdict
-   * (`compactionDue`) on what the chat's next turn would read.
+   * with the core's own resume and measured as it measures what it carries, once the runtime has
+   * sent what it saved. Whether the user's ask for a summary still stands, and whether a rollback
+   * holds the notes, are the core's own verdict (`compactionDue`) on what the chat's next turn would
+   * read.
    */
   private async session(userId: string, chatId: string, path: PathMessage[]): Promise<SessionView> {
     const { storage, settings } = this.deps;
+    const why = await this.caughtUp(userId, chatId);
+    const behind = why === null ? null : `${why} This shows what ${this.deps.name}'s storage holds, which may lack the newest. Look again in a moment.`;
     const snapshot = await settings.snapshot(userId);
     const core = settingsOf(snapshot.values.core);
     // A store for this one read: nothing is kept in memory past it, and nothing is written.
@@ -105,6 +154,7 @@ export class SessionsPage {
       // An ask stands until a summary is made or rolled back after it. Notes of no length are summarized for nothing but an ask that stands.
       asked: compactionDue({ ...standing, tokens: 0, limit: 0 }) === "due" ? asked : null,
       held: compactionDue({ ...standing, tokens, limit: limitOf(core.session.summarizeAtTokens) }) === "held",
+      ...(behind !== null ? { behind } : {}),
     };
   }
 
@@ -166,16 +216,21 @@ export class SessionsPage {
     };
   }
 
-  /** A stored transcript whole, by its hash; null when it is no longer stored, or the blob isn't one. Blobs are kept per user, so one read by its hash is always the reader's own. */
-  async stored(userId: string, hash: string): Promise<TurnTranscript | null> {
-    const text = await this.deps.storage.blob(userId, hashOf(hash, "A transcript"));
-    return text === null ? null : transcriptOf(text);
+  /** A stored transcript whole, by its hash; null when it is no longer stored, or the blob isn't one, with why the storage may be behind where it is. Blobs are kept per user, so one read by its hash is always the reader's own. */
+  private async stored(userId: string, hash: string): Promise<{ transcript: TurnTranscript | null; behind: string | null }> {
+    const { text, behind } = await this.text(userId, hashOf(hash, "A transcript"));
+    return { transcript: text === null ? null : transcriptOf(text), behind };
+  }
+
+  /** A text the storage doesn't have: gone, or (`behind`) not there yet. */
+  private missing(what: string, behind: string | null): UiRefused {
+    return new UiRefused("not_found", behind === null ? `${what} is no longer stored.` : `${what} isn't in ${this.deps.name}'s storage yet. ${behind} Look again in a moment.`);
   }
 
   /** `lah.transcript.get`: a stored transcript as a live view, its events from `from` on, a page of them. */
   async transcript(userId: string, hash: string, from: number): Promise<{ view: LiveView; next: number | null }> {
-    const stored = await this.stored(userId, hash);
-    if (stored === null) throw new UiRefused("not_found", "That turn's transcript is no longer stored.");
+    const { transcript: stored, behind } = await this.stored(userId, hash);
+    if (stored === null) throw this.missing("That turn's transcript", behind);
     const size = (await this.deps.settings.transport(userId)).live.page;
     const events = stored.events.slice(from - 1, from - 1 + size);
     const read = from - 1 + events.length;
@@ -211,21 +266,27 @@ export class SessionsPage {
     }
     const kept = latestRecord(await this.deps.chats.path(userId, chatId), null);
     if (kept === null) return null;
-    const stored = kept.record.transcript === undefined ? null : await this.stored(userId, kept.record.transcript);
+    const stored = kept.record.transcript === undefined ? null : (await this.stored(userId, kept.record.transcript)).transcript;
     return lastOfRecord({ messageId: kept.message.id, record: kept.record }, stored);
   }
 
   /** `lah.prompt.get`: the exact request of a model call. */
   async prompt(userId: string, hash: string): Promise<ModelRequest> {
-    const prompt = await readCallPrompt({ get: (h) => this.deps.storage.blob(userId, h) }, hashOf(hash, "A call's prompt"));
-    if (prompt === null) throw new UiRefused("not_found", "That call's prompt is no longer stored.");
+    let behind: string | null = null;
+    const get = async (h: string): Promise<string | null> => {
+      const read = await this.text(userId, h);
+      behind ??= read.behind;
+      return read.text;
+    };
+    const prompt = await readCallPrompt({ get }, hashOf(hash, "A call's prompt"));
+    if (prompt === null) throw this.missing("That call's prompt", behind);
     return prompt;
   }
 
   /** `lah.blob.get`: a stored text by its hash. */
   async blob(userId: string, hash: string): Promise<string> {
-    const text = await this.deps.storage.blob(userId, hashOf(hash, "A stored text"));
-    if (text === null) throw new UiRefused("not_found", "That text is no longer stored.");
+    const { text, behind } = await this.text(userId, hashOf(hash, "A stored text"));
+    if (text === null) throw this.missing("That text", behind);
     return text;
   }
 

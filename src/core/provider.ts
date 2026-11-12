@@ -2,7 +2,7 @@
 // port, and what comes back.
 //
 // Tool turns are native: an assistant turn goes back as its text and `tool_use` parts, the results as
-// `tool_result` parts, which Lumiverse maps to each provider's own. For a connection's model that
+// `tool_result` parts, which the host maps to each provider's own. For a connection's model that
 // refuses tools, and for an agent set to have its tools as text, the older convention stays: the
 // tools are offered as text, the results go back in a plain user message (`TEXT_TURNS`), and the
 // calls the model writes are recovered from its text, as they are from any model that writes a call
@@ -15,13 +15,13 @@
 // sends, go out under names a provider takes (`wireNames`), and a call that comes back is read back
 // to its tool's own name: the request sent is the only place the names on the wire stand.
 //
-// Here too: the effort a call goes with, a prompt's order and its cache breakpoints (within the
-// provider's limit, the connection's own counted), the usage request, whether a call streams, and the
+// Here too: the effort a call goes with, a prompt's order, the agent session its calls share the
+// provider's prompt cache by and how long the provider keeps it, whether a call streams, and the
 // accounts kept per connection: its throttles, its calls under way at once, and which of its models
 // were seen refusing native tools, and when. Every call reserves against its connection before it is
 // sent.
 
-import type { AgentStopCode, CallUsage, ConnectionProfile, HarnessHost, JsonObject, ModelDelta, ModelEffort, ModelMessage, ModelPart, ModelRequest, ModelResult, ModelThinkingBlock, ModelTool, SamplingParams } from "./ports";
+import type { AgentStopCode, CacheRetention, CallUsage, ConnectionProfile, HarnessHost, JsonObject, ModelDelta, ModelEffort, ModelMessage, ModelPart, ModelRequest, ModelResult, ModelThinkingBlock, ModelTool, SamplingParams } from "./ports";
 import { isRecord } from "./ports";
 import type { ConnectionThrottle, Settings, ToolCalls } from "./settings";
 import { renderDefault, TEXT, type Texts } from "./texts";
@@ -588,44 +588,17 @@ export interface Opening {
   tools: string | null;
 }
 
-/** A message with a cache breakpoint after its last part (a text message becomes one text part). */
-function marked(m: ModelMessage): ModelMessage {
-  const parts: ModelPart[] = m.parts ? [...m.parts] : [{ type: "text", text: m.content }];
-  const last = parts.at(-1);
-  if (last) parts[parts.length - 1] = { ...last, cache: true };
-  return { ...m, parts };
-}
-
 /**
- * One call's messages: the opening as the system message, then the conversation. With breakpoints to
- * spend, on a provider that takes them: the first after the opening, which every call of the agent
- * shares; the second after the conversation so far, so each round reads the rounds before it from the
- * cache; the third after the shared prefix, which other agents with the same prefix read too. With
- * none, the opening goes as one plain text, as every provider takes it. With no opening at all (the
- * writer, whose conversation is Lumiverse's messages as they came) the conversation goes as it is.
+ * One call's messages: the opening as one system message, then the conversation. With no opening
+ * at all (the writer, whose conversation is Lumiverse's messages as they came) the conversation
+ * goes as it is. Every call of an agent starts with the same opening, which the provider keeps in
+ * its prompt cache for the agent's session.
  */
-export function assemble(opening: Opening, conversation: readonly ModelMessage[], breakpoints: number): ModelMessage[] {
+export function assemble(opening: Opening, conversation: readonly ModelMessage[]): ModelMessage[] {
   const head = opening.nonce !== null && opening.nonce !== "" ? [opening.nonce] : [];
   const texts = [...head, ...opening.prefix, opening.system, ...(opening.tools ? [opening.tools] : [])].filter((t) => t !== "");
   if (texts.length === 0) return [...conversation];
-  const content = texts.join("\n\n");
-  if (breakpoints <= 0) return [{ role: "system", content }, ...conversation];
-  const parts = texts.map((text): ModelPart => ({ type: "text", text }));
-  const lastPrefix = head.length + opening.prefix.filter((t) => t !== "").length - 1;
-  parts[parts.length - 1] = { type: "text", text: texts[texts.length - 1] ?? "", cache: true };
-  if (breakpoints >= 3 && lastPrefix >= 0 && lastPrefix < parts.length - 1) parts[lastPrefix] = { type: "text", text: texts[lastPrefix] ?? "", cache: true };
-  const out: ModelMessage[] = [{ role: "system", content, parts }, ...conversation];
-  if (breakpoints >= 2 && conversation.length > 0) out[out.length - 1] = marked(out[out.length - 1] as ModelMessage);
-  return out;
-}
-
-/**
- * The breakpoints a connection's own prompt caching puts on every request on it: they count against
- * the provider's limit. Its tools' caching marks the last tool alone, so it takes one breakpoint
- * however many tools the call offers, and none with no tools.
- */
-export function ownBreakpoints(cache: NonNullable<ConnectionProfile["cache"]>, nativeTools: number): number {
-  return (cache.system ? 1 : 0) + (cache.lastMessage ? 1 : 0) + (cache.automatic ? 1 : 0) + (cache.tools && nativeTools > 0 ? 1 : 0);
+  return [{ role: "system", content: texts.join("\n\n") }, ...conversation];
 }
 
 // ---------------------------------------------------------------- accounts
@@ -819,8 +792,10 @@ export interface ProviderDeps {
 
 /**
  * What of an agent's spec its calls are made from: its connection, model and effort, its opening,
- * whether it marks cache breakpoints and the cache key it sends, how its tools are offered
- * (absent: `auto`), the sampling parameters it sends, and where a streamed answer's deltas go.
+ * its prompt cache (the agent session its calls belong to, which the provider keeps their shared
+ * prompt by, how long it keeps it, and the cache key that heads the prompt), how its tools are
+ * offered (absent: `auto`), the sampling parameters it sends, and where a streamed answer's deltas
+ * go.
  */
 export interface CallSpec {
   connectionId: string | null;
@@ -828,7 +803,7 @@ export interface CallSpec {
   effort: ModelEffort;
   system: string;
   prefix: readonly string[];
-  cache: { breakpoints: boolean; key: string };
+  cache: { session: string; retention: CacheRetention; key: string };
   toolCalls?: ToolCalls;
   params?: SamplingParams;
   onDelta?: (delta: ModelDelta) => void;
@@ -849,6 +824,8 @@ export interface PreparedCall {
   estimate: number;
   /** The connection's id and the model it answers with. */
   connection: string;
+  /** The connection the request names: the agent's own (null: the default), or the default's id where the agent's is gone. */
+  connectionId: string | null;
   model: string;
   /** The connection takes several tool calls in one answer. */
   parallel: boolean;
@@ -859,17 +836,16 @@ export function requestOf(spec: CallSpec, p: PreparedCall, maxTokens: number, se
   return {
     messages: p.messages,
     maxTokens,
-    connectionId: spec.connectionId,
+    connectionId: p.connectionId,
     model: spec.model,
     ...(p.tools.length > 0 ? { tools: p.tools } : {}),
     ...(p.tools.length > 0 && !p.parallel ? { parallelToolCalls: false as const } : {}),
     effort: callEffort(spec.effort, p.names.size > 0, settings.loop.thinkingInToolLoops),
-    // With thinking in tool loops, the model's thinking comes back as text, so the trace shows it.
-    ...(settings.loop.thinkingInToolLoops ? { thinkingDisplay: "summarized" as const } : {}),
     ...(spec.params && Object.keys(spec.params).length > 0 ? { params: spec.params } : {}),
-    usage: true,
     // Streamed, the provider's connection carries a long answer as it is written, never idle until it is whole.
     ...(settings.loop.stream || spec.onDelta ? { stream: true as const } : {}),
+    session: spec.cache.session,
+    cacheRetention: spec.cache.retention,
   };
 }
 
@@ -885,10 +861,11 @@ export interface ModelReply extends ModelTurn {
 }
 
 /**
- * An agent's calls: its connection read once (a loopback connection, or one that isn't there, stops
- * the agent before any call), each call assembled with its cache key and breakpoints, sent with its
- * effort and a usage request, and decoded. How its tools are offered is the spec's (`toolCalls`):
- * natively, and as text once its connection's model refuses them (`ToolsRefused`), which the accounts
+ * An agent's calls: its connection read once (one that is gone leaves the agent on the default
+ * connection; with neither, the agent stops before any call), each call assembled with its cache
+ * key and named by its session, whose prompt the provider keeps cached, sent with its effort, and
+ * decoded. How its tools are offered is the spec's (`toolCalls`): natively, and as text once its
+ * connection's model refuses them (`ToolsRefused`), which the accounts
  * remember for that model of the connection once a call so made works; always natively, a refusal
  * then being the call's own failure; or as text from the first call. Natively its tools go out under
  * names a provider takes, and its calls come back under their tools' own (`wireNames`).
@@ -900,6 +877,10 @@ export interface ModelReply extends ModelTurn {
  */
 export class ProviderSession {
   private profile: ConnectionProfile | undefined;
+  /** The connection its requests name: the spec's own, until that turns out to be gone and the default stands in for it. */
+  private named: string | null;
+  /** The read `connect` started ahead of the first call, which that call takes, whatever it came to: one that failed is asked again by the call after it. */
+  private reading: Promise<ConnectionProfile> | null = null;
   private readonly toolCalls: ToolCalls;
   /** The agent's tools go as text: it is set to have them so, or its connection's model refused them natively. */
   textTools: boolean;
@@ -917,21 +898,39 @@ export class ProviderSession {
   ) {
     this.toolCalls = spec.toolCalls ?? "auto";
     this.textTools = this.toolCalls === "text";
+    this.named = spec.connectionId;
   }
 
-  /** The connection as the host reads it, once; an `AgentStop` when it can't be used. */
+  /**
+   * Reads the connection ahead of the first call, so the agent's start names the connection its
+   * calls go on: the first `prepare` takes this read, a failure included, and asks nothing more.
+   */
+  connect(): Promise<ConnectionProfile> {
+    this.reading ??= this.connection();
+    return this.reading;
+  }
+
+  /** The connection its spec names where that is none of the host's connections, so the default stands in for it; null otherwise, and before the connection is read. */
+  get gone(): string | null {
+    return this.profile !== undefined && this.spec.connectionId !== null && this.named !== this.spec.connectionId ? this.spec.connectionId : null;
+  }
+
+  /** The connection as the host reads it, once: the agent's own, else, where that is gone, the default; an `AgentStop` when neither can be used. */
   private async connection(): Promise<ConnectionProfile> {
     if (this.profile !== undefined) return this.profile;
     const asked = this.spec.connectionId;
     let profile: ConnectionProfile | null;
     try {
       profile = await this.deps.host.connections.get(asked);
+      // One that is gone (taken away, or one of Lumiverse's own from before the runtime kept its connections) leaves the agent on the default, which its page says.
+      if (profile === null && asked !== null) {
+        profile = await this.deps.host.connections.get(null);
+        if (profile !== null) this.named = profile.id;
+      }
     } catch (error) {
       throw new AgentStop("connection", { id: TEXT.stop.connectionUnread, vars: { connection: asked ?? "", error: errorText(error) } });
     }
     if (profile === null) throw new AgentStop("connection", asked === null ? { id: TEXT.stop.noDefault } : { id: TEXT.stop.noConnection, vars: { connection: asked } });
-    // A call on a loopback connection would come back to the runtime as a request of its own.
-    if (profile.loopback) throw new AgentStop("connection", { id: TEXT.stop.loopback, vars: { connection: profile.name } });
     this.profile = profile;
     return profile;
   }
@@ -945,7 +944,9 @@ export class ProviderSession {
 
   async prepare(conversation: readonly ModelMessage[], tools: readonly ModelTool[]): Promise<PreparedCall> {
     const { settings, texts, accounts } = this.deps;
-    const profile = await this.connection();
+    const read = this.reading ?? this.connection();
+    this.reading = null;
+    const profile = await read;
     const model = this.spec.model ?? profile.model ?? "";
     // A session free to turn starts as text where this model of its connection was seen refusing native tools, for as long as that is remembered.
     if (this.toolCalls === "auto" && !this.textTools && tools.length > 0 && accounts.refusesTools(profile.id, model, settings.connections)) this.textTools = true;
@@ -956,21 +957,14 @@ export class ProviderSession {
           const name = wires.out.get(t.name) ?? t.name;
           return name === t.name ? t : { ...t, name };
         });
-    const { cache: own } = this.spec;
+    const { key } = this.spec.cache;
     // An agent with no instructions of its own (the writer) sends no cache key: its conversation goes as it came.
     const hasOpening = this.spec.system !== "" || this.spec.prefix.some((text) => text !== "");
-    const opening: Opening = { nonce: own.key === "" || !hasOpening ? null : texts.render(TEXT.runtime.cacheNonce, { nonce: own.key }), prefix: this.spec.prefix, system: this.spec.system, tools: this.textTools && tools.length > 0 ? toolsAsText(tools, texts) : null };
-    const cache = profile.cache;
-    const breakpoints = own.breakpoints && cache ? Math.max(0, cache.limit - ownBreakpoints(cache, offered.length)) : 0;
-    // A provider that takes breakpoints reads native tools first: with a third to spend, it goes after
-    // the last tool (the tool block alone, which every call offering the same tools reads, whatever its
-    // opening) instead of after the shared prefix. A connection that marks its tools itself keeps them.
-    const toolMark = offered.length > 0 && cache !== null && !cache.tools && breakpoints >= 3;
-    const native = toolMark ? offered.map((t, i): ModelTool => (i === offered.length - 1 ? { ...t, cache: true } : t)) : offered;
-    const messages = assemble(opening, conversation, toolMark ? breakpoints - 1 : breakpoints);
+    const opening: Opening = { nonce: key === "" || !hasOpening ? null : texts.render(TEXT.runtime.cacheNonce, { nonce: key }), prefix: this.spec.prefix, system: this.spec.system, tools: this.textTools && tools.length > 0 ? toolsAsText(tools, texts) : null };
+    const messages = assemble(opening, conversation);
     // A provider reads a call's name by the same rule wherever the call stands, so the calls in the conversation go out under their tools' names on the wire with the tools as text too. `assemble` made this list for this call: a message is replaced in it, and the conversation's own is left as it is.
     for (const [i, m] of messages.entries()) messages[i] = onWire(m, wires.out);
-    return { messages, tools: native, names: new Set(tools.map((t) => t.name)), called: wires.back, textTools: this.textTools && tools.length > 0, estimate: promptTokens(messages, native, settings.loop.charsPerToken), connection: profile.id, model, parallel: profile.parallelTools };
+    return { messages, tools: offered, names: new Set(tools.map((t) => t.name)), called: wires.back, textTools: this.textTools && tools.length > 0, estimate: promptTokens(messages, offered, settings.loop.charsPerToken), connection: profile.id, connectionId: this.named, model, parallel: profile.parallelTools };
   }
 
   /**

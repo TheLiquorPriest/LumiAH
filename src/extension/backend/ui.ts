@@ -10,12 +10,15 @@ import { type Settings, settingsOf } from "../../core/settings";
 import { LINK } from "../../link/contract";
 import { isRecord, toJsonObject } from "../../link/json";
 import { TRANSPORT_KEY } from "../../link/settings";
-import type { BackendToFrontend, ChatView, KeptApproval, KeyView, PermissionNeed, SetupView, UiErrorCode, UiProblem, UiRequest, UiRequestType, UiRequests, UiState, UiStatePart } from "../../shared/ui";
+import type { Timings } from "../../link/timings";
+import { timingsViewOf } from "../../link/timings";
+import type { BackendToFrontend, ChatDataView, ChatView, KeptApproval, KeyView, PermissionNeed, RuntimeView, SetupView, StoreStateView, TimingsPage, UiErrorCode, UiProblem, UiRequest, UiRequestType, UiRequests, UiState, UiStatePart } from "../../shared/ui";
 import { UI_VERSION, chatAnswered, uiRequestOf } from "../../shared/ui";
 import type { Asks, Where } from "./asks";
 import type { Definitions } from "./defs";
 import { type JobsBoard, jobOver } from "./jobs";
 import type { Chats } from "./chat";
+import type { CopyFeed } from "./copy";
 import type { Connections } from "./connections";
 import { KeyedQueue } from "./docs";
 import { LinkRefused, UiRefused, wordsOf } from "./errors";
@@ -23,6 +26,7 @@ import type { Keys } from "./keys";
 import type { LiveBuffer } from "./live";
 import type { Approvals } from "./approvals";
 import type { Notices } from "./notices";
+import type { ProxyRoad } from "./proxy";
 import type { RegistryStore } from "./registry";
 import type { Relays } from "./relays";
 import type { SessionsPage } from "./sessions";
@@ -35,6 +39,11 @@ import type { ChatSwitch } from "./switch";
 import type { Turns } from "./turns";
 import { agentNames, areaView, type ChatCharacter, changesView, chronicleView, citedView, embeddingView, fileChanged, fileRead, guidanceOf, guidanceView, jobOf, jobsOf, jobsPage, keptOf, loreEntry, loreSearch, loreView, pageOf, type SettingsNow, sideSession, sideStartedOf, sidesOf, sideTurns, sideTurnsOf, spendOf, spendView, storyOf, storyView, turnStarted, type UnkeptTurn, upkeepOf, upkeepView, versionsOf, versionsView } from "./views";
 
+/** Where a request about a runtime's connections and sign-ins goes: the runtime the page names, else the user's runtime last heard from. */
+function runtimeOf(r: { relay?: string }): Where {
+  return r.relay !== undefined ? { relay: r.relay } : {};
+}
+
 export interface UiDeps {
   relays: Relays;
   registry: RegistryStore;
@@ -46,6 +55,10 @@ export interface UiDeps {
   approvals: Approvals;
   notices: Notices;
   asks: Asks;
+  /** The asks' road through Lumiverse's proxy, as the Runtime page shows it. */
+  road: Pick<ProxyRoad, "view">;
+  /** This end of the timing log (Runtime → Timings). */
+  timings: Pick<Timings, "view">;
   jobs: JobsBoard;
   defs: Definitions;
   /** The key the core's settings sit under. */
@@ -53,6 +66,8 @@ export interface UiDeps {
   switch: ChatSwitch;
   turns: Turns;
   sessions: SessionsPage;
+  /** The runtime's copy of chat and lore: the database reader's switch, which is the operator's alone. */
+  copy: Pick<CopyFeed, "databaseView" | "setDatabase">;
   keys: Keys;
   /** What keeps LumiAH from working that no permission and no runtime's row says, each in plain words. */
   issues(): string[];
@@ -116,12 +131,34 @@ export class Ui {
     };
   }
 
+  /** The runtime as the Runtime page shows it: each runtime's row, and the road the pages' requests take to it. */
+  private async runtime(userId: string): Promise<RuntimeView> {
+    const view = await this.deps.relays.view(userId, this.deps.issues());
+    return { ...view, road: await this.deps.road.view(userId, view.relays.map((r) => ({ id: r.id, linked: r.link === "linked" }))) };
+  }
+
+  /** Runtime → Timings: this end's log, and each linked runtime's own, asked of it once (whichever road the ask takes, it goes in this end's log too). */
+  private async timings(userId: string): Promise<TimingsPage> {
+    const linked = await this.deps.relays.linked(userId);
+    const runtimes = await Promise.all(
+      linked.map(async (r) => {
+        try {
+          const timings = timingsViewOf(await this.deps.asks.ask(userId, "timings.read", {}, { relay: r.id }));
+          return { id: r.id, name: r.name, timings, problem: timings === null ? "Its timings couldn't be read: update the runtime and the extension to the same build." : null };
+        } catch (error) {
+          return { id: r.id, name: r.name, timings: null, problem: wordsOf(error) };
+        }
+      }),
+    );
+    return { extension: this.deps.timings.view(), runtimes };
+  }
+
   private async part<K extends UiStatePart>(userId: string, part: K): Promise<UiState[K]>;
   private async part(userId: string, part: UiStatePart): Promise<UiState[UiStatePart]> {
     const d = this.deps;
     switch (part) {
       case "runtime":
-        return d.relays.view(userId, d.issues());
+        return this.runtime(userId);
       case "setup":
         return this.setup(userId);
       case "key":
@@ -392,6 +429,9 @@ export class Ui {
       // The core reads the chat's choice with the chat at each run's start: nothing to push.
       case "lah.chat.story.set":
         return { story: await d.switch.setStory(userId, r.chatId, r.story) };
+      // Asked of the extension each time, as each run asks it: nothing of it is kept here.
+      case "lah.chat.lead.get":
+        return { lead: await d.switch.lead(userId, r.chatId) };
       case "lah.live.open":
         return d.live.open(userId, r.stream, session);
       case "lah.live.events": {
@@ -430,13 +470,31 @@ export class Ui {
         return { session: await d.sessions.view(userId, r.chatId) };
       case "lah.settings.set":
         return { settings: await d.settings.change(userId, r.set, r.reset) };
-      case "lah.models.list": {
-        const connection = await d.connections.one(userId, r.connectionId);
-        if (connection === null) throw new UiRefused("not_found", r.connectionId === null ? "This account has no default connection." : "There is no such connection.");
-        const models = await this.host.connections.models(connection.id, userId);
-        if (models === null) throw new UiRefused("unavailable", "This Lumiverse can't list a connection's models: type the model's name.");
-        return { models };
-      }
+      // The runtime's connections and sign-ins are its own: each of these goes to the runtime the page names (else the user's runtime), which answers it through its model layer (runtime/book.ts). A key goes there in `lah.connections.save` and never comes back.
+      case "lah.connections.list":
+        return (await d.asks.ask(userId, "connections.list", {}, runtimeOf(r))) as unknown as UiRequests["lah.connections.list"]["result"];
+      case "lah.connections.save":
+        return (await d.asks.ask(userId, "connections.save", { connection: toJsonObject(r.connection), ...(r.key !== undefined ? { key: r.key } : {}), ...(r.create === true ? { create: true } : {}) }, runtimeOf(r))) as unknown as UiRequests["lah.connections.save"]["result"];
+      case "lah.connections.remove":
+        return (await d.asks.ask(userId, "connections.remove", { id: r.id }, runtimeOf(r))) as unknown as UiRequests["lah.connections.remove"]["result"];
+      case "lah.connections.default":
+        return (await d.asks.ask(userId, "connections.default", { id: r.id }, runtimeOf(r))) as unknown as UiRequests["lah.connections.default"]["result"];
+      case "lah.connections.test":
+        return (await d.asks.ask(userId, "connections.test", { id: r.id }, runtimeOf(r))) as unknown as UiRequests["lah.connections.test"]["result"];
+      case "lah.connections.models":
+        return (await d.asks.ask(userId, "connections.models", "provider" in r ? { provider: r.provider } : { connectionId: r.connectionId }, runtimeOf(r))) as unknown as UiRequests["lah.connections.models"]["result"];
+      case "lah.connections.lumiverse":
+        return { connections: await d.connections.lumiverse(userId) };
+      case "lah.signin.start":
+        return (await d.asks.ask(userId, "signin.start", { provider: r.provider }, runtimeOf(r))) as unknown as UiRequests["lah.signin.start"]["result"];
+      case "lah.signin.finish":
+        return (await d.asks.ask(userId, "signin.finish", { flow: r.flow, code: r.code }, runtimeOf(r))) as unknown as UiRequests["lah.signin.finish"]["result"];
+      case "lah.signin.cancel":
+        return (await d.asks.ask(userId, "signin.cancel", { flow: r.flow }, runtimeOf(r))) as unknown as UiRequests["lah.signin.cancel"]["result"];
+      case "lah.signin.out":
+        return (await d.asks.ask(userId, "signin.out", { provider: r.provider }, runtimeOf(r))) as unknown as UiRequests["lah.signin.out"]["result"];
+      case "lah.signin.state":
+        return (await d.asks.ask(userId, "signin.state", { provider: r.provider }, runtimeOf(r))) as unknown as UiRequests["lah.signin.state"]["result"];
       case "lah.text.set":
         return { texts: await d.settings.text(userId, r.id, r.text) };
       case "lah.text.reset":
@@ -453,10 +511,17 @@ export class Ui {
           await d.relays.forget(userId, r.relay);
           d.streams.forget(userId, r.relay);
         }
-        return { runtime: await d.relays.view(userId, d.issues()) };
+        return { runtime: await this.runtime(userId) };
       }
       case "lah.drawer.close":
         return { closed: await this.host.closeDrawer(userId) };
+      // Asked of that runtime alone, and only of one of this user's (asks.ts: another user's is never linked for them): how it is run and kept, and its update.
+      case "lah.runtime.service.get":
+        return (await d.asks.ask(userId, "runtime.service.get", {}, { relay: r.relay })) as unknown as UiRequests["lah.runtime.service.get"]["result"];
+      case "lah.runtime.service.set":
+        return (await d.asks.ask(userId, "runtime.service.set", { ...(r.memory !== undefined ? { memory: r.memory } : {}), ...(r.autoUpdate !== undefined ? { autoUpdate: r.autoUpdate } : {}), ...(r.restart !== undefined ? { restart: r.restart } : {}) }, { relay: r.relay })) as unknown as UiRequests["lah.runtime.service.set"]["result"];
+      case "lah.runtime.update.apply":
+        return (await d.asks.ask(userId, "runtime.update.apply", {}, { relay: r.relay })) as unknown as UiRequests["lah.runtime.update.apply"]["result"];
       case "lah.turn.say": {
         if (d.live.running(userId, r.stream, r.turn) === null) return { said: false };
         const out = await d.asks.ask(userId, "run.say", { run: r.turn, text: r.text }, { run: { stream: r.stream, turn: r.turn } });
@@ -613,14 +678,33 @@ export class Ui {
         const spend = spendOf(await this.ask(userId, "spend", "get", { days: r.days }));
         // A side session about no chat spends under none: there is no chat to read a name of.
         const chats = spend.chats.flatMap((row) => (row.key === "" ? [] : [row.key]));
-        const [chatNames, agents, connections] = await Promise.all([this.chatNames(userId, chats), spend.agents.length === 0 ? new Map<string, string>() : this.agentNames(userId), d.connections.list(userId)]);
-        return spendView(spend, { chats: chatNames, agents, connections: new Map(connections.map((c) => [c.id, c.name])) }, await this.settingsNow(userId));
+        // The connections a call ran on are the runtime's own, and named as it names them now.
+        const [chatNames, agents, held] = await Promise.all([this.chatNames(userId, chats), spend.agents.length === 0 ? new Map<string, string>() : this.agentNames(userId), d.asks.ask(userId, "connections.list", {}).catch(() => null)]);
+        const listed = isRecord(held) && Array.isArray(held.connections) ? held.connections : [];
+        const connections = new Map(listed.flatMap((c) => (isRecord(c) && typeof c.id === "string" && typeof c.name === "string" ? [[c.id, c.name] as const] : [])));
+        return spendView(spend, { chats: chatNames, agents, connections }, await this.settingsNow(userId));
       }
       case "lah.upkeep.get":
         return upkeepView(upkeepOf(await d.asks.ask(userId, "upkeep.get", {})), await this.settingsNow(userId));
       case "lah.upkeep.sweep":
         // The sweep takes as long as the store is big: it is waited for as long as it takes.
         return upkeepView(upkeepOf(await d.asks.ask(userId, "upkeep.sweep", {}, { patient: true })), await this.settingsNow(userId));
+      case "lah.timings.get":
+        return this.timings(userId);
+      case "lah.runtime.store": {
+        // That runtime's working store, as it says it stands: its own answer, passed on.
+        const state = await d.asks.ask(userId, "store.state", {}, { relay: r.relay });
+        if (!isRecord(state) || typeof state.waiting !== "number") throw new UiRefused("internal", "The runtime answered with something that isn't its store's state: update the runtime and the extension to the same build.");
+        return { state: state as unknown as StoreStateView };
+      }
+      case "lah.runtime.chatdata": {
+        // That runtime's copy of chat and lore, as it says it stands; and the database reader's switch as this user is to see it, asked now.
+        const [state, database] = await Promise.all([d.asks.ask(userId, "copy.state", {}, { relay: r.relay }), d.copy.databaseView(userId)]);
+        if (!isRecord(state) || (state.road !== "copy" && state.road !== "link")) throw new UiRefused("internal", "The runtime answered with something that isn't its copy's state: update the runtime and the extension to the same build.");
+        return { state: state as unknown as ChatDataView, database };
+      }
+      case "lah.runtime.database":
+        return { database: await d.copy.setDatabase(userId, r.on) };
       case "lah.home.get": {
         if (r.chatId === null) return { chat: null, last: null };
         let chat: ChatView;

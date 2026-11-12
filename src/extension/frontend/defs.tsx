@@ -13,6 +13,7 @@ import { UiRequestError } from "./client";
 import { Badge, Banner, Button, Editor, Empty, Field, IconButton, SearchField, Section, useBusy } from "./components";
 import { type AgentDraft, copyId, countWords, type Def, filterDefs, idProblem, type KindWords, newKey, ownedWords, ownProblems, removeAsk, savedWords, saveLabel, saveStatus, sourceWords, standingWords, titleOf } from "./defs-model";
 import { Icon, type IconName } from "./icons";
+import type { LeadMark } from "./lead-model";
 import { revealInScroller } from "./scroll";
 import { createStore, type Store, useSelect } from "./store";
 
@@ -173,13 +174,14 @@ interface Refused {
   problems: readonly UiProblem[];
 }
 
-function DefRow(props: { open: boolean; title: string; id: string; standing: string; opening: string; off: boolean; unsaved: boolean; row: string; onOpen(): void }) {
+function DefRow(props: { open: boolean; title: string; id: string; standing: string; opening: string; off: boolean; unsaved: boolean; mark?: LeadMark | undefined; row: string; onOpen(): void }) {
   return (
     <button type="button" class="lah-navrow" aria-current={props.open} data-lah-def={props.row} data-off={props.off || undefined} onClick={props.onOpen}>
       <span class="lah-navrow-text">
         <span class="lah-navrow-title lah-inline">
           <span>{props.title}</span>
           {props.off ? <Badge>off</Badge> : null}
+          {props.mark !== undefined ? <Badge tone={props.mark.tone}>{props.mark.words}</Badge> : null}
           {props.unsaved ? <Badge tone="warn">not saved</Badge> : null}
         </span>
         <span class="lah-navrow-sub">
@@ -315,9 +317,10 @@ function DefDetail<V extends Def, D extends DraftHead>(props: {
   );
 }
 
-/** The Agents page and the Skills page: the kind's definitions as a list, and the one open beside it. */
-export function DefsFrame<V extends Def, D extends DraftHead>(props: { kind: DefKind<V, D> }) {
+/** The Agents page and the Skills page: the kind's definitions as a list, and the one open beside it. `about` says what the kind is where it isn't the kind's own words, and `marks` mark a definition's row by its id (the Agents page: who leads the open chat's replies). */
+export function DefsFrame<V extends Def, D extends DraftHead>(props: { kind: DefKind<V, D>; about?: string; marks?: ReadonlyMap<string, LeadMark> }) {
   const k = props.kind;
+  const about = props.about ?? k.about;
   const app = useApp();
   const library = libraryOf(app);
   const { read, again, take } = useDefs();
@@ -450,7 +453,7 @@ export function DefsFrame<V extends Def, D extends DraftHead>(props: { kind: Def
           </Button>
         </div>
         <DefsStale read={read} again={again} />
-        <p class="lah-lead lah-small">{k.about}</p>
+        <p class="lah-lead lah-small" data-lah-about>{about}</p>
         {news.length + defs.length === 0 ? (
           <Empty icon={k.icon} title={`No ${k.words.one} yet`}>
             {`New makes the first ${k.words.one} of yours.`}
@@ -468,7 +471,7 @@ export function DefsFrame<V extends Def, D extends DraftHead>(props: { kind: Def
                   <DefRow key={key} row={key} open={key === openKey} title={made.name.trim() !== "" || made.id !== "" ? titleOf(made) : `New ${k.words.one}`} id={made.id !== "" ? made.id : "no id yet"} standing="new" opening={made.description.trim() !== "" ? made.description : "No description yet."} off={false} unsaved onOpen={() => open(key)} />
                 ))}
                 {kept.map((def) => (
-                  <DefRow key={def.id} row={def.id} open={def.id === openKey} title={titleOf(def)} id={def.id} standing={sourceWords(def)} opening={def.description.trim() !== "" ? def.description : "No description."} off={def.off} unsaved={drafts.has(def.id)} onOpen={() => open(def.id)} />
+                  <DefRow key={def.id} row={def.id} open={def.id === openKey} title={titleOf(def)} id={def.id} standing={sourceWords(def)} opening={def.description.trim() !== "" ? def.description : "No description."} off={def.off} unsaved={drafts.has(def.id)} mark={props.marks?.get(def.id)} onOpen={() => open(def.id)} />
                 ))}
               </div>
             )}
@@ -499,7 +502,7 @@ export function DefsFrame<V extends Def, D extends DraftHead>(props: { kind: Def
           />
         ) : (
           <Empty icon={k.icon} title={`Pick ${k.words.a}`}>
-            {k.about}
+            {about}
           </Empty>
         )}
       </div>

@@ -141,7 +141,7 @@ describe("the interceptor as Lumiverse calls it", () => {
     expect(await registered()(came, { userId: "user-mara" })).toBe(came);
 
     expect(seen).toHaveLength(2);
-    expect(seen[0]).toMatchObject({ chatId: "chat-1", userId: "user-mara", generationId: "gen-2", type: "swipe", dryRun: true, connectionId: "conn-main", presetId: "preset-1", personaId: "persona-1", deadlineAt: 9_000, signal: stop.signal });
+    expect(seen[0]).toMatchObject({ chatId: "chat-1", userId: "user-mara", generationId: "gen-2", type: "swipe", dryRun: true, connectionId: "conn-main", presetId: "preset-1", personaId: "persona-1", signal: stop.signal });
     expect(seen[0]?.activated).toEqual([
       { entryId: "entry-quay", bookId: "book-harbour", title: "The quay", how: "key" },
       { entryId: "entry-light", bookId: null, title: "", how: "vector", score: 0.82 },

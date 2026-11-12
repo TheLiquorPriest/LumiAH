@@ -40,13 +40,13 @@ async function run(b: Bench, cut: Cut): Promise<Reached> {
   for (const [path, value] of Object.entries(BEFORE)) b.mirror.docs.set(path, JSON.stringify(value));
   let held: PromiseWithResolvers<void> | null = null;
   b.mirror.hold = async (what) => {
+    // While the steps are taken, what they send waits at its first change of the mirror.
+    if (held !== null && /^(write|remove|put|drop) /.test(what)) await held.promise;
     if (/^(write|remove|put|drop) /.test(what)) await cut.change();
     else await cut.look();
-    // While the steps are taken, a round of sending waits at its first look at the mark.
-    if (held !== null && what === "read mirror.json") await held.promise;
   };
-  // Every round reads the mark first, so the one the first step begins waits there.
-  const s = open(b, { disk: cutDisk(cut), limits: () => ({ markMs: 0 }) });
+  // The mark is written when the copy is taken and not again here: every change counted is the run's.
+  const s = open(b, { disk: cutDisk(cut), limits: () => ({ markMs: Number.MAX_SAFE_INTEGER }) });
   const alive = (work: Promise<unknown>): Promise<boolean> => Promise.race([work.then(() => true), cut.died.then(() => false)]);
   if (!(await alive(s.settle()))) return { acked: 0, during: null };
 

@@ -10,6 +10,7 @@ import { useContext, useEffect, useState } from "preact/hooks";
 import { type HomeView, isReply, type StoryView } from "../../../shared/ui";
 import { errorWords, ShownPagesContext, useApp } from "../app";
 import { Banner, Button, Disclosure, IconButton, Section, useBusy, useTick } from "../components";
+import { ConnectionsWanted } from "../connections";
 import { ago } from "../format";
 import { homeOf, type Need, type Way } from "../home-model";
 import { Icon } from "../icons";
@@ -128,6 +129,7 @@ export function HomePage() {
     <div class="lah-home" data-lah-view="home" data-lah-setup={model.setup !== null ? "todo" : "done"}>
       <div class="lah-home-col">
         {readFailed}
+        <ConnectionsWanted chatId={active} />
         {model.setup !== null ? (
           <Section title="Set up LumiAH" flush id="setup">
             <p class="lah-lead lah-home-lead">Before each reply, LumiAH's agents read your story (the chat, your lore, their own notes) and tell the model that writes your reply what it must keep true. {first === "chat" ? "Switch it on for a chat, then send a message. Nothing to install." : "One thing left: send a message."}</p>

@@ -5,6 +5,7 @@
 import { describe, expect, test } from "bun:test";
 import { createBackend } from "../../../src/extension/backend/backend";
 import { identityOf } from "../../../src/extension/backend/identity";
+import { isRecord } from "../../../src/link/json";
 import { FakeHost } from "../../support/fake-host";
 import { FakeLumiverse, FakePage } from "../../support/fake-lumiverse";
 import { USER } from "../../support/rig";
@@ -30,6 +31,19 @@ describe("a backend's identity", () => {
     expect(identityOf()).toEqual({ identifier: "lumi_ah", name: "LumiAH", connectionName: "LumiAH", anchorKey: "lumi_ah" });
     expect(identityOf({ identifier: "other_ext" })).toEqual({ identifier: "other_ext", name: "other_ext", connectionName: "other_ext", anchorKey: "other_ext" });
     expect(identityOf({ identifier: "other_ext", name: "Lantern", anchorKey: "harness" })).toEqual({ identifier: "other_ext", name: "Lantern", connectionName: "Lantern", anchorKey: "harness" });
+  });
+
+  test("says where its Settings are shown only when the extension says, and its runtime is told so: a timeout's words there name that place", async () => {
+    const at = "Lantern's Harness tab → System → Settings";
+    expect(identityOf({ identifier: "other_ext", name: "Lantern", settingsAt: at })).toEqual({ identifier: "other_ext", name: "Lantern", connectionName: "Lantern", anchorKey: "other_ext", settingsAt: at });
+    const told = async (identity: { name: string; settingsAt?: string }): Promise<unknown> => {
+      const host = new FakeHost("other_ext");
+      createBackend(host, ENV, { identity });
+      const answer = await registered(host, 7871);
+      return isRecord(answer) && isRecord(answer.body) ? answer.body.backend : undefined;
+    };
+    expect(await told({ name: "Lantern", settingsAt: at })).toEqual({ name: "Lantern", connection: "Lantern", settingsAt: at });
+    expect(await told({ name: "Lantern" })).toEqual({ name: "Lantern", connection: "Lantern" });
   });
 });
 

@@ -107,12 +107,14 @@ describe("a chat with a connection of its own", () => {
   });
 });
 
-describe("a call that names no connection", () => {
-  test("goes on the default connection, as Lumiverse runs it, whatever is selected", async () => {
+describe("Copy from Lumiverse", () => {
+  test("lists every connection but a loopback, with its address and model and never its key", async () => {
     const { host } = start();
-    const connections = new Connections(host, { model: "lumiah", bases: async () => [], serialTools: async () => [] });
-    host.select(USER, LOOPBACK.id);
-    expect(await connections.profile(USER, null)).toMatchObject({ id: MAIN.id, loopback: false });
-    expect(await connections.isLoopback(USER, null)).toBe(false);
+    const connections = new Connections(host, { model: "lumiah", bases: async () => [] });
+    const listed = await connections.lumiverse(USER);
+    expect(listed.map((c) => c.id)).toContain(MAIN.id);
+    expect(listed.map((c) => c.id)).not.toContain(LOOPBACK.id);
+    expect(JSON.stringify(listed)).not.toContain("api_key");
+    expect(listed.every((c) => Object.keys(c).sort().join(",") === "baseUrl,id,model,name,provider")).toBe(true);
   });
 });

@@ -93,9 +93,9 @@ describe("an account's own bounds", () => {
     for (let n = 0; n < CEILINGS.joinFrames + 6; n++) await backend.server.frame(part(`frame-${n}`, 0, 2, "Low tide "), USER, SESSION);
 
     expect(backend.server.joining(USER).frames).toBe(CEILINGS.joinFrames);
-    // The ones past it were refused as the account's own doing, each in words.
+    // The ones past it were refused as no room just now (the account's own frames, which pass once done), each in words.
     const refusals = host.sent.flatMap((s) => (isRecord(s.message) && s.message.type === "error" ? [String(s.message.code)] : []));
-    expect(refusals).toEqual(new Array(6).fill("too_large"));
+    expect(refusals).toEqual(new Array(6).fill("unavailable"));
   });
 
   test("stored past a ceiling by an earlier build read as the ceiling, and don't lock the account's settings", async () => {
@@ -125,12 +125,12 @@ describe("an account's own bounds", () => {
   });
 });
 
-const TUNING = { coalesceMs: 0, keepMs: TRANSPORT_DEFAULTS.streams.keepMs };
+const TUNING = { keepMs: TRANSPORT_DEFAULTS.streams.keepMs };
 const stream = (n: number): string => n.toString(16).padStart(32, "0");
 
 function registry() {
   const clock = { now: 1_000_000 };
-  return { clock, streams: new StreamRegistry({ now: () => clock.now, later: () => () => undefined, push: () => false }) };
+  return { clock, streams: new StreamRegistry({ now: () => clock.now, push: () => false }) };
 }
 
 /** What opening a stream was refused with; null when it was opened, or is open already. */
@@ -181,7 +181,7 @@ describe("the streams held for runtimes", () => {
 
   test("keep a finished one whose acknowledgement never came no longer than the ceiling, whatever the account's setting says", () => {
     const { streams, clock } = registry();
-    const writer = streams.open(USER, "relay-1", stream(1), null, { coalesceMs: 0, keepMs: 24 * 60 * 60_000 });
+    const writer = streams.open(USER, "relay-1", stream(1), null, { keepMs: 24 * 60 * 60_000 });
     writer?.value({ text: "Okoro keeps it now." });
 
     clock.now += CEILINGS.streamKeepMs;

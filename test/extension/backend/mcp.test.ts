@@ -19,12 +19,21 @@ function tides(): FakeMcpServer {
   };
 }
 
-function rig(on: string[] = ["srv-1"]) {
+function rig(on: string[] = ["srv-1"], waits: { callMs?: number; settingsAt?: string } = {}) {
   const host = new FakeHost();
   host.permissions.add("mcp_servers");
   host.mcpServers.push(tides());
-  const mcp = new Mcp(host, { on: async () => on, callMs: async () => 45_000 });
-  return { host, mcp };
+  // The waits begun, each fired only when the test says.
+  const timers: { ms: number; fn: () => void; cancelled: boolean }[] = [];
+  const later = (ms: number, fn: () => void): (() => void) => {
+    const timer = { ms, fn, cancelled: false };
+    timers.push(timer);
+    return () => {
+      timer.cancelled = true;
+    };
+  };
+  const mcp = new Mcp(host, { on: async () => on, callMs: async () => waits.callMs ?? 45_000, later, name: "LumiAH", ...(waits.settingsAt !== undefined ? { settingsAt: waits.settingsAt } : {}) });
+  return { host, mcp, timers };
 }
 
 describe("an MCP server's tools", () => {
@@ -97,6 +106,35 @@ describe("a call of an MCP tool", () => {
     const calling = mcp.call(USER, "mcp:harbour-tides:tide_table", { harbour: "Okoro's Quay" }, stop.signal);
     stop.abort(new Error("The turn was stopped."));
     await expect(calling).rejects.toThrow("The turn was stopped.");
+  });
+
+  test("that runs out of the Call time says so, naming that setting and where it is changed, before Lumiverse's own words", async () => {
+    // The Call time set short, in LumiAH's own Settings and in an extension's that shows them elsewhere; the server never answers.
+    for (const [settingsAt, place] of [
+      [undefined, "LumiAH's Settings → Timeouts → Tools and approvals"],
+      ["LumiRPEngine's Harness tab → System → Settings", "LumiRPEngine's Harness tab → System → Settings → Timeouts → Tools and approvals"],
+    ] as const) {
+      const { host, mcp, timers } = rig(["srv-1"], { callMs: 1_000, ...(settingsAt !== undefined ? { settingsAt } : {}) });
+      const first = host.mcpServers[0];
+      if (first === undefined) throw new Error("no server");
+      const asked = Promise.withResolvers<void>();
+      first.run = () => {
+        asked.resolve();
+        return new Promise<string>(() => undefined);
+      };
+      const calling = mcp.call(USER, "mcp:harbour-tides:tide_table", { harbour: "Okoro's Quay" }, new AbortController().signal);
+      await asked.promise;
+      expect(host.mcpCalls.map((c) => c.timeoutMs)).toEqual([1_000]);
+      expect(timers.map((t) => t.ms)).toEqual([1_000]);
+      timers[0]?.fn();
+      await expect(calling).rejects.toThrow(`The MCP tool mcp:harbour-tides:tide_table didn't answer within 1 second. Call time (${place}) says how long one call may take.`);
+    }
+  });
+
+  test("that answers in time lets its wait go", async () => {
+    const { mcp, timers } = rig();
+    expect(await mcp.call(USER, "mcp:harbour-tides:moon/phase", {}, new AbortController().signal)).toBe("Waning.");
+    expect(timers.map((t) => [t.ms, t.cancelled])).toEqual([[45_000, true]]);
   });
 });
 

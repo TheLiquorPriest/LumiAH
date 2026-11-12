@@ -5,12 +5,14 @@
 
 import { unitName } from "../../link/contract";
 import type { SavedConfig, SystemdService } from "../config";
-import { dataDir, installedPath, xdgDir } from "../config";
+import { controlled, dataDir, installedPath, xdgDir } from "../config";
+import { memoryRefusal } from "./memory";
 
 type Env = Readonly<Record<string, string | undefined>>;
 
-/** A word of a unit's ExecStart: quoted when it must be, `%` and `$` escaped (systemd.service(5)). */
+/** A word of a unit's ExecStart: quoted when it must be, `%` and `$` escaped (systemd.service(5)). A control character in it is an error: a newline would start a directive of its own. */
 function unitWord(word: string): string {
+  if (controlled(word)) throw new Error(`A path for the runtime's unit holds a control character (${JSON.stringify(word)}): no unit is written with it.`);
   const escaped = word.replace(/%/g, "%%").replace(/\$/g, "$$$$");
   return /^[A-Za-z0-9_@%+=:,./$-]+$/.test(escaped) ? escaped : `"${escaped.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
@@ -36,6 +38,12 @@ export function unitText(u: { name: string; bun: string; script: string; config:
     "WantedBy=default.target",
     "",
   ].join("\n");
+}
+
+/** The memory limit a unit's text holds its runtime to: its last `MemoryMax=` line, when that is a limit this build would write itself; null otherwise. A runtime set up before its limit was kept in its config has it nowhere else. */
+export function unitMemory(text: string | null): string | null {
+  const held = text === null ? undefined : [...text.matchAll(/^MemoryMax=(.*)$/gm)].at(-1)?.[1]?.trim();
+  return held !== undefined && memoryRefusal(held) === null ? held : null;
 }
 
 /** Where a user unit's file is: `$XDG_CONFIG_HOME/systemd/user`, or `~/.config/systemd/user`. */

@@ -1,7 +1,8 @@
 // What the lore and history tools read of Lumiverse beyond the lore and the chat ports (DESIGN §24),
 // and a chat's LumiBooks book (§23): the core's `RecallPorts` and `BookPort`, for one user at a time.
 // The core that runs here takes them as they are (`ports`, `book`); a runtime's core asks each
-// member over the link (`serve`).
+// member over the link (`serve`), but for the books with their entries and a range of the chat's
+// messages, which it reads over its own copy of chat and lore with the same logic (host/recall.ts).
 //
 // A backend serves every user, so every read is for the user who asks. A chat is read only when it
 // is theirs (refused `not_found` otherwise, another's in the same words as one that isn't there),
@@ -14,14 +15,15 @@
 
 import { textHash } from "../../core/hash";
 import type { BookEntry, BookMessageHash, BookPort, ChatBook, JsonObject } from "../../core/ports";
-import type { ActivatedEntry, Databank, LoreBookRead, LoreBookSource, MemoryArc, MemoryEntity, MemoryEntityBrief, MemoryHit, RecallPorts, TimedMessage, WebResult } from "../../core/recall/ports";
+import type { ActivatedEntry, Databank, MemoryArc, MemoryEntity, MemoryEntityBrief, MemoryHit, RecallPorts, WebResult } from "../../core/recall/ports";
 import { EMBED_BATCH_MAX, EMBED_TEXT_MAX } from "../../core/recall/ports";
+import { RecallReads, strings } from "../../host/recall";
 import type { LinkRequestType, LinkRequests } from "../../link/contract";
 import { isRecord } from "../../link/json";
 import type { Chats } from "./chat";
 import { LinkRefused } from "./errors";
 import type { Lore } from "./reads";
-import type { ActivatedInfo, BackendHost, HostChat, HostEntryRecord } from "./spindle";
+import type { ActivatedInfo, BackendHost, HostEntryRecord } from "./spindle";
 
 export interface RecallDeps {
   chats: Chats;
@@ -42,8 +44,6 @@ type Embedded = { vectors: number[][]; model: string; dimensions: number };
 type KeptHash = { index: number; hash: string };
 
 const SAME_BUILD = "update the runtime and LumiAH to the same build";
-
-const strings = (value: unknown): string[] => (Array.isArray(value) ? value.filter((s): s is string => typeof s === "string" && s !== "") : []);
 
 /** A link request's field that names something: text, and not empty. */
 function text(value: unknown, what: string): string {
@@ -120,17 +120,22 @@ function keptHashesOf(metadata: JsonObject): KeptHash[] | null {
 }
 
 export class Recall {
+  /** The books with their entries and a range of the chat's messages: read as the runtime reads them over its copy. */
+  private readonly reads: RecallReads;
+
   constructor(
     private readonly host: Pick<BackendHost, "chats" | "lore" | "embeddings" | "memory" | "databanks" | "web">,
     private readonly deps: RecallDeps,
-  ) {}
+  ) {
+    this.reads = new RecallReads(host, deps);
+  }
 
   /** What the lore and history tools read for one user's runs (`HarnessHost.recall`). */
   ports(userId: string): RecallPorts {
     const { embeddings, databanks, web } = this.host;
     return {
-      lore: { read: (chatId, known) => this.lore(userId, chatId, known), activated: (chatId, generationId) => this.activated(userId, chatId, generationId) },
-      chat: { messages: (chatId, from, to) => this.messages(userId, chatId, from, to) },
+      lore: { read: (chatId, known) => this.reads.lore(userId, chatId, known), activated: (chatId, generationId) => this.activated(userId, chatId, generationId) },
+      chat: { messages: (chatId, from, to) => this.reads.messages(userId, chatId, from, to) },
       embeddings: { connection: () => embeddings.connection(userId), embed: (texts, kind, signal) => this.embed(userId, texts, kind, signal) },
       memory: {
         enabled: (chatId) => this.memoryOn(userId, chatId),
@@ -161,12 +166,12 @@ export class Recall {
       case "recall.lore.read": {
         const known: Record<string, number> = {};
         if (isRecord(r.known)) for (const [id, at] of Object.entries(r.known)) if (typeof at === "number" && Number.isFinite(at)) known[id] = at;
-        return { books: await this.lore(userId, text(r.chat, "chat"), known) };
+        return { books: await this.reads.lore(userId, text(r.chat, "chat"), known) };
       }
       case "recall.lore.activated":
         return { entries: await this.activated(userId, text(r.chat, "chat"), text(r.generation, "generation")) };
       case "recall.chat.messages":
-        return { messages: await this.messages(userId, text(r.chat, "chat"), whole(r.from, "range"), whole(r.to, "range")) };
+        return { messages: await this.reads.messages(userId, text(r.chat, "chat"), whole(r.from, "range"), whole(r.to, "range")) };
       case "recall.embedder":
         return { connection: await embeddings.connection(userId) };
       case "recall.embed": {
@@ -201,57 +206,6 @@ export class Recall {
   // ---------------------------------------------------------------- lore
 
   /**
-   * `RecallLorePort.read`: every book that applies to the chat (`Lore.books` says which, and in what
-   * order), each with every entry of it. A book whose stamp is the one the caller holds for it
-   * comes with `entries` null.
-   *
-   * Lumiverse stamps a book when it or any entry of it changes, to the second. So a stamp says that
-   * nothing changed since only once its second is over: a change later in the same second carries
-   * the same one. Until then a book is given whole with no stamp (0), which a caller never holds
-   * against a later read.
-   */
-  private async lore(userId: string, chatId: string, known: Readonly<Record<string, number>> = {}): Promise<LoreBookRead[]> {
-    const chat = await this.deps.chats.own(userId, chatId);
-    const [books, sources] = await Promise.all([this.deps.lore.books(userId, chat), this.sources(userId, chat)]);
-    const read = await Promise.all(
-      books.map(async (book): Promise<LoreBookRead | null> => {
-        // The stamp is read before the entries: a change between the two reads moves the book's stamp past the one given here, so the entries are read again next time.
-        const record = await this.host.lore.record(book.id, userId);
-        if (record === null) return null;
-        const over = record.updatedAt > 0 && this.deps.now() >= (Math.floor(record.updatedAt / 1000) + 1) * 1000;
-        const stamp = over ? record.updatedAt : 0;
-        // What extensions keep on an entry is no part of what the lore tools read of it.
-        const entries = stamp > 0 && known[book.id] === stamp ? null : (await this.host.lore.records(book.id, userId)).map(({ extensions: _kept, ...entry }) => entry);
-        return { id: record.id, name: record.name, description: record.description, source: sources.get(record.id) ?? null, updatedAt: stamp, entries };
-      }),
-    );
-    return read.filter((book): book is LoreBookRead => book !== null);
-  }
-
-  /**
-   * Where each book attached somewhere the chat reads from applies from. A book attached at several
-   * places is said as Lumiverse says it, by the narrowest: a character's before a persona's before
-   * the chat's own before one switched on for every chat. The persona is the user's active one:
-   * which persona the chat's last turn was assembled for isn't known here. So a book that applies
-   * through another persona, or only because Lumiverse activated an entry of it, has no source.
-   */
-  private async sources(userId: string, chat: HostChat): Promise<Map<string, LoreBookSource>> {
-    const { lore } = this.host;
-    const [ofCharacter, ofPersona, global] = await Promise.all([
-      chat.characterId !== null ? lore.ofCharacter(chat.characterId, userId).catch((): string[] => []) : [],
-      lore.ofPersona(null, userId).catch(() => null),
-      lore.global(userId).catch((): string[] => []),
-    ]);
-    const out = new Map<string, LoreBookSource>();
-    // The widest first, so a narrower one stands over it.
-    for (const id of global) out.set(id, "global");
-    for (const id of strings(chat.metadata.chat_world_book_ids)) out.set(id, "chat");
-    if (ofPersona !== null) out.set(ofPersona, "persona");
-    for (const id of ofCharacter) out.set(id, "character");
-    return out;
-  }
-
-  /**
    * `RecallLorePort.activated`: how Lumiverse activated each entry it put in a generation's prompt,
    * each with its text as stored where it can still be read. Lumiverse says which entries and how,
    * and not the text it made of each, so an entry's macros stand unfilled here.
@@ -263,14 +217,6 @@ export class Recall {
         return { entryId: a.entryId, bookId: a.bookId ?? entry?.bookId ?? null, title: a.title !== "" ? a.title : (entry?.title ?? ""), how: a.how ?? null, ...(a.score !== undefined ? { score: a.score } : {}), ...(entry !== null ? { content: entry.content } : {}) };
       }),
     );
-  }
-
-  // ---------------------------------------------------------------- the chat
-
-  /** `RecallChatPort.messages`: as `Chats.messages`, each message with when it was sent. */
-  private async messages(userId: string, chatId: string, from: number, to: number): Promise<TimedMessage[]> {
-    await this.deps.chats.own(userId, chatId);
-    return (await this.deps.chats.range(chatId, from, to)).map((m) => ({ id: m.id, index: m.index, role: m.role, name: m.name, swipeId: m.swipeId, content: m.content, at: m.at }));
   }
 
   // ---------------------------------------------------------------- embeddings

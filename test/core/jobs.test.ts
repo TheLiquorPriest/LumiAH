@@ -758,10 +758,11 @@ describe("a restart and a failure", () => {
     const passing = await ended();
     expect(passing).toMatchObject({ state: "failed", reason: "503: overloaded" });
     expect(passing.lasting).toBeUndefined();
-    // No connection to run on: no call is made, and what the page lists says it lasts.
+    // No connection to run on (its own is gone, and the runtime has no default to run it on instead): no call is made, and what the page lists says it lasts.
     r.stored.values.agents.summarizer!.connectionId = "conn-gone";
+    r.host.defaultConnection = null;
     const gone = await ended();
-    expect(gone).toMatchObject({ state: "failed", reason: "the connection conn-gone no longer exists: give this agent another in LumiAH's Settings", lasting: true });
+    expect(gone).toMatchObject({ state: "failed", reason: "the connection conn-gone is no longer one of the runtime's, and the runtime has no default connection to run this agent on instead: give it another in LumiAH's Settings, or make one the default on LumiAH's Runtime page under Connections", lasting: true });
     expect((await r.harness.jobs.list({ chatId: CHAT, cursor: null, limit: 1 })).jobs[0]).toMatchObject({ id: gone.id, lasting: true });
     expect(r.host.calls).toHaveLength(3);
   });

@@ -8,14 +8,20 @@
 // Lumiverse about its session, which renews it, and it keeps its origin in its account's
 // local-inference scheduler exclusions.
 
-import type { AskPush, ChunkPush, ConnectionPush, ExtensionOffer, LinkNotice, LinkRequests, LinkRequestType, OpenStream, RuntimeReport, SchedulerState, SessionReport, StopPush } from "../link/contract";
+import type { AskPush, ChunkPush, ConnectionPush, CopyOffer, CopyPush, EventPush, ExtensionOffer, LinkNotice, LinkRequests, LinkRequestType, MirrorAsk, MirrorWord, OpenStream, OwnPush, RuntimeReport, SchedulerState, SessionReport, StopPush, UpdatePush } from "../link/contract";
 import { EXTENSION_IDENTIFIER, LINK, LINK_VERSION, versionWords } from "../link/contract";
-import { extensionOfferOf, linkedBackendOf, pushOf } from "../link/frames";
+import { copyOfferOf, extensionOfferOf, linkedBackendOf, mirrorWordOf, pushOf } from "../link/frames";
 import type { RuntimeTuning } from "../link/settings";
+import type { Timings } from "../link/timings";
+import { spanWords, transportWait } from "../link/waits";
+import type { SettingsOwner } from "../shared/timeouts";
 import type { OpenSocket } from "./connection";
 import { HostConnection, LinkError } from "./connection";
 import type { Http, LiveProblem, StoredLogin } from "./lumiverse";
-import { excludeOrigins, LiveError, runtimeOrigins, sessionOf } from "./lumiverse";
+import { excludeOrigins, LiveError, runtimeOrigins, sessionOf, WaitError } from "./lumiverse";
+
+/** The wait for the extension the requests of a reply, a job or a page take while the link is down, and a stream under way while the extension is out of reach ("Extension lost after"), by its place in the transport's settings. */
+export const LOST_WAIT = ["runtime", "lostMs"] as const;
 
 /**
  * Why the extension is out of reach: the link down; the extension silent (asked, unanswered,
@@ -52,8 +58,15 @@ export interface RuntimeLink {
   readonly refusedByLumiAH?: boolean;
   /** The extension it links to, as its words name it (`lumiah status` says it too); LumiAH where it isn't known. */
   readonly backendName?: string;
-  /** One request, sent once the link is up (waiting `waitMs` at most), with the relay's secret. */
-  request<T extends AskType>(type: T, fields: Asked<T>, waitMs: number): Promise<LinkRequests[T]["result"]>;
+  /** Whose Settings show the runtime's waits (the extension it links to, as its last hello said), for words that say where a wait is changed; LumiAH's own where it isn't known. */
+  readonly owner?: SettingsOwner;
+  /**
+   * One request, sent once the link is up (waiting `waitMs` at most), with the relay's secret.
+   * `waited`: the transport setting `waitMs` is, by its place in the transport's section
+   * (`LOST_WAIT`, `["runtime", "modelsWaitMs"]`): when that wait runs out with the link still
+   * down, the request fails with a `WaitError` in words that name it and where it is changed.
+   */
+  request<T extends AskType>(type: T, fields: Asked<T>, waitMs: number, waited?: readonly string[]): Promise<LinkRequests[T]["result"]>;
   /** A notice, sent now when the link is up and dropped when it isn't: nothing waits for it. */
   notify(notice: Omit<LinkNotice, "link">): void;
 }
@@ -77,8 +90,20 @@ export interface LinkHandlers {
   ask(push: AskPush): void;
   /** What the extension LumiAH is built into supplies to the core, as it said on this hello; null for LumiAH on its own. */
   offer(offer: ExtensionOffer | null): void;
+  /** The extension offers its own copy of the runtime (a build other than this one's): the update checks it, and takes it or says why not. */
+  update(push: UpdatePush): void;
   /** The turns under way, for the ping and the report. */
   turns(): string[];
+  /** What the runtime says of its working copy on a hello (null: it keeps none it can name): waited for, as the copy's id is read from its disk. */
+  mirrorAsk(): Promise<MirrorAsk | null>;
+  /** The extension's word on who holds the mirror: on each hello's answer (null: a backend from before the mirror had a holder), and pushed when it changes. */
+  mirror(word: MirrorWord | null): void;
+  /** What the runtime's copy of chat and lore may read, as the extension said on this hello (null: a backend from before the copy): what it holds is read again from here. Absent while the runtime keeps no copy. */
+  copied?(offer: CopyOffer | null): void;
+  /** One of the extension's numbered pushes for the copy: a Lumiverse event, a mounting extension's records changed, what the copy may read changed. */
+  news?(push: EventPush | OwnPush | CopyPush): void;
+  /** How many numbered pushes the extension had sent this runtime when it answered a ping: more than were heard means one was lost on the way. */
+  told?(count: number): void;
 }
 
 export interface LinkOptions {
@@ -102,6 +127,8 @@ export interface LinkOptions {
   tuning(): RuntimeTuning;
   now(): number;
   log(text: string): void;
+  /** The runtime's timing log: every request the link sends, by its op, its size each way, its time and how it ended. */
+  timings?: Timings;
 }
 
 /** Problems no wait mends: a request fails at once rather than wait for the link (a session that ended, an address locked out or refused, the extension missing or too old). */
@@ -127,6 +154,20 @@ export function refusedReply(link: RuntimeLink): string | null {
   if (link.refused === null) return null;
   return link.refusedByLumiAH === true ? `${link.refused} ${NO_FALLBACK}` : link.refused;
 }
+
+/** `attempt`, or a timeout once `ms` have passed without it settling: the caller stops waiting, and the attempt goes on by itself. */
+async function within<T>(attempt: Promise<T>, ms: number): Promise<T> {
+  const late = Promise.withResolvers<never>();
+  const timer = setTimeout(() => late.reject(new LiveError("timeout", "It was still being opened.")), Math.max(0, ms));
+  try {
+    return await Promise.race([attempt, late.promise]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** `text` ending as a sentence does. */
+const sentence = (text: string): string => (/[.!?]$/.test(text) ? text : `${text}.`);
 
 export class LinkClient implements RuntimeLink {
   private readonly conn: HostConnection;
@@ -182,6 +223,9 @@ export class LinkClient implements RuntimeLink {
       },
       onPush: (data) => this.push(data),
       onExtension: (change, detail) => this.lifecycle(change, detail),
+      ...(options.timings !== undefined ? { timings: options.timings } : {}),
+      // A request that runs out of time names the extension, and where its Settings are, as the last hello said.
+      owner: () => this.owner,
     });
   }
 
@@ -205,6 +249,10 @@ export class LinkClient implements RuntimeLink {
   get backendName(): string {
     if (this.hello !== null) return linkedBackendOf(this.hello.backend).name;
     return this.options.identifier === EXTENSION_IDENTIFIER ? "LumiAH" : `The extension "${this.options.identifier}"`;
+  }
+
+  get owner(): SettingsOwner {
+    return linkedBackendOf(this.hello?.backend);
   }
 
   /**
@@ -257,27 +305,34 @@ export class LinkClient implements RuntimeLink {
     return { name, build, runtime, host, listen, port, scheduler: this.scheduler, session: this.session, turns: this.handlers?.turns().length ?? 0 };
   }
 
-  async request<T extends AskType>(type: T, fields: Asked<T>, waitMs: number): Promise<LinkRequests[T]["result"]> {
+  async request<T extends AskType>(type: T, fields: Asked<T>, waitMs: number, waited?: readonly string[]): Promise<LinkRequests[T]["result"]> {
     const deadline = this.options.now() + waitMs;
     const pause = async (): Promise<void> => {
       const { promise, resolve } = Promise.withResolvers<void>();
       setTimeout(resolve, Math.min(1_000, Math.max(0, deadline - this.options.now())));
       await promise;
     };
+    // The wait ran out with the link still down: what kept it down, and the setting the wait is, where the caller names it.
+    const outwaited = (cause: unknown, why = cause instanceof Error ? cause.message : String(cause)): unknown =>
+      waited === undefined ? cause : new WaitError(`The runtime's link to ${this.backendName} didn't come up within ${spanWords(waitMs)}. ${sentence(why)} ${transportWait(waited, this.owner)} says how long it waits for the link.`);
     while (!this.up) {
       if (this.refusal !== null) throw new LiveError("forbidden", this.refusal);
       const stopped = this.stoppedBy;
       if (stopped !== null && this.conn.isOpen()) {
         // The live socket will say when Lumiverse starts the extension again; a crash it never restarts by itself.
-        if (stopped.why === "crashed" || this.options.now() >= deadline) throw new LiveError("not_running", stoppedWords(stopped.why, stopped.detail, this.backendName));
+        const ended = new LiveError("not_running", stoppedWords(stopped.why, stopped.detail, this.backendName));
+        if (stopped.why === "crashed") throw ended;
+        if (this.options.now() >= deadline) throw outwaited(ended, `${this.backendName} is stopped on Lumiverse (restarted, updated or turned off).`);
         await pause();
         continue;
       }
       try {
-        await this.connect();
+        // No longer than the wait: an attempt that outlasts it goes on by itself, for whatever asks next.
+        await within(this.connect(), deadline - this.options.now());
       } catch (error) {
         // A wait mends a link that is down, not a session that ended or an extension that's missing.
-        if ((error instanceof LiveError && LASTING[error.problem] === true) || this.options.now() >= deadline) throw error;
+        if (error instanceof LiveError && LASTING[error.problem] === true) throw error;
+        if (this.options.now() >= deadline) throw outwaited(error);
         await pause();
       }
     }
@@ -325,7 +380,7 @@ export class LinkClient implements RuntimeLink {
     const gen = this.socketGen;
     let answer: LinkRequests["hello"]["result"];
     try {
-      answer = await this.ask("hello", { secret: this.options.secret(), version: LINK_VERSION, build: this.options.build, report: this.report(), open: this.handlers?.open() ?? [] });
+      answer = await this.ask("hello", { secret: this.options.secret(), version: LINK_VERSION, build: this.options.build, report: this.report(), open: this.handlers?.open() ?? [], mirror: (await this.handlers?.mirrorAsk()) ?? null });
     } catch (error) {
       if (error instanceof LinkError && error.code === "forbidden") this.refuse(this.unknownWords(error.message), true);
       else if (error instanceof LinkError && error.code === "version") this.refuse(error.message, true);
@@ -348,7 +403,10 @@ export class LinkClient implements RuntimeLink {
     this.suspect = null;
     if (Array.isArray(answer.lost) && answer.lost.length > 0) this.handlers?.lost(answer.lost);
     if (typeof answer.settings === "number") this.handlers?.settings(answer.settings);
+    // Before what the hello sets going (a restart's recovery reads the store): the store knows first whether it keeps its copy.
+    this.handlers?.mirror(mirrorWordOf(answer.mirror));
     this.handlers?.offer(extensionOfferOf(answer.extension));
+    this.handlers?.copied?.(copyOfferOf(answer.copy));
     this.options.log(`${again ? "linked again" : "linked"} to ${linkedBackendOf(answer.backend).name} ${answer.build} on ${this.options.base}`);
     this.failures = 0;
     this.lastProblem = "";
@@ -393,6 +451,21 @@ export class LinkClient implements RuntimeLink {
         this.options.rotated(push.secret);
         this.options.log(`${this.backendName} rotated this runtime's secret: the new one is in its config`);
         return;
+      case "update":
+        this.handlers?.update(push);
+        return;
+      case "greet":
+        // A new worker, which knows neither this runtime's session nor its streams, asks: as when Lumiverse says it started the extension, the next tick says hello to it.
+        if (this.refusal === null) this.lifecycle("loaded", null);
+        return;
+      case "mirror":
+        this.handlers?.mirror(push);
+        return;
+      case "event":
+      case "own":
+      case "copy":
+        this.handlers?.news?.(push);
+        return;
     }
   }
 
@@ -403,7 +476,7 @@ export class LinkClient implements RuntimeLink {
     const origins = runtimeOrigins(this.options.listen, this.options.port);
     const was = this.scheduler;
     this.scheduler = await excludeOrigins(this.options.http, this.options.base, token, origins);
-    if (this.scheduler !== was && (this.scheduler === "missing" || this.scheduler === "unknown")) this.options.log(`couldn't put ${origins.join(" and ")} in the local-inference scheduler's Excluded origins. Before turning the scheduler on, add them there (Lumiverse → Settings → Inference scheduler): a turn would otherwise wait on its own calls.`);
+    if (this.scheduler !== was && (this.scheduler === "missing" || this.scheduler === "unknown")) this.options.log(`couldn't put ${origins.join(" and ")} in the local-inference scheduler's Excluded origins. Before turning the scheduler on, add them there (Lumiverse → Settings → Inference scheduler): a reply the runtime answers would otherwise hold the scheduler, and Lumiverse's local models wait, for as long as its agents work.`);
     this.pingedAt = 0;
   }
 
@@ -427,6 +500,7 @@ export class LinkClient implements RuntimeLink {
     this.ask("ping", { secret: this.options.secret(), report: this.report(), streams, turns })
       .then((answer) => {
         if (Array.isArray(answer.lost) && answer.lost.length > 0) this.handlers?.lost(answer.lost);
+        if (typeof answer.told === "number") this.handlers?.told?.(answer.told);
       })
       .catch((error: unknown) => {
         if (error instanceof LinkError && error.code === "forbidden") this.refuse(this.unknownWords(error.message), true);

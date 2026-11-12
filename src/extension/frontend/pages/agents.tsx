@@ -2,32 +2,34 @@
 // definition says what an agent is (its name, and the description a delegating agent reads when it
 // chooses whom to start), what it is told (its instructions), what it is given when another agent
 // starts it, and what it runs with. The frame, and everything an agent shares with a skill, is
-// defs.tsx; what the page decides is defs-model.ts.
+// defs.tsx; what the page decides is defs-model.ts, and what it says of who leads the open chat's
+// replies (an extension's claim may name an agent of its own: §21) is lead-model.ts.
 
-import { useId, useMemo, useRef } from "preact/hooks";
-import type { AgentView, ConnectionView, TextsView } from "../../../shared/ui";
+import { useEffect, useId, useMemo, useRef, useState } from "preact/hooks";
+import type { AgentView, ChatLeadView, ModelChoice, TextsView } from "../../../shared/ui";
 import { useApp } from "../app";
 import { Banner, Button, Editor, Field, Section, useBusy } from "../components";
+import { useRuntimeConnections } from "../connections";
 import { type DefKind, DefsFrame, type KindFieldsProps, libraryOf } from "../defs";
 import { AGENT_WORDS, type AgentDraft, agentDraft, agentForm, agentToSave, applyAgentForm, copyAgent, followsWords, grantSettingWords, instructionsNote, instructionsShown, lacksToSave, lacksWords, newAgent, ownedFields, ownProblems, sameAgent, titleOf, typedInstructions, withTools } from "../defs-model";
 import { Icon } from "../icons";
+import { GENERAL_ABOUT, type LeadRead, leadWords } from "../lead-model";
 import { formOf, problemsByPath, valueAt } from "../settings-model";
 import { useSelect } from "../store";
 import { FieldNode, type FormCtx } from "./settings-form";
 
 const NO_TEXTS: TextsView = { defs: [], own: {} };
-const NO_CONNECTIONS: readonly ConnectionView[] = [];
 
 /** An agent's own fields: its instructions, then what it is given and runs with, as the form the backend's schema describes. */
 function AgentFields(props: KindFieldsProps<AgentView, AgentDraft>) {
   const app = useApp();
   const { draft, saved, view } = props;
   const texts = useSelect(app.client.state, (s) => s?.texts ?? NO_TEXTS);
-  const connections = useSelect(app.client.state, (s) => s?.connections ?? NO_CONNECTIONS);
+  const connections = useRuntimeConnections();
   const settings = useSelect(app.client.state, (s) => s?.settings ?? null);
   const box = useId();
   /** The models each connection offers, asked for once while this agent shows. */
-  const modelLists = useRef(new Map<string, Promise<string[]>>());
+  const modelLists = useRef(new Map<string, Promise<ModelChoice[]>>());
   const kept = saved !== null ? agentDraft(saved).instructions : null;
   const note = instructionsNote(draft.instructions, kept, texts.defs);
   const { own, rest } = ownProblems(props.problems, ["instructions", "text"]);
@@ -61,10 +63,11 @@ function AgentFields(props: KindFieldsProps<AgentView, AgentDraft>) {
     found: null,
     at: (path) => valueAt(draft.rest, path),
     models: (connectionId) => {
-      const key = connectionId ?? "";
+      const relay = connections.view?.relay.id;
+      const key = `${relay ?? ""} ${connectionId ?? ""}`;
       let list = modelLists.current.get(key);
       if (!list) {
-        list = app.client.request("lah.models.list", { connectionId }).then((r) => r.models);
+        list = app.client.request("lah.connections.models", { ...(relay !== undefined ? { relay } : {}), connectionId }).then((r) => r.models);
         modelLists.current.set(key, list);
         // A list that couldn't be read is asked for again next time.
         list.catch(() => modelLists.current.delete(key));
@@ -145,7 +148,7 @@ const AGENTS: DefKind<AgentView, AgentDraft> = {
   same: sameAgent,
   save: (app, draft) => app.client.request("lah.agent.save", { agent: agentToSave(draft) }),
   owned: ownedFields,
-  about: "The main agent works on every reply and hands work to the others; a job or a conversation starts with one. Open one to see what it is told, the tools it is given and the model it runs with.",
+  about: GENERAL_ABOUT,
   help: {
     newId: 'What delegate, a job and a conversation name it by: lower-case letters, digits, "-" and "_". It is fixed once the agent is made.',
     madeId: "What delegate, a job and a conversation name it by. It is fixed: copy the agent to have it under another id.",
@@ -155,6 +158,32 @@ const AGENTS: DefKind<AgentView, AgentDraft> = {
   Fields: AgentFields,
 };
 
+const NO_AGENTS: readonly AgentView[] = [];
+
+/** Who leads the open chat's replies, as its claim says (`lah.chat.lead.get`): read when the page shows, and again when another chat opens. One that can't be read leaves the page saying how it goes in general. */
+function useLead(): LeadRead {
+  const app = useApp();
+  const chat = useSelect(app.host.activeChat, (c) => c);
+  const [read, setRead] = useState<{ chat: string; lead: ChatLeadView | null } | null>(null);
+  useEffect(() => {
+    if (chat === null) return;
+    let live = true;
+    app.client.request("lah.chat.lead.get", { chatId: chat }).then(
+      (r) => live && setRead({ chat, lead: r.lead }),
+      () => live && setRead(null),
+    );
+    return () => {
+      live = false;
+    };
+  }, [chat]);
+  if (chat === null) return { chat: null };
+  return read !== null && read.chat === chat ? { chat, read: { lead: read.lead } } : { chat, read: null };
+}
+
 export function AgentsPage() {
-  return <DefsFrame kind={AGENTS} />;
+  const app = useApp();
+  const lead = useLead();
+  const agents = useSelect(libraryOf(app).read, (r) => r.view?.agents ?? NO_AGENTS);
+  const words = leadWords(lead, agents);
+  return <DefsFrame kind={AGENTS} about={words.about} marks={words.marks} />;
 }

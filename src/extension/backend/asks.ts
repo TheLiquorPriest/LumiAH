@@ -1,7 +1,7 @@
 // What a page asks of the core (DESIGN §4, §8, §25). The core keeps the workspace, the jobs, the
 // side sessions, the spend and the rest in documents in the user's storage, and it runs in the
-// user's runtime. So a page's request for any of it is sent on to a runtime (the `ask` push), which
-// does it with its core and answers (`ask.answer`). Which runtime:
+// user's runtime. So a page's request for any of it is sent on to a runtime, which does it with its
+// core and answers. Which runtime:
 //
 // - about a chat on a loopback connection: the one that chat's replies reach (the one whose loopback
 //   connection the chat generates on), since its jobs and side sessions run there; while that one
@@ -11,17 +11,32 @@
 //   chat that generates elsewhere): the user's runtime, the one linked now that was heard from last.
 //
 // With no runtime linked there is nobody to ask, and the page is told that in plain words.
+//
+// Which road (PI-BUILD-PLAN §4.7): through Lumiverse's proxy to the runtime's loopback server where
+// it reaches that runtime (proxy.ts says when) and the ask's wait fits under the proxy's own 30
+// seconds; else over the link, as an `ask` push answered with `ask.answer`. On the proxy road an ask
+// doesn't wait behind the link's large frames. Past the proxy road's own wait it is sent over the
+// link as well, and whichever answers first is taken; one the proxy road fails, or whose answer is
+// too large for it, goes over the link once. The runtime does an ask once, whichever road brings it
+// (by its id), so nothing a page asked is done twice. Each crossing goes in the timing log, by its
+// op, road, size each way and time: never what it carried.
 
 import type { JsonObject, JsonValue } from "../../core/ports";
 import { LINK } from "../../link/contract";
 import { isRecord } from "../../link/json";
+import { PROXY_HOP_MS, PROXY_MAX_BYTES, PROXY_ROOM_BYTES } from "../../link/road";
+import type { Outcome, Road, Timings } from "../../link/timings";
+import { spanWords, transportWait } from "../../link/waits";
 import type { UiErrorCode, UiProblem } from "../../shared/ui";
 import { UiRefused } from "./errors";
+import type { Opened, ProxyRoad } from "./proxy";
 import type { Relays } from "./relays";
 import type { SettingsStore } from "./settings";
 
-/** What a page's request is about, which says where it is done. At most one of `chat`, `run`, `job` and `side`; none: about no chat. */
+/** What a page's request is about, which says where it is done. At most one of `relay`, `chat`, `run`, `job` and `side`; none: about no chat. */
 export interface Where {
+  /** One of the user's runtimes, by its id (`RelayView.id`): what it is asked of itself (how it is run, its update, its connections, its store). Another user's is never asked. */
+  relay?: string;
   /** The chat it is about; null: none. */
   chat?: string | null;
   /** A run under way, by the stream it is followed under and its id. */
@@ -49,20 +64,44 @@ export interface AsksDeps {
   jobOf(userId: string, job: string): string | null;
   /** The extension as its pages show it. */
   name: string;
+  /** Where its Settings are shown, where that isn't "<name>'s Settings" (`BackendIdentity.settingsAt`): a timeout's words name it. */
+  settingsAt?: string;
+  now(): number;
   /** Runs `fn` once after `ms`; what it returns cancels that. */
   later(ms: number, fn: () => void): () => void;
-  /** An id no other ask under way has. */
+  /** An id no other ask under way has: 128 bits or more, as hex. */
   id(): string;
+  /** The road through Lumiverse's proxy (proxy.ts); absent, every ask goes over the link. */
+  road?: Pick<ProxyRoad, "open" | "send">;
+  /** This end of the timing log; absent, nothing is logged. */
+  timings?: Timings;
 }
+
+/** How an ask ended: its value, or what refused it or gave it up; the road that brought it, how long the runtime said it worked on it, and the characters that came. */
+type Settled = ({ value: JsonValue } | { error: Error; outcome: Exclude<Outcome, "ok"> }) & { road: Road; took: number | null; got: number };
 
 interface Pending {
   userId: string;
   relay: string;
-  settle(out: { value: JsonValue } | { error: Error }): void;
+  op: string;
+  args: JsonObject;
+  /** When it was sent, the characters it sent, and the road it took first. */
+  at: number;
+  sent: number;
+  road: Road;
+  /** It went over the link (its push reached the runtime's session). */
+  linked: boolean;
+  /** Its ask on the proxy road is still out. */
+  proxied: boolean;
+  /** Ends the wait on the proxy road alone. */
+  unproxy(): void;
+  settle(out: Settled): void;
 }
 
 /** The codes a refusal may carry to a page; anything else its place says is a failure of its own. */
 const CODES: Readonly<Record<string, UiErrorCode>> = { bad_request: "bad_request", not_found: "not_found", forbidden: "forbidden", unavailable: "unavailable", invalid: "invalid", conflict: "conflict" };
+
+const LINK_DROPPED = "The runtime's link just dropped. Try again once the Runtime page shows it linked.";
 
 function problemsOf(raw: unknown): UiProblem[] | undefined {
   if (!Array.isArray(raw)) return undefined;
@@ -77,6 +116,9 @@ export function refused(refusal: { code?: unknown; message?: unknown; problems?:
   const code = typeof refusal.code === "string" ? CODES[refusal.code] : undefined;
   return new UiRefused(code ?? "internal", code === undefined ? `${who} couldn't do that (${said}).` : said, problemsOf(refusal.problems));
 }
+
+/** The characters a value comes to as JSON: about what crossed for it, for the timing log. */
+const sizeOf = (value: unknown): number => JSON.stringify(value ?? null).length;
 
 export class Asks {
   private readonly pending = new Map<string, Pending>();
@@ -96,8 +138,10 @@ export class Asks {
     }
   }
 
-  /** The runtime a request goes to, by its id; `{ chat }`: that chat's runtime, which isn't linked; null: no runtime of the user's is linked. */
-  private async place(userId: string, where: Where): Promise<string | { chat: string } | null> {
+  /** The runtime a request goes to, by its id; `{ chat }`: that chat's runtime, which isn't linked; `{ relay }`: the runtime asked for, which isn't one of the user's linked now; null: no runtime of the user's is linked. */
+  private async place(userId: string, where: Where): Promise<string | { chat: string } | { relay: string } | null> {
+    // Only the user's own runtime is ever pushed to: an id that isn't one of theirs is never linked for them.
+    if (where.relay !== undefined) return this.deps.relays.isLinked(userId, where.relay) ? where.relay : { relay: where.relay };
     const running = where.run !== undefined ? this.deps.runOf(userId, where.run.stream, where.run.turn) : null;
     if (running !== null) return running;
     let chat = where.chat ?? null;
@@ -120,43 +164,92 @@ export class Asks {
     const relay = await this.place(userId, where);
     const start = `Start it (its line is on ${this.deps.name}'s Runtime page) and try again.`;
     if (relay === null) throw new UiRefused("unavailable", `${this.deps.name} needs its runtime for this, and none is linked now. ${start}`);
-    if (typeof relay !== "string") throw new UiRefused("unavailable", `This chat runs in a runtime, and that runtime isn't linked now. ${start}`);
-    const waitMs = (await this.deps.settings.transport(userId)).pages.askMs;
+    if (typeof relay !== "string") throw new UiRefused("unavailable", "relay" in relay ? `That runtime isn't linked now. ${start}` : `This chat runs in a runtime, and that runtime isn't linked now. ${start}`);
+    const { askMs: waitMs, proxyMs } = (await this.deps.settings.transport(userId)).pages;
+    // Lumiverse's proxy waits 30 seconds at most: an ask that may wait longer goes over the link, as an ask always went.
+    const opened = where.patient !== true && waitMs <= PROXY_HOP_MS && this.deps.road !== undefined ? await this.deps.road.open(userId, relay) : null;
     const id = this.deps.id();
+    // The ask as the proxy road carries it, with where it is going, so a runtime refuses one meant for another.
+    const body = opened === null ? null : JSON.stringify({ ask: id, op, args, where: { ...where, relay } });
+    const proxied = body !== null && body.length <= PROXY_MAX_BYTES - PROXY_ROOM_BYTES;
     const { promise, resolve, reject } = Promise.withResolvers<JsonValue>();
     const unwait = where.patient
       ? (): void => undefined
-      : this.deps.later(waitMs, () => this.settle(id, { error: new UiRefused("unavailable", `The runtime didn't answer within ${Math.round(waitMs / 1000)} seconds. It may be busy or restarting: try again in a moment.`) }));
+      : this.deps.later(waitMs, () => {
+          const pending = this.pending.get(id);
+          if (pending !== undefined) this.settle(id, { error: new UiRefused("unavailable", `The runtime didn't answer within ${spanWords(waitMs)}. It may be busy or restarting: try again in a moment. ${transportWait(["pages", "askMs"], this.deps)} says how long a page waits for it.`), outcome: "timeout", road: pending.road, took: null, got: 0 });
+        });
     this.pending.set(id, {
       userId,
       relay,
+      op,
+      args,
+      at: this.deps.now(),
+      sent: proxied && body !== null ? body.length : sizeOf(args),
+      road: proxied ? "proxy" : "link",
+      linked: false,
+      proxied,
+      unproxy: () => undefined,
       settle: (out) => {
         unwait();
         if ("error" in out) reject(out.error);
         else resolve(out.value);
       },
     });
-    if (!this.deps.relays.push(userId, relay, { link: LINK, type: "ask", ask: id, op, args })) this.settle(id, { error: new UiRefused("unavailable", "The runtime's link just dropped. Try again once the Runtime page shows it linked.") });
+    if (proxied && opened !== null && body !== null) this.viaProxy(id, opened, body, proxyMs);
+    else this.viaLink(id);
     return promise;
   }
 
-  private settle(id: string, out: { value: JsonValue } | { error: Error }): void {
+  /** Sends an ask on the proxy road, and past the road's own wait over the link as well; whichever answers first settles it. */
+  private viaProxy(id: string, opened: Opened, body: string, proxyMs: number): void {
+    const pending = this.pending.get(id);
+    const road = this.deps.road;
+    if (pending === undefined || road === undefined) return;
+    pending.unproxy = this.deps.later(proxyMs, () => this.viaLink(id));
+    void road.send(pending.userId, pending.relay, opened, body).then((answer) => {
+      const still = this.pending.get(id);
+      // Answered over the link already, or given up.
+      if (still === undefined) return;
+      still.proxied = false;
+      still.unproxy();
+      if (answer.kind === "answer") {
+        if (answer.refusal !== null) this.settle(id, { error: refused(answer.refusal, "The runtime"), outcome: "refused", road: "proxy", took: answer.took, got: answer.got });
+        else this.settle(id, { value: answer.value, road: "proxy", took: answer.took, got: answer.got });
+      }
+      // Too large for the proxy, or the road failed: over the link, once (the runtime answers it from what it kept, or does it if it never got it).
+      else if (!still.linked) this.viaLink(id);
+    });
+  }
+
+  /** Sends an ask over the link (once). While the link is down it fails, unless its ask on the proxy road is still out, whose answer is then waited for. */
+  private viaLink(id: string): void {
+    const pending = this.pending.get(id);
+    if (pending === undefined || pending.linked) return;
+    if (this.deps.relays.push(pending.userId, pending.relay, { link: LINK, type: "ask", ask: id, op: pending.op, args: pending.args })) pending.linked = true;
+    else if (!pending.proxied) this.settle(id, { error: new UiRefused("unavailable", LINK_DROPPED), outcome: "failed", road: "link", took: null, got: 0 });
+  }
+
+  private settle(id: string, out: Settled): void {
     const pending = this.pending.get(id);
     if (pending === undefined) return;
     this.pending.delete(id);
+    pending.unproxy();
+    this.deps.timings?.add({ at: pending.at, op: pending.op, road: out.road, sent: pending.sent, got: out.got, ms: this.deps.now() - pending.at, workMs: out.took, outcome: "error" in out ? out.outcome : "ok" });
     pending.settle(out);
   }
 
-  /** `ask.answer`: what a runtime answered. One that names no ask of this runtime's (answered late, or twice) is left. */
-  answered(userId: string, relay: string, ask: unknown, value: unknown, refusal: unknown): void {
+  /** `ask.answer`: what a runtime answered over the link, and how long it worked on it (`took`, ms; absent from a runtime from before it). One that names no ask of this runtime's (answered late, twice, or by the other road first) is left. */
+  answered(userId: string, relay: string, ask: unknown, value: unknown, refusal: unknown, took?: unknown): void {
     if (typeof ask !== "string") return;
     const pending = this.pending.get(ask);
     if (pending === undefined || pending.userId !== userId || pending.relay !== relay) return;
+    const worked = typeof took === "number" && Number.isFinite(took) && took >= 0 ? took : null;
     if (isRecord(refusal)) {
-      this.settle(ask, { error: refused(refusal, "The runtime") });
+      this.settle(ask, { error: refused(refusal, "The runtime"), outcome: "refused", road: "link", took: worked, got: sizeOf(refusal) });
       return;
     }
-    this.settle(ask, { value: value === undefined ? null : (value as JsonValue) });
+    this.settle(ask, { value: value === undefined ? null : (value as JsonValue), road: "link", took: worked, got: sizeOf(value) });
   }
 
   /** A user's runtimes changed how they stand: what one whose link is gone was asked, and hasn't answered, fails now. */
@@ -166,10 +259,10 @@ export class Asks {
     for (const relay of gone) this.relayGone(userId, relay);
   }
 
-  /** A runtime's link went away, or it was forgotten: what it was asked and hasn't answered fails now. */
+  /** A runtime's link went away, or it was forgotten: what it was asked and hasn't answered fails now, unless its ask on the proxy road is still out, which answers or fails by itself. */
   relayGone(userId: string, relay: string): void {
     for (const [id, pending] of [...this.pending]) {
-      if (pending.userId === userId && pending.relay === relay) this.settle(id, { error: new UiRefused("unavailable", "The runtime's link dropped before it answered. Try again once the Runtime page shows it linked.") });
+      if (pending.userId === userId && pending.relay === relay && !pending.proxied) this.settle(id, { error: new UiRefused("unavailable", "The runtime's link dropped before it answered. Try again once the Runtime page shows it linked."), outcome: "failed", road: pending.road, took: null, got: 0 });
     }
   }
 }

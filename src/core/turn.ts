@@ -9,6 +9,12 @@
 // writes, its final answer is the reply. The turn ends with its record, which the caller anchors on
 // the reply's message.
 //
+// Who leads is settled first, before anything is read or sent (§21): the agent the extension's
+// claim on the chat names, else LumiAH's main agent. Where the claim's agent can't run in this run
+// (there is no such agent, it is switched off, the extension's definitions gave no answer), or the
+// extension never said whether it claims the chat, the turn doesn't start: no model is called, no
+// writer writes, and the turn fails with why. Nothing of LumiAH's stands in for the extension's.
+//
 // Nothing of LumiAH's own that fails before the writer costs the reply (rule 5): settings that can't
 // be read, a session that can't be resumed, the main agent's own run. The turn then ends where a
 // main agent that stops short ends: the writer writes from the request alone, unless Settings say
@@ -30,7 +36,7 @@ import { recallTold } from "./recall/turn";
 import { writerLore } from "./recall/writer";
 import { carriedOf, receiptOf } from "./receipts";
 import { briefedRequest, requestDocument, sentMessage } from "./request";
-import { askExtension, readSetup, Run, type Setup, type Shared } from "./run";
+import { askExtension, claimMissing, readSetup, Run, type Setup, type Shared, unansweredWords } from "./run";
 import { type Compaction, compactionAsked, compactionDue, type ResumedSession, type SegmentStep, type SessionSegment } from "./sessions";
 import { AGENT, type Settings, settingsOf } from "./settings";
 import { leftOutWhy, type StorySource, storyHolds } from "./story";
@@ -138,7 +144,10 @@ export class Turn {
     let failed = unread;
     if (failed === null) {
       try {
-        const main = await this.runMain(work, run);
+        // Who leads is settled before anything is read or sent: where that can't be the agent it should be, no other is, and nothing runs.
+        const lead = this.lead(run);
+        if (typeof lead === "string") return { status: "failed", reason: lead };
+        const main = await this.runMain(work, run, lead);
         // The agents released the reply themselves: it is what they released, whatever the main agent answered last (§3.4).
         if (this.streamed) return this.released();
         // Where the extension says only what is released is the reply, nothing else stands in for it.
@@ -227,8 +236,8 @@ export class Turn {
     }
   }
 
-  /** The turn's agents at work up to the main agent's last word: the session read (and summarized), and the main agent run on the request. */
-  private async runMain(work: Work, run: Run): Promise<{ reply: AgentReply; id: string; writes: boolean }> {
+  /** The turn's agents at work up to the main agent's last word: the session read (and summarized), and the agent that leads (`main`) run on the request. */
+  private async runMain(work: Work, run: Run, main: ResolvedAgent): Promise<{ reply: AgentReply; id: string; writes: boolean }> {
     const { host, turn, settings, texts, shared } = this;
     const session = await shared.sessions.resume(turn);
     work.session = session;
@@ -279,7 +288,8 @@ export class Turn {
         dropped: [...refs.dropped],
         missing: session.missing,
         ...(work.compaction ? { compacted: { folded: work.compaction.folded, kept: work.compaction.kept.length, summary: work.compaction.summary } } : {}),
-        ...(refs.rolledBack !== null ? { rolledBack: { summary: refs.rolledBack } } : {}),
+        // A rollback is said once, to the first turn that reads past it: the turns after go on reading past it, and that is no news to them.
+        ...(refs.rolledBack !== null && refs.rollbackFresh ? { rolledBack: { summary: refs.rolledBack } } : {}),
         ...(news.length > 0 ? { jobs: news } : {}),
       },
       at: host.clock.now(),
@@ -290,9 +300,7 @@ export class Turn {
     const droppedReplies = texts.render(refs.fresh.length === 1 ? TEXT.main.replyOne : TEXT.main.replyMany, { list: refs.fresh.map((index) => `#${index}`).join(", ") });
     if (refs.fresh.length > 0) this.progress(TEXT.progress.dropped, { replies: droppedReplies });
 
-    // The extension that claims the chat may name the agent that answers it; LumiAH's own answers every other.
-    const claimed = run.claim?.mainAgent;
-    const main = (claimed !== undefined ? run.resolve(claimed) : undefined) ?? this.resolved(run, AGENT.main);
+    // `main`, the agent that leads, was settled before anything began (`lead`).
     const writes = this.settings.reply.writer === "main";
     const blocks = await this.blocks();
     // What the prompt holds of the lore and of the chat (§24.1) and the top of the chat's chronicle (§24.7) follow the request's messages.
@@ -325,7 +333,7 @@ export class Turn {
     });
     const notes = [
       ...(refs.fresh.length > 0 ? [texts.render(TEXT.main.noteDropped, { replies: droppedReplies })] : []),
-      ...(refs.rolledBack !== null ? [texts.render(TEXT.main.noteRolledBack)] : []),
+      ...(refs.rolledBack !== null && refs.rollbackFresh ? [texts.render(TEXT.main.noteRolledBack)] : []),
       ...(session.missing > 0 ? [texts.render(TEXT.main.noteMissing, { count: texts.counted(session.missing, TEXT.word.part) })] : []),
       ...(lead !== null ? [texts.render(TEXT.main.noteSummary, { summary: lead })] : []),
       ...(session.continued ? [texts.render(TEXT.main.noteContinued, { receipt: receiptOf(session.continued.segment, settings.session, texts) })] : []),
@@ -366,6 +374,29 @@ export class Turn {
     const agent = run.resolve(id);
     if (!agent) throw new Error(`there is no agent definition "${id}"`);
     return agent;
+  }
+
+  /**
+   * The agent that leads the turn: the one the extension's claim on the chat names, else LumiAH's own
+   * main agent. Nothing stands in for a named one that can't run in this run, and nothing answers a
+   * chat whose extension never said whether it claims it: the turn then doesn't start, and why, in
+   * the user's words, is what this gives.
+   */
+  private lead(run: Run): ResolvedAgent | string {
+    const { texts, shared } = this;
+    const { options } = shared;
+    const unclaimed = run.unanswered.claim;
+    if (unclaimed !== undefined) return claimMissing(unclaimed, texts, options);
+    const named = run.claim?.mainAgent;
+    if (named === undefined) return this.resolved(run, AGENT.main);
+    const lead = run.resolve(named);
+    if (lead) return lead;
+    const vars = { extension: options.extension?.name ?? "The extension", agent: named };
+    const off = run.definitions.switchedOff(named);
+    if (off) return texts.render(TEXT.progress.leadOff, { ...vars, agent: off.name === off.id ? off.id : `${off.name} (${off.id})` });
+    const unsupplied = run.unanswered.definitions;
+    if (unsupplied !== undefined) return unansweredWords({ why: unsupplied, late: TEXT.progress.leadLate, failed: TEXT.progress.leadUnread, texts, options, vars });
+    return texts.render(TEXT.progress.leadMissing, vars);
   }
 
   /** The active preset's blocks, which mark the request's instructions; none when the chat has no preset, or it can't be read (the request then goes unmarked, and the log says why). */
@@ -904,5 +935,5 @@ function shippedSetup(shared: Shared, userId: string): Setup {
   const settings = settingsOf(null, definitions.scope());
   // Whether prompts and transcripts are kept is the user's to say, and what they said can't be read: nothing they may have switched off is kept for this turn.
   settings.keep = { ...settings.keep, prompts: false, transcripts: false };
-  return { userId, settings, texts: textsOf(null), definitions, chat: null, claim: null, story: storyHolds({ user: settings.story, sovereignHand: null }) };
+  return { userId, settings, texts: textsOf(null), definitions, chat: null, claim: null, story: storyHolds({ user: settings.story, sovereignHand: null }), unanswered: {} };
 }

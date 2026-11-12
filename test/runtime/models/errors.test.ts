@@ -2,11 +2,12 @@
 // of a failure (core/provider.ts) tells one that passes (a rate limit, an overloaded provider, a
 // stream that dropped) from one that lasts (a refused key, an account out of credit) and from a
 // refusal of native tools, as it did when Lumiverse relayed them. pi-ai never tries again on its
-// own, and no key the runtime holds is ever in the words.
+// own, and no key, token or header's value the runtime holds is ever in the words, whole or in part.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { isLasting, isToolRefusal, isTransient } from "../../../src/core/provider";
-import type { ModelTool } from "../../../src/core/ports";
+import type { ModelMessage, ModelTool } from "../../../src/core/ports";
+import { redact } from "../../../src/runtime/models/words";
 import type { Rig, Script } from "./support";
 import { anthropicStream, anthropicTurn, eventStream, failed, forever, request, rig } from "./support";
 
@@ -32,10 +33,10 @@ async function anthropicFailure(script: Script): Promise<Error> {
   );
 }
 
-/** The words a call with a tool fails with on an OpenAI-compatible server that answers as `script` does. */
-async function serverFailure(script: Script): Promise<Error> {
+/** The words a call with a tool fails with on an OpenAI-compatible server, sent with `headers`, that answers as `script` does. */
+async function serverFailure(script: Script, headers?: Record<string, string>): Promise<Error> {
   r = rig({ script });
-  await r.layer.book.save({ name: "Proxy", provider: "openai-compatible", auth: "key", baseUrl: "https://proxy.example.com/v1", model: "served-model" }, SERVER_KEY);
+  await r.layer.book.save({ name: "Proxy", provider: "openai-compatible", auth: "key", baseUrl: "https://proxy.example.com/v1", model: "served-model", ...(headers ? { headers } : {}) }, SERVER_KEY);
   return r.layer.models.call(request({ messages: [{ role: "user", content: "Look it up." }], tools: [LOOKUP] }), forever()).then(
     () => {
       throw new Error("the call answered");
@@ -132,5 +133,43 @@ describe("a call its connection can't make", () => {
     await made.layer.book.setDefault(null);
     await expect(ask(null)).rejects.toThrow("There is no default connection");
     expect(made.sent).toEqual([]);
+  });
+
+  test("holding what no message of its kind carries to the model is refused in words that say so, and sends nothing: media in a system message or in the model's own turn, audio or a video anywhere", async () => {
+    const made = rig();
+    r = made;
+    await made.layer.book.save({ name: "Claude", provider: "anthropic", auth: "key", model: "claude-sonnet-4-5" }, ANTHROPIC_KEY);
+    const image = { type: "media", media: "image", data: "iVBORw0KGgo=", mimeType: "image/png" } as const;
+    const ask = (messages: ModelMessage[]) => made.layer.models.call(request({ messages }), forever());
+    const chart = "The harbour's chart.";
+    // In the system prompt, and in a system message further on.
+    await expect(ask([{ role: "system", content: chart, parts: [{ type: "text", text: chart }, image] }, { role: "user", content: "Where is the reef?" }])).rejects.toThrow("A system message in this call holds an image, and the runtime's model calls carry a system message's text only.");
+    await expect(ask([{ role: "user", content: "Where is the reef?" }, { role: "system", content: "", parts: [{ ...image, media: "audio", mimeType: "audio/wav" }] }])).rejects.toThrow("A system message in this call holds audio");
+    await expect(ask([{ role: "user", content: "Show me the reef." }, { role: "assistant", content: "", parts: [image] }, { role: "user", content: "Again." }])).rejects.toThrow("One of the model's own turns in this call holds an image, and the runtime's model calls carry only the text, reasoning and tool calls of one.");
+    await expect(ask([{ role: "user", content: "", parts: [{ ...image, media: "video", mimeType: "video/mp4" }] }])).rejects.toThrow("This call holds a video, and the runtime's model calls carry text and images only.");
+    expect(made.sent).toEqual([]);
+  });
+});
+
+describe("words that leave the layer", () => {
+  test("a header's value the provider repeats is never in them: a header may carry a gateway's credential", async () => {
+    const gateway = "gw-token-Okoro0123456789abcdef";
+    const error = await serverFailure(() => failed(401, { error: { message: `Unknown gateway token ${gateway}.`, type: "invalid_request_error" } }), { "x-gateway-token": gateway });
+    expect(error.message).toBe("401: Unknown gateway token [secret]. (invalid_request_error)");
+    expect(r?.sent[0]?.headers["x-gateway-token"]).toBe(gateway);
+  });
+
+  test("a secret that holds another is taken out whole, never half shown around the other", () => {
+    const key = "sk-proxy-0123456789abcdefghijklmnop";
+    const header = `Bearer ${key}-gateway-Okoro`;
+    expect(redact(`401: token ${header} refused`, [key, header])).toBe("401: token [secret] refused");
+  });
+
+  test("a secret a text was cut through leaves none of its first characters behind: before pi-ai's mark of the cut, or at the text's end", () => {
+    const key = "sk-proxy-0123456789abcdefghijklmnop";
+    expect(redact(`401: {"message":"bad key ${key.slice(0, 20)}... [truncated 812 chars]`, [key])).toBe(`401: {"message":"bad key [secret]... [truncated 812 chars]`);
+    expect(redact(`401: bad key ${key.slice(0, 14)}`, [key])).toBe("401: bad key [secret]");
+    // Its first few characters alone are any key's of its kind, and stay.
+    expect(redact(`401: bad key ${key.slice(0, 7)}`, [key])).toBe(`401: bad key ${key.slice(0, 7)}`);
   });
 });

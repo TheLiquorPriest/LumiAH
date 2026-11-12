@@ -234,6 +234,11 @@ export function SessionsPage() {
         {list.session ? (
           <Section title="What carries into the next reply" id="session">
             <div class="lah-stack" data-lah-session-now>
+              {list.session.behind !== undefined ? (
+                <Banner tone="warn" title="This may not be the newest">
+                  {list.session.behind}
+                </Banner>
+              ) : null}
               {sessionLines(list.session).map((line) => (
                 <p key={line}>{line}</p>
               ))}

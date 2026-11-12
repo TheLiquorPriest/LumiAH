@@ -1,11 +1,12 @@
 // Token usage per model call: what a call sent (and how much of it the provider read from its cache,
 // and wrote to it), what it wrote (and how much of that was reasoning), and what it cost, read per
-// provider from the usage Lumiverse passes on, the provider's own fields in `provider_raw`. A count a
-// provider never reports is the runtime's estimate, flagged as one: Lumiverse passes no cached count
-// for Gemini or OpenAI's Responses API, and Anthropic bills thinking as output without saying how
-// much. What a call wrote to the cache is no estimate: it is there only when the provider says. Cost
-// is the provider's own where it reports one (OpenRouter's `cost`), else what the user's price for
-// the model makes of the counts, flagged as an estimate and with the price's name, else unknown.
+// provider from the usage the host passes on, the provider's own fields in `provider_raw`. A count a
+// provider never reports is the runtime's estimate, flagged as one. What a call wrote to the cache is
+// no estimate: it is there only when the provider says. Cost is the provider's own where it billed
+// one (OpenRouter's `cost`); else what the user's price for the model makes of the counts, flagged as
+// an estimate and with the price's name; else what the provider's published price makes of them
+// (`list_cost`, where the host knows that price), flagged as an estimate too: it is no bill; else
+// unknown.
 
 import type { AgentUsage, CallUsage, JsonObject, ModelMessage, ModelTool, UsageField } from "./ports";
 import { isRecord } from "./ports";
@@ -47,7 +48,7 @@ function count(o: unknown, key: string): number | undefined {
 }
 
 /**
- * A call's usage from Lumiverse's `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`, and
+ * A call's usage from the host's `usage` (`prompt_tokens`, `completion_tokens`, `total_tokens`, and
  * the provider's own in `provider_raw`) by its connection's provider; `estimate` fills each count it
  * lacks, listed in `estimated`.
  * - Anthropic: `input_tokens` leaves out what was read from the cache and written to it, which the
@@ -62,7 +63,9 @@ function count(o: unknown, key: string): number | undefined {
  *   `prompt_tokens_details.cache_write_tokens` (OpenRouter; some routers Anthropic's own
  *   `cache_creation_input_tokens`, or `cache_creation_tokens`), and its reasoning under
  *   `completion_tokens_details.reasoning_tokens`.
- * The cost is the provider's `cost` (in the usage or in `provider_raw`) where it reports one.
+ * The cost is the provider's `cost` (in the usage or in `provider_raw`) where it billed one; else the
+ * host's `list_cost`, what the provider's published price makes of the counts, flagged as an
+ * estimate (`priced` puts the user's own price for the model in its place).
  */
 export function parseUsage(raw: JsonObject | undefined, provider: string | null, estimate: UsageEstimate): CallUsage {
   const estimated: UsageField[] = [];
@@ -74,7 +77,9 @@ export function parseUsage(raw: JsonObject | undefined, provider: string | null,
   const completion = count(raw, "completion_tokens");
   const own = raw && isRecord(raw.provider_raw) ? raw.provider_raw : {};
   const cost = count(raw, "cost") ?? count(own, "cost");
-  const priced = cost !== undefined ? { cost } : {};
+  const listed = cost === undefined ? count(raw, "list_cost") : undefined;
+  if (listed !== undefined) estimated.push("cost");
+  const priced = cost !== undefined ? { cost } : listed !== undefined ? { cost: listed } : {};
   if (provider === "anthropic") {
     const fresh = count(own, "input_tokens");
     const read = count(own, "cache_read_input_tokens");
@@ -132,17 +137,19 @@ function priceName(models: readonly string[], prices: Readonly<Record<string, Mo
 }
 
 /**
- * A call's usage with its cost: the provider's where it said, else what the user's price for the
- * model makes of the counts (flagged as an estimate, with the name in Prices that gave it:
- * `priceName`, by the model's names in `models`), else none. Prices are per million tokens.
+ * A call's usage with its cost: the provider's where it billed one, else what the user's price for
+ * the model makes of the counts (flagged as an estimate, with the name in Prices that gave it:
+ * `priceName`, by the model's names in `models`), else the estimate it came with (the provider's
+ * published price), else none. Prices are per million tokens.
  */
 export function priced(usage: CallUsage, models: readonly string[], prices: Readonly<Record<string, ModelPrice>>): CallUsage {
-  const name = usage.cost === undefined ? priceName(models, prices) : undefined;
+  const billed = usage.cost !== undefined && !usage.estimated.includes("cost");
+  const name = billed ? undefined : priceName(models, prices);
   const price = name === undefined ? undefined : prices[name];
   if (name === undefined || !price) return usage;
   const fresh = Math.max(0, usage.in - usage.cachedIn);
   const cost = (fresh * price.in + usage.cachedIn * price.cachedIn + usage.out * price.out) / 1_000_000;
-  return { ...usage, cost, estimated: [...usage.estimated, "cost"], pricedAs: name };
+  return { ...usage, cost, estimated: usage.estimated.includes("cost") ? usage.estimated : [...usage.estimated, "cost"], pricedAs: name };
 }
 
 export function emptyUsage(): AgentUsage {

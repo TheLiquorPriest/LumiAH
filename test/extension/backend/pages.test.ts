@@ -102,8 +102,8 @@ function scripted(s: Script): NonNullable<RigOptions["harness"]> {
 }
 
 let open: Rig | null = null;
-afterEach(() => {
-  open?.close();
+afterEach(async () => {
+  await open?.close();
   open = null;
 });
 
@@ -214,7 +214,7 @@ describe("a chat is switched on", () => {
 
     // The runtime goes away. The chat stays pinned to it, and its view says the runtime isn't answering.
     it.runtime.shutdown();
-    it.runtime.close();
+    await it.runtime.close();
     await until(() => !it.backend.relays.isLinked(USER, it.registration.relay), "the runtime's link to be gone");
     expect((await it.page.request("lah.chat.get", { chatId })).chat).toMatchObject({ on: true, away: true, connection: { id: loopback, loopback: true } });
     expect((await it.page.request("lah.hello", {})).chats.find((view) => view.chatId === chatId)?.away).toBe(true);

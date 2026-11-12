@@ -1,16 +1,20 @@
 // An in-memory Lumiverse for the extension backend's tests: everything `BackendHost` asks of Spindle,
-// kept in maps, with a scripted model and hooks to fire Lumiverse's events by hand. Nothing here is
-// LumiAH's: it stands where Lumiverse stands. All names and texts are made up.
+// kept in maps, with hooks to fire Lumiverse's events by hand, and the script a test's models answer
+// from (the runtime's own model layer calls them: models.ts). Nothing here is LumiAH's: it stands
+// where Lumiverse and the providers stand. All names and texts are made up.
 //
 // One host is one extension's view of that Lumiverse. A test of two extensions installed together
 // makes the second host beside the first: both see the same chats, messages and connections and
 // are told of the same generations, and each keeps its own identifier, storage, permissions,
 // sessions and entry on a message, as Lumiverse keeps them apart.
 
-import type { ChatRole, JsonObject, JsonValue, ModelDelta, ModelRequest, ModelResult, ModelToolCall } from "../../src/core/ports";
+import type { Message } from "@earendil-works/pi-ai";
+import type { ChatRole, JsonObject, JsonValue, ModelRequest, ModelToolCall } from "../../src/core/ports";
 import type { DatabankDocument, EmbedderInfo, MemoryArc, MemoryEntity, MemoryEntityBrief, MemoryHit, WebResult } from "../../src/core/recall/ports";
-import type { BackendHost, GenerationEnded, GenerationStarted, GenerationStopped, HostBook, HostBookEntry, HostBookRecord, HostChat, HostConnection, HostDatabank, HostEntryRecord, HostGenerationType, HostLogLevel, HostMcpServer, HostMcpTool, HostMessage, HostPresetBlock, InterceptorInput, InterceptorVerdict, PassRequest, SwipeChanged } from "../../src/extension/backend/spindle";
+import type { BackendHost, CorsReply, GenerationEnded, GenerationStarted, GenerationStopped, HostBook, HostBookEntry, HostBookRecord, HostChat, HostConnection, HostDatabank, HostEntryRecord, HostGenerationType, HostLogLevel, HostMcpServer, HostMcpTool, HostMessage, HostPresetBlock, InterceptorInput, InterceptorVerdict, SwipeChanged } from "../../src/extension/backend/spindle";
+import type { PassedRequest } from "../../src/runtime/openai";
 import { isRecord } from "../../src/link/json";
+import { RowWatch } from "./rows";
 
 /** A made-up MCP server: what it offers, whether it connects, and what answers a call of each tool. */
 export interface FakeMcpServer {
@@ -91,11 +95,30 @@ export interface FakeChat {
   messages: FakeMessage[];
 }
 
-/** One scripted answer: its text alone, or its parts; `error` fails the call with those words; `hang` never answers until the call's signal ends it. */
-export type Answer = string | { content?: string; toolCalls?: ModelToolCall[]; reasoning?: string; finishReason?: string; usage?: JsonObject; error?: string; hang?: true; deltas?: string[] };
+/**
+ * One scripted answer: its text alone, or its parts; `error` fails the call with those words; `hang`
+ * never answers until the call's signal ends it. `waits`: what its stream waits on as it goes, the
+ * first after its reasoning, the next after each piece of its text, so a test sees each piece arrive
+ * while the call is still under way.
+ */
+export type Answer = string | { content?: string; toolCalls?: ModelToolCall[]; reasoning?: string; finishReason?: string; usage?: JsonObject; error?: string; hang?: true; deltas?: string[]; waits?: Promise<void>[] };
 
-/** A model call as the host got it: an agent's (`call`) or a passed-through request (`pass`). */
-export type MadeCall = { kind: "call"; userId: string; request: ModelRequest } | { kind: "pass"; userId: string; request: PassRequest };
+/** A model call as the runtime's model layer was asked it: an agent's (`call`), or a request passed through (`pass`) with the connection the writer names (null: none). */
+export type MadeCall = { kind: "call"; userId: string; request: ModelRequest } | { kind: "pass"; userId: string; request: PassedRequest & { connectionId: string | null } };
+
+/** What a provider was sent for a call: who it went to, the model, the key it was signed with, how it was asked to reason, cache and answer, and the messages as pi-ai handed them on (the system prompt and the tools among them). */
+export interface ProviderCall {
+  provider: string;
+  model: string;
+  api: string;
+  /** The key the call carried; null: none (a sign-in, or a server that takes none). */
+  key: string | null;
+  reasoning: string | null;
+  sessionId: string | null;
+  cacheRetention: string | null;
+  maxTokens: number | null;
+  messages: Message[];
+}
 
 export const toolCall = (name: string, args: JsonObject, callId = `call_${name}`): ModelToolCall => ({ name, args, callId });
 
@@ -108,11 +131,20 @@ function plain(e: FakeEntry): HostBookEntry {
 
 /** What every extension installed in one Lumiverse sees alike: the users' chats with their messages, their connections, and each other, since what happens to a chat is told to all of them. */
 class Shared {
-  readonly chats = new Map<string, FakeChat>();
+  readonly hosts: FakeHost[] = [];
+  /** Lumiverse's rows as its database keeps them, watched: every change to a chat, a message or a world book is told to every extension as the event Lumiverse sends for it (rows.ts). */
+  readonly rows = new RowWatch({
+    event: (name, payload, userId) => {
+      for (const host of this.hosts) host.emit.lumiverse(name, payload, userId);
+    },
+    touched: (chatId, gone, userId) => {
+      for (const host of this.hosts) host.emit.touched(chatId, gone, userId);
+    },
+  });
+  readonly chats = this.rows.chats;
   connections: HostConnection[] = [];
   /** The connection each user has selected (Lumiverse's active profile), by user. */
   readonly selected = new Map<string, string>();
-  readonly hosts: FakeHost[] = [];
   nextId = 1;
 }
 
@@ -131,7 +163,8 @@ export class FakeHost implements BackendHost {
   /** The characters' names, by id. */
   readonly characters = new Map<string, string>();
   readonly files = new Map<string, string>();
-  readonly books = new Map<string, FakeBook>();
+  /** This extension's view of the users' world books, watched as the chats are. */
+  readonly books: Map<string, FakeBook>;
   globalBooks: string[] = [];
   /** The world books attached to each character, by character, and the one attached to the user's persona. */
   readonly characterBooks = new Map<string, string[]>();
@@ -140,8 +173,12 @@ export class FakeHost implements BackendHost {
   /** A chat's preset binding, by chat. */
   readonly activePresets = new Map<string, { presetId: string | null; states: Record<string, boolean> }>();
 
-  /** Every model call made, in order, and what answers them. */
+  /** Every model call the runtime's model layer was asked, in order, and what answers them. */
   readonly calls: MadeCall[] = [];
+  /** What each provider was sent, in the order the calls reached them. */
+  readonly providerCalls: ProviderCall[] = [];
+  /** The agent sessions the core said ended, whose prompt cache the layer let go. */
+  readonly endedSessions: string[] = [];
   /** How many calls under way were ended by their signal (a cancel, a stop). */
   cancelled = 0;
   script: Answer[] | ((call: MadeCall, n: number) => Answer | Promise<Answer>) = [];
@@ -167,6 +204,7 @@ export class FakeHost implements BackendHost {
     forked: [] as ((fork: { sourceChatId: string; chatId: string; userId: string | null }) => void)[],
     selected: [] as ((userId: string | null) => void)[],
     permission: [] as ((permission: string, granted: boolean) => void)[],
+    lumiverse: [] as { names: readonly string[]; handler: (name: string, payload: unknown, userId: string | null) => void }[],
   };
 
   /** `beside`: the host of another extension installed in the same Lumiverse, whose chats, messages, connections and generations this one shares. */
@@ -176,6 +214,7 @@ export class FakeHost implements BackendHost {
     this.identifier = identifier;
     this.install = { bun: "/opt/bun/bin/bun", dir: `/srv/lumiverse/extensions/${identifier}/dist` };
     this.chatList = this.shared.chats;
+    this.books = this.shared.rows.books();
   }
 
   /** The extensions installed in this Lumiverse, this one among them, in the order they were installed. */
@@ -202,7 +241,54 @@ export class FakeHost implements BackendHost {
   };
   granted = (permission: string): boolean => this.permissions.has(permission);
   onPermission = (handler: (permission: string, granted: boolean) => void): void => void this.on.permission.push(handler);
+  /** An owner grants a permission, or takes it away, while the extension runs: Lumiverse tells the worker at once. */
+  grant(permission: string, granted: boolean): void {
+    if (granted) this.permissions.add(permission);
+    else this.permissions.delete(permission);
+    for (const handler of this.on.permission) handler(permission, granted);
+  }
+
+  /** What Lumiverse's proxy reaches (`spindle.cors`), by origin (`http://127.0.0.1:7871`): each a handler as Bun.serve runs one. An origin none serves is an address nothing answers on. */
+  readonly servers = new Map<string, (request: Request) => Promise<Response>>();
+  /** How long the proxy waits for an answer: Lumiverse's 30 seconds, unless a test of the wait sets its own. */
+  corsMs = 30_000;
+  /** Every request that went through the proxy: its address, its headers and its body, as they left. */
+  readonly corsed: { url: string; headers: Record<string, string>; body: string }[] = [];
+  /**
+   * Lumiverse's proxy as an extension sees it: refused without `cors_proxy`, a path ending in `.js`
+   * refused, its own User-Agent and the Host the address names added, no Origin, the answer read
+   * whole within `corsMs` and refused past 25 MiB.
+   */
+  cors = async (url: string, init: { method: "POST"; headers: Record<string, string>; body: string }): Promise<CorsReply> => {
+    if (!this.permissions.has("cors_proxy")) throw new Error("PERMISSION_DENIED: cors_proxy — CORS proxy permission not granted");
+    const target = new URL(url);
+    if (/\.(js|mjs|cjs|es)$/i.test(target.pathname)) throw new Error("JavaScript downloads are blocked: URL path identifies a JavaScript file");
+    const headers: Record<string, string> = { ...init.headers, "User-Agent": "Lumiverse/test", Host: target.host };
+    this.corsed.push({ url, headers: { ...headers }, body: init.body });
+    const server = this.servers.get(target.origin);
+    if (server === undefined) throw new Error("Unable to connect. Is the computer able to access the url?");
+    const { promise: late, reject } = Promise.withResolvers<never>();
+    const timer = setTimeout(() => reject(new Error(`Request timed out after ${this.corsMs}ms`)), this.corsMs);
+    try {
+      const response = await Promise.race([server(new Request(url, { method: init.method, headers, body: init.body })), late]);
+      const text = await Promise.race([response.text(), late]);
+      if (text.length > 25 * 1024 * 1024) throw new Error("Response too large: more than 26214400 bytes");
+      const answered: Record<string, string> = {};
+      response.headers.forEach((value, name) => {
+        answered[name.toLowerCase()] = value;
+      });
+      return { status: response.status, headers: answered, body: text };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
   capability = (name: string): boolean => this.capabilities.has(name);
+  /** Each user's role in this Lumiverse; anyone not named is a `user`. */
+  readonly roles = new Map<string, "operator" | "admin" | "user">();
+  role = async (userId: string): Promise<"operator" | "admin" | "user"> => this.roles.get(userId) ?? "user";
+  /** Lumiverse's database file as the extension's entry places it; none until a test says where. */
+  databaseFile: string | null = null;
+  database = (): string | null => this.databaseFile;
 
   readonly frontend = {
     send: (message: unknown, userId: string, session?: string): void => {
@@ -211,6 +297,14 @@ export class FakeHost implements BackendHost {
       this.sent.push({ message: wire, userId, session });
       const to = session !== undefined ? [this.outlets.get(session)] : [...this.outlets.values()].filter((o) => o.userId === userId);
       for (const outlet of to) if (outlet !== undefined && outlet.userId === userId) queueMicrotask(() => outlet.receive(wire));
+    },
+    // To every session of every user, as Lumiverse sends an operator's extension's message that names no user.
+    everyone: (message: unknown): void => {
+      const wire = clone(message);
+      for (const outlet of [...this.outlets.values()]) {
+        this.sent.push({ message: wire, userId: outlet.userId, session: undefined });
+        queueMicrotask(() => outlet.receive(wire));
+      }
     },
     onMessage: (handler: (payload: unknown, userId: string, session: string | undefined) => void): void => {
       this.messageHandler = handler;
@@ -239,6 +333,7 @@ export class FakeHost implements BackendHost {
     onChatTouched: (handler: (chatId: string, gone: boolean, userId: string | null) => void): void => void this.on.touched.push(handler),
     onChatForked: (handler: (fork: { sourceChatId: string; chatId: string; userId: string | null }) => void): void => void this.on.forked.push(handler),
     onSelectedConnection: (handler: (userId: string | null) => void): void => void this.on.selected.push(handler),
+    onLumiverse: (names: readonly string[], handler: (name: string, payload: unknown, userId: string | null) => void): void => void this.on.lumiverse.push({ names, handler }),
   };
 
   /** Lumiverse's events, fired by hand. */
@@ -253,6 +348,10 @@ export class FakeHost implements BackendHost {
     touched: (chatId: string, gone = false, userId: string | null = null): void => this.on.touched.forEach((h) => h(chatId, gone, userId)),
     forked: (fork: { sourceChatId: string; chatId: string; userId: string | null }): void => this.on.forked.forEach((h) => h(fork)),
     selectedConnection: (userId: string | null): void => this.on.selected.forEach((h) => h(userId)),
+    /** One of Lumiverse's own events by its name, with its payload as Lumiverse sends it, to those who hear that name. */
+    lumiverse: (name: string, payload: unknown, userId: string | null): void => {
+      for (const { names, handler } of this.on.lumiverse) if (names.includes(name)) handler(name, clone(payload), userId);
+    },
   };
 
   /** Fires an event on every extension installed in this Lumiverse, this one among them: Lumiverse tells each of them what happens to a chat. */
@@ -275,44 +374,6 @@ export class FakeHost implements BackendHost {
     this.closedHandlers.length = 0;
     for (const handlers of Object.values(this.on)) handlers.length = 0;
   }
-
-  private async answer(call: MadeCall, stream: boolean, signal: AbortSignal, onDelta: (delta: ModelDelta) => void): Promise<ModelResult> {
-    const n = this.calls.length;
-    this.calls.push(clone(call));
-    signal.throwIfAborted();
-    const scripted = typeof this.script === "function" ? await this.script(call, n) : this.script[n];
-    if (scripted === undefined) throw new Error(`no answer scripted for call ${n + 1}`);
-    const answer = typeof scripted === "string" ? { content: scripted } : scripted;
-    if (answer.hang) {
-      const { promise, reject } = Promise.withResolvers<never>();
-      const ended = (): void => {
-        this.cancelled++;
-        reject(signal.reason instanceof Error ? signal.reason : new Error("aborted"));
-      };
-      if (signal.aborted) ended();
-      else signal.addEventListener("abort", ended, { once: true });
-      return promise;
-    }
-    const content = answer.content ?? "";
-    if (stream) {
-      if (answer.reasoning) onDelta({ reasoning: answer.reasoning });
-      for (const piece of answer.deltas ?? (content === "" ? [] : (content.match(/\S+\s*/g) ?? [content]))) onDelta({ content: piece });
-    }
-    if (answer.error !== undefined) throw new Error(answer.error);
-    return {
-      content,
-      finishReason: answer.finishReason ?? (answer.toolCalls?.length ? "tool_calls" : "stop"),
-      model: "scripted-model",
-      ...(answer.toolCalls?.length ? { toolCalls: answer.toolCalls } : {}),
-      ...(answer.reasoning !== undefined ? { reasoning: answer.reasoning } : {}),
-      usage: answer.usage ?? { prompt_tokens: 120, completion_tokens: 30, total_tokens: 150 },
-    };
-  }
-
-  readonly models = {
-    call: (request: ModelRequest, userId: string, signal: AbortSignal, onDelta: (delta: ModelDelta) => void): Promise<ModelResult> => this.answer({ kind: "call", userId, request }, true, signal, onDelta),
-    pass: (request: PassRequest, userId: string, signal: AbortSignal, onDelta: (delta: ModelDelta) => void): Promise<ModelResult> => this.answer({ kind: "pass", userId, request }, true, signal, onDelta),
-  };
 
   readonly connections = {
     list: async (_userId: string): Promise<HostConnection[]> => clone(this.connectionList),
@@ -578,10 +639,10 @@ export class FakeHost implements BackendHost {
 
   // ---------------------------------------------------------------- what the tests set up
 
+  /** A new chat of the user's, as the rows' view of it (every change made through it is told: rows.ts). */
   addChat(userId: string, name: string, id = `chat-${this.shared.nextId++}`): FakeChat {
-    const chat: FakeChat = { id, userId, name, characterId: null, metadata: {}, messages: [] };
-    this.chatList.set(id, chat);
-    return chat;
+    this.chatList.set(id, { id, userId, name, characterId: null, metadata: {}, messages: [] });
+    return this.chatList.get(id) as FakeChat;
   }
 
   /** Adds a message to the end of a chat. */
@@ -604,7 +665,8 @@ export class FakeHost implements BackendHost {
     };
     chat.messages.push(message);
     this.everywhere((emit) => emit.touched(chatId));
-    return message;
+    // The rows' view of it, through which a change is told.
+    return this.message(chatId, message.id);
   }
 
   message(chatId: string, messageId: string): FakeMessage {
@@ -630,6 +692,16 @@ export class FakeHost implements BackendHost {
   selected(userId: string): string | null {
     const id = this.shared.selected.get(userId);
     return id !== undefined && this.connectionList.some((c) => c.id === id) ? id : null;
+  }
+
+  /** The rows Lumiverse's database holds, as its HTTP routes and its file give them (rows.ts). */
+  get rows(): RowWatch {
+    return this.shared.rows;
+  }
+
+  /** Changes Lumiverse makes and tells of by no event: what `change` does to the rows is told to no extension. */
+  quietly<T>(change: () => T): T {
+    return this.shared.rows.quietly(change);
   }
 
   /** The text of a file in a user's storage, parsed; null when there is none. */

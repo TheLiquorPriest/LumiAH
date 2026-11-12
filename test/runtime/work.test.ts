@@ -4,15 +4,16 @@
 // job's run and its end, the user's words to a run under way, a page's request the core serves, what
 // an extension that LumiAH is built into supplies), whatever the core then does with it.
 
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import type { HarnessExtension } from "../../src/core/extension";
 import type { Harness as Core } from "../../src/core/harness";
-import type { AgentUsage, HarnessHost, JobView, TraceEvent } from "../../src/core/ports";
+import type { AgentUsage, HarnessHost, JobView, TraceEvent, TurnRecord } from "../../src/core/ports";
 import { newAgentSettings } from "../../src/core/settings";
 import type { BackendExtension, BackendTools } from "../../src/extension/backend/extension";
 import type { Harness } from "../../src/runtime/turn";
 import { UiFailure } from "../support/fake-lumiverse";
-import { type Rig, rig, until, USER } from "../support/rig";
+import { plug } from "../support/plug";
+import { PORT, type Rig, rig, until, USER } from "../support/rig";
 
 const USAGE: AgentUsage = { calls: 1, toolTurns: 0, in: 10, cachedIn: 0, out: 5, reasoningOut: 0, estimated: false, ms: 1 };
 
@@ -36,10 +37,12 @@ interface Script {
   sideTurns: { session: string; generationId: string; text: string }[];
   /** The chat the script's one side session is about; "": about none. */
   sideChat: string;
+  /** The record the reply turn hands back for the runtime to commit; none unless a test gives one. */
+  record: TurnRecord | null;
 }
 
 function script(): Script {
-  return { host: null, extension: null, queue: [], gate: null, ran: [], said: [], held: [], asked: [], recovered: [], sideTurns: [], sideChat: "" };
+  return { host: null, extension: null, queue: [], gate: null, ran: [], said: [], held: [], asked: [], recovered: [], sideTurns: [], sideChat: "", record: null };
 }
 
 /** A harness that does what its script says and traces as the core would. */
@@ -80,7 +83,7 @@ function scripted(s: Script): NonNullable<Parameters<typeof rig>[0]>["harness"] 
         sink.content("Okoro keeps it now.");
         sink.done("stop", USAGE);
         trace(turn.generationId, turn.chatId, { kind: "turn_ended", status: "done", usage: USAGE, at: 2 });
-        return { status: "done", record: null, reply: "Okoro keeps it now.", usage: USAGE };
+        return { status: "done", record: s.record, reply: "Okoro keeps it now.", usage: USAGE };
       },
       jobs: {
         async run({ id }, signal) {
@@ -125,8 +128,8 @@ function scripted(s: Script): NonNullable<Parameters<typeof rig>[0]>["harness"] 
 }
 
 let open: Rig | null = null;
-afterEach(() => {
-  open?.close();
+afterEach(async () => {
+  await open?.close();
   open = null;
 });
 
@@ -176,6 +179,38 @@ describe("a job", () => {
     expect(after.notices[0]?.text).toContain("Ilse kept it before him.");
     // Dismissed, it is gone from every page's state.
     expect((await it.page.request("lah.notice.dismiss", { id: null })).notices).toEqual([]);
+  });
+
+  test("told of its changes together, the pages hold the last one the runtime told: the extension takes a runtime's requests in the order sent, though it checks their secret side by side", async () => {
+    const s = script();
+    const { it, chatId, host } = await start(s);
+    // Bun's WebCrypto ends digests that run together in any order. Here every check of the runtime's secret is held, and they end in the reverse of the order they were asked in.
+    const digest = crypto.subtle.digest.bind(crypto.subtle);
+    const held: { hashing: Promise<ArrayBuffer>; end(): void }[] = [];
+    const checking = spyOn(crypto.subtle, "digest").mockImplementation((algorithm, data) => {
+      const hashing = digest(algorithm, data);
+      if (!(data instanceof Uint8Array) || new TextDecoder().decode(data) !== it.registration.secret) return hashing;
+      const { promise, resolve } = Promise.withResolvers<void>();
+      held.push({ hashing, end: resolve });
+      return promise.then(() => hashing);
+    });
+    const notices = (): number => it.lumiverse.frames.filter((f) => f.to === "lumiverse" && f.text.includes("job.changed")).length;
+    const sent = notices();
+    const taken = it.backend.jobs.state(USER, false, false).changed;
+    const told = job("job-told", chatId);
+    try {
+      host.jobs?.changed?.(told);
+      host.jobs?.changed?.({ ...told, state: "running", startedAt: 3 });
+      // The extension checks a request's secret as its frame reaches it: once both notices have crossed, both checks are held.
+      await until(() => notices() === sent + 2, "both of the job's notices to cross");
+    } finally {
+      checking.mockRestore();
+    }
+    await Promise.all(held.map((h) => h.hashing));
+    for (const h of held.reverse()) h.end();
+    await until(() => it.backend.jobs.state(USER, false, false).changed >= taken + 2, "both of the job's notices to be taken");
+    expect(it.backend.jobs.active(USER, "job-told")?.state).toBe("running");
+    expect((await state(it)).jobs.active.map((j) => [j.id, j.state])).toEqual([["job-told", "running"]]);
   });
 
   test("stopped from its live view ends by its signal, and one a restart cut off is told as interrupted", async () => {
@@ -362,4 +397,74 @@ describe("what an extension that LumiAH is built into supplies", () => {
     await supplied.runEnded?.({ userId: "", chatId, turn: "turn-9", kind: "new", status: "done", reply: "", record: null, usage: USAGE });
     expect(it.host.sent.length).toBe(before);
   });
+});
+
+// Real time, on purpose: what is shown is a wait the runtime keeps by the clock.
+describe("a wait for the extension while the runtime's link is down", () => {
+  const PLACE = "Extension lost after (LumiAH's Settings → Timeouts → The link) says how long";
+  /** The shortest Extension lost after the user's Settings take. */
+  const LOST_MS = 5_000;
+  /** How long a wait may take past its setting on a slow machine: the runtime looks at a stream's every second. */
+  const SLACK_MS = 3_000;
+
+  /** A runtime whose user set Extension lost after at its shortest, as its config keeps it too; `cut` then drops its link with Lumiverse out of its reach. */
+  async function cutOff(s: Script) {
+    const power = plug();
+    const it = await rig({ harness: scripted(s), wire: power.wire, tuning: { lostMs: LOST_MS } });
+    open = it;
+    await it.backend.settings.change(USER, [{ path: ["transport", "runtime", "lostMs"], value: LOST_MS }], []);
+    const chatId = await it.setUp();
+    await it.mirrored();
+    if (s.host === null) throw new Error("the runtime made no harness");
+    const cut = (): number => {
+      it.lumiverse.dropSockets();
+      power.pull();
+      return Date.now();
+    };
+    return { it, chatId, host: s.host, cut };
+  }
+
+  const call = (chatId: string) => ({ turn: "turn-1", chatId, agentId: "main", role: "main", callId: "call-1", kind: "new" as const, main: true, above: [] });
+
+  test("a tool call that runs in the extension gives up at Extension lost after, and names it", async () => {
+    const { chatId, host, cut } = await cutOff(script());
+    const at = cut();
+    await expect(host.tools?.call({ ...call(chatId), name: "harbour_log", args: {} }, new AbortController().signal)).rejects.toThrow(PLACE);
+    expect(Date.now() - at).toBeGreaterThanOrEqual(LOST_MS - 50);
+    expect(Date.now() - at).toBeLessThan(LOST_MS + SLACK_MS);
+  }, 30_000);
+
+  test("a call held for the user's word gives up asking at Extension lost after, and names it", async () => {
+    const { chatId, host, cut } = await cutOff(script());
+    const at = cut();
+    await expect(host.approvals?.ask({ ...call(chatId), tool: "workspace_write", tier: "write", args: { path: "notes.md" }, at: 10, until: null }, new AbortController().signal)).rejects.toThrow(PLACE);
+    expect(Date.now() - at).toBeLessThan(LOST_MS + SLACK_MS);
+  }, 30_000);
+
+  test("a reply's turn gives up its begin at Extension lost after, and the reply says so", async () => {
+    const { it, cut } = await cutOff(script());
+    const at = cut();
+    const told = await it.lumiverse.post(it.runtime.fetch, { model: "lumiah", lumiah_turn: "tag-cut-off", messages: [{ role: "user", content: "Who keeps the harbour light now?" }] }, { key: it.key, port: PORT });
+    expect(told.error?.code).toBe("timeout");
+    expect(told.error?.message).toStartWith("The runtime's link to LumiAH didn't come up within 5 seconds.");
+    expect(told.error?.message).toContain(PLACE);
+    expect(Date.now() - at).toBeLessThan(LOST_MS + SLACK_MS);
+  }, 30_000);
+
+  test("a reply's record gives up its handing over at Extension lost after, and the log names it", async () => {
+    const s = script();
+    s.record = { v: 1, generationId: "gen-cut-off", kind: "new", at: 1, path: "a".repeat(64), segment: "b".repeat(64), usage: USAGE };
+    s.gate = Promise.withResolvers<void>();
+    const { it, chatId, cut } = await cutOff(s);
+    const generating = it.generate(chatId);
+    await until(() => it.backend.live.runningOf(USER).length === 1, "the turn to be running");
+    const at = cut();
+    s.gate.resolve();
+    expect((await generating).content).toBe("Okoro keeps it now.");
+    const given = (): string | undefined => it.logs.find((line) => line.includes("its record wasn't handed to LumiAH"));
+    await until(() => given() !== undefined, "the record to be given up", 15_000);
+    expect(given()).toContain("The runtime's link to LumiAH didn't come up within 5 seconds.");
+    expect(given()).toContain(PLACE);
+    expect(Date.now() - at).toBeLessThan(LOST_MS + SLACK_MS);
+  }, 30_000);
 });

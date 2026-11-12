@@ -9,7 +9,7 @@
 // source reads only its user's rows: over HTTP the session decides whose, and a source that reads
 // the file itself must scope every read to that user.
 
-import type { HostBookRecord, HostChat, HostEntryRecord, HostMessage } from "../../extension/backend/spindle";
+import type { HostBookRecord, HostChat, HostEntryRecord, HostMessage } from "../../host/rows";
 
 /** A message as a source gives it: the row the extension's host gives, with what the copy keeps beside it. */
 export interface SourceMessage {
@@ -59,7 +59,10 @@ export interface SourceBook {
 /** How a chat stands now, cheaply: how many messages it has, and its newest one as the host gives it. */
 export interface ChatSignature {
   count: number;
+  /** A message at the chat's newest place: where two share it, whichever the source's own rule picks (Lumiverse's tail picks the greater id). */
   last: HostMessage | null;
+  /** The chat's own row now, where the source reads it for the signature: Lumiverse writes some keys of a chat's metadata with no event. */
+  chat?: HostChat;
   /** The chat's fingerprint now, as `SourceChat.fingerprint`: another than the one read has the chat read again. */
   fingerprint?: string;
 }
@@ -72,20 +75,57 @@ export interface SourceChanges {
   mark: string | null;
 }
 
+/**
+ * The source can't answer a read: one of its routes answered other than as the source expects (a
+ * status it doesn't take for an answer, "not found" among them, or a body it can't read), or the
+ * source asks that route nothing for a while because it kept doing so. Lumiverse's HTTP routes are no
+ * interface it promises to keep, so such an answer says nothing of the chat or the book: the read goes
+ * to the fallback, whose answer alone may say there is no such one.
+ */
+export class Unanswered extends Error {
+  constructor(
+    /** The route, as `GET /api/v1/chats/:id`. */
+    readonly route: string,
+    /** What it answered: its status (200 for a body the source can't read). */
+    readonly status: number,
+    /** Until when the source asks that route nothing; null: it asks it again at the next read. */
+    readonly until: number | null,
+    message: string,
+  ) {
+    super(message);
+    this.name = "Unanswered";
+  }
+}
+
 export interface CopySource {
   /** Where its rows come from, in the words the copy's state uses: `http`, `database`. */
   readonly kind: string;
-  /** The chat read whole; null when the user has no such chat. Rejects when it can't be read whole and consistent. */
+  /**
+   * The chat read whole; null when the user has no such chat, which only a source that reads
+   * Lumiverse's own tables may say (the database reader). Rejects when it can't be read whole and
+   * consistent, and with `Unanswered` where a route didn't answer as expected.
+   */
   readChat(chatId: string): Promise<SourceChat | null>;
   /**
-   * The book read whole; null when the user has no such book. `held` is the copy's last read of it:
-   * a source that can tell the book is still as held answers with `held` itself.
+   * The book read whole; null when the user has no such book, as `readChat` says. Rejects when it
+   * can't be read whole and consistent. `held` is the copy's last read of it: a source that can tell
+   * for certain the book is still as held answers with `held` itself. HTTP can't (Lumiverse's ETag
+   * misses some writes), so it always reads.
    */
   readBook(bookId: string, held: SourceBook | null): Promise<SourceBook | null>;
-  /** How the chat stands now; null when the user has no such chat. */
+  /** How the chat stands now; null when the user has no such chat, as `readChat` says. */
   chatSignature(chatId: string): Promise<ChatSignature | null>;
-  /** The book's signature now, to compare with `SourceBook.signature`; null when the user has no such book. `held` lets a source answer without reading the book again. */
+  /**
+   * The book's signature now, to compare with `SourceBook.signature`; null when the user has no such
+   * book, as `readChat` says. `held` lets a source answer without reading the book again. Asked only
+   * of a source whose `changedSince` can tell: the copy takes it as its word that every row of the
+   * book is as held.
+   */
   bookSignature(bookId: string, held: SourceBook | null): Promise<string | null>;
-  /** Whether anything this source reads may have changed since `mark` (null: since nothing). Cheap: asked before a kept chat or book is used. */
+  /**
+   * Whether anything this source reads may have changed since `mark` (null: since nothing). Cheap:
+   * asked before a kept chat or book is used. A source that can't tell (null) has a kept book read
+   * whole again instead of checked, as no cheap answer of its can vouch for every row of a book.
+   */
   changedSince(mark: string | null): Promise<SourceChanges>;
 }

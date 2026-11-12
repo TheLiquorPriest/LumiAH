@@ -8,11 +8,13 @@ export type { OwnedEntry, RuntimeFiles, RuntimeIO, ServeOptions, Served } from "
 export { USAGE, lumiah, serve } from "./cli";
 export type { OpenSocket, Socket, SocketEvents } from "./connection";
 export { HostConnection, LinkError } from "./connection";
-export { ModelCallError, linkHost } from "./host";
+export { linkHost } from "./host";
 export type { LinkHandlers, OutOfReach, RuntimeLink } from "./link";
 export { LinkClient } from "./link";
 export type { Http, HttpReply, HttpRequest, StoredLogin } from "./lumiverse";
 export { LiveError } from "./lumiverse";
+export type { ModelLayer, ModelLayerDeps } from "./models";
+export { createModelLayer } from "./models";
 export type { Runtime, RuntimeDeps } from "./runtime";
 export { createRuntime } from "./runtime";
 export type { Harness } from "./turn";

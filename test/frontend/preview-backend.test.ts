@@ -159,7 +159,8 @@ describe("the stand-in backend answers the whole contract", () => {
     expect(await outcome(w.ask("lah.prompt.get", { prompt: fakeHash("no such prompt") }))).toMatchObject({ code: "not_found", message: "The store no longer has that prompt." });
     expect(await outcome(w.ask("lah.live.events", { stream: "chat-mara", turn: "another-turn", from: 1 }))).toMatchObject({ code: "not_found" });
     expect(await outcome(w.ask("lah.relay", { op: "forget", relay: "relay-9" }))).toMatchObject({ code: "not_found" });
-    expect(await outcome(w.ask("lah.models.list", { connectionId: "conn-local" }))).toMatchObject({ code: "unavailable" });
+    expect(await outcome(w.ask("lah.connections.models", { connectionId: "conn-local" }))).toMatchObject({ code: "not_found" });
+    expect(await outcome(w.ask("lah.connections.list", { relay: "relay-9" }))).toMatchObject({ code: "unavailable" });
     // A request the page's own types wouldn't let it send still gets an answer.
     const malformed = w.client.request("lah.chat.get", { chatId: "" });
     expect(await outcome(malformed)).toMatchObject({ code: "bad_request", message: "The request lah.chat.get is malformed." });

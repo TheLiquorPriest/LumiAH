@@ -27,7 +27,7 @@ import { isRecord } from "./ports";
 import type { AgentAccounts } from "./provider";
 import { type RecallRun, recallOf } from "./recall/recall";
 import type { Sessions } from "./sessions";
-import { type AgentBudget, isEffort, type Settings, settingsOf, type TurnBudget } from "./settings";
+import { type AgentBudget, isEffort, type Settings, settingsOf, settingTitle, type TurnBudget } from "./settings";
 import type { SkillRegistry } from "./skills";
 import type { Spend } from "./spend";
 import { type StoryHolds, storyHolds, storyWordOf } from "./story";
@@ -62,6 +62,13 @@ export interface HarnessOptions {
    * no user (`""`): enough where its backend serves one user, as behind a runtime's link.
    */
   userId?: string;
+  /**
+   * Where the user changes one of the core's settings, as the words of a wait of the core's that ran
+   * out name it: its own name (`title`) with where it is shown (`path`: its place in the core's
+   * section, `["extension", "waitMs"]`). The runtime says it as its own waits do: "Wait for the
+   * extension (LumiAH's Settings → Timeouts → Tools and approvals)". Absent: the title alone.
+   */
+  place?(path: readonly string[], title: string): string;
 }
 
 /** What a harness keeps across runs. */
@@ -89,31 +96,79 @@ export interface Shared {
 
 // ---------------------------------------------------------------- the extension, asked
 
+/** Why an ask of the extension has no answer: its call failed (`error`, in its own words), or its wait of `ms` ran out. */
+export type Unanswered = { error: string } | { ms: number };
+
 /**
- * One call of the extension's, waited for no longer than Settings allow: its answer, or `fallback`
- * when it fails or doesn't come in time. An extension adds to a run and never holds one.
+ * One call of the extension's, waited for no longer than Settings allow: its answer, or why there
+ * is none. An extension adds to a run and never holds one.
  */
-export async function askExtension<T>(shared: Pick<Shared, "host" | "options">, what: string, waitMs: Limit, call: (() => Promise<T>) | undefined, fallback: T): Promise<T> {
-  if (!call) return fallback;
-  const { host } = shared;
+export async function extensionAnswer<T>(shared: Pick<Shared, "host">, waitMs: Limit, call: () => Promise<T>): Promise<{ answer: T } | { unanswered: Unanswered }> {
   const over = new AbortController();
   const ms = timerMs(limitOf(waitMs));
-  const late =
-    ms === null
-      ? null
-      : host.clock.sleep(ms, over.signal).then(() => {
-          throw new Error(`no answer in ${ms} ms (Wait for the extension)`);
-        });
+  const late = ms === null ? null : shared.host.clock.sleep(ms, over.signal).then(() => ({ unanswered: { ms } }));
   // The wait that lost the race is ended below and rejects with nobody waiting on it.
   late?.catch(() => undefined);
   try {
-    return await (late ? Promise.race([call(), late]) : call());
+    const answered = call().then((answer) => ({ answer }));
+    return await (late ? Promise.race([answered, late]) : answered);
   } catch (error) {
-    host.log("warn", `[LumiAH] ${shared.options.extension?.name ?? "the extension"} gave no ${what} (${errorText(error)}): the run goes on without it`);
-    return fallback;
+    return { unanswered: { error: errorText(error) } };
   } finally {
     over.abort();
   }
+}
+
+/** Why an ask of the extension has no answer, as the log says it. */
+function unansweredLog(why: Unanswered): string {
+  return "ms" in why ? `no answer in ${why.ms} ms (Wait for the extension)` : why.error;
+}
+
+/**
+ * One call of the extension's that the run can do without: its answer, or `fallback` when it fails
+ * or doesn't come in time, with a line in the log.
+ */
+export async function askExtension<T>(shared: Pick<Shared, "host" | "options">, what: string, waitMs: Limit, call: (() => Promise<T>) | undefined, fallback: T): Promise<T> {
+  if (!call) return fallback;
+  const got = await extensionAnswer(shared, waitMs, call);
+  if ("answer" in got) return got.answer;
+  shared.host.log("warn", `[LumiAH] ${shared.options.extension?.name ?? "the extension"} gave no ${what} (${unansweredLog(got.unanswered)}): the run goes on without it`);
+  return fallback;
+}
+
+/** How long a wait was, as the words of one that ran out say it: "4 seconds", "500 ms". */
+function waitWords(ms: number): string {
+  if (ms < 1000) return `${ms} ms`;
+  const seconds = Math.round(ms / 100) / 10;
+  return `${seconds} second${seconds === 1 ? "" : "s"}`;
+}
+
+/** Wait for the extension, as the user is told where to change it. */
+function extensionWait(options: Pick<HarnessOptions, "place">): string {
+  const path = ["extension", "waitMs"];
+  const title = settingTitle(path);
+  return options.place?.(path, title) ?? title;
+}
+
+/**
+ * What the user reads of an ask of the extension's that got no answer, in their texts: `late` where
+ * its wait ran out (with how long it was and where that wait is changed), `failed` where it failed
+ * (with its error). `vars` fill the rest of either.
+ */
+export function unansweredWords(input: { why: Unanswered; late: string; failed: string; texts: Texts; options: Pick<HarnessOptions, "extension" | "place">; vars?: Readonly<Record<string, string>> }): string {
+  const { why, texts, options } = input;
+  const vars = { extension: options.extension?.name ?? "The extension", ...input.vars };
+  return "ms" in why ? texts.render(input.late, { ...vars, wait: waitWords(why.ms), setting: extensionWait(options) }) : texts.render(input.failed, { ...vars, error: why.error });
+}
+
+/** Why the extension's agents and skills are missing from a run, in the user's words: what a run's live view is told, and why a job or a conversation whose agent is the extension's doesn't start. */
+export function agentsMissing(why: Unanswered, texts: Texts, options: Pick<HarnessOptions, "extension" | "place">): string {
+  return unansweredWords({ why, late: TEXT.progress.agentsLate, failed: TEXT.progress.agentsUnread, texts, options });
+}
+
+/** Why a run about a chat doesn't start when the extension never said whether it answers that chat itself: run as one of LumiAH's own, the chat could be answered wrongly. */
+export function claimMissing(why: Unanswered, texts: Texts, options: Pick<HarnessOptions, "extension" | "place">): string {
+  return unansweredWords({ why, late: TEXT.progress.claimLate, failed: TEXT.progress.claimUnread, texts, options });
 }
 
 const TIERS: readonly string[] = ["read", "write", "external"];
@@ -168,6 +223,13 @@ export interface Setup {
   chat: ChatInfo | null;
   claim: ChatClaim | null;
   story: StoryHolds;
+  /**
+   * The extension's asks that got no answer for this run, with why. Without its definitions the run
+   * has none of its agents and skills: it goes on only where none of them is needed, and its live
+   * view says they are missing. Without its claim nobody knows whether the extension answers the
+   * chat itself: a run about that chat doesn't start (`claimMissing`).
+   */
+  unanswered: { definitions?: Unanswered; claim?: Unanswered };
 }
 
 /**
@@ -196,12 +258,22 @@ export async function readSetup(shared: Shared, chatId: string, userId: string =
   const sovereignHand = typeof chat?.sovereignHand === "boolean" ? chat.sovereignHand : null;
   const below = storyHolds({ chat: chosen, user: early.story, sovereignHand });
   const [own, claimed, remote] = await Promise.all([
-    askExtension<unknown>(shared, "definitions", waitMs, extension?.definitions ? () => extension.definitions?.({ userId, chatId: chatId === "" ? null : chatId }) ?? Promise.resolve({}) : undefined, {}),
-    chatId === "" ? null : askExtension<unknown>(shared, "answer for the chat", waitMs, extension?.claim ? () => extension.claim?.({ userId, chatId, chat: asked, story: below.source, sovereignHand }) ?? Promise.resolve(null) : undefined, null),
+    extension?.definitions ? extensionAnswer<unknown>(shared, waitMs, () => extension.definitions?.({ userId, chatId: chatId === "" ? null : chatId }) ?? Promise.resolve({})) : { answer: {} },
+    chatId !== "" && extension?.claim ? extensionAnswer<unknown>(shared, waitMs, () => extension.claim?.({ userId, chatId, chat: asked, story: below.source, sovereignHand }) ?? Promise.resolve(null)) : { answer: null },
     remoteTools(host, chatId),
   ]);
-  const supplied = isRecord(own) ? own : {};
-  const claim = claimOf(claimed);
+  const name = extension?.name ?? "the extension";
+  const unanswered: Setup["unanswered"] = {};
+  if ("unanswered" in own) {
+    unanswered.definitions = own.unanswered;
+    host.log("warn", `[LumiAH] ${name} gave no definitions (${unansweredLog(own.unanswered)}): this run has none of its agents and skills`);
+  }
+  if ("unanswered" in claimed) {
+    unanswered.claim = claimed.unanswered;
+    host.log("warn", `[LumiAH] ${name} gave no answer for the chat ${chatId} (${unansweredLog(claimed.unanswered)}): nobody knows whether it answers the chat itself, so this run doesn't start`);
+  }
+  const supplied = "answer" in own && isRecord(own.answer) ? own.answer : {};
+  const claim = "answer" in claimed ? claimOf(claimed.answer) : null;
   const definitions = mergeDefinitions(
     {
       code: { agents: shared.agents.all(), skills: shared.skills.all(), tools: shared.tools.all() },
@@ -216,7 +288,7 @@ export async function readSetup(shared: Shared, chatId: string, userId: string =
   const settings = settingsOf(stored.values, definitions.scope());
   shared.latest = settings;
   const story = claim?.story ? storyHolds({ claim: claim.story, chat: chosen, user: early.story, sovereignHand }) : below;
-  return { userId, settings, texts: textsOf(stored.texts), definitions, chat, claim, story };
+  return { userId, settings, texts: textsOf(stored.texts), definitions, chat, claim, story, unanswered };
 }
 
 /** An agent definition's instructions as they are sent: the user's text for a definition that names one of the core's, else its own. */
@@ -316,6 +388,8 @@ export class Run {
   readonly definitions: Definitions;
   readonly chat: ChatInfo | null;
   readonly claim: ChatClaim | null;
+  /** The extension's asks that got no answer for this run, with why (`Setup.unanswered`). */
+  readonly unanswered: Setup["unanswered"];
   /** What counts as the chat's story for this run (§24.4): every agent of it reads the chat as this says. */
   readonly story: StoryHolds;
   readonly startedAt: number;
@@ -365,6 +439,7 @@ export class Run {
     this.definitions = setup.definitions;
     this.chat = setup.chat;
     this.claim = setup.claim;
+    this.unanswered = setup.unanswered;
     this.story = setup.story;
     this.startedAt = start.startedAt;
     this.trace = new TurnTrace(host, { turn: this.info.id, chatId: this.info.chatId }, shared.blobs, this.settings.keep.prompts, (event) => this.hear(event));
@@ -384,8 +459,6 @@ export class Run {
     this.deps = { host, settings: this.settings, texts: this.texts, accounts: shared.accounts, turn: this.agents, approval: approvalGate(host, this.settings, this.info, approved) };
     this.delegator = new Delegator(this);
     shared.runs.set(this.info.id, this);
-    // An agent with no connection set uses the chat's own, where the host names one.
-    this.ownConnection = setup.chat?.connectionId ?? null;
     this.trace.emit({
       kind: "turn_started",
       turn: this.info.id,
@@ -396,10 +469,12 @@ export class Run {
       ...(start.side !== undefined ? { side: start.side } : {}),
       at: start.startedAt,
     });
+    // A run that goes on without the extension's agents and skills says so where the user watches it, and why: not only in the log.
+    const missing = setup.unanswered.definitions;
+    if (missing !== undefined) this.trace.emit({ kind: "notice", text: agentsMissing(missing, this.texts, shared.options), at: start.startedAt });
   }
 
   private readonly approved: ChatApprovals | null;
-  private readonly ownConnection: string | null;
 
   /** The guidance its agents are given, each level as their instructions hold it (§12): what the writer is given beside the brief where Settings say so. */
   guidanceLines(): readonly string[] {
@@ -470,10 +545,11 @@ export class Run {
     this.start.heard?.(event);
   }
 
-  /** The run ended: its trace says how, the agents its agents started are let go, and what it spent is written. */
+  /** The run ended: its trace says how, the agents its agents started are let go, each agent's session of the provider's prompt cache ends, and what it spent is written. */
   close(ended: { status: TurnStatus; reason?: string; at: number }, usage: AgentUsage): void {
     this.trace.emit({ kind: "turn_ended", status: ended.status, ...(ended.reason !== undefined ? { reason: ended.reason } : {}), usage, at: ended.at });
     this.delegator.close();
+    for (const agent of this.lines.keys()) this.shared.host.models.ended?.(agent);
     this.shared.runs.delete(this.info.id);
     this.shared.spend.flush().catch((error: unknown) => this.shared.host.log("warn", `[LumiAH] what the run spent couldn't be written (${errorText(error)})`));
   }
@@ -573,7 +649,7 @@ export class Run {
     const agent = startAgent(
       {
         role: definition.id,
-        connectionId: chosen.connectionId ?? resolved.connectionId ?? this.ownConnection,
+        connectionId: chosen.connectionId ?? resolved.connectionId,
         // A connection the extension chose runs its own model unless it named one: the definition's was chosen for another connection.
         model: chosen.model ?? (chosen.connectionId !== undefined ? null : resolved.model),
         effort: chosen.effort ?? resolved.effort,

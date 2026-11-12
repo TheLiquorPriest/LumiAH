@@ -22,10 +22,10 @@ import { PORT, type Rig, rig, runtimeFor, until, USER } from "../support/rig";
 
 let r: Rig | null = null;
 /** What a test started beside the rig, stopped with it. */
-const also: (() => void)[] = [];
-afterEach(() => {
-  for (const stop of also.splice(0)) stop();
-  r?.close();
+const also: (() => Promise<void>)[] = [];
+afterEach(async () => {
+  for (const stop of also.splice(0)) await stop();
+  await r?.close();
   r = null;
 });
 
@@ -196,6 +196,8 @@ describe("a chat whose runtime is gone", () => {
     const heard: string[] = [];
     it.backend.onRuntime((userId) => void heard.push(userId));
     power.pull();
+    // A killed process never stops in good order: what it kept stays on its disk, and nothing of it waits for the extension's storage.
+    await it.runtime.store.close();
     await until(() => !it.backend.relays.isLinked(USER, it.registration.relay), "the runtime's link to be gone");
     expect(heard).toContain(USER);
     // The chat's view says so, still pinned to the runtime; and the extension reads the same in plain words.
@@ -236,16 +238,16 @@ describe("a runtime fit to be required", () => {
     it.runtime.shutdown();
     const cut = await first;
     expect(cut.error).toEqual({ message: "The runtime is restarting. Press Retry in a moment.", code: "unavailable" });
-    it.runtime.close();
+    await it.runtime.close();
 
     // The service starts it again from the same config: it links, and the chat's next reply is answered.
     const again: Runtime = runtimeFor(it.lumiverse, it.registration, it.logs);
     // Its own clockwork (pings, reconnects), which `lumiah serve` runs every second and the rig every few milliseconds: the two ends talk over queued deliveries, with no one clock to move by hand.
     const ticker = setInterval(() => again.tick(), 5);
-    also.push(() => {
+    also.push(async () => {
       clearInterval(ticker);
       again.shutdown();
-      again.close();
+      await again.close();
     });
     await again.link.connect();
     const next = await it.lumiverse.generate(again.fetch, chatId, { key: it.key, port: PORT });
@@ -281,50 +283,6 @@ describe("a runtime fit to be required", () => {
     expect(state.linked).toBe(false);
     expect(state.words).toBe(versionWords(LINK_VERSION - 1, LINK_VERSION));
     expect(state.words).toContain("update the runtime by running its start line on LumiAH's Runtime page again");
-  });
-});
-
-describe("an agent with no connection of its own, in a chat that plays in the runtime", () => {
-  test("runs on the connection the chat was on before its pin, else on the one selected in Lumiverse, though the account has no default; with none, the reply fails naming all three", async () => {
-    const it = (r = await rig());
-    // No connection of the account's is its default, as on the test bed.
-    for (const c of it.host.connectionList) c.isDefault = false;
-    it.host.addConnection({ id: "conn-own", name: "Own", provider: "openai", model: "model-own", isDefault: false });
-    await it.runtime.link.connect();
-    it.key = (await it.page.request("lah.key", { op: "mint" })).key ?? "";
-    const chat = it.host.addChat(USER, "Harbour light");
-    chat.metadata.connection_profile_id = "conn-own";
-    it.host.say(chat.id, "user", "Who keeps the harbour light now?");
-    await it.page.request("lah.chat.set", { chatId: chat.id, on: true });
-    it.host.script = [
-      { toolCalls: [toolCall("write_reply", { brief: "Okoro keeps the light." })] },
-      "Okoro keeps it now.",
-      { toolCalls: [toolCall("write_reply", { brief: "Brann sells mackerel." })] },
-      "Brann sells mackerel on market day.",
-    ];
-
-    const out = await it.generate(chat.id);
-    expect(out.error).toBeNull();
-    expect(out.content).toBe("Okoro keeps it now.");
-    // The main agent and the writer both ran on the chat's own earlier connection, never the loopback it is pinned to now.
-    expect(it.host.calls.map((c) => (c.kind === "call" ? c.request.connectionId : "passed"))).toEqual(["conn-own", "conn-own"]);
-
-    // A chat that had no connection of its own before its pin ran on the one selected in Lumiverse, so its agents run on that one.
-    const bare = it.host.addChat(USER, "The fish market");
-    it.host.say(bare.id, "user", "What does Brann sell on market day?");
-    await it.page.request("lah.chat.set", { chatId: bare.id, on: true });
-    it.host.select(USER, "conn-own");
-    const selected = await it.generate(bare.id);
-    expect(selected.error).toBeNull();
-    expect(selected.content).toBe("Brann sells mackerel on market day.");
-    expect(it.host.calls.slice(2).map((c) => (c.kind === "call" ? c.request.connectionId : "passed"))).toEqual(["conn-own", "conn-own"]);
-
-    // With nothing selected either, on an account with no default: nothing runs, and the words name all three.
-    it.host.select(USER, null);
-    it.host.say(bare.id, "user", "And on the feast day?");
-    const failed = await it.generate(bare.id);
-    expect(failed.error?.message ?? "").toContain("it has none of its own, its chat had none before it was set to play in the runtime, no connection is selected in Lumiverse, and Lumiverse has no default connection");
-    expect(it.host.calls).toHaveLength(4);
   });
 });
 

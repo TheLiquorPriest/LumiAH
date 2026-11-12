@@ -23,7 +23,7 @@ export const PAGES_CSS = `
 .lah-set-group-head{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:var(--lah-s1) var(--lah-s2);padding:var(--lah-s2) var(--lah-s3) 0;min-width:0}
 .lah-set-group-title{font-weight:600;min-width:0;overflow-wrap:anywhere}
 .lah-set-group-help{padding:0 var(--lah-s3);font-size:var(--lah-fs-sm);color:var(--lah-muted);overflow-wrap:anywhere}
-.lah-set-row{display:flex;flex-direction:column;gap:var(--lah-s1);padding:var(--lah-s3);border-top:1px solid var(--lah-hairline);min-width:0;scroll-margin-top:calc(var(--lah-bar-h,0px) + var(--lah-s3))}
+.lah-set-row{display:flex;flex-direction:column;gap:var(--lah-s1);padding:var(--lah-s3);border-top:1px solid var(--lah-hairline);min-width:0;scroll-margin-top:calc(var(--lah-stick-top,0px) + var(--lah-bar-h,0px) + var(--lah-s3))}
 .lah-set-group>.lah-set-row:first-child,.lah-set-group-head+.lah-set-row,.lah-set-group-help+.lah-set-row{border-top:0}
 .lah-set-row[data-lah-found]{box-shadow:inset 3px 0 0 var(--lah-mark-now)}
 .lah-set-row-head{display:flex;flex-wrap:wrap;align-items:center;gap:var(--lah-s1) var(--lah-s2);min-width:0;min-height:var(--lah-tap-sm)}

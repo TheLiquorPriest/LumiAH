@@ -1,12 +1,12 @@
 // An OpenAI-compatible request body, as Lumiverse's Custom connection posts it. A turn reads it into
 // the core's own shapes: its messages (tool calls, tool results, images and audio included), its
 // sampling parameters and answer room. An untagged request is passed through instead: its messages
-// and tools as Lumiverse's generation call takes them, whole or not at all, with every other field
-// of the body as it came.
+// and tools as the runtime's model layer takes them (models/pass.ts), whole or not at all, with
+// every other field of the body as it came.
 
 import type { JsonObject, ModelMessage, ModelPart, RequestMessage, SamplingParams } from "../core/ports";
 import { TAG_PARAM, contentMark } from "../link/contract";
-import type { PassedMessage, PassedPart, PassedTool, SourceMark } from "../link/contract";
+import type { SourceMark } from "../link/contract";
 import { isRecord } from "../link/json";
 
 /** A part's text: a string as it is, a list of parts as its text parts joined. */
@@ -104,10 +104,13 @@ export function maxTokensOf(body: JsonObject): number | null {
 
 // ---------------------------------------------------------------- a request passed through
 //
-// A request with no tag goes to the writer's connection through Lumiverse's generation call, which
-// takes messages in Lumiverse's own shape. What that shape has a place for is carried. What it has
-// none for refuses the request, in words that name it. Nothing is left out on the way: a part
-// dropped here would change what the model is told, and neither Lumiverse nor the user would know.
+// A request with no tag goes to the writer's connection, else the runtime's default, through the
+// runtime's model layer (models/pass.ts), which takes its messages in the shape below. What that
+// shape has a place for is carried; what it has none for refuses the request, here or in the layer
+// (which knows the connection's API), in words that name it. Nothing is left out on the way: a part
+// dropped would change what the model is told, and neither Lumiverse nor the user would know. A
+// cache mark (`cache_control`) is the one thing let go: the provider places its own, and a mark
+// changes nothing of what the model is told.
 
 /** Something of a request that can't be carried: its words go back to whoever sent the request. */
 class NotCarried extends Error {}
@@ -127,16 +130,8 @@ function onlyFields(record: Record<string, unknown>, fields: readonly string[], 
   }
 }
 
-/** A cache breakpoint as the request gave it (`cache_control`). */
-function cacheOf(record: Record<string, unknown>, what: string): { cacheControl?: JsonObject } {
-  const raw = record.cache_control;
-  if (holdsNothing(raw)) return {};
-  if (!isRecord(raw)) throw new NotCarried(`${what} has a \`cache_control\` that isn't an object`);
-  return { cacheControl: raw as JsonObject };
-}
-
 /**
- * Media given as a base64 `data:` URL, which is how Lumiverse's generation call takes it: its type
+ * Media given as a base64 `data:` URL, which is how the runtime's model calls take it: its type
  * (with whatever parameters the type has) and its data. Media named by an address can't be handed
  * on, since the runtime downloads nothing.
  */
@@ -145,7 +140,7 @@ function dataOf(url: unknown, what: string): { mimeType: string; data: string } 
   const found = /^data:([^,]+);base64,(.*)$/s.exec(url);
   if (found) return { mimeType: found[1] ?? "", data: found[2] ?? "" };
   if (url.startsWith("data:")) throw new NotCarried(`${what} is a \`data:\` URL of another form than \`data:<type>;base64,<data>\``);
-  throw new NotCarried(`${what} is given by its address (${url.length > QUOTED ? `${url.slice(0, QUOTED)}…` : url}), and Lumiverse's generation call takes media only as its data: send it as a base64 \`data:\` URL (the runtime downloads nothing)`);
+  throw new NotCarried(`${what} is given by its address (${url.length > QUOTED ? `${url.slice(0, QUOTED)}…` : url}), and the runtime's model calls take media only as its data: send it as a base64 \`data:\` URL (the runtime downloads nothing)`);
 }
 
 /** One part of a message's content list. */
@@ -159,28 +154,27 @@ function partOf(raw: unknown, what: string): PassedPart {
     onlyFields(inner, fields, what);
     return inner;
   };
-  const cache = cacheOf(raw, what);
   switch (raw.type) {
     case "text":
     case "input_text":
       onlyFields(raw, ["type", "text", "cache_control"], what);
       if (typeof raw.text !== "string") throw new NotCarried(`${what} has no text`);
-      return { type: "text", text: raw.text, ...cache };
+      return { type: "text", text: raw.text };
     case "image_url": {
       const image = held("image_url", ["url", "detail"]);
       // `auto` is what a provider does when nothing is said.
-      if (!holdsNothing(image.detail) && image.detail !== "auto") throw new NotCarried(`${what} asks for its image at \`detail: ${String(image.detail)}\`, which Lumiverse's generation call has no place for: leave \`detail\` out`);
-      return { type: "media", media: "image", ...dataOf(image.url, what), ...cache };
+      if (!holdsNothing(image.detail) && image.detail !== "auto") throw new NotCarried(`${what} asks for its image at \`detail: ${String(image.detail)}\`, which the runtime's model calls have no place for: leave \`detail\` out`);
+      return { type: "media", media: "image", ...dataOf(image.url, what) };
     }
     case "video_url":
-      return { type: "media", media: "video", ...dataOf(held("video_url", ["url"]).url, what), ...cache };
+      return { type: "media", media: "video", ...dataOf(held("video_url", ["url"]).url, what) };
     case "input_audio": {
       const audio = held("input_audio", ["data", "format"]);
       if (typeof audio.data !== "string" || audio.data === "" || typeof audio.format !== "string" || audio.format === "") throw new NotCarried(`${what} is audio without its data or its format`);
-      return { type: "media", media: "audio", mimeType: `audio/${audio.format}`, data: audio.data, ...cache };
+      return { type: "media", media: "audio", mimeType: `audio/${audio.format}`, data: audio.data };
     }
     default:
-      throw new NotCarried(`${what} is a part of the kind \`${raw.type}\`, and Lumiverse's generation call carries text, images, audio and video, each as its data`);
+      throw new NotCarried(`${what} is a part of the kind \`${raw.type}\`, which the runtime has no way to pass on`);
   }
 }
 
@@ -197,7 +191,7 @@ function toolUseOf(raw: unknown, what: string): PassedPart {
   if (!isRecord(raw)) throw new NotCarried(`${what} isn't a tool call`);
   onlyFields(raw, ["id", "type", "function"], what);
   const fn = raw.function;
-  if (!(raw.type === undefined || raw.type === "function") || !isRecord(fn)) throw new NotCarried(`${what} isn't a function call, the one kind of tool call Lumiverse's generation call carries`);
+  if (!(raw.type === undefined || raw.type === "function") || !isRecord(fn)) throw new NotCarried(`${what} isn't a function call, the one kind of tool call the runtime passes on`);
   onlyFields(fn, ["name", "arguments"], what);
   if (typeof raw.id !== "string" || raw.id === "" || typeof fn.name !== "string" || fn.name === "") throw new NotCarried(`${what} has no id, or names no function`);
   // OpenAI writes the arguments as JSON text; a call that gives none takes none.
@@ -218,10 +212,10 @@ const ASSISTANT_FIELDS = [...MESSAGE_FIELDS, "prefix", "partial", "tool_calls", 
 const TOOL_FIELDS = [...MESSAGE_FIELDS, "tool_call_id"];
 
 /**
- * The body's messages as Lumiverse's generation call takes them. `developer` messages are system
+ * The body's messages as the runtime's model layer takes them. `developer` messages are system
  * messages; an assistant's tool calls follow its content as `tool_use` parts; each run of `tool`
- * messages is one user message of `tool_result` parts, which is where Lumiverse keeps a tool's
- * result; `prefix: true` (or `partial: true`) on an assistant message is its mark as a prefix.
+ * messages is one user message of `tool_result` parts; `prefix: true` (or `partial: true`) on an
+ * assistant message is its mark as a prefix.
  */
 function passedMessages(raw: unknown): PassedMessage[] {
   if (!Array.isArray(raw)) throw new NotCarried("it has no list of messages");
@@ -231,14 +225,13 @@ function passedMessages(raw: unknown): PassedMessage[] {
   raw.forEach((m: unknown, i) => {
     const what = `message ${i + 1}`;
     if (!isRecord(m)) throw new NotCarried(`${what} isn't a message`);
-    const cache = cacheOf(m, what);
     const content = contentOf(m.content, what);
     if (m.role === "tool") {
       // A result's `name` repeats its call's, which is sent: nothing is lost with it.
       onlyFields(m, TOOL_FIELDS, what);
       if (typeof m.tool_call_id !== "string" || m.tool_call_id === "") throw new NotCarried(`${what}, a tool's result, names no tool call`);
-      if (typeof content !== "string" && content.some((p) => p.type !== "text" || p.cacheControl !== undefined)) throw new NotCarried(`${what}, a tool's result, holds more than text, and Lumiverse's generation call takes a result as one text`);
-      const part: PassedPart = { type: "tool_result", toolUseId: m.tool_call_id, content: typeof content === "string" ? content : content.map((p) => (p.type === "text" ? p.text : "")).join(""), ...cache };
+      if (typeof content !== "string" && content.some((p) => p.type !== "text")) throw new NotCarried(`${what}, a tool's result, holds more than text, and the runtime passes a result on as one text`);
+      const part: PassedPart = { type: "tool_result", toolUseId: m.tool_call_id, content: typeof content === "string" ? content : content.map((p) => (p.type === "text" ? p.text : "")).join("") };
       if (results === null) out.push({ role: "user", content: (results = [part]) });
       else results.push(part);
       return;
@@ -248,7 +241,7 @@ function passedMessages(raw: unknown): PassedMessage[] {
     if (role !== "system" && role !== "user" && role !== "assistant") throw new NotCarried(`${what} has the role \`${String(m.role)}\`, and LumiAH passes on system, developer, user, assistant and tool messages`);
     onlyFields(m, role === "assistant" ? ASSISTANT_FIELDS : MESSAGE_FIELDS, what);
     if (!holdsNothing(m.name) && typeof m.name !== "string") throw new NotCarried(`${what} has a name that isn't text`);
-    const message: PassedMessage = { role, content, ...(typeof m.name === "string" && m.name !== "" ? { name: m.name } : {}), ...cache };
+    const message: PassedMessage = { role, content, ...(typeof m.name === "string" && m.name !== "" ? { name: m.name } : {}) };
     if (role === "assistant") {
       if (!holdsNothing(m.tool_calls)) {
         if (!Array.isArray(m.tool_calls)) throw new NotCarried(`${what}'s tool calls aren't a list`);
@@ -271,7 +264,7 @@ function passedMessages(raw: unknown): PassedMessage[] {
   return out;
 }
 
-/** The body's tools (`[{type: "function", function: {name, description, parameters, strict}}]`) as Lumiverse's generation call offers them: functions, the one kind it has. */
+/** The body's tools (`[{type: "function", function: {name, description, parameters, strict}}]`) as the runtime's model calls offer them: functions, the one kind they have. */
 function passedTools(raw: unknown): PassedTool[] {
   if (holdsNothing(raw)) return [];
   if (!Array.isArray(raw)) throw new NotCarried("its tools aren't a list");
@@ -280,7 +273,7 @@ function passedTools(raw: unknown): PassedTool[] {
     if (!isRecord(tool)) throw new NotCarried(`${what} isn't a tool`);
     onlyFields(tool, ["type", "function"], what);
     const fn = tool.function;
-    if (!(tool.type === undefined || tool.type === "function") || !isRecord(fn)) throw new NotCarried(`${what} isn't a function, the one kind of tool Lumiverse's generation call offers a model`);
+    if (!(tool.type === undefined || tool.type === "function") || !isRecord(fn)) throw new NotCarried(`${what} isn't a function, the one kind of tool the runtime's model calls offer a model`);
     onlyFields(fn, ["name", "description", "parameters", "strict"], what);
     const { name, description, parameters, strict } = fn;
     if (typeof name !== "string" || name === "") throw new NotCarried(`${what} names no function`);
@@ -304,24 +297,62 @@ function passedParameters(body: JsonObject): JsonObject {
   return out;
 }
 
-/** An untagged request as the link carries it to the extension. */
+/** A part of a passed-through message: text, media as its data (an image, audio or video, base64), a tool call the model made, or a tool's result going back. */
+export type PassedPart =
+  | { type: "text"; text: string }
+  | { type: "media"; media: "image" | "audio" | "video"; data: string; mimeType: string }
+  | { type: "tool_use"; id: string; name: string; input: JsonObject }
+  | { type: "tool_result"; toolUseId: string; content: string };
+
+/**
+ * A message of a request passed through (one with no tag), as read here. Its content is its text as
+ * it came, or its parts where the request gave parts, tool calls or tool results. `name` is the
+ * participant's name; `prefix` marks an assistant message the model is to continue (`prefix: true`
+ * or `partial: true` in the request); `reasoning` and `reasoningDetails` are an assistant turn's
+ * reasoning, sent back as the model gave it (`reasoning_content`, `reasoning_details`). What a
+ * request holds beyond these, and what of these the connection's API can't take, refuses the
+ * request: nothing is dropped.
+ */
+export interface PassedMessage {
+  role: "system" | "user" | "assistant";
+  content: string | PassedPart[];
+  name?: string;
+  prefix?: true;
+  reasoning?: string;
+  reasoningDetails?: JsonObject[];
+}
+
+/** A tool a passed-through request offers: a function, its parameters as a JSON Schema, and `strict` where the request said it. */
+export interface PassedTool {
+  name: string;
+  description: string;
+  parameters: JsonObject;
+  strict?: boolean;
+}
+
+/** An untagged request as the runtime's model layer takes it (`ModelLayer.passing`). */
 export interface PassedRequest {
   messages: PassedMessage[];
   tools: PassedTool[];
   parameters: JsonObject;
 }
 
+/** The words a request passed through is refused in, `what` saying what of it can't be carried and what to do. */
+export function notPassedWords(what: string): string {
+  return `LumiAH didn't pass this request on: ${what}. A request that is no reply of a chat's goes to the writer's connection whole or not at all, so that nothing of a prompt is dropped on the way.`;
+}
+
 /**
  * An untagged request's body as it is passed on: its messages and its tools whole, and its other
- * fields as the parameters of Lumiverse's generation call. Where something in it can't be carried,
- * `refused` says what, for the answer to whoever sent the request, which then goes nowhere.
+ * fields as the call's parameters. Where something in it can't be carried, `refused` says what, for
+ * the answer to whoever sent the request, which then goes nowhere.
  */
 export function passedRequest(body: JsonObject): PassedRequest | { refused: string } {
   try {
     return { messages: passedMessages(body.messages), tools: passedTools(body.tools), parameters: passedParameters(body) };
   } catch (error) {
     if (!(error instanceof NotCarried)) throw error;
-    return { refused: `LumiAH didn't pass this request on: ${error.message}. A request that is no reply of a chat's goes to the writer's connection whole or not at all, so that nothing of a prompt is dropped on the way.` };
+    return { refused: notPassedWords(error.message) };
   }
 }
 

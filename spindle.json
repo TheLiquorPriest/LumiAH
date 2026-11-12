@@ -5,7 +5,7 @@
   "author": "TheLiquorPriest",
   "github": "https://github.com/TheLiquorPriest/LumiAH",
   "homepage": "https://github.com/TheLiquorPriest/LumiAH",
-  "description": "An agent harness for Lumiverse: a main agent with tools works before each reply of the chats you switch it on for, and briefs the writer. Nothing to install; a runtime beside Lumiverse is optional.",
+  "description": "An agent harness for Lumiverse: a main agent with tools works before each reply of the chats you switch it on for, and briefs the writer. It needs its runtime, a program you start once beside Lumiverse, which runs the agents and calls your models.",
   "permissions": [
     "generation",
     "interceptor",
@@ -20,7 +20,8 @@
     "embeddings",
     "memories",
     "databanks",
-    "web_search"
+    "web_search",
+    "cors_proxy"
   ],
   "interceptorTimeoutMs": 300000,
   "entry_backend": "dist/backend.js",

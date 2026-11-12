@@ -26,16 +26,21 @@ import { linkedBackendOf } from "../link/frames";
 import { isRecord } from "../link/json";
 import { RUNTIME_DEFAULTS } from "../link/settings";
 import type { RuntimeConfig, SavedConfig, SystemdService } from "./config";
-import { SETUP_DEFAULTS, configDir, configOf, configPathOf, configText, dataDir, installedPath } from "./config";
+import { EXTENSION_FORM, RUNTIME_DIR_MODE, SETUP_DEFAULTS, configDir, configOf, configPathOf, configText, dataDir, installedPath, runtimeDir } from "./config";
 import type { OpenSocket } from "./connection";
 import { HostConnection, LinkError } from "./connection";
 import type { Http, StoredLogin } from "./lumiverse";
 import { addConnectionProfile, connectionProfiles, editAndSendPrefersActive, excludeOrigins, inClear, LiveError, loopbackProfile, normalizeBase, runtimeOrigins, sessionOf, signIn } from "./lumiverse";
-import { healthProof } from "./relay";
+import { createModelLayer } from "./models";
+import { healthProof } from "./proof";
 import { createRuntime } from "./runtime";
 import type { Harness } from "./turn";
 import { DEFAULT_MEMORY, memoryRefusal } from "./update/memory";
-import { systemctlOf, unitPath, unitRunning, unitText } from "./update/service";
+import type { Ran } from "./update/programs";
+import { HANDED_OVER, type Successor } from "./update/restart";
+import { installedCopy, systemctlOf, unitMemory, unitPath, unitRunning, unitText } from "./update/service";
+import type { UpdateFiles } from "./update/update";
+import { createUpdate } from "./update/update";
 
 export interface ServeOptions {
   hostname: string;
@@ -70,6 +75,8 @@ export interface RuntimeFiles {
   stat(path: string): OwnedEntry | null;
   /** The path with every symlink in it resolved. */
   real(path: string): string;
+  /** Makes the folder, and those above it that are missing, and gives it `mode` (mkdir's is masked by the umask, and a folder there already keeps its own); the path the folder is at. */
+  folder(path: string, mode: number): string;
 }
 
 /** The machine as the command needs it. */
@@ -95,8 +102,8 @@ export interface RuntimeIO {
   platform: string;
   home: string;
   files: RuntimeFiles;
-  /** Runs a program (systemctl, loginctl, id, getent) with `env` over this process's environment. */
-  run(command: string, args: readonly string[], env?: Readonly<Record<string, string>>): Promise<{ code: number; out: string; err: string }>;
+  /** Runs a program (systemctl, loginctl, id, getent; Bun, for a new build's version) with `env` over this process's environment: one named without a path is found in the system's own folders, never through PATH. Ended after `timeoutMs` when that is given. */
+  run(command: string, args: readonly string[], env?: Readonly<Record<string, string>>, timeoutMs?: number): Promise<Ran>;
   sleep(ms: number): Promise<void>;
   now(): number;
   /** The identifier of the extension a new runtime links to unless `--extension` names another: LumiAH's own. */
@@ -107,6 +114,12 @@ export interface RuntimeIO {
   /** The core's harness over a host, and where the core's settings name the writer's connection. */
   harness: Parameters<typeof createRuntime>[1]["harness"];
   writerConnection(values: JsonObject): string | null;
+  /** The disk as an update needs it: the bytes of the extension's copy of the runtime, and lumiah's copy and unit written whole. */
+  updateFiles: UpdateFiles;
+  /** Hands this process to the runtime's successor once it has stopped serving (`handOver`): resolves only where that failed, by throwing words with the line that starts it. */
+  handOver(next: Successor): Promise<void>;
+  /** This process's id: a copy that waits for another to stop serving says which process it is. */
+  pid: number;
 }
 
 interface Args {
@@ -297,20 +310,36 @@ async function changeable(io: RuntimeIO, path: string, uid: number, groupOf: Gro
   }
 }
 
+/** The folder the command's config is in (`--config`'s, else where configs live), or the nearest folder above it that is there yet: `up` makes the rest, as this account's own. */
+function configFolder(a: Args, io: RuntimeIO): string {
+  const given = a.values["--config"];
+  let at = given === undefined ? configDir(io.env, io.home) : given.includes("/") ? given.slice(0, given.lastIndexOf("/")) || "/" : ".";
+  for (;;) {
+    try {
+      io.files.real(at);
+      return at;
+    } catch {
+      if (at === "/" || !at.includes("/")) return at;
+      at = at.slice(0, at.lastIndexOf("/")) || "/";
+    }
+  }
+}
+
 /**
  * Why this account won't run this, or null when it may: this bundle, the Bun it runs on and the one
  * `--bun` names for its unit must be no one else's to change but root's, as must every directory
- * above them, or whoever else can change one would run code as this account through it. The refusal
- * names each; for one of this account's or root's that its group or everyone else can write, the
- * `chmod` that takes that write away, and for one of another account's, how to run the runtime as
- * that account.
+ * above them, or whoever else can change one would run code as this account through it. So must the
+ * folder its config is in: the config names the files the runtime runs and updates from, and holds
+ * its secret and its session. The refusal names each; for one of this account's or root's that its
+ * group or everyone else can write, the `chmod` that takes that write away, and for one of another
+ * account's, how to run the runtime as that account.
  */
 async function refusal(a: Args, io: RuntimeIO): Promise<string | null> {
   const me = io.uid;
   if (me === null) return null;
   const groupOf = groupsOf(io);
   const unsafe: { path: string; uid: number | null; why: string | null; entry?: OwnedEntry }[] = [];
-  for (const path of new Set([io.self, io.bun, a.values["--bun"]])) {
+  for (const path of new Set([io.self, io.bun, a.values["--bun"], configFolder(a, io)])) {
     if (path === null || path === undefined) continue;
     let found: { path: string; entry: OwnedEntry }[];
     try {
@@ -534,7 +563,7 @@ async function up(a: Args, io: RuntimeIO): Promise<number> {
   if (io.serve === null || io.bun === null) throw new UsageError("LumiAH's runtime runs on Bun (Bun.serve, idleTimeout 0): run this line with Bun, as LumiAH's Runtime page shows it.");
   const systemd = a.flags["--systemd"] === true;
   const asked = a.values["--extension"];
-  if (asked !== undefined && !/^[a-z][a-z0-9_]*$/.test(asked)) throw new UsageError(`--extension is "${asked}": an extension's identifier is lowercase letters, digits and _.`);
+  if (asked !== undefined && !EXTENSION_FORM.test(asked)) throw new UsageError(`--extension is "${asked}": an extension's identifier is lowercase letters, digits and _.`);
   const named = givenName(a);
   // The runtime this line sets up again, as far as it says before anyone has signed in: the one it names, else the only one here of the extension it is for. That one's address and sign-in are this line's defaults.
   const before = named !== undefined ? configNamed(named, io) : onlyOf(asked ?? io.extension, io);
@@ -544,8 +573,15 @@ async function up(a: Args, io: RuntimeIO): Promise<number> {
   const base = await baseFor(a, io, before);
   const listen = a.values["--listen"] ?? LISTEN;
   if (listen !== LISTEN && listen !== "localhost") io.err(`Warning: the runtime will listen on ${listen}, where other machines can reach it, not only this one. Your loopback key and every prompt cross to it in clear http, so keep it behind something that encrypts (a tunnel, a reverse proxy with HTTPS) or on a private network. Every call still needs the key and must be addressed to ${listen} itself, unless that is a wildcard address (0.0.0.0, ::), which answers any name; nothing else stands between them and it.`);
-  const bun = a.values["--bun"] ?? io.bun;
-  if (!bun.startsWith("/")) throw new UsageError(`--bun must be an absolute path (systemd searches no PATH that has Bun): ${bun}`);
+  const given = a.values["--bun"] ?? io.bun;
+  if (!given.startsWith("/")) throw new UsageError(`--bun must be an absolute path (systemd searches no PATH that has Bun): ${given}`);
+  // What the unit runs is the very file the check above passed: a link in the path could be pointed elsewhere later.
+  let bun: string;
+  try {
+    bun = io.files.real(given);
+  } catch (error) {
+    throw new UsageError(`--bun names no Bun here (${given}): ${error instanceof Error ? error.message : String(error)}`);
+  }
   const memoryAsked = a.values["--memory"];
   const memoryWhy = memoryAsked === undefined ? null : memoryRefusal(memoryAsked);
   if (memoryWhy !== null) throw new UsageError(`--memory is "${memoryAsked}": ${memoryWhy}.`);
@@ -590,13 +626,15 @@ async function up(a: Args, io: RuntimeIO): Promise<number> {
 
   const origins = runtimeOrigins(listen, port);
   const scheduler = await excludeOrigins(io.http, base, session.token, origins);
-  // Lumiverse reads the scheduler's setting through a short cache: a turn begun within a few seconds may still wait behind the old one.
-  if (scheduler === "excluded") io.out(`Its address (${origins.join(", ")}) is in ${who}'s local-inference scheduler exclusions, so the scheduler never holds a turn's own calls behind it.`);
+  // Lumiverse reads the scheduler's setting through a short cache: a reply begun within a few seconds may still be scheduled under the old one.
+  if (scheduler === "excluded") io.out(`Its address (${origins.join(", ")}) is in ${who}'s local-inference scheduler exclusions, so a reply it answers never holds the scheduler while its agents work.`);
   else if (scheduler === "unavailable") io.out("This Lumiverse has no local-inference scheduler: nothing to exclude.");
-  else io.err(`Couldn't put ${origins.join(" and ")} in ${who}'s local-inference scheduler exclusions. Before turning the scheduler on, add them under Settings → Inference scheduler → Excluded origins: a turn would otherwise wait on its own calls.`);
+  else io.err(`Couldn't put ${origins.join(" and ")} in ${who}'s local-inference scheduler exclusions. Before turning the scheduler on, add them under Settings → Inference scheduler → Excluded origins: a reply the runtime answers would otherwise hold the scheduler, and Lumiverse's local models wait, for as long as its agents work.`);
 
   // How it is kept: the limit it had (unless --memory gives another), its own choice of updating by itself, and the file this line runs, which it later takes its updates from. The unit it had stays its until `down` removes it; a unit installed below is recorded there instead.
-  const config: SavedConfig = { name, base, extension, listen, port, relay: registered.relay, secret: registered.secret, session, tuning, memory: memoryAsked ?? previous?.memory ?? SETUP_DEFAULTS.memory, autoUpdate: previous?.autoUpdate ?? SETUP_DEFAULTS.autoUpdate, source: io.self, service: previous?.service ?? null };
+  // The limit it had is its config's once the config names the unit holding it to one. A runtime set up before the limit was kept there has it only in its unit: read from there, setting it up again with this build doesn't quietly give it another.
+  const had = previous?.service != null ? previous.memory : (unitMemory(io.files.read(place.unit)) ?? previous?.memory);
+  const config: SavedConfig = { name, base, extension, listen, port, relay: registered.relay, secret: registered.secret, session, tuning, memory: memoryAsked ?? had ?? SETUP_DEFAULTS.memory, autoUpdate: previous?.autoUpdate ?? SETUP_DEFAULTS.autoUpdate, source: io.self, service: previous?.service ?? null };
   const connection = await loopbackConnection(io, base, session.token, runtimeBase(listen, port), registered.model || loopbackModel(extension), config.tuning.connectionsRead, linked);
   // Lumiverse's "always use the active connection" acts on Edit and Send only: there it overrides a chat's pin to the loopback.
   if ((await editAndSendPrefersActive(io.http, base, session.token)) === true) io.err(`${who} has "always use the active connection" on for Edit and Send: a message sent with Edit and Send goes on the active connection, not a chat's pin to the loopback, and ${linked.name} answers it only when the active connection is the loopback.`);
@@ -677,7 +715,62 @@ async function loopbackConnection(io: RuntimeIO, base: string, token: string, ur
 
 // ---------------------------------------------------------------- serve
 
-/** Runs the runtime until the process is asked to stop. `path` is its config, read again for the session whenever the link opens, so `lumiah login` takes effect without a restart. */
+/** How often a copy of the runtime that waits for another to stop serving asks again, and renews its mark. */
+const WAIT_MS = 5_000;
+/** A waiting copy's mark in the runtime's own folder: `{ pid, since, seen }`. */
+const WAITING = "waiting.json";
+
+/** Whether a runtime answers `GET /healthz` on this config's address now: another copy of this one serves there, or another runtime does. */
+async function answersThere(config: RuntimeConfig, io: RuntimeIO): Promise<boolean> {
+  try {
+    const body = await healthOf(config, io);
+    return isRecord(body) && (body.up === true || typeof body.link === "string");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Never two copies of one runtime on its port. Where a restart starts the runtime as a new process
+ * (Windows, which can't replace one in place), the task or service wrapper that ran the old process
+ * may start one too. Whichever copy comes second finds the first answering on the port: it serves
+ * nothing and links to nothing, waits until that one stops, and meanwhile keeps a mark in the
+ * runtime's folder, which the one that serves shows on the Runtime page. Resolves null once the
+ * port is this one's to take; with the signal's name when it is asked to stop while it waits.
+ */
+async function waitForPort(config: RuntimeConfig, io: RuntimeIO, dir: string, log: (text: string) => void, stopping: Promise<string>): Promise<string | null> {
+  const mark = `${dir}/${WAITING}`;
+  let since: number | null = null;
+  try {
+    while (await answersThere(config, io)) {
+      const now = io.now();
+      if (since === null) {
+        since = now;
+        log(`another copy of this runtime serves on ${config.listen}:${config.port}: this one waits, and serves once that one stops (stop this one if it shouldn't)`);
+      }
+      io.files.write(mark, JSON.stringify({ pid: io.pid, since, seen: now }), 0o600, RUNTIME_DIR_MODE);
+      const stopped = await Promise.race([io.sleep(WAIT_MS).then(() => null), stopping]);
+      if (stopped !== null) return stopped;
+    }
+    return null;
+  } finally {
+    if (since !== null) io.files.remove(mark);
+  }
+}
+
+/** The copy of this runtime that waits to serve while this one does, by the mark it renews; null when none does, or its mark is too old to be one's that still waits. */
+function waitingCopy(io: RuntimeIO, dir: string): { pid: number; since: number } | null {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(io.files.read(`${dir}/${WAITING}`) ?? "null");
+  } catch {
+    return null;
+  }
+  if (!isRecord(raw) || typeof raw.pid !== "number" || typeof raw.since !== "number" || typeof raw.seen !== "number" || raw.pid === io.pid) return null;
+  return io.now() - raw.seen <= 3 * WAIT_MS ? { pid: raw.pid, since: raw.since } : null;
+}
+
+/** Runs the runtime until the process is asked to stop, or an update restarts it. `path` is its config, read again for the session whenever the link opens, so `lumiah login` takes effect without a restart. */
 export async function serve(config: SavedConfig, path: string, io: RuntimeIO): Promise<number> {
   const start = io.serve;
   if (start === null) throw new UsageError("LumiAH's runtime runs on Bun (Bun.serve, idleTimeout 0): run it with Bun.");
@@ -692,6 +785,7 @@ export async function serve(config: SavedConfig, path: string, io: RuntimeIO): P
     }
     return current.session;
   };
+  // The one writer of the config while the runtime runs: it writes the whole of `current`, so every change (a secret rotated, the limits, the Runtime page's settings) goes through it.
   const keep = (change: Partial<SavedConfig>): void => {
     session();
     current = { ...current, ...change };
@@ -701,40 +795,85 @@ export async function serve(config: SavedConfig, path: string, io: RuntimeIO): P
       log(`couldn't write ${path}: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
-  // The unit that runs it, for the Runtime page's lines: the one `up --systemd` installed, when this process is that unit's.
-  const unit = unitRunning(config, { env: io.env, home: io.home, bun: io.bun, self: io.self, real: (file) => io.files.real(file) })?.unit ?? null;
+  // The unit that runs it, for the Runtime page's lines and for how it restarts: the one `up --systemd` installed, when this process is that unit's.
+  const me = { env: io.env, home: io.home, bun: io.bun, self: io.self, real: (file: string) => io.files.real(file) };
+  const service = unitRunning(config, me);
+  // The runtime's own folder: its connections, its keys and its working store go in it, so no one but its owner may enter it.
+  const dir = io.files.folder(runtimeDir(dataDir(io.env, io.home), config.name), RUNTIME_DIR_MODE);
+  const stopping = io.stopped();
+  const stoppedFirst = await waitForPort(config, io, dir, log, stopping);
+  if (stoppedFirst !== null) {
+    log(`stopping (${stoppedFirst}) before it served`);
+    return 0;
+  }
+  // An update restarts the runtime by leaving: it stops serving as a stop does, then hands its process to its successor.
+  const left = Promise.withResolvers<Successor>();
   const runtime = createRuntime(config, {
     http: io.http,
     openSocket: io.openSocket,
     now: io.now,
     log,
     build: io.build,
-    ran: { bun: io.bun, script: io.self, unit },
+    ran: { bun: io.bun, script: io.self, unit: service?.unit ?? null },
     host: io.hostname,
+    dir,
     credentials: session,
     secret: () => current.secret,
     rotated: (secret) => keep({ secret }),
     keepTuning: (tuning) => keep({ tuning }),
     harness: io.harness,
     writerConnection: io.writerConnection,
+    models: createModelLayer,
+    update: (busy) =>
+      createUpdate({
+        config: () => current,
+        save: (change) => keep(change),
+        configPath: path,
+        build: io.build,
+        bun: io.bun,
+        self: io.self,
+        installed: installedCopy(config, me),
+        service,
+        platform: io.platform,
+        container: inContainer(io),
+        env: io.env,
+        uid: io.uid,
+        files: io.updateFiles,
+        run: io.run,
+        leave: (next) => left.resolve(next),
+        busy,
+        now: io.now,
+        log,
+        name: () => runtime.link.backendName,
+        handedOver: io.env[HANDED_OVER] !== undefined,
+        waitingCopy: () => waitingCopy(io, dir),
+      }),
   });
   let server: Served;
   try {
     server = start({ hostname: config.listen, port: config.port, fetch: runtime.fetch });
   } catch (error) {
+    await runtime.close();
     throw new Error(`The runtime can't serve on ${config.listen}:${config.port}: ${error instanceof Error ? error.message : String(error)}. Is another runtime running there?`);
   }
   log(`serving ${runtimeBase(config.listen, config.port)} for ${config.base} as ${config.session.username} (build ${io.build})`);
   void runtime.link.fix();
   const timer = setInterval(() => runtime.tick(), 1_000);
-  const signal = await io.stopped();
-  log(`stopping (${signal})`);
+  const ended = await Promise.race([stopping, left.promise]);
+  log(`stopping (${typeof ended === "string" ? ended : "to restart on its new build"})`);
   clearInterval(timer);
   runtime.shutdown();
   // A moment for the error chunks and cancels to go out.
   await io.sleep(current.tuning.stopGraceMs);
   server.stop();
-  runtime.close();
+  await runtime.close();
+  if (typeof ended === "string") return 0;
+  try {
+    await io.handOver(ended);
+  } catch (error) {
+    log(error instanceof Error ? error.message : String(error));
+    return 1;
+  }
   return 0;
 }
 
@@ -746,7 +885,7 @@ export async function serve(config: SavedConfig, path: string, io: RuntimeIO): P
  * nothing is told only that it is up. Rejects when nothing answers there.
  */
 async function healthOf(config: RuntimeConfig, io: RuntimeIO): Promise<unknown> {
-  const reply = await io.http({ method: "GET", url: `${runtimeBase(config.listen, config.port).replace(/\/v1$/, "")}/healthz`, headers: { Accept: "application/json", Authorization: `Bearer ${await healthProof(config.secret)}` } });
+  const reply = await io.http({ method: "GET", url: `${runtimeBase(config.listen, config.port).replace(/\/v1$/, "")}/healthz`, headers: { Accept: "application/json", Authorization: `Bearer ${await healthProof(config.secret, io.now())}` } });
   return JSON.parse(reply.text) as unknown;
 }
 

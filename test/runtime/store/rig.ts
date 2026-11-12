@@ -1,12 +1,19 @@
 // What the working store's tests run it on (src/runtime/store): a folder of its own, a made-up mirror
 // (the extension's storage as the link reaches it) that can fail, come back or hold a call, a clock
 // whose timers run when a test moves it on, and a disk that stops for good part way, as the disk is
-// left when the process dies there.
+// left when the process dies there. A store opened alone (`open`) is given the mirror at once; the
+// runtimes of a test about who holds it (`linked`) say hello to the extension's own part that decides
+// it (backend/mirror.ts), and their writes to the mirror go through it, as over the link.
 
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { BlobInfo, JsonValue, LogLevel, StorePort } from "../../../src/core/ports";
+import { type BlobInfo, type BlobsPort, isRecord, type JsonValue, type LogLevel, type StorePort } from "../../../src/core/ports";
+import { Mirrors } from "../../../src/extension/backend/mirror";
+import type { Caller } from "../../../src/extension/backend/relays";
+import { LinkRefused } from "../../../src/host/refused";
+import type { MirrorWord } from "../../../src/link/contract";
+import { mirrorWordOf } from "../../../src/link/frames";
 import { type Disk, nodeDisk } from "../../../src/runtime/store/disk";
 import { createWorkingStore, type WorkingStore, type WorkingStoreDeps } from "../../../src/runtime/store/index";
 
@@ -40,6 +47,9 @@ export class Clock {
   }
 }
 
+/** What the made-up mirror refuses a call with for good: by a rule of its own, which asking again doesn't change. */
+export class Refused extends Error {}
+
 /** The extension's storage, made up: documents kept as JSON text and blobs with the time each was last written, as Spindle's storage keeps them. */
 export class Mirror {
   readonly docs = new Map<string, string>();
@@ -54,6 +64,8 @@ export class Mirror {
   down: string | null = null;
   /** While set, every call waits on it first. */
   hold: ((what: string) => Promise<void>) | null = null;
+  /** The words it refuses a call with for good (`Refused`), where this gives any. */
+  refuses: (what: string) => string | null = () => null;
 
   constructor(private readonly clock: Clock) {}
 
@@ -62,6 +74,8 @@ export class Mirror {
     if (this.down !== null) throw new Error(this.down);
     await this.hold?.(what);
     if (this.down !== null) throw new Error(this.down);
+    const rule = this.refuses(what);
+    if (rule !== null) throw new Refused(rule);
   }
 
   /** A document as it holds it, read; null when it holds none. */
@@ -161,11 +175,13 @@ export interface Bench {
   logs: { level: LogLevel; message: string }[];
   /** Ids given so far: each id is new, as a random one is. */
   ids: number;
+  /** The extension's part that decides who holds the mirror, for the runtimes `linked` to it. */
+  arbiter: Arbiter;
 }
 
 export async function bench(): Promise<Bench> {
   const clock = new Clock();
-  return { dir: await mkdtemp(join(tmpdir(), "lumiah-store-")), clock, mirror: new Mirror(clock), logs: [], ids: 0 };
+  return { dir: await mkdtemp(join(tmpdir(), "lumiah-store-")), clock, mirror: new Mirror(clock), logs: [], ids: 0, arbiter: new Arbiter(clock) };
 }
 
 export async function cleanUp(b: Bench): Promise<void> {
@@ -174,20 +190,159 @@ export async function cleanUp(b: Bench): Promise<void> {
 
 export const IDENTITY = { lumiverse: "http://127.0.0.1:7860", user: "reader", extension: "lumiah" };
 
-/** A working store on the bench: its mirror, its clock, its folder; `over` changes any of it. */
-export function open(b: Bench, over: Partial<WorkingStoreDeps> = {}): WorkingStore {
-  return createWorkingStore({
+/** The word that gives a store the mirror. */
+export const GIVEN: MirrorWord = { held: true, holder: null, gen: 0 };
+
+/** The count of changes the mirror's mark says it took; null when it has no mark that says one. */
+export function markCount(b: Bench): number | null {
+  const mark = b.mirror.doc("mirror.json");
+  return isRecord(mark) && typeof mark.count === "number" ? mark.count : null;
+}
+
+/** The registration the arbiter keeps as the mirror's holder; null when none holds it. */
+export function holderRelay(b: Bench): string | null {
+  const kept: unknown = JSON.parse(b.arbiter.files.get(`${IDENTITY.user}/mirror-holder.json`) ?? "null");
+  return isRecord(kept) && isRecord(kept.holder) && typeof kept.holder.relay === "string" ? kept.holder.relay : null;
+}
+
+/** A working store on the bench: its mirror, its clock, its folder; `over` changes any of it. Given the mirror at once (`word`: another word, or none: it waits for one). */
+export function open(b: Bench, over: Partial<WorkingStoreDeps> & { word?: MirrorWord | null | "none" } = {}): WorkingStore {
+  const { word = GIVEN, ...deps } = over;
+  const ports = { store: b.mirror.store, blobs: b.mirror.blobs };
+  const s = createWorkingStore({
     dir: b.dir,
     identity: IDENTITY,
-    remote: { store: b.mirror.store, blobs: b.mirror.blobs },
+    remote: ports,
+    direct: ports,
+    holding: (b.ids++).toString(16).padStart(32, "0"),
     owner: "runtime one",
     now: b.clock.now,
     later: b.clock.later,
     id: () => (b.ids++).toString(16).padStart(32, "0"),
     log: (level, message) => void b.logs.push({ level, message }),
     chatDocuments,
-    ...over,
+    ...deps,
   });
+  if (word !== "none") s.heard(word);
+  return s;
+}
+
+/** A refusal as the extension's link sends it, as the runtime's link hands it on: the cause carries the code. */
+function refusedOverLink(error: unknown): unknown {
+  return error instanceof LinkRefused ? new Error(error.message, { cause: error }) : error;
+}
+
+/** Whether the extension refused a working copy's write because its runtime doesn't hold the mirror (host.ts `withdrawn`, over the bench's link). */
+export function withdrawnHere(error: unknown): boolean {
+  const cause: unknown = error instanceof Error ? error.cause : undefined;
+  return cause instanceof LinkRefused && cause.code === "conflict";
+}
+
+/**
+ * The extension's part that decides who holds each user's mirror (backend/mirror.ts, the real one),
+ * over the bench's clock, its own files kept in memory as the user's storage keeps the backend's. A
+ * runtime's hello goes to it, and its words and pushes to the runtime's store; while a session is
+ * down nothing reaches it. `restart` starts it anew, as Lumiverse starts the extension's worker again:
+ * its files stay, what it held in memory goes.
+ */
+export class Arbiter {
+  readonly files = new Map<string, string>();
+  quietMs = 120_000;
+  mirrors: Mirrors;
+  /** Each linked runtime's store, by the session it speaks on now. */
+  readonly sessions = new Map<string, WorkingStore>();
+
+  constructor(private readonly clock: Clock) {
+    this.mirrors = this.made();
+  }
+
+  restart(): void {
+    this.mirrors = this.made();
+  }
+
+  private made(): Mirrors {
+    const { files, clock } = this;
+    const storage = {
+      read: async (path: string, userId: string) => files.get(`${userId}/${path}`) ?? null,
+      write: async (path: string, text: string, userId: string) => void files.set(`${userId}/${path}`, text),
+      remove: async (path: string, userId: string) => void files.delete(`${userId}/${path}`),
+      stat: async (path: string, userId: string) => (files.has(`${userId}/${path}`) ? { bytes: files.get(`${userId}/${path}`)?.length ?? 0, writtenAt: clock.now() } : null),
+      list: async (dir: string, userId: string) => [...files.keys()].filter((key) => key.startsWith(`${userId}/${dir}/`)).map((key) => key.slice(`${userId}/${dir}/`.length)),
+    };
+    return new Mirrors(
+      { storage, log: () => undefined },
+      {
+        now: clock.now,
+        quietMs: async () => this.quietMs,
+        send: (push, _userId, session) => {
+          if (push.type === "mirror") this.sessions.get(session)?.heard(mirrorWordOf(push));
+        },
+        name: "LumiAH",
+      },
+    );
+  }
+}
+
+/** A runtime of the bench's user, linked: its store, its registration, the session it speaks on now; it says hello again on a new session (`hello`), and its link can go down (`drop`). */
+export interface Linked {
+  store: WorkingStore;
+  relay: string;
+  session: string;
+  hello(): Promise<MirrorWord>;
+  /** Its link goes down: the extension hears its session close, nothing reaches it, and what it sends fails, until its next hello. */
+  drop(): void;
+}
+
+/**
+ * A runtime started on the bench, linked to the arbiter as the real link links one: its store's
+ * writes to the mirror go through the arbiter (those of its copy named by its holding), and it says
+ * hello once its store can say what its copy is. `relay`: its registration (another runtime of the
+ * user's has its own; the same one started again, on its folder or another, has the same).
+ */
+export async function linked(b: Bench, relay: string, over: Partial<WorkingStoreDeps> = {}): Promise<Linked> {
+  const { arbiter } = b;
+  const holding = (b.ids++).toString(16).padStart(32, "0");
+  let session = `session-${b.ids++}`;
+  let down = false;
+  const caller = (): Caller => ({ userId: IDENTITY.user, relay: { id: relay, name: relay, secret: "", build: "", host: "", listen: "127.0.0.1", port: 1, registeredAt: 0, report: null }, session });
+  const through = (mark: string | undefined): { store: Required<StorePort>; blobs: Required<BlobsPort> } => {
+    const write = <T>(changed: { docs: string[]; blobs: string[] }, apply: () => Promise<T>): Promise<T> => {
+      if (down) return Promise.reject(new Error("the extension isn't linked"));
+      let out: T | undefined;
+      return arbiter.mirrors
+        .write(caller(), mark, changed, async () => {
+          out = await apply();
+        })
+        .then(() => out as T, (error: unknown) => Promise.reject(refusedOverLink(error)));
+    };
+    return {
+      store: { ...b.mirror.store, read: (path) => (down ? Promise.reject(new Error("the extension isn't linked")) : b.mirror.store.read(path)), list: (prefix) => (down ? Promise.reject(new Error("the extension isn't linked")) : b.mirror.store.list(prefix)), write: (path, value) => write({ docs: [path], blobs: [] }, () => b.mirror.store.write(path, value)), remove: (path) => write({ docs: [path], blobs: [] }, () => b.mirror.store.remove(path)) },
+      blobs: { ...b.mirror.blobs, get: (hash) => (down ? Promise.reject(new Error("the extension isn't linked")) : b.mirror.blobs.get(hash)), put: (hash, text) => write({ docs: [], blobs: [] }, () => b.mirror.blobs.put(hash, text)), remove: (hashes) => write({ docs: [], blobs: [...hashes] }, () => b.mirror.blobs.remove(hashes)) },
+    };
+  };
+  const store = open(b, { word: "none", holding, remote: through(holding), direct: through(undefined), withdrawn: withdrawnHere, release: async () => void (await arbiter.mirrors.release(caller(), holding)), ...over });
+  const runtime: Linked = {
+    store,
+    relay,
+    get session() {
+      return session;
+    },
+    async hello() {
+      down = false;
+      arbiter.sessions.set(session, store);
+      const word = await arbiter.mirrors.hello(caller(), await store.ask(), null);
+      store.heard(word);
+      return word;
+    },
+    drop() {
+      down = true;
+      arbiter.sessions.delete(session);
+      arbiter.mirrors.sessionClosed(session);
+      session = `session-${b.ids++}`;
+    },
+  };
+  await runtime.hello();
+  return runtime;
 }
 
 /** How a call ended, as it ends: "done", or its error's words. */
@@ -266,6 +421,8 @@ export class Cut {
   /** Resolves when the process dies. */
   readonly died = this.death.promise;
   dead = false;
+  /** While false, changes are made and not counted: a run sets itself up first, and the steps it is cut in count from there. */
+  armed = true;
 
   constructor(private readonly at: number) {}
 
@@ -276,6 +433,7 @@ export class Cut {
 
   /** A change about to be made: the one the process dies at waits for good, as does every call after. */
   async change(): Promise<void> {
+    if (!this.armed) return;
     if (!this.dead && this.made >= this.at) {
       this.dead = true;
       this.death.resolve();
@@ -329,6 +487,10 @@ export function cutDisk(cut: Cut): Disk {
     async mkdir(path) {
       await cut.change();
       await disk.mkdir(path);
+    },
+    async removeEmpty(path) {
+      await cut.change();
+      return disk.removeEmpty(path);
     },
   };
 }

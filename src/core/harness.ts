@@ -18,7 +18,7 @@ import { type GuidanceId, type GuidanceRead, guidanceGuard, readGuidance } from 
 import { jobEnded } from "./job-words";
 import { Jobs } from "./jobs";
 import { DOC, docKey, ROOT_AREA } from "./paths";
-import type { FileAuthor, FileChange, JobAllowance, JobView, JobWhen, JsonObject, ReplySink, TurnRecord, TurnRequest, TurnResult, WorkspaceArea } from "./ports";
+import type { FileAuthor, FileChange, JobAllowance, JobView, JobWhen, JsonObject, ReplySink, StorePort, TurnRecord, TurnRequest, TurnResult, WorkspaceArea } from "./ports";
 import { isRecord } from "./ports";
 import { AgentAccounts } from "./provider";
 import { chronicleRefusal, RECALL_SKILLS, recallAgents } from "./recall/definitions";
@@ -53,6 +53,25 @@ export type ApprovalRow = KeptApproval & { chatId: string };
  * Read here only to forget a chat's.
  */
 const VECTORS = "recall/vectors/";
+
+/**
+ * The documents that are a chat's, as forgetting it removes them (its jobs' own aside, which the
+ * jobs name): every document under the chat's folder, and its search vectors in every embedding
+ * space. Read through a store that lists; one that can't gives those of the chat's documents its id
+ * names that exist (what its turns kept under their own ids, and its vectors, can't be found so).
+ * The rule the runtime's store forgets a chat by too, over its own copy and over the extension's.
+ */
+export async function chatDocuments(store: Pick<StorePort, "list" | "read">, chatId: string): Promise<Set<string>> {
+  const paths = new Set<string>();
+  if (store.list) {
+    for (const path of await store.list(chatFolder(chatId))) paths.add(path);
+    const owner = `/chat/${docKey(chatId)}/`;
+    for (const path of await store.list(VECTORS)) if (path.includes(owner)) paths.add(path);
+    return paths;
+  }
+  for (const path of [DOC.learned(chatId), DOC.chatArea(chatId, ROOT_AREA), DOC.approvals(chatId), DOC.session(chatId), DOC.chatJobs(chatId)]) if ((await store.read(path)) !== null) paths.add(path);
+  return paths;
+}
 
 /**
  * A file an agent keeps through a tool that runs outside the core (`workspace.writeAs`): the chat
@@ -546,18 +565,9 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
 
         // Nothing of the chat is answered from memory or written back once its documents are gone.
         shared.areas.forget(chatId);
-        const folder = chatFolder(chatId);
-        const paths = new Set<string>();
+        const paths = await chatDocuments(store, chatId);
         for (const id of jobs) paths.add(DOC.job(id));
-        if (store.list) {
-          for (const path of await store.list(folder)) paths.add(path);
-          const owner = `/chat/${docKey(chatId)}/`;
-          for (const path of await store.list(VECTORS)) if (path.includes(owner)) paths.add(path);
-        } else {
-          // A store that can't list gives up the documents a chat's id names; the heads its turns left under their own ids and its vectors can't be found there.
-          for (const path of [DOC.learned(chatId), DOC.chatArea(chatId, ROOT_AREA), DOC.approvals(chatId), DOC.session(chatId), DOC.chatJobs(chatId)]) if ((await store.read(path)) !== null) paths.add(path);
-          host.log("warn", `[LumiAH] this runtime can't list its documents, so forgetting chat ${chatId} left what its turns kept under their own ids and its search vectors`);
-        }
+        if (!store.list) host.log("warn", `[LumiAH] this runtime can't list its documents, so forgetting chat ${chatId} left what its turns kept under their own ids and its search vectors`);
         for (const path of paths) await store.remove(path);
         return { documents: paths.size + about.length, jobs: jobs.size, sides: about.length };
       },

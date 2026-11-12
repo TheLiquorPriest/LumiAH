@@ -6,7 +6,7 @@
 // is each place where its mapper fails on a row: Lumiverse can't send such a row over HTTP either, so it
 // isn't read from the file (`Unreadable`).
 
-import type { HostBookRecord, HostChat } from "../../extension/backend/spindle";
+import type { HostBookRecord, HostChat } from "../../host/rows";
 import { bookOf, chatOf, entryOf, messageOf } from "../copy/rows";
 import type { SourceEntry, SourceMessage } from "../copy/source";
 

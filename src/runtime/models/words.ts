@@ -5,8 +5,9 @@
 // (429): {json}" and "Mistral API error (429): body", or Google's JSON alone with its code inside.
 // Each is read back to a status and the provider's message.
 //
-// And what keeps a secret out of every word that leaves the layer: a key or a token the runtime
-// holds, wherever it shows up in a provider's text (some echo a key they refused), is taken out.
+// And what keeps a secret out of every word that leaves the layer: a key, a token or a header's
+// value the runtime holds, wherever it shows up in a provider's text (some echo a key they
+// refused), is taken out, and no text that leaves is longer than a page or a log line has use for.
 
 import { isRecord } from "../../core/ports";
 
@@ -65,16 +66,59 @@ export function failureWords(text: string): string {
   return status !== undefined ? `${status}: ${words}` : words;
 }
 
+/** What Bun's fetch says when it meets a redirect it was told not to follow. */
+export const REDIRECT_REFUSED = /\bUnexpectedRedirect\b/;
+/** The words for it: the runtime follows no redirect, since a call's key and headers would go with it to an address nobody gave them for. */
+export const REDIRECT_WORDS = "the server answered with a redirect to another address, which the runtime doesn't follow, so that the connection's key and headers never go with it: give the connection the address it moved to.";
+
 /** The shortest secret worth looking for: shorter ones would match ordinary words. */
 const SECRET_FLOOR = 8;
+/** What stands where a secret was. */
+const HIDDEN = "[secret]";
+/** Where pi-ai cut a long error body short ("… [truncated 120 chars]"): a secret the cut went through leaves its first characters just before it. */
+const CUT_MARK = "... [truncated ";
+/** The most characters of words that leave the layer: a server's error body can be any length, and a page or a log line has no use for more. */
+export const WORDS_MAX = 2000;
 
-/** Text with every secret named taken out of it, wherever it stands. */
+/**
+ * Text fit to leave the layer: every secret named taken out, wherever it stands, and the text cut
+ * to `WORDS_MAX` characters after that, so no cut ever leaves part of a secret behind.
+ */
 export function redact(text: string, secrets: Iterable<string>): string {
+  // Longest first: a secret that holds a shorter one is taken out whole, never left half shown around it.
+  const wanted = [...new Set(secrets)].filter((s) => s.length >= SECRET_FLOOR).sort((a, b) => b.length - a.length);
   let out = text;
-  for (const secret of secrets) {
-    if (secret.length >= SECRET_FLOOR && out.includes(secret)) out = out.split(secret).join("[secret]");
+  for (const secret of wanted) if (out.includes(secret)) out = out.split(secret).join(HIDDEN);
+  out = withoutCutSecrets(out, wanted);
+  return out.length > WORDS_MAX ? `${out.slice(0, WORDS_MAX)}…` : out;
+}
+
+/** Takes out the first characters of a secret where a text was cut short through it: before pi-ai's mark of a cut, or at the text's very end. */
+function withoutCutSecrets(text: string, secrets: readonly string[]): string {
+  const cuts: number[] = [];
+  for (let at = text.indexOf(CUT_MARK); at !== -1; at = text.indexOf(CUT_MARK, at + 1)) cuts.push(at);
+  cuts.push(text.length);
+  let out = text;
+  // From the last cut back, so that where the earlier ones stand still holds.
+  for (const end of cuts.reverse()) {
+    for (const secret of secrets) {
+      const head = secret.slice(0, SECRET_FLOOR);
+      let from = out.indexOf(head, Math.max(0, end - secret.length + 1));
+      while (from !== -1 && from <= end - SECRET_FLOOR && !secret.startsWith(out.slice(from, end))) from = out.indexOf(head, from + 1);
+      if (from !== -1 && from <= end - SECRET_FLOOR) {
+        out = `${out.slice(0, from)}${HIDDEN}${out.slice(end)}`;
+        break;
+      }
+    }
   }
   return out;
+}
+
+/** A wait in words: "5 minutes", "a minute", "90 seconds". */
+export function durationWords(ms: number): string {
+  const seconds = Math.max(1, Math.round(ms / 1000));
+  if (seconds % 60 === 0) return seconds === 60 ? "a minute" : `${seconds / 60} minutes`;
+  return seconds === 1 ? "a second" : `${seconds} seconds`;
 }
 
 /** An error's text: its message, or what it is. */

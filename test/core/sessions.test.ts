@@ -346,6 +346,30 @@ describe("compaction and rollback", () => {
     expect(text).toContain("The user rolled back a summary of your notes: the turns it had replaced are back as their own receipts.");
   });
 
+  test("a rollback is told once, to the first turn after it: the turns after go on reading past it, and aren't told it again", async () => {
+    const r = await compacted();
+    const reply = r.host.last(CHAT);
+    await rollback(r.host, CHAT, reply.id, reply.swipeId);
+    const summary = r.fourth.result.record?.summary ?? "";
+    const told = "The user rolled back a summary of your notes: the turns it had replaced are back as their own receipts.";
+    // Time passes between the rollback and the turns after it, as it does for a user.
+    r.host.clock.advance(1000);
+    await r.exchange("I listen.");
+    expect(lastSession(r.host)).toMatchObject({ turns: 4, summary: false, rolledBack: { summary } });
+    expect(carried(r.host)).toContain(told);
+    for (const said of ["I listen longer.", "I go home."]) {
+      r.host.clock.advance(1000);
+      await r.exchange(said);
+      // Still read past: the turns the summary replaced are carried whole, as the rollback asked, and nothing more is said of it.
+      expect(lastSession(r.host)?.summary).toBe(false);
+      expect(lastSession(r.host)?.rolledBack).toBeUndefined();
+      const text = carried(r.host);
+      expect(text).not.toContain(told);
+      expect(text).toContain(`"brief":"brief 1"`);
+      expect(text).not.toContain("Okoro keeps the lighthouse.");
+    }
+  });
+
   test("a rollback holds: with Summarize past as it was, the next turns don't summarize again, and the thinking block says why", async () => {
     const r = await compacted();
     const reply = r.host.last(CHAT);
@@ -420,7 +444,9 @@ describe("compaction and rollback", () => {
       const next = await r.exchange("I listen.");
       expect(summarized(r.host)).toBe(1);
       expect(next.result.record?.summary).toBeUndefined();
-      expect(lastSession(r.host)).toMatchObject({ turns: 4, summary: false, rolledBack: { summary } });
+      // It still reads past the summary, and isn't told of the rollback again: the turn that answered the reply again was.
+      expect(lastSession(r.host)).toMatchObject({ turns: 4, summary: false });
+      expect(lastSession(r.host)?.rolledBack).toBeUndefined();
       expect(carried(r.host)).not.toContain("Okoro keeps the lighthouse.");
     });
   }

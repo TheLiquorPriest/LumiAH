@@ -6,7 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { resolve } from "node:path";
 
 const ROOT = resolve(import.meta.dir, "../..");
-const SOURCES = ["examples/mcp-tide-table/tide-table.js", "examples/dice-tools/src/dice.ts", "examples/dice-tools/src/backend.ts", "examples/dice-tools/src/frontend.ts", "examples/dice-tools/spindle.json", "examples/dice-tools/package.json"];
+const SOURCES = ["examples/mcp-tide-table/tide-table.js", "examples/dice-tools/src/dice.ts", "examples/dice-tools/src/backend.ts", "examples/dice-tools/src/frontend.ts", "examples/dice-tools/build.ts", "examples/dice-tools/spindle.json", "examples/dice-tools/package.json"];
 
 /** A text's lines without their indentation, blank lines left out. */
 const linesOf = (text: string): string[] =>

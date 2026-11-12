@@ -183,7 +183,10 @@ function needsOf(state: UiState, active: string | null): Need[] {
   if (trouble !== null) needs.push({ key: "runtime", kind: "runtime", icon: "link", tone: "warn", text: trouble, todo: null, action: { do: "go", label: "Open Runtime", target: { page: "runtime" } }, notice: null });
   const optional = optionalPermissions(state);
   if (needed.length === 0 && optional.length > 0) {
-    needs.push({ key: "optional", kind: "optional", icon: "shield", tone: "warn", text: `A part of LumiAH is off: it isn't allowed to ${optional.map((p) => p.what).join("; or to ")}.`, todo: optional[0]?.todo ?? null, action: { do: "grant", label: optional.length === 1 ? "Allow it" : "Allow them", permissions: optional.map((p) => p.id) }, notice: null });
+    const one = optional.length === 1;
+    // What is off, then what allowing it gives (each permission's purpose follows the asking, never the lack), then that the rest works without it.
+    const text = `${one ? "A part of LumiAH is off" : "Parts of LumiAH are off"}: ${optional.map((p) => p.without).join("; ")}. Allowing ${one ? "it" : "them"} lets LumiAH ${optional.map((p) => p.what).join("; and ")}. Everything else works without ${one ? "it" : "them"}.`;
+    needs.push({ key: "optional", kind: "optional", icon: "shield", tone: "warn", text, todo: optional[0]?.todo ?? null, action: { do: "grant", label: one ? "Allow it" : "Allow them", permissions: optional.map((p) => p.id) }, notice: null });
   }
   return needs;
 }

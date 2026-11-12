@@ -29,7 +29,7 @@ import type { ChatClaim, ClaimAsk } from "../../core/extension";
 import type { ChatInfo, JsonValue } from "../../core/ports";
 import { type StorySetting, storyHolds, storyWordOf } from "../../core/story";
 import { isRecord } from "../../link/json";
-import type { ChatStoryView, ChatView } from "../../shared/ui";
+import type { ChatLeadView, ChatStoryView, ChatView } from "../../shared/ui";
 import type { Chats } from "./chat";
 import type { ChatConnection, Connections } from "./connections";
 import { UserDocs } from "./docs";
@@ -82,8 +82,8 @@ function storedOf(raw: unknown): Stored | null {
 export interface SwitchDeps {
   chats: Chats;
   connections: Connections;
-  /** Whether the runtime a chat's replies reach (the one behind the loopback connection the chat generates on) is linked now. */
-  runtimeLinked(userId: string, chatId: string): Promise<boolean>;
+  /** The runtime a chat's replies reach (the one behind the loopback connection the chat generates on), by its relay id and name; null while it isn't linked. */
+  runtimeOf(userId: string, chatId: string): Promise<{ id: string; name: string } | null>;
   /** Why LumiAH can answer no chat now, in words that say what to do (a permission it needs is missing); null when it can. */
   blocked(): string | null;
   /** Who this backend is: its identifier keys its mark on a chat, and its name is what another backend's pages call it. */
@@ -91,8 +91,8 @@ export interface SwitchDeps {
   now(): number;
   /** The user's own setting of what counts as the story (Settings), which a chat's choice stands over. */
   storySetting(userId: string): Promise<StorySetting>;
-  /** What the extension that answers this backend's chats says of a chat: its claim, with its name. Null where it claims nothing or gave no answer. Absent where it supplies no claims. */
-  claim?(ask: ClaimAsk, userId: string): Promise<{ by: string; claim: ChatClaim } | null>;
+  /** What the extension that answers this backend's chats says of a chat: its claim, with its name. Null where it claims nothing; `failed`, with why, where it gave no answer. Absent where it supplies no claims. */
+  claim?(ask: ClaimAsk, userId: string): Promise<{ by: string; claim: ChatClaim } | { by: string; failed: string } | null>;
 }
 
 export class ChatSwitch {
@@ -158,30 +158,10 @@ export class ChatSwitch {
     // On only while the pin it made still stands: a chat pinned elsewhere since is answered by that connection, whatever was asked here. And never while the chat is another backend's.
     const pinned = connection?.loopback === true && chat.metadata[PIN] === connection.id;
     const on = other === null && switched !== undefined && pinned;
-    // Its runtime isn't linked now: nothing answers its replies there, and nothing here does in its place.
-    const away = on && !(await this.deps.runtimeLinked(userId, chat.id));
-    return { chatId: chat.id, name: chat.name === "" ? null : chat.name, on, since: on ? switched.since : null, connection: connection === null ? null : { id: connection.id, name: connection.name, loopback: connection.loopback }, ...(other !== null ? { other } : {}), ...(away ? { away: true as const } : {}) };
-  }
-
-  /**
-   * The connection an agent with none of its own runs on in a run of this chat (§25): the one the
-   * chat was on before it was pinned to the loopback (`chat`), while it is there; else the
-   * connection the user has selected in Lumiverse now (`selected`), which a chat that pinned none
-   * ran on; else Lumiverse's default connection (`default`). Never a loopback. Null: none of these,
-   * and the agent can't run.
-   */
-  async agentConnection(userId: string, chatId: string): Promise<{ id: string; from: "chat" | "selected" | "default" } | null> {
-    const tries: [string | null, "chat" | "selected" | "default"][] = [];
-    const prior = (await this.docs.get(userId)).on[chatId]?.prior ?? null;
-    if (prior !== null) tries.push([prior, "chat"]);
-    const selected = await this.deps.connections.selectedId(userId);
-    if (selected !== null) tries.push([selected, "selected"]);
-    tries.push([null, "default"]);
-    for (const [id, from] of tries) {
-      const found = await this.deps.connections.resolve(userId, id);
-      if (found !== null && !found.loopback) return { id: found.connection.id, from };
-    }
-    return null;
+    // The runtime that plays it, while it is linked; one that isn't: nothing answers its replies there, and nothing here does in its place.
+    const runtime = on ? await this.deps.runtimeOf(userId, chat.id) : null;
+    const away = on && runtime === null;
+    return { chatId: chat.id, name: chat.name === "" ? null : chat.name, on, since: on ? switched.since : null, connection: connection === null ? null : { id: connection.id, name: connection.name, loopback: connection.loopback }, ...(other !== null ? { other } : {}), ...(runtime !== null ? { runtime } : {}), ...(away ? { away: true as const } : {}) };
   }
 
   /** `lah.chat.get`: a chat as the pages show it. */
@@ -219,11 +199,32 @@ export class ChatSwitch {
     const ask = await this.claimAsk(userId, chatId, setting);
     if (ask === null) throw new LinkRefused("not_found", "There is no such chat in this account.");
     const chosen = ask.chat.story ?? {};
-    const said = this.deps.claim === undefined ? null : await this.deps.claim(ask, userId);
+    const answered = this.deps.claim === undefined ? null : await this.deps.claim(ask, userId);
+    // A claim that gave no answer says nothing of the story here: the log says so, and the chat's and the user's words stand.
+    const said = answered !== null && "claim" in answered ? answered : null;
     // What the page shows as the extension's word is what its claim says of the story: a claim that says nothing of it leaves the chat's and the user's to stand.
     const word = storyWordOf(said?.claim.story);
     const claimed = said !== null && Object.keys(word).length > 0 ? { by: said.by, story: word } : null;
     return { chatId, chosen, setting, claimed, sovereignHand: ask.sovereignHand, holds: storyHolds({ claim: claimed?.story ?? null, chat: chosen, user: setting, sovereignHand: ask.sovereignHand }) };
+  }
+
+  /**
+   * `lah.chat.lead.get`: who leads a chat's replies, as the extension that answers this backend's
+   * chats claims it: the agent its claim names (null: none, so LumiAH's main agent leads), and
+   * whether the reply is only what the agents release; or that it gave no answer, with why. Null
+   * where it doesn't claim the chat, or supplies no claims.
+   */
+  async lead(userId: string, chatId: string): Promise<ChatLeadView | null> {
+    await this.deps.chats.own(userId, chatId);
+    if (this.deps.claim === undefined) return null;
+    const ask = await this.claimAsk(userId, chatId);
+    if (ask === null) throw new LinkRefused("not_found", "There is no such chat in this account.");
+    const said = await this.deps.claim(ask, userId);
+    if (said === null) return null;
+    if ("failed" in said) return { by: said.by, unanswered: said.failed };
+    // The claim is the extension's answer: only a name it gives is an agent's.
+    const { mainAgent, reply } = said.claim as { mainAgent?: unknown; reply?: unknown };
+    return { by: said.by, lead: typeof mainAgent === "string" && mainAgent !== "" ? mainAgent : null, released: reply === "released" };
   }
 
   /** `lah.chat.story.set`: the chat's own choice, whole (each member left out follows Settings), kept while the chat is off too. */

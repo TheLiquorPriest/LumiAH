@@ -1,17 +1,19 @@
 // The only file of the backend that touches the `spindle` global (DESIGN §1). Everything else talks to
 // `BackendHost`, the interface it implements, so the tests run the whole backend against a fake.
 //
-// What crosses here is already in LumiAH's own shapes: a model call takes the core's `ModelRequest`
-// and gives its `ModelResult`; a chat's messages come with only this extension's own metadata; an
-// event comes decoded. Where the running Lumiverse differs from the published types, the difference
-// is read here and nowhere else.
+// What crosses here is already in LumiAH's own shapes: a chat's messages come with only this
+// extension's own metadata; an event comes decoded. The backend calls no model: the agents' calls go
+// from the runtime to each provider on the runtime's own connections. Where the running Lumiverse
+// differs from the published types, the difference is read here and nowhere else.
 
-import type { ChatGetMessagesOptionsDTO, GenerationReasoningOverrideDTO, GenerationRequestDTO, LlmMessageDTO, LlmMessagePartDTO, SpindleAPI, StreamChunkDTO, ToolSchemaDTO, WorldBookEntryDTO } from "lumiverse-spindle-types";
-import type { ChatRole, JsonObject, JsonValue, ModelDelta, ModelEffort, ModelMessage, ModelRequest, ModelResult, ModelThinkingBlock, ModelTool, ModelToolCall } from "../../core/ports";
+import type { ChatGetMessagesOptionsDTO, LlmMessageDTO, SpindleAPI, WorldBookEntryDTO } from "lumiverse-spindle-types";
+import type { ChatRole, JsonObject, JsonValue } from "../../core/ports";
 import type { DatabankDocument, EmbedderInfo, MemoryArc, MemoryEntity, MemoryEntityBrief, MemoryHit, MemoryRelation, WebResult } from "../../core/recall/ports";
-import type { PassedMessage, PassedTool } from "../../link/contract";
 import { EXTENSION_IDENTIFIER } from "../../link/contract";
 import { isRecord, toJson, toJsonObject } from "../../link/json";
+import type { ActivatedInfo, ChatReads, HostBook, HostBookEntry, HostBookRecord, HostChat, HostEntryRecord, HostMessage, LoreReads } from "../../host/rows";
+
+export type { ActivatedInfo, HostBook, HostBookEntry, HostBookRecord, HostChat, HostEntryRecord, HostMessage } from "../../host/rows";
 
 declare const spindle: SpindleAPI;
 
@@ -71,15 +73,6 @@ export interface PromptMessage {
   sourceIndex?: number;
 }
 
-/** A World Info entry Lumiverse activated for a prompt: which, of which book, and how it got there (a key matched, or a match by meaning with its score), where Lumiverse says. */
-export interface ActivatedInfo {
-  entryId: string;
-  bookId: string | null;
-  title: string;
-  how?: "key" | "vector";
-  score?: number;
-}
-
 export interface InterceptorInput {
   chatId: string;
   userId: string;
@@ -96,8 +89,6 @@ export interface InterceptorInput {
   messages: PromptMessage[];
   /** Ends when Lumiverse stops waiting for the interceptor: the generation was stopped, or the interceptor's time ran out. Absent on a Lumiverse that gives none. */
   signal?: AbortSignal;
-  /** When Lumiverse stops waiting for the interceptor, by this machine's clock, where its context says; absent: the manifest's `interceptorTimeoutMs` from the moment of the call. */
-  deadlineAt?: number;
 }
 
 /**
@@ -128,74 +119,6 @@ export interface HostConnection {
   metadata: JsonObject;
 }
 
-export interface HostChat {
-  id: string;
-  name: string;
-  characterId: string | null;
-  metadata: JsonObject;
-}
-
-/** A chat message with the swipe it shows and what LumiAH keeps on it. */
-export interface HostMessage {
-  id: string;
-  /** Its place in the chat, from 0. */
-  index: number;
-  role: ChatRole;
-  name: string;
-  swipeId: number;
-  /** How many swipes it has. */
-  swipes: number;
-  /** The text of the swipe it shows. */
-  content: string;
-  /** The user hid it from the prompt: Lumiverse's own mark on the message, which its prompt assembly passes over. False where Lumiverse doesn't say. */
-  hidden: boolean;
-  /** LumiAH's own entry in the message's extension metadata; null when it has none. */
-  own: JsonValue | null;
-  /** When it was sent, in milliseconds since 1970; null where Lumiverse has no time for it. */
-  at: number | null;
-}
-
-export interface HostBook {
-  id: string;
-  name: string;
-  description: string;
-}
-
-export interface HostBookEntry {
-  id: string;
-  bookId: string;
-  title: string;
-  keys: string[];
-  secondaryKeys: string[];
-  content: string;
-  enabled: boolean;
-  constant: boolean;
-}
-
-/** A world book as the lore and history tools read it (DESIGN §24): with what its makers keep on it, and when it last changed. */
-export interface HostBookRecord extends HostBook {
-  /** The book's own metadata: where an extension marks a book it made (LumiBooks marks a chat's book with the chat). */
-  metadata: JsonObject;
-  /** When the book or any entry of it last changed, in milliseconds since 1970, as Lumiverse stamps it: to the second. 0 where it has no stamp. */
-  updatedAt: number;
-}
-
-/** An entry with the state Lumiverse keeps on it beside its text, and what extensions keep on it. */
-export interface HostEntryRecord extends HostBookEntry {
-  /** Lumiverse may activate it by a vector match as well as by its keys. */
-  vectorized: boolean;
-  /** Its keys are regular expressions, not words. */
-  regex: boolean;
-  /** As whose message it goes into the prompt; null: as the preset's World Info marker has it. */
-  role: ChatRole | null;
-  /** Its order among the entries put in one place: the lower comes first. */
-  order: number;
-  /** When it last changed, in milliseconds since 1970; 0 where Lumiverse has no stamp. */
-  updatedAt: number;
-  /** What extensions keep on the entry, each under its own key. */
-  extensions: JsonObject;
-}
-
 /** A databank of the user's, as Lumiverse keeps it. */
 export interface HostDatabank {
   id: string;
@@ -220,14 +143,6 @@ export interface HostPresetBlock {
   marker: string | null;
 }
 
-/** A request passed through as it came: its messages and its tools, whole, and every parameter of its body. */
-export interface PassRequest {
-  connectionId: string | null;
-  messages: PassedMessage[];
-  tools: PassedTool[];
-  parameters: JsonObject;
-}
-
 /** An MCP server the user set up in Lumiverse, as much of it as an extension may see: where it connects to and its secrets never leave Lumiverse. */
 export interface HostMcpServer {
   id: string;
@@ -245,6 +160,13 @@ export interface HostMcpTool {
 }
 
 export type HostLogLevel = "info" | "warn" | "error";
+
+/** An answer Lumiverse's proxy brought back whole: its status, its headers (names in lower case) and its body as text. */
+export interface CorsReply {
+  status: number;
+  headers: Record<string, string>;
+  body: string;
+}
 
 /**
  * Lumiverse as the backend needs it. Every call names its user: the extension may be installed for
@@ -264,22 +186,29 @@ export interface BackendHost {
   granted(permission: string): boolean;
   /** A permission was granted or revoked while the extension runs. */
   onPermission(handler: (permission: string, granted: boolean) => void): void;
+  /**
+   * One HTTP request through Lumiverse's own proxy (`spindle.cors`, permission `cors_proxy`): how the
+   * asks reach the runtime's loopback server on their own road. Lumiverse waits 30 seconds for an
+   * answer, buffers it whole (25 MiB at most), adds its own User-Agent, follows redirects and refuses
+   * a path that ends in `.js`. Rejects in Lumiverse's words where it refuses or fails, and without
+   * the permission.
+   */
+  cors(url: string, init: { method: "POST"; headers: Record<string, string>; body: string }): Promise<CorsReply>;
   /** What this Lumiverse can do, by capability name (`spindle.host.capabilities`). */
   capability(name: string): boolean;
   /** Where this build runs from: Lumiverse's own Bun, and the directory its bundles are in; null where the worker can't say. */
   install: { bun: string | null; dir: string | null };
   /** The extension's identifier in Lumiverse (its `spindle.json`): LumiAH's own, or that of the extension LumiAH is built into. A runtime finds the extension by it. */
   identifier: string;
-  /**
-   * How long Lumiverse waits for this extension's interceptor before it sends the prompt on as it
-   * was, in milliseconds: the manifest's `interceptorTimeoutMs` as Lumiverse holds it (from one
-   * second to five minutes), else its own default, which the user may have changed.
-   */
-  interceptorMs: number;
-
+  /** A user's role in this Lumiverse (`spindle.users.getRole`): `operator` is the instance's owner. Anyone Lumiverse doesn't say of is a `user`. */
+  role(userId: string): Promise<"operator" | "admin" | "user">;
+  /** Lumiverse's database file, as this extension's own entry places it (`databaseOf`); null where it can't be told. */
+  database(): string | null;
   frontend: {
     /** To one page of the user's (a frontend session), or to all of them. A runtime is a session of its own. */
     send(message: unknown, userId: string, sessionId?: string): void;
+    /** To every page and runtime of every user the extension reaches: Lumiverse sends an operator's extension's message to all of them, a user's extension's to its installer's. Nothing in it may be anyone's own. */
+    everyone(message: unknown): void;
     onMessage(handler: (payload: unknown, userId: string, sessionId: string | undefined) => void): void;
     /** A page went away, or a message for it found no page. */
     onClosed(handler: (sessionId: string) => void): void;
@@ -298,6 +227,8 @@ export interface BackendHost {
     onChatForked(handler: (fork: { sourceChatId: string; chatId: string; userId: string | null }) => void): void;
     /** The connection the user has selected in Lumiverse (`connections.active`) changed, or may have. */
     onSelectedConnection(handler: (userId: string | null) => void): void;
+    /** Lumiverse's own events of these names, each with its payload untouched and the user it is of where Lumiverse says, in the order Lumiverse sent them: what the runtime's copy of chat and lore is told. */
+    onLumiverse(names: readonly string[], handler: (name: string, payload: unknown, userId: string | null) => void): void;
   };
 
   /**
@@ -307,21 +238,12 @@ export interface BackendHost {
    */
   registerInterceptor(handler: (input: InterceptorInput) => Promise<InterceptorVerdict>, options: { priority: number; types: readonly HostGenerationType[]; required: boolean }): void;
 
-  models: {
-    /** One model call through Lumiverse's generation API on the request's connection, streamed; rejects with the provider's or Lumiverse's own words. */
-    call(request: ModelRequest, userId: string, signal: AbortSignal, onDelta: (delta: ModelDelta) => void): Promise<ModelResult>;
-    /** A request passed through as it came. */
-    pass(request: PassRequest, userId: string, signal: AbortSignal, onDelta: (delta: ModelDelta) => void): Promise<ModelResult>;
-  };
-
   connections: {
     /** The user's connections as Lumiverse lists them: the one changed last first, and no more than its own page of them. */
     list(userId: string): Promise<HostConnection[]>;
     get(connectionId: string, userId: string): Promise<HostConnection | null>;
     /** The connection the user has selected in Lumiverse (their active profile), by id; null when they have selected none or the one selected is gone; undefined where this Lumiverse doesn't say (a page of the user's reads it there instead). */
     active(userId: string): Promise<string | null | undefined>;
-    /** The models a connection's provider lists; null where this Lumiverse can't ask. */
-    models(connectionId: string, userId: string): Promise<string[] | null>;
   };
 
   /** The user's own storage for this extension: text files by path. */
@@ -336,8 +258,8 @@ export interface BackendHost {
     list(dir: string, userId: string): Promise<string[]>;
   };
 
-  chats: {
-    get(chatId: string, userId: string): Promise<HostChat | null>;
+  /** The reads of a user's chats (host/rows.ts), and the writes only the extension makes. */
+  chats: ChatReads & {
     /**
      * Sets these keys of the chat's metadata, keeping the others; a null value takes its key away.
      * Where Lumiverse writes on condition (`chat-conditional-metadata-v1`, with `chat_mutation`),
@@ -345,43 +267,13 @@ export interface BackendHost {
      * if the metadata never holds still for it; elsewhere such a change is lost.
      */
     patchMetadata(chatId: string, patch: Record<string, JsonValue>, userId: string): Promise<void>;
-    /** The chat's messages in chat order: all of them, `count` from the `from`th, or the last `tail`. */
-    messages(chatId: string, range?: { from: number; count: number } | { tail: number }): Promise<HostMessage[]>;
-    /** The text of one swipe of a message, shown or not; null when there is no such message or swipe, or its text can't be read. */
-    swipe(chatId: string, messageId: string, swipe: number): Promise<string | null>;
     /** Writes LumiAH's own entry in a message's extension metadata, keeping every other extension's. */
     setOwn(chatId: string, messageId: string, value: JsonValue): Promise<void>;
     /** Deletes a message of a chat. */
     deleteMessage(chatId: string, messageId: string): Promise<void>;
-    /** The user's chats, `limit` of them from the `offset`th in an order that holds still, and how many they have in all. */
-    list(userId: string, offset: number, limit: number): Promise<{ chats: HostChat[]; total: number }>;
-    /** A character's name; null when there is no such character, or the permission to read characters isn't granted. */
-    characterName(characterId: string, userId: string): Promise<string | null>;
-    /**
-     * Whether Lumiverse's Sovereign Hand is on for the user in a chat (DESIGN §24.4): what a story
-     * that follows Lumiverse reads. Null where Lumiverse doesn't tell extensions.
-     */
-    sovereignHand(chatId: string, userId: string): Promise<boolean | null>;
   };
 
-  lore: {
-    /** A book of the user's; null when they have none such, or the permission to read world books isn't granted. */
-    book(bookId: string, userId: string): Promise<HostBook | null>;
-    /** A book's entries, in the book's order; none without that permission. */
-    entries(bookId: string, userId: string): Promise<HostBookEntry[]>;
-    /** One entry; null when there is none such, or without that permission. */
-    entry(entryId: string, userId: string): Promise<HostBookEntry | null>;
-    /** A book with what its makers keep on it and when it last changed; null as `book` is. */
-    record(bookId: string, userId: string): Promise<HostBookRecord | null>;
-    /** A book's entries, in the book's order, each with its state and what extensions keep on it; none as `entries` are. */
-    records(bookId: string, userId: string): Promise<HostEntryRecord[]>;
-    /** The books switched on for every chat; none without that permission. */
-    global(userId: string): Promise<string[]>;
-    /** The books attached to a character, and the one attached to a persona; none where the permission to read them isn't granted. */
-    ofCharacter(characterId: string, userId: string): Promise<string[]>;
-    /** The book attached to a persona (null: to the user's active persona); none where there is no such persona or the permission to read it isn't granted. */
-    ofPersona(personaId: string | null, userId: string): Promise<string | null>;
-  };
+  lore: LoreReads;
 
   presets: {
     /** The preset's blocks in order; null when there is no such preset, or the permission to read presets isn't granted. */
@@ -580,155 +472,6 @@ function memoryHitOf(raw: unknown): MemoryHit | null {
   return { source: raw.source === "consolidation" ? "arc" : "chunk", text: raw.content, score: num(raw, "finalScore") ?? 0, span, entities: strings(raw.entityNames) };
 }
 
-// ---------------------------------------------------------------- a model call as the host takes it
-
-/**
- * A call's effort as the host's per-request reasoning override: none for `inherit` (the connection's
- * reasoning binding, else the user's setting, stands), the off-switch for `off`, else that effort,
- * which the host maps to the provider's own field, with how the model's thinking shows when
- * `display` says (`summarized`: its text comes back).
- */
-export function reasoningOverride(effort: ModelEffort | undefined, display?: "summarized"): GenerationReasoningOverrideDTO | undefined {
-  if (effort === undefined || effort === "inherit") return undefined;
-  return effort === "off" ? { source: "off" } : { source: "custom", apiReasoning: true, effort, ...(display ? { thinkingDisplay: display } : {}) };
-}
-
-/**
- * A message as the host takes it (`LlmMessageDTO`): its text, or its parts with each breakpoint as
- * an ephemeral `cache_control`, and an assistant turn's reasoning carriers, sent back as the model
- * gave them. A message with no parts and no carriers goes as `{role, content}`.
- */
-export function messageDTO(m: ModelMessage): LlmMessageDTO {
-  const cache = (on: true | undefined) => (on ? { cache_control: { type: "ephemeral" } } : {});
-  const content =
-    m.parts?.map((p): LlmMessagePartDTO => {
-      if (p.type === "text") return { type: "text", text: p.text, ...cache(p.cache) };
-      if (p.type === "tool_use") return { type: "tool_use", id: p.id, name: p.name, input: p.input, ...(p.thoughtSignature !== undefined ? { thought_signature: p.thoughtSignature } : {}), ...cache(p.cache) };
-      if (p.type === "tool_result") return { type: "tool_result", tool_use_id: p.toolUseId, content: p.content, ...(p.isError ? { is_error: true } : {}), ...cache(p.cache) };
-      return { type: p.media, data: p.data, mime_type: p.mimeType, ...cache(p.cache) };
-    }) ?? m.content;
-  return {
-    role: m.role,
-    content,
-    ...(m.reasoning !== undefined ? { reasoning_content: m.reasoning } : {}),
-    ...(m.thinkingBlocks ? { thinking_blocks: m.thinkingBlocks } : {}),
-    ...(m.reasoningDetails ? { reasoning_details: m.reasoningDetails } : {}),
-  };
-}
-
-/**
- * A tool as the host takes it (`ToolSchemaDTO`), its breakpoint as an ephemeral `cache_control`: the
- * host passes it on, and its Anthropic provider sends it on the tool; the published DTO doesn't name
- * the field.
- */
-export function toolDTO(t: ModelTool): ToolSchemaDTO {
-  return { name: t.name, description: t.description, parameters: t.parameters, ...(t.cache ? { cache_control: { type: "ephemeral" } } : {}) };
-}
-
-/**
- * A passed-through message as the host takes it (`LlmMessageDTO`): its text or its parts, its name,
- * its mark as a prefix the model continues (`partial`), its cache breakpoints as the request gave
- * them, and an assistant turn's reasoning. Each goes on only where the message has it, so a plain
- * message goes as `{role, content}`.
- */
-export function passedMessageDTO(m: PassedMessage): LlmMessageDTO {
-  const cache = (control: JsonObject | undefined) => (control !== undefined ? { cache_control: control } : {});
-  const content =
-    typeof m.content === "string"
-      ? m.content
-      : m.content.map((p): LlmMessagePartDTO => {
-          if (p.type === "text") return { type: "text", text: p.text, ...cache(p.cacheControl) };
-          if (p.type === "tool_use") return { type: "tool_use", id: p.id, name: p.name, input: p.input };
-          if (p.type === "tool_result") return { type: "tool_result", tool_use_id: p.toolUseId, content: p.content, ...cache(p.cacheControl) };
-          return { type: p.media, data: p.data, mime_type: p.mimeType, ...cache(p.cacheControl) };
-        });
-  return {
-    role: m.role,
-    content,
-    ...(m.name !== undefined ? { name: m.name } : {}),
-    ...(m.prefix ? { partial: true } : {}),
-    ...cache(m.cacheControl),
-    ...(m.reasoning !== undefined ? { reasoning_content: m.reasoning } : {}),
-    ...(m.reasoningDetails ? { reasoning_details: m.reasoningDetails } : {}),
-  };
-}
-
-/**
- * A passed-through request's tool as the host takes it (`ToolSchemaDTO`), with `strict` where the
- * request said it: the host hands a tool on as it came, and its OpenAI-compatible providers send
- * `strict` with the function; the published DTO doesn't name the field.
- */
-export function passedToolDTO(t: PassedTool): ToolSchemaDTO {
-  return { name: t.name, description: t.description, parameters: t.parameters, ...(t.strict !== undefined ? { strict: t.strict } : {}) };
-}
-
-function thinkingBlock(raw: unknown): ModelThinkingBlock | null {
-  const type = str(raw, "type");
-  if (type !== "thinking" && type !== "redacted_thinking") return null;
-  const thinking = str(raw, "thinking");
-  const signature = str(raw, "signature");
-  const data = str(raw, "data");
-  return { type, ...(thinking !== undefined ? { thinking } : {}), ...(signature !== undefined ? { signature } : {}), ...(data !== undefined ? { data } : {}) };
-}
-
-/** The host's whole answer (a stream's `done` chunk) as a model result: the usage as the provider gave it, untouched. */
-export function modelResult(raw: unknown): ModelResult {
-  // `tool_calls` (`ToolCallDTO[]`): a call without a name is dropped; arguments that aren't an object read as none.
-  const calls = isRecord(raw) && Array.isArray(raw.tool_calls) ? raw.tool_calls : [];
-  const toolCalls: ModelToolCall[] = calls.flatMap((c, i) => {
-    if (!isRecord(c) || typeof c.name !== "string") return [];
-    const signature = str(c, "thought_signature");
-    return [{ name: c.name, args: toJsonObject(c.args), callId: str(c, "call_id") ?? `call_${i}`, ...(signature !== undefined ? { thoughtSignature: signature } : {}) }];
-  });
-  const model = str(raw, "model");
-  const thought = str(raw, "reasoning");
-  const blocks = isRecord(raw) && Array.isArray(raw.thinking_blocks) ? raw.thinking_blocks.flatMap((b) => thinkingBlock(b) ?? []) : [];
-  const details = isRecord(raw) && Array.isArray(raw.reasoning_details) ? raw.reasoning_details.filter(isRecord).map(toJsonObject) : [];
-  return {
-    content: str(raw, "content") ?? "",
-    finishReason: str(raw, "finish_reason") ?? "",
-    ...(model ? { model } : {}),
-    ...(toolCalls.length > 0 ? { toolCalls } : {}),
-    ...(thought ? { reasoning: thought } : {}),
-    ...(blocks.length > 0 ? { thinkingBlocks: blocks } : {}),
-    ...(details.length > 0 ? { reasoningDetails: details } : {}),
-    ...(isRecord(raw) && isRecord(raw.usage) ? { usage: toJsonObject(raw.usage) } : {}),
-  };
-}
-
-/**
- * A streamed call's answer (`generate.quietStream`): its pieces as they come, then its end, `done`,
- * which holds the whole answer. The call's signal ends the wait at once, whether or not Lumiverse has
- * answered the cancel the stream sends it; the stream is let go of either way, which after a cancel
- * tells Lumiverse again.
- */
-async function streamedAnswer(stream: AsyncGenerator<StreamChunkDTO, void, void>, signal: AbortSignal, onDelta: (delta: ModelDelta) => void): Promise<unknown> {
-  type Step = IteratorResult<StreamChunkDTO, void>;
-  let wait: PromiseWithResolvers<Step> | null = null;
-  const abort = (): void => wait?.reject(new DOMException("Generation aborted", "AbortError"));
-  signal.addEventListener("abort", abort, { once: true });
-  try {
-    for (;;) {
-      wait = Promise.withResolvers<Step>();
-      if (signal.aborted) abort();
-      else stream.next().then(wait.resolve, wait.reject);
-      const step = await wait.promise;
-      if (step.done) throw new Error("The model's stream ended without its answer");
-      const chunk = step.value;
-      if (chunk.type === "done") return chunk;
-      if (chunk.token !== "") onDelta(chunk.type === "reasoning" ? { reasoning: chunk.token } : { content: chunk.token });
-    }
-  } finally {
-    signal.removeEventListener("abort", abort);
-    void stream.return(undefined).catch(() => undefined);
-  }
-}
-
-async function generate(input: GenerationRequestDTO, signal: AbortSignal, onDelta: (delta: ModelDelta) => void): Promise<ModelResult> {
-  // Always streamed on Lumiverse's side, so a long answer's connection is never idle and a gateway never cuts it.
-  return modelResult(await streamedAnswer(spindle.generate.quietStream(input), signal, onDelta));
-}
-
 // ---------------------------------------------------------------- the host
 
 /** Reads a file that may not be there: the read itself, and only once it fails, whether the file is there (the host fails a read of a missing one), so a missing file reads as none and any other failure stands. */
@@ -756,14 +499,21 @@ const MCP_PAGE = 100;
 const METADATA_TRIES = 4;
 
 /**
- * Lumiverse's own bounds on an interceptor's time and its default for a manifest that names none
- * (its `spindle-settings.service`): the host's, so none is a setting of LumiAH's.
+ * Lumiverse's database file, from the absolute path of an extension's backend entry: Lumiverse runs an
+ * extension's backend from `<data folder>/extensions/<identifier>/repo/…` (its `repoDir`) and keeps its
+ * database at `<data folder>/lumiverse.db` (`initDatabase`), with whichever separator the system's
+ * paths use. Null for an entry placed otherwise, or not absolute: no file is guessed at.
  */
-const INTERCEPTOR_MS = { min: 1_000, max: 300_000, unnamed: 10_000 } as const;
-
-/** The time Lumiverse gives this extension's interceptor: what the manifest asks for, held within Lumiverse's bounds; its default where the manifest asks for none. */
-export function interceptorTime(asked: unknown): number {
-  return typeof asked === "number" && Number.isFinite(asked) ? Math.min(INTERCEPTOR_MS.max, Math.max(INTERCEPTOR_MS.min, Math.floor(asked))) : INTERCEPTOR_MS.unnamed;
+export function databaseOf(entry: unknown, identifier: string): string | null {
+  if (typeof entry !== "string" || identifier === "") return null;
+  for (const sep of ["/", "\\"]) {
+    const at = entry.lastIndexOf(`${sep}extensions${sep}${identifier}${sep}repo${sep}`);
+    if (at <= 0) continue;
+    const data = entry.slice(0, at);
+    const absolute = sep === "/" ? data.startsWith("/") : /^(?:[A-Za-z]:|\\\\)/.test(data);
+    return absolute ? `${data}${sep}lumiverse.db` : null;
+  }
+  return null;
 }
 
 /**
@@ -816,14 +566,31 @@ export function createSpindleHost(identifier: string = EXTENSION_IDENTIFIER): Ba
     onPermission(handler) {
       spindle.permissions.onChanged((detail) => handler(detail.permission, detail.granted));
     },
+    async cors(url, init) {
+      const raw: unknown = await spindle.cors(url, { method: init.method, headers: init.headers, body: init.body });
+      if (!isRecord(raw) || typeof raw.status !== "number" || typeof raw.body !== "string") throw new Error("Lumiverse's proxy gave an answer that can't be read.");
+      const headers: Record<string, string> = {};
+      if (isRecord(raw.headers)) for (const [name, value] of Object.entries(raw.headers)) if (typeof value === "string") headers[name.toLowerCase()] = value;
+      return { status: raw.status, headers, body: raw.body };
+    },
     capability,
     install: { bun: typeof process.execPath === "string" && process.execPath.startsWith("/") ? process.execPath : null, dir },
     identifier,
-    interceptorMs: interceptorTime(spindle.manifest?.interceptorTimeoutMs),
+    async role(userId) {
+      // Newer than some hosts: one without it says nobody is the operator.
+      const users: unknown = spindle.users;
+      if (!isRecord(users) || typeof users.getRole !== "function") return "user";
+      const role = await spindle.users.getRole(userId);
+      return role === "operator" || role === "admin" ? role : "user";
+    },
+    database: () => databaseOf(isRecord(spindle.manifest) ? spindle.manifest.entry_backend : undefined, identifier),
 
     frontend: {
       send(message, userId, sessionId) {
         spindle.sendToFrontend(message, userId, sessionId !== undefined ? { frontendSessionId: sessionId } : undefined);
+      },
+      everyone(message) {
+        spindle.sendToFrontend(message);
       },
       onMessage(handler) {
         spindle.onFrontendMessage(handler);
@@ -905,6 +672,9 @@ export function createSpindleHost(identifier: string = EXTENSION_IDENTIFIER): Ba
           if (keys.includes("activeProfileId")) handler(userId ?? null);
         });
       },
+      onLumiverse(names, handler) {
+        for (const name of names) spindle.on(name, (payload: unknown, userId?: string) => handler(name, payload, userId ?? null));
+      },
     },
 
     registerInterceptor(handler, options) {
@@ -941,7 +711,6 @@ export function createSpindleHost(identifier: string = EXTENSION_IDENTIFIER): Ba
               messages: messages.map(promptMessageOf),
               // The worker's own signal for this call: Lumiverse ends it when the generation is stopped or the interceptor's time is up.
               ...(isRecord(ctx) && ctx.signal instanceof AbortSignal ? { signal: ctx.signal } : {}),
-              ...(num(ctx, "interceptorDeadlineAt") !== undefined ? { deadlineAt: num(ctx, "interceptorDeadlineAt") } : {}),
             });
             // Lumiverse takes parameters only from an extension granted this, and says so in its log each time it takes them off: without it they are left out here.
             const parameters = verdict.parameters !== undefined && spindle.permissions.has("generation_parameters") ? verdict.parameters : undefined;
@@ -973,49 +742,6 @@ export function createSpindleHost(identifier: string = EXTENSION_IDENTIFIER): Ba
       });
     },
 
-    models: {
-      call(request, userId, signal, onDelta) {
-        // The host merges these over the connection's preset parameters, so one left out stays the connection's own.
-        const parameters: Record<string, unknown> = { ...request.params, max_tokens: request.maxTokens };
-        // The host reads `parameters.model` as a per-request model override.
-        if (request.model) parameters.model = request.model;
-        // Only then does an OpenAI-compatible stream report usage; every provider drops the key itself.
-        if (request.usage) parameters._include_usage = true;
-        if (request.parallelToolCalls === false && request.tools !== undefined && request.tools.length > 0) parameters.parallel_tool_calls = false;
-        const reasoning = reasoningOverride(request.effort, request.thinkingDisplay);
-        return generate(
-          {
-            type: "quiet",
-            messages: request.messages.map(messageDTO),
-            parameters,
-            ...(request.connectionId ? { connection_id: request.connectionId } : {}),
-            ...(request.tools && request.tools.length > 0 ? { tools: request.tools.map(toolDTO) } : {}),
-            ...(reasoning ? { reasoning } : {}),
-            userId,
-            signal,
-          },
-          signal,
-          onDelta,
-        );
-      },
-      pass(request, userId, signal, onDelta) {
-        // Every parameter as the request's body gave it; only the usage is asked for beside them, so the answer can report it.
-        return generate(
-          {
-            type: "quiet",
-            messages: request.messages.map(passedMessageDTO),
-            parameters: { ...request.parameters, _include_usage: true },
-            ...(request.connectionId ? { connection_id: request.connectionId } : {}),
-            ...(request.tools.length > 0 ? { tools: request.tools.map(passedToolDTO) } : {}),
-            userId,
-            signal,
-          },
-          signal,
-          onDelta,
-        );
-      },
-    },
-
     connections: {
       async list(userId) {
         return (await spindle.connections.list(userId)).map((c) => ({ id: c.id, name: c.name, provider: c.provider, url: c.api_url, model: c.model, isDefault: c.is_default, metadata: toJsonObject(c.metadata) }));
@@ -1029,12 +755,6 @@ export function createSpindleHost(identifier: string = EXTENSION_IDENTIFIER): Ba
         const organization = spindle.connections.organization;
         if (organization === undefined) return undefined;
         return (await organization.get({ kind: "llm", userId })).connections.find((c) => c.active)?.id ?? null;
-      },
-      async models(connectionId, userId) {
-        // Older hosts can't list models.
-        const list = spindle.connections.getModels;
-        if (!list) return null;
-        return (await list.call(spindle.connections, connectionId, userId)).map((m) => m.id);
       },
     },
 

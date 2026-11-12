@@ -53,8 +53,8 @@ function lantern() {
 }
 
 let r: Rig | null = null;
-afterEach(() => {
-  r?.close();
+afterEach(async () => {
+  await r?.close();
   r = null;
 });
 

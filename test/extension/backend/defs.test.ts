@@ -31,8 +31,8 @@ function scripted(seen: { definitions: unknown[] }): NonNullable<Parameters<type
 }
 
 let open: Rig | null = null;
-afterEach(() => {
-  open?.close();
+afterEach(async () => {
+  await open?.close();
   open = null;
 });
 

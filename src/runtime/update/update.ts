@@ -21,6 +21,7 @@ import { isRecord } from "../../link/json";
 import { OpRefused } from "../../link/work";
 import type { RuntimeSetup, SavedConfig, SystemdService } from "../config";
 import { memoryRefusal } from "./memory";
+import type { Ran } from "./programs";
 import type { Successor } from "./restart";
 import { systemctlOf, unitText } from "./service";
 
@@ -35,7 +36,7 @@ export interface UpdateOffer {
 export interface UpdateFiles {
   /** The file's bytes; null when there is none. */
   read(path: string): Uint8Array | null;
-  /** Writes the file whole with `mode` and flushes it to the disk; a crash part way leaves it part written. */
+  /** Writes the file whole with `mode` and flushes it to the disk; a crash part way leaves it part written. The file is made anew: one already at `path` (a temporary one a crash left, or one someone else put there) is removed first and never written through. */
   write(path: string, bytes: Uint8Array, mode: number): void;
   /** The file's permission bits; null where it has none to give (Windows, or no such file). */
   mode(path: string): number | null;
@@ -69,8 +70,8 @@ export interface UpdateDeps {
   env: Readonly<Record<string, string | undefined>>;
   uid: number | null;
   files: UpdateFiles;
-  /** Runs a program (systemctl) and waits for it to end. */
-  run(command: string, args: readonly string[], env?: Readonly<Record<string, string>>): Promise<{ code: number; out: string; err: string }>;
+  /** Runs a program and waits for it to end, for at most `timeoutMs` when that is given (the program is then ended). */
+  run(command: string, args: readonly string[], env?: Readonly<Record<string, string>>, timeoutMs?: number): Promise<Ran>;
   /** Ends what the runtime serves as a stop does, then hands its process to its successor (`handOver`). */
   leave(next: Successor): void;
   /** Whether a turn or a job is under way. */
@@ -79,6 +80,10 @@ export interface UpdateDeps {
   log(text: string): void;
   /** The extension's name as words say it: LumiAH, or the extension LumiAH is built into. */
   name(): string;
+  /** This process was started by the runtime before it, which then left: where a process can't be replaced in place (Windows), a restart is a new process, which the task or service wrapper that ran the old one doesn't watch. */
+  handedOver: boolean;
+  /** Another copy of this runtime that waits to serve on its port while this one serves (one that a task or service wrapper started meanwhile): its process and since when; null when none does. */
+  waitingCopy(): { pid: number; since: number } | null;
 }
 
 /** What became of an offer: the runtime runs that build already, it waits to take it, it is taking it now; or why it won't. */
@@ -109,6 +114,10 @@ export interface UpdateView {
   /** Why the last update or change didn't take; and the line to run where the runtime can't do it itself. */
   problem: string | null;
   line: string | null;
+  /** This process was started by the one before it (`UpdateDeps.handedOver`). */
+  handedOver: boolean;
+  /** Another copy of this runtime that waits to serve on its port (`UpdateDeps.waitingCopy`). */
+  waitingCopy: { pid: number; since: number } | null;
 }
 
 /** What a change of the settings did: it holds already, it holds once the runtime restarts, or the runtime is restarting for it. */
@@ -134,17 +143,27 @@ const BUILD_ID = /^[A-Za-z0-9._-]{1,64}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 /** Longer than any path a system takes: an offer naming a longer one is no offer. */
 const PATH_MAX = 4096;
+/** What a path in a log line or on a page must not carry as it is: the control characters (C0, DEL, C1), which a terminal may take as commands, and the line and paragraph separators. An offer naming a path with one is no offer. */
+const UNSHOWN = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
+/** A path as words show it: each such character written as its escape, so nothing in a path can forge a log line or a page's words. */
+export function shown(path: string): string {
+  return path.replace(new RegExp(UNSHOWN.source, "g"), (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
 
 function offerOf(raw: unknown): UpdateOffer | null {
   if (!isRecord(raw)) return null;
   const { build, path, sha256 } = raw;
-  if (typeof build !== "string" || !BUILD_ID.test(build) || typeof path !== "string" || path === "" || path.length > PATH_MAX || typeof sha256 !== "string" || !SHA256.test(sha256)) return null;
+  if (typeof build !== "string" || !BUILD_ID.test(build) || typeof path !== "string" || path === "" || path.length > PATH_MAX || UNSHOWN.test(path) || typeof sha256 !== "string" || !SHA256.test(sha256)) return null;
   return { build, path, sha256 };
 }
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
+/** How long a new build is given to say its version before it is taken as one that can't start here. */
+const STARTS_MS = 30_000;
 
 export function createUpdate(deps: UpdateDeps): Update {
   // The build this process runs, by what its file held as it started: an offer of that build is no update, whatever the offer calls it.
@@ -189,96 +208,138 @@ export function createUpdate(deps: UpdateDeps): Update {
 
   /** The line that sets the runtime up again from the extension's file, as the Runtime page's update line does. */
   function upLine(config: SavedConfig, systemd: boolean): string {
-    return [deps.bun ?? "bun", config.source ?? deps.self, "up", "--name", config.name, ...(config.extension === EXTENSION_IDENTIFIER ? [] : ["--extension", config.extension]), ...(systemd ? ["--systemd"] : [])].map(shellWord).join(" ");
+    return [deps.bun ?? "bun", config.source ?? deps.self, "up", "--name", config.name, ...(config.extension === EXTENSION_IDENTIFIER ? [] : ["--extension", config.extension]), ...(systemd ? ["--systemd"] : [])].map((word) => shellWord(shown(word))).join(" ");
   }
 
-  /** The offered build's bytes, read from the file the runtime was set up from and checked against the offer; else why they can't be taken. */
+  /** The offered build's bytes, read from the file the runtime was set up from and checked against the offer; else why they can't be taken. Every path in its words is shown escaped. */
   function verified(o: UpdateOffer, config: SavedConfig): Uint8Array | { why: string } {
-    const name = deps.name();
+    const name = shown(deps.name());
     const again = `run the update line on ${name}'s Runtime page`;
     const source = config.source;
     if (source === null) return { why: `This runtime was set up before it could update itself. Run the update line on ${name}'s Runtime page once; from then on it updates by itself.` };
-    if (written(o.path) !== written(source)) return { why: `${name} offers the runtime at ${o.path}, and this runtime was set up from ${source}. Run the update line on ${name}'s Runtime page once: from then on it updates from there.` };
-    if (!same(deps.self, source) && !same(deps.self, deps.installed)) return { why: `This runtime runs from ${deps.self}, a file it doesn't update: it updates only its own installed copy (${deps.installed}), and nothing when it runs from ${source} itself. Copy ${source} over ${deps.self} and restart the runtime, or ${again}.` };
+    if (written(o.path) !== written(source)) return { why: `${name} offers the runtime at ${shown(o.path)}, and this runtime was set up from ${shown(source)}. Run the update line on ${name}'s Runtime page once: from then on it updates from there.` };
+    if (!same(deps.self, source) && !same(deps.self, deps.installed)) return { why: `This runtime runs from ${shown(deps.self)}, a file it doesn't update: it updates only its own installed copy (${shown(deps.installed)}), and nothing when it runs from ${shown(source)} itself. Copy ${shown(source)} over ${shown(deps.self)} and restart the runtime, or ${again}.` };
     let bytes: Uint8Array | null;
     try {
       bytes = deps.files.read(source);
     } catch (error) {
-      return { why: `The runtime at ${source} can't be read (${message(error)}): ${again}.` };
+      return { why: `The runtime at ${shown(source)} can't be read (${shown(message(error))}): ${again}.` };
     }
-    if (bytes === null) return { why: `There is no runtime at ${source}, where this runtime was set up from. Check that ${name} is still installed in Lumiverse, then ${again}.` };
-    if (createHash("sha256").update(bytes).digest("hex") !== o.sha256) return { why: `The runtime at ${source} isn't the build ${name} offers (${o.build}). When ${name} has just been updated, it offers again once Lumiverse has loaded its new build; otherwise ${again}.` };
+    if (bytes === null) return { why: `There is no runtime at ${shown(source)}, where this runtime was set up from. Check that ${name} is still installed in Lumiverse, then ${again}.` };
+    if (createHash("sha256").update(bytes).digest("hex") !== o.sha256) return { why: `The runtime at ${shown(source)} isn't the build ${name} offers (${o.build}). When ${name} has just been updated, it offers again once Lumiverse has loaded its new build; otherwise ${again}.` };
     return bytes;
   }
 
-  /** Puts `bytes` in place of the file at `target`: written whole beside it, then renamed over it, so `target` is never part written. */
-  function replace(target: string, bytes: Uint8Array, name: string): void {
-    // One temporary name per runtime: what a crash left is written over on the next try, and two runtimes that share a copy never write the same one.
+  /** Writes `bytes` whole beside `target`, under one temporary name per runtime (two runtimes that share a copy never write the same one), with `target`'s mode; that name. Nothing is left there when it fails. */
+  function stage(target: string, bytes: Uint8Array, name: string): string {
     const temp = `${target}.${name}.tmp`;
-    const mode = deps.files.mode(target) ?? 0o644;
     try {
-      deps.files.write(temp, bytes, mode);
+      deps.files.write(temp, bytes, deps.files.mode(target) ?? 0o644);
+    } catch (error) {
+      discard(temp);
+      throw error;
+    }
+    return temp;
+  }
+
+  function discard(temp: string): void {
+    try {
+      deps.files.remove(temp);
+    } catch {
+      // The error worth telling is the one that left it.
+    }
+  }
+
+  /** Puts the staged file in place of `target` in one step, so `target` is never part written. */
+  function put(temp: string, target: string): void {
+    try {
       deps.files.rename(temp, target);
     } catch (error) {
-      try {
-        deps.files.remove(temp);
-      } catch {
-        // The error worth telling is the first one.
-      }
+      discard(temp);
       throw error;
     }
   }
 
-  /** Restarts the runtime onto what is in place now (`done` says what that is); null once it is on its way, else why it can't, with the line that does it. */
-  async function restart(done: string): Promise<{ refused: string } | null> {
-    const service = deps.service;
-    if (service !== null) {
-      const ctl = systemctlOf(deps.env, deps.uid);
-      // Queued, not waited for: the restart is a job of the account's service manager, which stops this process as it stops any and then starts it again.
-      const queued = await deps.run("systemctl", [...ctl.args, "restart", "--no-block", service.unit], ctl.env);
-      if (queued.code !== 0) return fail(`${done}, but systemd didn't restart the runtime (${(queued.err || queued.out).trim() || `exit code ${queued.code}`}). Restart it with:`, `systemctl --user restart ${service.unit}`);
-      deps.log(`${done}: restarting through ${service.unit}`);
-      return null;
-    }
-    if (deps.bun === null) return fail(`${done}, but the runtime can't restart itself here. Stop it, then start it again with:`, ["bun", deps.self, "serve", "--config", deps.configPath].map(shellWord).join(" "));
-    deps.log(`${done}: restarting`);
-    deps.leave({ command: deps.bun, args: [deps.self, "serve", "--config", deps.configPath] });
+  /** Whether the runtime at `file` starts on `bun`, the Bun that would run it: null when it says its version, else what went wrong. */
+  async function starts(bun: string, file: string): Promise<string | null> {
+    const said = await deps.run(bun, [file, "--version"], undefined, STARTS_MS);
+    if (said.code === 0 && /^lumiah /.test(said.out)) return null;
+    const words = (said.err || said.out).split("\n").map((piece) => piece.trim()).filter((piece) => piece !== "").slice(-3).join(" ");
+    return `${shown(bun)} ${shown(file)} --version ${said.code === 0 ? "said no version" : `ended with ${said.code}`}${words !== "" ? `: ${shown(words)}` : ""}`;
+  }
+
+  /** Restarts the runtime through its unit onto what is in place now (`done` says what that is); null once it is on its way, else why it can't, with the line that does it. */
+  async function restartUnit(done: string, service: SystemdService): Promise<{ refused: string } | null> {
+    const ctl = systemctlOf(deps.env, deps.uid);
+    // Queued, not waited for: the restart is a job of the account's service manager, which stops this process as it stops any and then starts it again.
+    const queued = await deps.run("systemctl", [...ctl.args, "restart", "--no-block", service.unit], ctl.env);
+    // That stop ends every process of the unit, and systemctl is one of them for as long as it is still there: ended by the stop, it had queued the restart, which is on its way.
+    if (queued.code !== 0 && queued.signal !== "SIGTERM") return fail(`${done}, but systemd didn't restart the runtime (${shown((queued.err || queued.out).trim()) || `exit code ${queued.code}`}). Restart it with:`, `systemctl --user restart ${service.unit}`);
+    deps.log(`${done}: restarting through ${service.unit}`);
     return null;
   }
 
-  /** Takes the update that waits; null once the runtime is restarting onto it, else why it didn't. */
+  /** Takes the update that waits; null once the runtime is restarting onto it, else why it didn't. A build that can't start here never takes the place of the one that runs. */
   async function apply(): Promise<{ refused: string } | null> {
     const o = waiting;
     if (o === null || updating) return null;
     updating = true;
+    // Not tried again by itself, whichever way it fails: the extension offers again when the runtime next says hello.
+    const drop = (words: string, run: string | null = null): { refused: string } => {
+      waiting = null;
+      updating = false;
+      return fail(words, run);
+    };
     try {
       const config = deps.config();
       const bytes = verified(o, config);
-      if (!(bytes instanceof Uint8Array)) {
-        waiting = null;
-        updating = false;
-        return fail(bytes.why);
-      }
+      if (!(bytes instanceof Uint8Array)) return drop(bytes.why);
       const source = config.source ?? deps.self;
+      const cannot = (why: string): { refused: string } => drop(`Build ${o.build} can't start here (${why}), so the runtime stays on build ${deps.build}. Update Bun, or the extension, and it is offered again.`);
+      // The Bun that runs it after the restart: its unit's, else this process's.
+      const bun = deps.service?.bun ?? deps.bun;
+      if (bun === null) return cannot("no Bun is known to run it with");
       if (!same(deps.self, source)) {
+        const unput = (error: unknown): { refused: string } => {
+          const copy = `${deps.platform === "win32" ? "Copy-Item" : "cp"} ${shellWord(shown(source))} ${shellWord(shown(deps.installed))}`;
+          return drop(`Couldn't put build ${o.build} in place of ${shown(deps.installed)} (${shown(message(error))}). Copy it yourself, then restart the runtime:`, deps.service !== null ? `${copy} && systemctl --user restart ${deps.service.unit}` : copy);
+        };
+        let temp: string;
         try {
-          replace(deps.installed, bytes, config.name);
+          temp = stage(deps.installed, bytes, config.name);
         } catch (error) {
-          // Not tried again by itself: the extension offers again when the runtime next says hello.
-          waiting = null;
-          updating = false;
-          const copy = `${deps.platform === "win32" ? "Copy-Item" : "cp"} ${shellWord(source)} ${shellWord(deps.installed)}`;
-          return fail(`Couldn't put build ${o.build} in place of ${deps.installed} (${message(error)}). Copy it yourself, then restart the runtime:`, deps.service !== null ? `${copy} && systemctl --user restart ${deps.service.unit}` : copy);
+          return unput(error);
         }
+        // Checked where it is staged, before it takes the copy's place: the copy that runs now stays as it is when it can't start.
+        const why = await starts(bun, temp);
+        if (why !== null) {
+          discard(temp);
+          return cannot(why);
+        }
+        try {
+          put(temp, deps.installed);
+        } catch (error) {
+          return unput(error);
+        }
+      } else {
+        // Running from the extension's own file, the new build is in place already: the restart is the update, and it is made only onto a build that starts.
+        const why = await starts(bun, source);
+        if (why !== null) return cannot(why);
       }
       waiting = null;
       clear();
-      const refused = await restart(`Build ${o.build} is in place`);
-      if (refused !== null) updating = false;
-      return refused;
+      const done = `Build ${o.build} is in place`;
+      if (deps.service !== null) {
+        const refused = await restartUnit(done, deps.service);
+        if (refused !== null) updating = false;
+        return refused;
+      }
+      deps.log(`${done}: restarting`);
+      deps.leave({ command: bun, args: [deps.self, "serve", "--config", deps.configPath] });
+      return null;
     } catch (error) {
       updating = false;
-      return fail(`The update to build ${o.build} stopped part way: ${message(error)}`);
+      return fail(`The update to build ${o.build} stopped part way: ${shown(message(error))}`);
     }
   }
 
@@ -295,15 +356,15 @@ export function createUpdate(deps: UpdateDeps): Update {
   async function rewriteUnit(service: SystemdService, memory: string): Promise<boolean> {
     const config = deps.config();
     try {
-      replace(service.file, new TextEncoder().encode(unitText({ name: config.name, bun: service.bun, script: service.script, config: deps.configPath, memory })), config.name);
+      put(stage(service.file, new TextEncoder().encode(unitText({ name: config.name, bun: service.bun, script: service.script, config: deps.configPath, memory })), config.name), service.file);
     } catch (error) {
-      fail(`The limit is saved, but the runtime's unit couldn't be written (${message(error)}). Write it again from the saved limit with:`, upLine(config, true));
+      fail(`The limit is saved, but the runtime's unit couldn't be written (${shown(message(error))}). Write it again from the saved limit with:`, upLine(config, true));
       return false;
     }
     const ctl = systemctlOf(deps.env, deps.uid);
     const reload = await deps.run("systemctl", [...ctl.args, "daemon-reload"], ctl.env);
     if (reload.code !== 0) {
-      fail(`The limit is in the unit, but systemd didn't read the unit again (${(reload.err || reload.out).trim() || `exit code ${reload.code}`}). Have it read it with:`, "systemctl --user daemon-reload");
+      fail(`The limit is in the unit, but systemd didn't read the unit again (${shown((reload.err || reload.out).trim()) || `exit code ${reload.code}`}). Have it read it with:`, "systemctl --user daemon-reload");
       return false;
     }
     clear();
@@ -327,12 +388,14 @@ export function createUpdate(deps: UpdateDeps): Update {
       updating,
       problem,
       line,
+      handedOver: deps.handedOver,
+      waitingCopy: deps.waitingCopy(),
     };
   }
 
   return {
     async offer(raw) {
-      const name = deps.name();
+      const name = shown(deps.name());
       const o = offerOf(raw);
       if (o === null) {
         waiting = null;
@@ -366,7 +429,7 @@ export function createUpdate(deps: UpdateDeps): Update {
 
     async applyNow() {
       if (updating) throw new OpRefused("unavailable", "The runtime is updating already: it is back in a moment.");
-      if (waiting === null) throw new OpRefused("unavailable", problem ?? `There is no update to take: this runtime is on the build ${deps.name()} offered, or ${deps.name()} hasn't offered one since it started.`);
+      if (waiting === null) throw new OpRefused("unavailable", problem ?? `There is no update to take: this runtime is on the build ${shown(deps.name())} offered, or ${shown(deps.name())} hasn't offered one since it started.`);
       const refused = await apply();
       if (refused !== null) throw new OpRefused("unavailable", refused.refused);
       return get();
@@ -380,7 +443,7 @@ export function createUpdate(deps: UpdateDeps): Update {
       if (memory !== undefined) {
         if (typeof memory !== "string") throw new OpRefused("bad_request", "The memory limit is a size, such as 768M or 2G.");
         const why = memoryRefusal(memory);
-        if (why !== null) throw new OpRefused("bad_request", `The memory limit "${memory}" can't be used: ${why}.`);
+        if (why !== null) throw new OpRefused("bad_request", `The memory limit "${shown(memory)}" can't be used: ${why}.`);
       }
       if (autoUpdate !== undefined && typeof autoUpdate !== "boolean") throw new OpRefused("bad_request", "autoUpdate is true (updates are taken by themselves) or false (only from the button).");
       if (asked !== undefined && typeof asked !== "boolean") throw new OpRefused("bad_request", "restart is true or false.");
@@ -393,9 +456,9 @@ export function createUpdate(deps: UpdateDeps): Update {
       const service = deps.service;
       const inUnit = change.memory === undefined || service === null || (await rewriteUnit(service, change.memory));
       const needed = service !== null && deps.config().memory !== started;
-      if (asked === true && needed && inUnit && !updating) {
+      if (asked === true && needed && inUnit && !updating && service !== null) {
         updating = true;
-        if ((await restart(`The memory limit ${deps.config().memory} is in the unit`)) !== null) updating = false;
+        if ((await restartUnit(`The memory limit ${deps.config().memory} is in the unit`, service)) !== null) updating = false;
       }
       return { view: get(), restart: updating ? "restarting" : needed ? "needed" : "none" };
     },

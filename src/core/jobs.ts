@@ -24,7 +24,7 @@ import type { AgentStopCode, AgentUsage, HarnessHost, JobAllowance, JobDue, JobL
 import { isRecord } from "./ports";
 import { AgentStop, isLasting } from "./provider";
 import { HarnessRefusal } from "./refusal";
-import { type Equipment, readSetup, Run, type Setup, type Shared } from "./run";
+import { agentsMissing, claimMissing, type Equipment, readSetup, Run, type Setup, type Shared } from "./run";
 import { pathTurns } from "./sessions";
 import { AGENT, type Settings, type TurnBudget } from "./settings";
 import type { AllJobsDoc, ChatJobsDoc, JobDoc, RunningJobsDoc } from "./stored";
@@ -670,8 +670,12 @@ export class Jobs {
       if (typeof setup === "string") return await this.stopped(doc, live.cancelled !== null ? { state: "cancelled", reason: live.cancelled } : { state: "failed", reason: setup });
       const { settings, texts } = setup;
       if (!settings.jobs.enabled) return await this.stopped(doc, { state: "cancelled", reason: texts.render(TEXT.jobs.whyOff) });
+      // A chat whose extension never said whether it answers it itself isn't worked on as one of LumiAH's own: the job doesn't start, and can be started again.
+      const { unanswered } = setup;
+      if (unanswered.claim !== undefined) return await this.stopped(doc, { state: "failed", reason: claimMissing(unanswered.claim, texts, shared.options) });
       const resolved = setup.definitions.resolve(doc.job.agent, settings);
-      if (!resolved) return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyGone, { agent: doc.job.agent }), lasting: true });
+      // An agent that is there no more stays gone; one missing because the extension's agents are missing from this run may be there at the next.
+      if (!resolved) return await this.stopped(doc, unanswered.definitions !== undefined && !setup.definitions.switchedOff(doc.job.agent) ? { state: "failed", reason: agentsMissing(unanswered.definitions, texts, shared.options) } : { state: "failed", reason: texts.render(TEXT.jobs.whyGone, { agent: doc.job.agent }), lasting: true });
       if (!(await this.stands(doc.job, settings.jobs.recordWaitMs, signal).catch(() => true))) return await this.stopped(doc, { state: "off_path", reason: texts.render(this.ended.get(doc.job.basis ?? "")?.record === false ? TEXT.jobs.whyNoRecord : TEXT.jobs.whyOffPath) });
 
       const startedAt = host.clock.now();

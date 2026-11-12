@@ -6,6 +6,7 @@ import { describe, expect, test } from "bun:test";
 import { CHATS, fakeHash, type HeldWord, type PlayStep, Trace } from "../../dev/preview/fixtures";
 import { type MockCtx, type PlayOptions, Refusal } from "../../dev/preview/mock/ctx";
 import { jobsMock } from "../../dev/preview/mock/jobs";
+import { LINK_VERSION } from "../../src/link/contract";
 import { UI_VERSION, type JobState, type JobView, type JobsPage, type RunningTurn, type UiRequests, type UiState } from "../../src/shared/ui";
 
 const T0 = Date.UTC(2026, 10, 10, 9, 0, 0);
@@ -24,7 +25,7 @@ function world(ready = true) {
   let now = T0;
   let state: UiState = {
     rev: 1,
-    runtime: { build: "test", link: 1, model: "lumiah", relays: [], start: { service: null, foreground: null, missing: [] }, issues: [], ready: false },
+    runtime: { build: "test", link: LINK_VERSION, model: "lumiah", relays: [], start: { service: null, foreground: null, missing: [] }, issues: [], ready: false, selfUpdate: false, road: { granted: false, offer: null, relays: {} } },
     setup: { steps: [] },
     key: { set: false, print: null, at: null },
     chats: ready ? CHATS : [],

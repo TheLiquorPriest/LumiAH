@@ -9,6 +9,7 @@ import type { Provider } from "@earendil-works/pi-ai";
 import type { ModelRequest } from "../../../src/core/ports";
 import type { CallCache, ModelLayer } from "../../../src/runtime/models";
 import { createModelLayer } from "../../../src/runtime/models";
+import type { SettingsOwner } from "../../../src/shared/timeouts";
 
 /** One request a scripted fetch was sent. */
 export interface Sent {
@@ -18,11 +19,13 @@ export interface Sent {
   /** The body as JSON where it is JSON, else its text. */
   body: unknown;
   text: string;
+  /** What the request does at a redirect: "error" refuses one. */
+  redirect: string;
 }
 
 export type Script = (sent: Sent, index: number) => Response | Promise<Response>;
 
-/** A fetch that answers from a script and keeps every request it was sent. */
+/** A fetch that answers from a script and keeps every request it was sent; as a real fetch does, it gives up on an answer still to come once the request's signal ends. */
 export function scriptedFetch(script: Script): { fetch: typeof globalThis.fetch; sent: Sent[] } {
   const sent: Sent[] = [];
   const answer = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -34,9 +37,15 @@ export function scriptedFetch(script: Script): { fetch: typeof globalThis.fetch;
     } catch {
       // A form or plain text: kept as its text.
     }
-    const one: Sent = { url: request.url, method: request.method, headers: Object.fromEntries(request.headers), body, text };
+    const one: Sent = { url: request.url, method: request.method, headers: Object.fromEntries(request.headers), body, text, redirect: request.redirect };
     sent.push(one);
-    return script(one, sent.length - 1);
+    const answered = Promise.resolve(script(one, sent.length - 1));
+    const signal = init?.signal;
+    if (signal === undefined || signal === null) return answered;
+    signal.throwIfAborted();
+    const ended = Promise.withResolvers<never>();
+    signal.addEventListener("abort", () => ended.reject(signal.reason), { once: true });
+    return Promise.race([answered, ended.promise]);
   };
   return { fetch: Object.assign(answer, { preconnect: (): void => undefined }), sent };
 }
@@ -142,12 +151,22 @@ export class Timers {
 
 export interface RigOptions {
   script?: Script;
+  /** A fetch of the test's own in place of the scripted one: a local server's, through the process's own fetch. */
+  fetch?: typeof globalThis.fetch;
   providers?: readonly Provider[];
   caching?: (request: ModelRequest | null) => CallCache;
   passConnection?: string | null;
   serialTools?: readonly string[];
   /** A folder of the test's own, for a layer that reads another's files. */
   dir?: string;
+  /** The environment the layer takes the SDKs' own variables out of; the process's when not given. */
+  env?: Record<string, string | undefined>;
+  /** How long a call's answer may go silent; the layer's default when not given. */
+  silentMs?: number;
+  /** How long a connection's test or a server's list of models waits; the layer's default when not given. */
+  askMs?: number;
+  /** Whose Settings show the layer's waits, as its words say them; LumiAH's own when not given. */
+  owner?: SettingsOwner;
 }
 
 export interface Rig {
@@ -156,6 +175,8 @@ export interface Rig {
   sent: Sent[];
   timers: Timers;
   logs: string[];
+  /** Moves the layer's clock on by `ms`. */
+  advance(ms: number): void;
   /** Closes the layer and takes its folder away. */
   done(): Promise<void>;
 }
@@ -163,7 +184,7 @@ export interface Rig {
 /** The installation id the rig's layers make for OpenAI's sign-in. */
 export const DEVICE = "0f8e6a52-1c3b-4d7a-9e2f-5b6c7d8e9f01";
 
-/** A model layer over a folder of its own, its HTTP scripted, its ids counted and its timers held. */
+/** A model layer over a folder of its own, its HTTP scripted, its ids counted, its clock and its timers held. */
 export function rig(options: RigOptions = {}): Rig {
   const dir = options.dir ?? mkdtempSync(join(tmpdir(), "lumiah-models-"));
   const { fetch, sent } = scriptedFetch(options.script ?? (() => failed(500, { error: { message: "nothing scripted" } })));
@@ -177,13 +198,17 @@ export function rig(options: RigOptions = {}): Rig {
     id: () => `id${++ids}`,
     uuid: () => DEVICE,
     log: (text) => logs.push(text),
-    fetch,
+    fetch: options.fetch ?? fetch,
     setTimeout: timers.set,
     clearTimeout: timers.clear,
     caching: options.caching ?? (() => ({ retention: "short" })),
     passConnection: async () => options.passConnection ?? null,
     ...(options.serialTools ? { serialTools: () => options.serialTools ?? [] } : {}),
     ...(options.providers ? { providers: options.providers } : {}),
+    ...(options.env ? { env: options.env } : {}),
+    ...(options.silentMs !== undefined ? { silentMs: () => options.silentMs ?? 0 } : {}),
+    ...(options.askMs !== undefined ? { askMs: () => options.askMs ?? 0 } : {}),
+    ...(options.owner !== undefined ? { owner: () => options.owner ?? { name: "LumiAH" } } : {}),
   });
   return {
     layer,
@@ -191,6 +216,9 @@ export function rig(options: RigOptions = {}): Rig {
     sent,
     timers,
     logs,
+    advance(ms) {
+      clock += ms;
+    },
     async done() {
       await layer.close();
       if (options.dir === undefined) rmSync(dir, { recursive: true, force: true });

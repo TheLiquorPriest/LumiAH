@@ -11,8 +11,8 @@ import { TAGGED_TYPES } from "../../../src/extension/backend/turns";
 import { type Rig, rig, USER } from "../../support/rig";
 
 let open: Rig | null = null;
-afterEach(() => {
-  open?.close();
+afterEach(async () => {
+  await open?.close();
   open = null;
 });
 

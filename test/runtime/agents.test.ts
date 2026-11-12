@@ -21,10 +21,10 @@ import { type Rig, rig, runtimeFor, until, USER } from "../support/rig";
 
 let r: Rig | null = null;
 /** What a test started beside the rig, stopped with it. */
-const also: (() => void)[] = [];
-afterEach(() => {
-  for (const stop of also.splice(0)) stop();
-  r?.close();
+const also: (() => Promise<void>)[] = [];
+afterEach(async () => {
+  for (const stop of also.splice(0)) await stop();
+  await r?.close();
   r = null;
 });
 
@@ -470,10 +470,10 @@ async function relinked(it: Rig): Promise<Runtime> {
   const second = runtimeFor(it.lumiverse, it.registration, []);
   // The real runtime's clockwork (its link's pings, a gap asked about again) has no clock a test can move by hand, as rig.ts says of the first one's: it is run every few milliseconds, as the rig runs that.
   const ticker = setInterval(() => second.tick(), 5);
-  also.push(() => {
+  also.push(async () => {
     clearInterval(ticker);
     second.shutdown();
-    second.close();
+    await second.close();
   });
   await second.link.connect();
   return second;
@@ -495,7 +495,9 @@ describe("a job a runtime restart cut off", () => {
 
     // The runtime's process is killed as the job works: it writes and says nothing more, so the page still shows the job running.
     power.pull();
-    it.close();
+    // Nor does a killed process stop in good order: what it kept stays on its disk, and nothing of it waits for the extension's storage.
+    await it.runtime.store.close();
+    await it.close();
     expect((await state(it)).jobs.active).toMatchObject([{ id: job.id, state: "running" }]);
 
     // Started again on the same registration, the runtime finds the job it was cut off from.
@@ -531,7 +533,8 @@ describe("a job a runtime restart cut off", () => {
     ]);
 
     power.pull();
-    it.close();
+    await it.runtime.store.close();
+    await it.close();
     await relinked(it);
     await until(() => activeJobs(it).length === 0, "the first job to be found interrupted and the second to have run");
     await it.backend.settle();

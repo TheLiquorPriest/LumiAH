@@ -239,6 +239,33 @@ export function agentModel(a: AgentView): string | null {
   return answered?.entry.kind === "answer" && answered.entry.model !== "" ? answered.entry.model : a.start.model;
 }
 
+/**
+ * The connection an agent's calls went on, as its line says it: by the name the trace kept, else
+ * (a trace kept before names were) by `connection`, which names an id as the runtime lists it;
+ * "the default connection" where its settings named none.
+ */
+export function onConnection(start: Pick<AgentStarted, "connectionId" | "connectionName">, connection: (id: string) => string = (id) => id): string {
+  if (start.connectionName !== undefined) return `on ${start.connectionName}`;
+  return start.connectionId ? `on ${connection(start.connectionId)}` : "on the default connection";
+}
+
+/**
+ * What the feed says once of a connection an agent's settings name that is none of the runtime's
+ * (`AgentStarted.gone`): that the agents that name it ran on the default, which it names. Said in
+ * the feed of the first of them, so null for any other agent, and for one whose settings name a
+ * connection the runtime has.
+ */
+export function goneNotice(turn: Pick<TurnView, "agents">, a: AgentView): string | null {
+  const gone = a.start.gone;
+  if (gone === undefined) return null;
+  const on = turn.agents.filter((x) => x.start.gone === gone);
+  if (on[0] !== a) return null;
+  const names = [...new Set(on.map((x) => agentLabel(x.start)))];
+  const one = names.length === 1;
+  const used = a.start.connectionName !== undefined ? `the default connection, ${a.start.connectionName}` : "the default connection";
+  return `The connection Settings name for ${listed(names)} (${gone}) isn't one of the runtime's connections, so ${one ? "it" : "they"} ran on ${used}. Pick one of the runtime's connections for ${one ? "it" : "them"} in Settings to change that.`;
+}
+
 /** How long an agent has worked: from its start to its finish, or to `now` while it works. */
 export function agentMs(a: AgentView, now: number): number {
   return Math.max(0, (a.state === "working" ? now : a.lastAt) - a.start.at);
@@ -399,6 +426,19 @@ export function rangeCount(ranges: readonly (readonly [number, number])[]): numb
   return ranges.reduce((n, [from, to]) => n + Math.max(0, to - from + 1), 0);
 }
 
+/** A call's exact prompt in a line of facts: its model, the connection it ran on (named by `connection`, the list of the runtime that plays the transcript's chat, as the agent's own line names it), its effort, its room, how it was answered, and its sampling. */
+export function promptFacts(p: CallPrompt, connection: (id: string) => string): string[] {
+  return [
+    p.model ?? "the connection's model",
+    p.connectionId ? `on ${connection(p.connectionId)}` : "on the default connection",
+    `effort ${p.effort ?? "inherit"}`,
+    `up to ${count(p.maxTokens)} tokens`,
+    p.stream ? "streamed" : "answered whole",
+    ...(p.parallelToolCalls === false ? ["one tool call an answer"] : []),
+    ...Object.entries(p.params ?? {}).map(([k, v]) => `${k} ${JSON.stringify(v)}`),
+  ];
+}
+
 /** What the prompt held, in a line for its fold: how much lore, and how much of the chat word for word. */
 export function heldLine(held: PromptHeld): string {
   const tokens = held.lore.reduce((n, e) => n + e.tokens, 0);
@@ -503,7 +543,7 @@ export function sessionWords(s: SessionTrace): string[] {
   if (s.dropped.length > 0) lines.push(`Its notes from ${s.dropped.length === 1 ? "reply" : "replies"} ${s.dropped.map((i) => `#${i}`).join(", ")} were dropped: an earlier message changed, so they no longer fit the chat.`);
   if (s.missing > 0) lines.push(`${counted(s.missing, "stored part")} ${s.missing === 1 ? "was" : "were"} missing and left out.`);
   if (s.compacted) lines.push(`This turn compacted the session: ${counted(s.compacted.folded, "turn")} summarized, ${count(s.compacted.kept)} kept as ${s.compacted.kept === 1 ? "it was" : "they were"}.`);
-  if (s.rolledBack) lines.push("A compaction was rolled back: the turns it summarized are read again in full.");
+  if (s.rolledBack) lines.push("A summary was rolled back since the last turn: the turns it had replaced are carried whole again, until the notes are summarized anew.");
   if (s.jobs && s.jobs.length > 0) lines.push(`Told of ${counted(s.jobs.length, "job")} that ended since its last turn: ${s.jobs.map((j) => `${roleLabel(j.agent)} (${JOB_STATE_WORDS[j.state]})`).join(", ")}.`);
   return lines;
 }
@@ -732,6 +772,9 @@ export function feedOf(turn: TurnView, filter: Filter, from = 0): AgentFeed[] {
       if (text !== "") items.push({ key: `i:${id}`, kind: "instructions", seq: a.seq, text });
       if (a.start.history > 0) items.push({ key: `h:${id}`, kind: "history", seq: a.seq, messages: a.start.history });
     }
+    // Its settings name a connection the runtime doesn't have, so it ran on the default: said once, in the feed of the first agent that names it.
+    const gone = kinds.has("stops") && !filter.problems && a.seq >= from ? goneNotice(turn, a) : null;
+    if (gone !== null) items.push({ key: `g:${id}`, kind: "notice", seq: a.seq, text: gone, at: a.start.at, of: "run", info: true });
     let calls = 0;
     let hidden = 0;
     for (const s of a.steps) {
@@ -969,6 +1012,8 @@ export interface CallRow {
   /** Its number among its agent's calls, from 1. */
   call: number;
   model: string;
+  /** The connection it went on, as its agent's start names it (`onConnection`). */
+  on: Pick<AgentStarted, "connectionId" | "connectionName">;
   /** When it was asked (its answer's time less how long it took) and how long it took. */
   startedAt: number;
   ms: number;
@@ -1049,7 +1094,7 @@ export function turnTotals(turn: TurnView, now: number): TurnTotals {
         n += 1;
         addCall(sum, e);
         sum.toolCalls += e.calls.length;
-        const r: CallRow = { agentId: a.start.id, seq: s.seq, call: n, model: e.model, startedAt: e.at - e.ms, ms: e.ms, usage: e.usage, finishReason: e.finishReason, tools: e.calls.length, toolMs: 0, prompt: e.prompt ?? null };
+        const r: CallRow = { agentId: a.start.id, seq: s.seq, call: n, model: e.model, on: a.start, startedAt: e.at - e.ms, ms: e.ms, usage: e.usage, finishReason: e.finishReason, tools: e.calls.length, toolMs: 0, prompt: e.prompt ?? null };
         calls.push(r);
         for (const c of e.calls) row.set(c.id, r);
       } else if (e.kind === "result") {
@@ -1095,13 +1140,13 @@ function csvField(value: string | number): string {
   return /[",\n\r]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
-/** Tokens, time and cost per call as CSV, a call a row, for a spreadsheet: which agent made it, on which model, when, how long it took, what it spent (and which of those counts are estimates), how it finished, and the tools it called. */
+/** Tokens, time and cost per call as CSV, a call a row, for a spreadsheet: which agent made it, on which model and connection, when, how long it took, what it spent (and which of those counts are estimates), how it finished, and the tools it called. */
 export function totalsCsv(totals: TurnTotals): string {
   const role = new Map(totals.agents.map((t) => [t.agent.start.id, t.agent.start.role]));
   const instance = new Map(totals.agents.map((t) => [t.agent.start.id, t.agent.start.as ?? ""]));
-  const head = ["agent", "role", "as", "call", "model", "started", "ms", "in", "cached_in", "cache_write", "out", "reasoning_out", "estimated", "cost_usd", "finish", "tool_calls", "tool_ms", "prompt"];
+  const head = ["agent", "role", "as", "call", "model", "connection", "started", "ms", "in", "cached_in", "cache_write", "out", "reasoning_out", "estimated", "cost_usd", "finish", "tool_calls", "tool_ms", "prompt"];
   // A cost worked out from prices carries the arithmetic's noise in its last places (0.0007761600000000001): ten significant digits keep every digit that means something.
-  const rows = totals.calls.map((c) => [c.agentId, role.get(c.agentId) ?? "", instance.get(c.agentId) ?? "", c.call, c.model, new Date(c.startedAt).toISOString(), c.ms, c.usage.in, c.usage.cachedIn, c.usage.cacheWrite ?? 0, c.usage.out, c.usage.reasoningOut, c.usage.estimated.join(" "), c.usage.cost === undefined ? "" : Number(c.usage.cost.toPrecision(10)), c.finishReason, c.tools, c.toolMs, c.prompt ?? ""]);
+  const rows = totals.calls.map((c) => [c.agentId, role.get(c.agentId) ?? "", instance.get(c.agentId) ?? "", c.call, c.model, c.on.connectionName ?? c.on.connectionId ?? "", new Date(c.startedAt).toISOString(), c.ms, c.usage.in, c.usage.cachedIn, c.usage.cacheWrite ?? 0, c.usage.out, c.usage.reasoningOut, c.usage.estimated.join(" "), c.usage.cost === undefined ? "" : Number(c.usage.cost.toPrecision(10)), c.finishReason, c.tools, c.toolMs, c.prompt ?? ""]);
   return `${[head, ...rows].map((row) => row.map(csvField).join(",")).join("\n")}\n`;
 }
 
@@ -1179,7 +1224,7 @@ export function transcriptMarkdown(turn: TurnView, feeds: readonly AgentFeed[] =
   for (const feed of feeds) {
     const a = feed.agent;
     out.push(`## ${agentLabel(a.start)}${a.start.task ? ` · ${a.start.task}` : ""} · ${AGENT_STATE_WORDS[a.state]}`);
-    out.push(`${agentModel(a) ?? "the connection's model"}${a.start.connectionId ? ` on ${a.start.connectionId}` : ""} · effort ${a.start.effort}${a.start.parent ? ` · started by ${a.start.parent}` : ""}`);
+    out.push(`${agentModel(a) ?? "the connection's model"} ${onConnection(a.start)} · effort ${a.start.effort}${a.start.parent ? ` · started by ${a.start.parent}` : ""}`);
     if (feed.hidden > 0) out.push(`(${counted(feed.hidden, "earlier step")} not shown)`);
     for (const item of feed.items) {
       const text = itemMarkdown(item);

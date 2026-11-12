@@ -30,14 +30,13 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
 
 /**
  * A part of a model message: text, a tool call the model made, a tool's result going back, or media
- * the request carried (an image, audio or video, passed on as it came). `cache` marks a cache
- * breakpoint after the part, which only a provider that takes explicit breakpoints reads.
+ * the request carried (an image, audio or video, passed on as it came).
  */
 export type ModelPart =
-  | { type: "text"; text: string; cache?: true }
-  | { type: "tool_use"; id: string; name: string; input: JsonObject; thoughtSignature?: string; cache?: true }
-  | { type: "tool_result"; toolUseId: string; content: string; isError?: true; cache?: true }
-  | { type: "media"; media: "image" | "audio" | "video"; data: string; mimeType: string; cache?: true };
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id: string; name: string; input: JsonObject; thoughtSignature?: string }
+  | { type: "tool_result"; toolUseId: string; content: string; isError?: true }
+  | { type: "media"; media: "image" | "audio" | "video"; data: string; mimeType: string };
 
 /** A provider's thinking block (Anthropic's signed `thinking`, or `redacted_thinking`), sent back verbatim after a tool call. */
 export interface ModelThinkingBlock {
@@ -99,14 +98,19 @@ export function modelMessages(value: unknown): ModelMessage[] | null {
 }
 
 /**
- * How hard a model reasons on a call, as Lumiverse's per-request reasoning override takes it:
- * `inherit` leaves it to the connection's reasoning binding, else the user's Lumiverse setting; `off`
- * turns reasoning off; `auto` lets the model choose (alias models that pick their own); the rest ask
- * for that effort, which the host maps to each provider's own field.
+ * How hard a model reasons on a call: `inherit` and `auto` leave it to the connection's own effort
+ * (where it sets none, the provider's default); `off` turns reasoning off; the rest ask for that
+ * effort, which the host fits to what the model offers.
  */
 export type ModelEffort = "inherit" | "off" | "auto" | "minimal" | "low" | "medium" | "high" | "max" | "xhigh";
 
-/** Sampling parameters by the names Lumiverse's generation call takes; each one left out is the connection's own. */
+/** How long a provider keeps a call's prompt cache: not at all, a few minutes (its default), or about an hour where it offers that. */
+export type CacheRetention = "none" | "short" | "long";
+
+/** The cache retention a call has where nobody chose one: the provider's own default. */
+export const DEFAULT_CACHE_RETENTION: CacheRetention = "short";
+
+/** Sampling parameters by their usual names; each one left out is the connection's own. */
 export interface SamplingParams {
   temperature?: number;
   top_p?: number;
@@ -119,15 +123,11 @@ export interface SamplingParams {
   stop?: string[];
 }
 
-/**
- * A tool a call offers: its parameters as a JSON Schema. `cache` marks a cache breakpoint after it:
- * the tools up to it are one cached prefix, read first, whatever follows them.
- */
+/** A tool a call offers: its parameters as a JSON Schema. */
 export interface ModelTool {
   name: string;
   description: string;
   parameters: JsonObject;
-  cache?: true;
 }
 
 /** A tool call the model made, its arguments parsed; `thoughtSignature`, Google's, goes back with it. */
@@ -142,7 +142,7 @@ export interface ModelRequest {
   messages: ModelMessage[];
   /** What the call may write, its reasoning included. */
   maxTokens: number;
-  /** The connection the call goes on; null: the user's default connection. */
+  /** The connection the call goes on; null: the default connection. */
   connectionId: string | null;
   /** Overrides the connection's model for this call; null: the connection's own. */
   model: string | null;
@@ -152,14 +152,14 @@ export interface ModelRequest {
   parallelToolCalls?: false;
   /** Absent: `inherit`. */
   effort?: ModelEffort;
-  /** With an effort of the call's own, the model's thinking comes back as text (`summarized`); absent: the host's default. */
-  thinkingDisplay?: "summarized";
   /** Absent: every one is the connection's own. */
   params?: SamplingParams;
-  /** Asks the provider for its token usage: only then does an OpenAI-compatible stream report it. */
-  usage?: true;
   /** Takes the answer as the provider streams it, each delta handed to the call's `onDelta`; the result is the same whole answer. */
   stream?: true;
+  /** The agent session the call belongs to: the calls of one session share the provider's prompt cache, and the host lets go of what it keeps for it when the session ends (`ModelsPort.ended`). */
+  session?: string;
+  /** How long the provider keeps the call's prompt cache; absent: `DEFAULT_CACHE_RETENTION`. */
+  cacheRetention?: CacheRetention;
 }
 
 /** A piece of a streaming call's answer as it arrives: its text, or its reasoning. */
@@ -182,7 +182,7 @@ export interface ModelResult {
   /** Reasoning carriers to send back on the next call after a tool call, when the host passes them. */
   thinkingBlocks?: ModelThinkingBlock[];
   reasoningDetails?: JsonObject[];
-  /** The provider's usage as Lumiverse passed it: `prompt_tokens`, `completion_tokens`, `total_tokens`, and in `provider_raw` the provider's own fields (its cache counts, reasoning tokens, cost). */
+  /** The provider's usage: `prompt_tokens`, `completion_tokens`, `total_tokens`, and in `provider_raw` the provider's own counts (its cache reads and writes, its reasoning tokens). `cost` is what the provider billed, where it said; `list_cost`, what its published price makes of the counts, where the host knows one. */
   usage?: JsonObject;
 }
 
@@ -190,12 +190,14 @@ export interface ModelsPort {
   /**
    * One model call. A call with `stream` hands each delta to `onDelta` as it arrives. The signal ends
    * the call: it rejects with the signal's reason. A failed call rejects with an `Error` whose message
-   * is the provider's or Lumiverse's own words, status included where there was one ("503: …"). The
-   * loop reads two things from them: a refusal of native tools, which it asks again with the tools
-   * as text; and a failure that passes (a timeout, a rate limit, a 5xx, a stream that dropped),
-   * which it makes again as Settings allow.
+   * is the provider's own words, status included where there was one ("503: …"). The loop reads two
+   * things from them: a refusal of native tools, which it asks again with the tools as text; and a
+   * failure that passes (a timeout, a rate limit, a 5xx, a stream that dropped), which it makes
+   * again as Settings allow.
    */
   call(request: ModelRequest, signal: AbortSignal, onDelta?: (delta: ModelDelta) => void): Promise<ModelResult>;
+  /** An agent session ended (`ModelRequest.session`): what the host keeps for its prompt cache is let go. */
+  ended?(session: string): void;
 }
 
 // ---------------------------------------------------------------- connections
@@ -207,19 +209,10 @@ export interface ConnectionInfo {
   provider: string;
   /** Its own model; null when it names none. */
   model: string | null;
-  /** It is a loopback connection: a call on it would come back to the runtime, so no agent may use it. */
-  loopback: boolean;
 }
 
-/**
- * A connection as the loop needs it: its explicit cache breakpoints (null where the provider takes
- * none; else the most a request may hold, the provider's own limit, and those the connection's own
- * prompt caching adds to every request on it: one after the leading system messages, one on the last
- * message, one on the last tool, and one for its automatic mode), and whether it takes several tool
- * calls in one answer.
- */
+/** A connection as the loop needs it: whether it takes several tool calls in one answer. */
 export interface ConnectionProfile extends ConnectionInfo {
-  cache: { limit: number; system: boolean; lastMessage: boolean; tools: boolean; automatic: boolean } | null;
   parallelTools: boolean;
 }
 
@@ -305,10 +298,7 @@ export interface ChatMessage {
 
 /**
  * What the core reads of a chat besides its messages: its name, the character it is with (null for a
- * chat with none, or with several), the chat it was branched from, if it was, and, where the core
- * runs inside Lumiverse (DESIGN §25), the connection the chat generates on: an agent of the chat's
- * jobs and side sessions that has no connection set uses it. A runtime's host leaves it out: there
- * the chat generates on the loopback, which no agent may call.
+ * chat with none, or with several), and the chat it was branched from, if it was.
  *
  * What decides the chat's story beside the user's setting (§24.4): the user's own choice for this
  * chat (`story`, each member given stands over their setting; absent: none), and whether Lumiverse's
@@ -321,7 +311,6 @@ export interface ChatInfo {
   characterId: string | null;
   characterName: string | null;
   branchedFrom: string | null;
-  connectionId?: string | null;
   story?: Partial<StorySetting>;
   sovereignHand?: boolean | null;
 }
@@ -769,9 +758,8 @@ export interface RequestMessage extends ModelMessage {
  * where Lumiverse makes the reply's message only as it saves it, so the reply comes after every
  * message of the path; for a regenerate or a swipe, the new swipe; for a continue, the swipe it
  * continues), the preset the prompt was assembled from, the assembled messages as Lumiverse sent
- * them, and the request's own sampling parameters and answer room. It names no connection: its
- * turns reach the runtime over the loopback, which no agent may call, so an agent with no
- * connection set uses the chat's own, else the user's default.
+ * them, and the request's own sampling parameters and answer room. It names no connection: an
+ * agent runs on its own connection, else on the default one.
  */
 export interface TurnRequest {
   userId: string;
@@ -976,14 +964,24 @@ export type TranscriptEntry =
 
 /**
  * An agent starting work: its id (the handle a delegating agent continues it by, §14) and its role
- * (the id of the definition it runs as), its connection, model and effort, what it is told first
- * (`prefix`: the guidance files that apply, §12), how many messages of a conversation it takes up,
- * and who started it.
+ * (the id of the definition it runs as), the connection its calls go on, its model and effort, what
+ * it is told first (`prefix`: the guidance files that apply, §12), how many messages of a
+ * conversation it takes up, and who started it.
  */
 export interface AgentStarted {
   id: string;
   role: string;
+  /**
+   * The connection its calls go on: the one its settings name, else the default (where they name
+   * none, or one that is none of the host's connections). Where no connection could be read, the
+   * one its settings name (null: the default), and its stop says why. In a trace kept before the
+   * connection was read for the start, always the one its settings name.
+   */
   connectionId: string | null;
+  /** That connection's name as the host had it then; absent where none could be read, and in a trace kept before names were. */
+  connectionName?: string;
+  /** The connection its settings name where that is none of the host's connections (taken away, or one of Lumiverse's own from before the runtime kept its connections), so the default stood in for it. */
+  gone?: string;
   model: string | null;
   effort: ModelEffort;
   system: string;
@@ -1002,8 +1000,9 @@ export interface AgentStarted {
  * What the main agent carries into a turn (DESIGN §5): the session segments it read, their tokens as
  * estimated, whether a summary stands for the turns before them, the replies whose notes were dropped
  * because an earlier message changed (by their chat index), the blobs it names that the store couldn't
- * give, the compaction the turn made of it, a compaction a rollback undid that it read past (the
- * summary's hash), and the jobs it was told have ended since its last turn (§15).
+ * give, the compaction the turn made of it, a compaction a rollback undid that it is the first turn
+ * to read past (the summary's hash: said once, as the main agent is told it once), and the jobs it
+ * was told have ended since its last turn (§15).
  */
 export interface SessionTrace {
   turns: number;

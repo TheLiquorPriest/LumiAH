@@ -9,8 +9,8 @@
 // by another build never break a turn.
 
 import type { OwnedField } from "./agents";
-import type { JsonObject, JsonValue, ModelEffort, ToolTier } from "./ports";
-import { isRecord } from "./ports";
+import type { CacheRetention, JsonObject, JsonValue, ModelEffort, ToolTier } from "./ports";
+import { DEFAULT_CACHE_RETENTION, isRecord } from "./ports";
 import { defaultRecallSettings, RECALL_SETTINGS_SCHEMA, type RecallSettings } from "./recall/settings";
 import { STORY_DEFAULTS, type StorySetting } from "./story";
 import { FAMILY, TOOL } from "./text-def";
@@ -131,8 +131,8 @@ export interface Settings {
     cutRoomTokens: number;
   };
   cache: {
-    /** Explicit cache breakpoints, where the provider takes them. */
-    breakpoints: boolean;
+    /** How long a provider keeps an agent's prompt cache: none, a few minutes, or about an hour where it offers that. */
+    retention: CacheRetention;
     /** Heads every agent's prompt when not empty, so a provider's cached prompt no longer matches. */
     key: string;
   };
@@ -383,7 +383,7 @@ export function defaultSettings(): Settings {
     // An answer of fewer tokens than the floor is cut before it says anything; two rounds' warning is one to finish reading and one to answer.
     // An answer cut while it was all thinking gets one more go with twice the room: enough for a strong reasoning model that thought at length, at most 64,000 tokens so one call never runs away.
     loop: { repeats: 3, clipChars: 6000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000, answerFloor: 256, warnRounds: 2, cutRoomFactor: 2, cutRoomTokens: 64_000 },
-    cache: { breakpoints: true, key: "" },
+    cache: { retention: DEFAULT_CACHE_RETENTION, key: "" },
     // An hour is long enough not to pay for a refused call on every turn, and short enough that a connection whose model changed gets its native tools back.
     connections: { atOnce: null, throttles: {}, toolRefusalMinutes: 60 },
     prices: {},
@@ -432,9 +432,9 @@ const flag = (title: string, description: string): JsonObject => ({ title, descr
 const choice = (title: string, description: string, options: readonly [value: string, title: string, description?: string][]): JsonObject => ({ title, description, type: "string", oneOf: options.map(([value, name, about]) => ({ const: value, title: name, ...(about !== undefined ? { description: about } : {}) })) });
 
 const EFFORTS: readonly [ModelEffort, string, string?][] = [
-  ["inherit", "As the connection has it", "The connection's own reasoning setting, else yours in Lumiverse."],
+  ["inherit", "As the connection has it", "The connection's own effort; where it sets none, the provider's default."],
   ["off", "Off"],
-  ["auto", "Set by the model", "For a model that chooses its own effort."],
+  ["auto", "Set by the model", "The connection's own effort, as with As the connection has it: for a model that chooses its own."],
   ["minimal", "Minimal"],
   ["low", "Low"],
   ["medium", "Medium"],
@@ -478,7 +478,7 @@ function agentSchema(title: string, description: string, noConnection: string, n
     description,
     type: "object",
     properties: {
-      connectionId: { title: "Connection", description: "The connection its calls go on. Never the loopback connection: its calls would come back to LumiAH.", type: ["string", "null"], format: "connection", "x-none": noConnection },
+      connectionId: { title: "Connection", description: "One of the runtime's connections (Runtime → Connections) its calls go on. One that is gone leaves it on the default connection.", type: ["string", "null"], format: "connection", "x-none": noConnection },
       model: { title: "Model", description: "A model of that connection to use instead of the connection's own.", type: ["string", "null"], format: "model", "x-none": noModel },
       effort: choice("Effort", "How hard its model reasons on each call.", EFFORTS),
       toolCalls: choice("Tool calls", "How its tools are offered to its model.", TOOL_CALLS),
@@ -609,9 +609,14 @@ export const SETTINGS_SCHEMA: JsonObject = {
     },
     cache: {
       title: "Prompt caching",
+      description: "Each agent's calls share its prompt with the provider's cache, so a call reads again what the one before it sent at a fraction of the price.",
       type: "object",
       properties: {
-        breakpoints: flag("Cache breakpoints", "Mark the stable start of each agent's prompt for providers that take explicit cache breakpoints, within the provider's limit."),
+        retention: choice("Kept for", "How long the provider keeps an agent's prompt in its cache. A provider that bills for writing to its cache bills a longer keep at more.", [
+          ["none", "Not cached", "Every call sends its prompt anew."],
+          ["short", "A few minutes", "The provider's own default."],
+          ["long", "About an hour", "Where the provider offers it; elsewhere, its own default."],
+        ]),
         key: { title: "Cache key", description: "Text put at the head of every agent's prompt. Change it to make a provider's cached prompts miss; leave it empty to send none. The writer's prompt is your preset's alone and never carries it.", type: "string", maxLength: 64 },
       },
     },
@@ -641,7 +646,7 @@ export const SETTINGS_SCHEMA: JsonObject = {
     },
     prices: {
       title: "Prices",
-      description: "Per model. Where a provider reports no cost, a call's cost is worked out from these and shown as an estimate.",
+      description: "Per model. Where a provider reports no cost, a call's cost is worked out from these and shown as an estimate. A model priced here goes by this price; one not priced here goes by the provider's published price where the runtime knows it, also an estimate.",
       type: "object",
       "x-keys": "model",
       additionalProperties: {
@@ -809,7 +814,7 @@ export const SETTINGS_SCHEMA: JsonObject = {
       title: "The extension beside LumiAH",
       type: "object",
       properties: {
-        waitMs: { ...limit("Wait for the extension", "How long a turn waits for one answer of an extension that builds LumiAH into itself (its definitions, its claim on a chat, its rewrite of the writer's request, its hooks). Past it the turn goes on without that answer.", "ms"), "x-none": "As long as it takes" },
+        waitMs: { ...limit("Wait for the extension", "How long a run waits for one answer of an extension that builds LumiAH into itself (its definitions, its claim on a chat, its rewrite of the writer's request, its hooks). Past it the run goes on without that answer, where it can: without the claim, a run about the chat doesn't start, and without the agent the claim names to lead it, neither does a reply.", "ms"), "x-none": "As long as it takes" },
       },
     },
     recall: RECALL_SETTINGS_SCHEMA,
@@ -905,17 +910,26 @@ function read(schema: JsonObject, fallback: JsonValue, value: unknown, path: (st
 
 /**
  * Settings an earlier build had and this one took away, by path: what built-in mode read (it runs
- * on LumiAH's `main` branch, not here). A value a user kept at one names nothing now, and the
+ * on LumiAH's `main` branch, not here), and the explicit cache breakpoints Lumiverse's provider took
+ * (the runtime's provider places its own). A value a user kept at one names nothing now, and the
  * settings' store passes over it quietly rather than refuse every later change for it.
  */
 export const RETIRED_SETTINGS: readonly (readonly string[])[] = [
   ["reply", "warnMs"],
   ["reply", "pendingMs"],
+  ["cache", "breakpoints"],
 ];
 
 /** The settings' JSON Schema for a harness whose registries hold more than the core's own (`scope`). */
 export function settingsSchema(scope: SettingsScope): JsonObject {
   return { ...SETTINGS_SCHEMA, properties: { ...(SETTINGS_SCHEMA.properties as JsonObject), agents: agentsSchema(scope) } };
+}
+
+/** A setting's own name, as the schema gives it, by its place (`["extension", "waitMs"]`: "Wait for the extension"); the place itself where the schema names none. */
+export function settingTitle(path: readonly string[]): string {
+  let at: unknown = SETTINGS_SCHEMA;
+  for (const key of path) at = isRecord(at) && isRecord(at.properties) ? at.properties[key] : undefined;
+  return isRecord(at) && typeof at.title === "string" ? at.title : path.join(".");
 }
 
 /** The schema and the defaults `scope` gives: the core's own for none. */

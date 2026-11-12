@@ -4,7 +4,7 @@
 // out of these, in an order that a crash between any two of them can't turn into a loss; a test hands
 // it a disk that stops between two of them, as a process that dies there would.
 
-import { mkdir, open, readdir, readFile, rename, rm, stat, utimes } from "node:fs/promises";
+import { mkdir, open, readdir, readFile, rename, rm, rmdir, stat, utimes } from "node:fs/promises";
 import { dirname } from "node:path";
 
 export interface Disk {
@@ -26,6 +26,8 @@ export interface Disk {
   touch(path: string, at: number): Promise<void>;
   /** Makes a folder, and those above it that are missing. */
   mkdir(path: string): Promise<void>;
+  /** Removes a folder that holds nothing; false when it holds something (it stays). One that isn't there counts as removed. */
+  removeEmpty(path: string): Promise<boolean>;
 }
 
 /** Whether a call failed for want of the file: none there, a folder in its place, or a file where a folder of its path should be. */
@@ -102,6 +104,17 @@ export function nodeDisk(): Disk {
     },
     async mkdir(path) {
       await mkdir(path, { recursive: true, mode: 0o700 });
+    },
+    async removeEmpty(path) {
+      try {
+        await rmdir(path);
+        return true;
+      } catch (error) {
+        if (missing(error)) return true;
+        const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+        if (code === "ENOTEMPTY" || code === "EEXIST") return false;
+        throw error;
+      }
     },
   };
 }

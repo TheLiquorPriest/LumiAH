@@ -8,12 +8,15 @@
 // HTTP and the socket are passed in: the tests run all of this against a fake Lumiverse.
 
 import type { LinkErrorCode, LinkNotice, LinkRequests, LinkRequestType } from "../link/contract";
-import { EXTENSION_IDENTIFIER, LINK } from "../link/contract";
+import { EXTENSION_IDENTIFIER, LINK, OWN_BACKEND } from "../link/contract";
 import { answerOf, isLinkFrame } from "../link/frames";
 import { isRecord } from "../link/json";
 import { PartJoiner, needsParts, partOf, splitFrame } from "../link/parts";
+import type { Outcome, Timings } from "../link/timings";
+import { transportWait } from "../link/waits";
+import type { SettingsOwner } from "../shared/timeouts";
 import type { Http, StoredLogin } from "./lumiverse";
-import { exchange, inClear, LiveError, loginAgain, refused } from "./lumiverse";
+import { exchange, inClear, LiveError, loginAgain, refused, WaitError } from "./lumiverse";
 
 export interface SocketEvents {
   message(text: string): void;
@@ -79,6 +82,10 @@ export interface ConnectionOptions {
    * ends its streams at once rather than wait for silence.
    */
   onExtension?(change: "loaded" | "unloaded" | "error", detail: string | null): void;
+  /** The runtime's timing log: each request's op, its size each way, its time and how it ended (never what it carried). */
+  timings?: Timings;
+  /** The extension it links to, as it last said, read when a request runs out of time: its words name it and where its Settings are. Absent: LumiAH's own. */
+  owner?(): SettingsOwner;
 }
 
 interface Pending {
@@ -86,6 +93,9 @@ interface Pending {
   resolve(body: unknown): void;
   reject(error: Error): void;
   timer: ReturnType<typeof setTimeout> | undefined;
+  /** When it was sent, and the characters it sent, for the timing log. */
+  at: number;
+  sent: number;
 }
 
 /** A frontend session id as Lumiverse takes one: 32 lowercase hex digits, fresh for every socket. */
@@ -163,14 +173,18 @@ export class HostConnection {
     const frames = needsParts(whole) ? splitFrame(JSON.stringify(payload), id).map(wrap) : [whole];
     const { promise, resolve, reject } = Promise.withResolvers<unknown>();
     const limit = this.options.limits().requestMs;
+    const at = this.options.now();
+    const sent = frames.reduce((n, frame) => n + frame.length, 0);
     const timer =
       limit === null
         ? undefined
         : setTimeout(() => {
             this.pending.delete(id);
-            reject(new LiveError("timeout", `LumiAH didn't answer ${type} within ${formatMs(limit)}.`));
+            this.timed({ type, at, sent }, 0, null, "timeout");
+            const owner = this.options.owner?.() ?? OWN_BACKEND;
+            reject(new WaitError(`${owner.name} didn't answer ${type} within ${formatMs(limit)}: ${transportWait(["runtime", "requestMs"], owner)} says how long a request waits.`));
           }, limit);
-    this.pending.set(id, { type, resolve, reject, timer });
+    this.pending.set(id, { type, resolve, reject, timer, at, sent });
     for (const frame of frames) socket.send(frame);
     return promise as Promise<LinkRequests[T]["result"]>;
   }
@@ -317,11 +331,11 @@ export class HostConnection {
       return;
     }
     if (msg.event !== "SPINDLE_FRONTEND_MSG" || !isRecord(msg.payload) || msg.payload.extensionId !== this.extension?.id) return;
-    this.frame(msg.payload.data);
+    this.frame(msg.payload.data, text.length);
   }
 
-  /** One frame of the extension's: a part of a larger one, an answer to a request of ours, or a push. */
-  private frame(data: unknown): void {
+  /** One frame of the extension's: a part of a larger one, an answer to a request of ours, or a push. `size`: the characters it came in, for the timing log. */
+  private frame(data: unknown, size: number): void {
     // The extension's messages to its pages travel the same channel: only the link's are the runtime's.
     if (!isLinkFrame(data)) return;
     const part = partOf(data);
@@ -335,13 +349,14 @@ export class HostConnection {
           // Not a frame after all: dropped, and whatever waited for it times out.
         }
         // A whole frame is never itself a part.
-        if (partOf(whole) === null) this.frame(whole);
+        if (partOf(whole) === null) this.frame(whole, joined.text.length);
       } else if ("refused" in joined) {
         // Its answer never comes whole: the request it answered fails now rather than time out.
         const waiting = this.pending.get(joined.id);
         if (waiting !== undefined) {
           this.pending.delete(joined.id);
           clearTimeout(waiting.timer);
+          this.timed(waiting, 0, null, "failed");
           waiting.reject(new LiveError("too_large", `LumiAH's answer to ${waiting.type} was too large for the runtime: ${joined.refused} Raise the runtime's "Largest frame joined" in LumiAH's settings.`));
         }
       }
@@ -355,8 +370,14 @@ export class HostConnection {
     }
     this.pending.delete(answer.id);
     clearTimeout(waiting.timer);
+    this.timed(waiting, size, answer.took ?? null, answer.type === "result" ? "ok" : "refused");
     if (answer.type === "result") waiting.resolve(answer.body);
     else waiting.reject(new LinkError(answer.code, answer.message));
+  }
+
+  /** A request's crossing in the timing log: its op, its size each way, its whole time, how long the extension said it worked, how it ended. */
+  private timed(request: Pick<Pending, "type" | "at" | "sent">, got: number, workMs: number | null, outcome: Outcome): void {
+    this.options.timings?.add({ at: request.at, op: request.type, road: "link", sent: request.sent, got, ms: this.options.now() - request.at, workMs, outcome });
   }
 
   /** The socket is gone: whatever waited on it fails, and the next request opens a new one. */
@@ -369,6 +390,7 @@ export class HostConnection {
     this.pending.clear();
     for (const w of waiting) {
       clearTimeout(w.timer);
+      this.timed(w, 0, null, "failed");
       w.reject(new LiveError("closed", `The connection to Lumiverse closed (${code}${reason ? ` ${reason}` : ""}) before LumiAH answered ${w.type}.`));
     }
   }

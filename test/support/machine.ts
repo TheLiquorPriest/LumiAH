@@ -5,7 +5,9 @@
 
 import { isRecord } from "../../src/link/json";
 import type { OwnedEntry, RuntimeIO } from "../../src/runtime/cli";
+import type { Successor } from "../../src/runtime/update/restart";
 import type { FakeLumiverse } from "./fake-lumiverse";
+import { tempFolder } from "./folders";
 
 export const HOME = "/home/mara";
 export const BUN = "/opt/bun/bin/bun";
@@ -28,6 +30,12 @@ export interface Machine {
   ran: string[];
   /** Every request made of Lumiverse, as `METHOD path`. */
   asked: string[];
+  /** Every folder made, with the mode it was given and the real folder that stands in for it (the runtime keeps its own files on the disk). */
+  folders: Map<string, { mode: number; at: string }>;
+  /** Symbolic links, by the path that is one, to the path it leads to. */
+  links: Map<string, string>;
+  /** Every successor the runtime handed its process to, in order (nothing is started). */
+  handedOver: Successor[];
 }
 
 /** What a test's machine differs in: who runs the command, on what system, with what in its environment, under which Bun. */
@@ -35,7 +43,8 @@ export type MachineChange = Partial<Pick<RuntimeIO, "uid" | "platform" | "env" |
 
 /** A machine Lumiverse is reached from. The command runs as LumiAH's own copy of the runtime; a test that runs another extension's gives `io` that copy's path as `self`. */
 export function machine(lumiverse: FakeLumiverse, change: MachineChange = {}): Machine {
-  const m: Omit<Machine, "io"> = { out: [], err: [], files: new Map(), owners: new Map(), taken: new Set(), served: [], ran: [], asked: [] };
+  const m: Omit<Machine, "io"> = { out: [], err: [], files: new Map(), owners: new Map(), taken: new Set(), served: [], ran: [], asked: [], folders: new Map(), links: new Map(), handedOver: [] };
+  const real = (path: string): string => m.links.get(path) ?? path;
   const uid = change.uid === undefined ? 1000 : change.uid;
   const io: RuntimeIO = {
     out: (text) => void m.out.push(text),
@@ -72,12 +81,20 @@ export function machine(lumiverse: FakeLumiverse, change: MachineChange = {}): M
       remove: (path) => void m.files.delete(path),
       // Everything is the account's own, and no one else's to write, unless a test says otherwise.
       stat: (path) => m.owners.get(path) ?? { uid: uid ?? 1000, gid: uid ?? 1000, mode: 0o755 },
-      real: (path) => path,
+      real,
+      // A folder made here is a real one, made once for each path: what the runtime keeps in it stays there from one serve to the next.
+      folder: (path, mode) => {
+        const at = m.folders.get(path)?.at ?? tempFolder();
+        m.folders.set(path, { mode, at });
+        return at;
+      },
     },
     run: async (command, args) => {
       m.ran.push([command, ...args].join(" "));
       if (command === "id") return { code: 0, out: args.includes("-nu") && args.length === 1 ? "mara\n" : "brann\n", err: "" };
       if (command === "loginctl" && args[0] === "show-user") return { code: 0, out: "yes\n", err: "" };
+      // A build of the runtime says its version, as a whole one does; a test of one that can't start answers otherwise.
+      if (args.at(-1) === "--version") return { code: 0, out: "lumiah 0.0.2 (build next-build)\n", err: "" };
       return { code: 0, out: "", err: "" };
     },
     sleep: async () => undefined,
@@ -95,6 +112,25 @@ export function machine(lumiverse: FakeLumiverse, change: MachineChange = {}): M
       const writer = isRecord(values) && isRecord(values.core) && isRecord(values.core.agents) ? values.core.agents.writer : undefined;
       return isRecord(writer) && typeof writer.connectionId === "string" ? writer.connectionId : null;
     },
+    // The same files as the command's, as bytes.
+    updateFiles: {
+      read: (path) => {
+        const file = m.files.get(path);
+        return file === undefined ? null : new TextEncoder().encode(file.text);
+      },
+      write: (path, bytes, mode) => void m.files.set(path, { text: new TextDecoder().decode(bytes), mode, dirMode: null }),
+      mode: (path) => m.files.get(path)?.mode ?? null,
+      rename: (from, to) => {
+        const file = m.files.get(from);
+        if (file === undefined) throw new Error(`no such file: ${from}`);
+        m.files.set(to, file);
+        m.files.delete(from);
+      },
+      remove: (path) => void m.files.delete(path),
+      real,
+    },
+    handOver: async (next) => void m.handedOver.push(next),
+    pid: 4242,
   };
   return { ...m, io };
 }

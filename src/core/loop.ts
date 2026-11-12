@@ -325,6 +325,8 @@ class Agent implements AgentHandle {
   private readonly scratch = new Map<string, { whole: Whole; per: number }>();
   /** The room the round's results have left in the agent's next call, in characters, where Prompt per call limits it (`roomOf`); endless where it doesn't. */
   private room = Number.POSITIVE_INFINITY;
+  /** Its start on the trace (`begin`), asked for by its first message; null before that. */
+  private started: Promise<void> | null = null;
   private startedAt: number | null = null;
   /** How long the run had been held when this agent started: time it was held before then isn't this agent's to subtract. */
   private heldBefore = 0;
@@ -372,7 +374,8 @@ class Agent implements AgentHandle {
             this.piece(delta);
           }
         : undefined;
-    this.callSpec = { connectionId: spec.connectionId, model: spec.model, effort: spec.effort, system: spec.system, prefix: spec.prefix, cache: settings.cache, ...(spec.toolCalls !== undefined ? { toolCalls: spec.toolCalls } : {}), ...(spec.params ? { params: spec.params } : {}), ...(streamed ? { onDelta: streamed } : {}) };
+    // The agent's calls are one session of the provider's prompt cache, let go when its run ends.
+    this.callSpec = { connectionId: spec.connectionId, model: spec.model, effort: spec.effort, system: spec.system, prefix: spec.prefix, cache: { ...settings.cache, session: this.id }, ...(spec.toolCalls !== undefined ? { toolCalls: spec.toolCalls } : {}), ...(spec.params ? { params: spec.params } : {}), ...(streamed ? { onDelta: streamed } : {}) };
     this.session = new ProviderSession(deps, this.callSpec);
     this.conversation = [...(spec.history ?? [])];
     for (const tool of spec.tools) this.tools.set(tool.name, tool);
@@ -380,11 +383,29 @@ class Agent implements AgentHandle {
     if (this.tools.size > 0) this.tools.set(SCRATCH_READ, this.scratchRead());
     this.offered = [...this.tools.values()].map((t) => ({ name: t.name, description: t.description, parameters: t.parameters }));
     this.offeredTokens = toolTokens(this.offered, settings.loop.charsPerToken);
-    deps.turn?.trace?.start({ id: this.id, role: spec.role, connectionId: spec.connectionId, model: spec.model, effort: spec.effort, system: spec.system, prefix: [...spec.prefix], history: this.conversation.length, ...(spec.parent !== undefined ? { parent: spec.parent } : {}), ...(spec.task !== undefined ? { task: spec.task } : {}), ...(spec.as !== undefined ? { as: spec.as } : {}), at: this.now() });
   }
 
   private now(): number {
     return this.deps.host.clock.now();
+  }
+
+  /**
+   * The agent's start on the trace, before anything of its work: its connection is read first, so
+   * the start names the connection its calls go on, by its id and its name, and the one its
+   * settings name where that is none of the host's and the default stands in. Where no connection
+   * can be read, the start names what its settings name, and its first call's stop says why.
+   */
+  private async begin(): Promise<void> {
+    const { spec } = this;
+    let on: Pick<AgentStarted, "connectionId" | "connectionName" | "gone"> = { connectionId: spec.connectionId };
+    try {
+      const profile = await this.session.connect();
+      const gone = this.session.gone;
+      on = { connectionId: profile.id, connectionName: profile.name, ...(gone !== null ? { gone } : {}) };
+    } catch {
+      // Not lost: the first call takes this read, its failure too, and its stop says why.
+    }
+    this.deps.turn?.trace?.start({ id: this.id, role: spec.role, ...on, model: spec.model, effort: spec.effort, system: spec.system, prefix: [...spec.prefix], history: spec.history?.length ?? 0, ...(spec.parent !== undefined ? { parent: spec.parent } : {}), ...(spec.task !== undefined ? { task: spec.task } : {}), ...(spec.as !== undefined ? { as: spec.as } : {}), at: this.now() });
   }
 
   private text(id: string, vars: Readonly<Record<string, string>> = {}): string {
@@ -401,6 +422,8 @@ class Agent implements AgentHandle {
 
   /** One message's work: the message joins the conversation (none for `run`), and the loop runs on it. */
   private async work(text: string | null, signal: AbortSignal | undefined): Promise<AgentReply> {
+    // Its start is on the trace before anything of its work is.
+    if (this.deps.turn?.trace) await (this.started ??= this.begin());
     const used = emptyUsage();
     if (this.controller.signal.aborted) return this.end(used, new AgentStop("cancelled", { id: TEXT.stop.cancelled }));
     if (this.busy) return this.end(used, new AgentStop("busy", { id: TEXT.stop.busy }));

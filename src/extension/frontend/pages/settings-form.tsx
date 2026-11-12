@@ -5,8 +5,10 @@
 // whole value at once (on a press, or when a typed value is left), so every change is one request.
 
 import { useEffect, useId, useState } from "preact/hooks";
-import type { ConnectionView, JsonValue, SettingPath } from "../../../shared/ui";
+import { addConnectionWords } from "../../../shared/connections";
+import type { JsonValue, ModelChoice, SettingPath } from "../../../shared/ui";
 import { Badge, Button, Check, NumberField, Seg, Select, Switch, TextArea, TextInput } from "../components";
+import { goneWords, type KnownConnections, modelsConnection, noneWords, pickerLabel, unlistedWords, whoseWords } from "../connections-model";
 import { Icon } from "../icons";
 import { besideNumber, changedCount, type Choice, type Control, type FormNode, initialOf, isBranch, linesOf, pathKey, sameJson, shownNumber, storedNumber, valueWords, withoutRow } from "../settings-model";
 
@@ -18,21 +20,30 @@ export interface FormCtx {
   busy: boolean;
   /** What the settings refused, by the path of the setting it is about (`pathKey`). */
   problems: ReadonlyMap<string, string>;
-  connections: readonly ConnectionView[];
+  /** The runtime's connections, which a setting that names a connection picks from (`useRuntimeConnections`). */
+  connections: KnownConnections;
   /** The setting a search led to (`pathKey`), marked so it is found on the page. */
   found: string | null;
   /** The value now at a path of the settings. */
   at(path: SettingPath): JsonValue | undefined;
-  /** The models a connection offers (null: the default connection); rejects where they can't be listed. */
-  models(connectionId: string | null): Promise<string[]>;
+  /** The models a connection of the runtime's offers (null: the default connection); rejects where they can't be listed. */
+  models(connectionId: string | null): Promise<ModelChoice[]>;
   /** The tools' names, for a table with a row per tool; left out where the page doesn't know them, and a name is then typed. */
   tools?: readonly string[];
   /** Each setting's row also says the key it is kept under (`core.agents.main.connectionId`): off unless the user asked for the details. */
   details?: boolean;
+  /** Each setting's row says its default even while it is the default (the Timeouts page, where the default is part of each row). */
+  defaults?: boolean;
 }
 
-function connectionLabel(c: ConnectionView): string {
-  return `${c.name} · ${c.provider}${c.model ? ` · ${c.model}` : ""}${c.loopback ? " (the loopback: no agent may use it)" : ""}`;
+/** A line under a connection's control: what the page can't say yet, or whose connections these are. */
+function ConnectionsNote(props: { known: KnownConnections }) {
+  const words = unlistedWords(props.known) ?? whoseWords(props.known);
+  return words !== null ? (
+    <span class="lah-field-help" style={{ flexBasis: "100%" }} data-lah-connections-note>
+      {words}
+    </span>
+  ) : null;
 }
 
 /** One of several choices: a row of buttons while they are few and short, else a list. */
@@ -55,13 +66,13 @@ function ChoiceControl(props: { node: FormNode; options: readonly Choice[]; ctx:
   );
 }
 
-/** A model's name, typed, with the connection's own models offered once they are listed. */
+/** A model's name, typed, with the models of the connection the agent runs on offered once they are listed: the one chosen beside it where the runtime has it, else the default. */
 function ModelControl(props: { node: FormNode; connection: SettingPath | null; ctx: FormCtx }) {
   const { node, ctx } = props;
   const listId = useId();
   const named = props.connection ? ctx.at(props.connection) : null;
-  const connectionId = typeof named === "string" && named !== "" ? named : null;
-  const [models, setModels] = useState<string[] | null>(null);
+  const connectionId = modelsConnection(typeof named === "string" && named !== "" ? named : null, ctx.connections);
+  const [models, setModels] = useState<ModelChoice[] | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   // Another connection has other models.
   useEffect(() => {
@@ -80,7 +91,7 @@ function ModelControl(props: { node: FormNode; connection: SettingPath | null; c
       <TextInput label={node.label} value={typeof node.value === "string" ? node.value : ""} placeholder={node.nullable ? node.none : "A model's name"} list={listId} mono disabled={ctx.busy} onFocus={list} onCommit={(text) => ctx.save([{ path: node.path, value: text.trim() === "" && node.nullable ? null : text.trim() }])} />
       <datalist id={listId}>
         {(models ?? []).map((m) => (
-          <option key={m} value={m} />
+          <option key={m.id} value={m.id} label={m.name !== m.id ? m.name : undefined} />
         ))}
       </datalist>
       {models !== null ? <span class="lah-field-help" style={{ flexBasis: "100%" }}>{models.length === 0 ? "The connection lists no models: type the name." : `The connection offers ${models.length} model${models.length === 1 ? "" : "s"}: start typing to pick one.`}</span> : null}
@@ -147,27 +158,29 @@ function SetControl(props: { node: FormNode; options: readonly Choice[]; ctx: Fo
 }
 
 /**
- * The user's connections, each ticked or not: a setting that holds connection ids. The loopback
- * connection isn't offered (no agent's call goes on it). An id the setting holds that is none of
- * the user's connections (one since deleted) shows too, so what is stored is never hidden and can
- * be taken out.
+ * The runtime's connections, each ticked or not: a setting that holds connection ids. An id the
+ * setting holds that is none of the runtime's connections (one since removed, or one of
+ * Lumiverse's from before the runtime kept its own) shows too, so what is stored is never hidden and
+ * can be taken out; while the runtime's list isn't known, every id held shows as it is.
  */
 function ConnectionsControl(props: { node: FormNode; ctx: FormCtx }) {
   const { node, ctx } = props;
+  const view = ctx.connections.view;
   const held = Array.isArray(node.value) ? node.value.filter((v): v is string => typeof v === "string") : [];
-  const offered = ctx.connections.filter((x) => !x.loopback || held.includes(x.id));
-  const gone = held.filter((id) => !ctx.connections.some((x) => x.id === id));
+  const offered = view?.connections ?? [];
+  const gone = held.filter((id) => !offered.some((x) => x.id === id));
   const set = (id: string, on: boolean): void => ctx.save([{ path: node.path, value: on ? [...held.filter((x) => x !== id), id] : held.filter((x) => x !== id) }]);
   return (
     <div class="lah-set-checks" role="group" aria-label={node.label} data-lah-connections>
       <span class="lah-set-unit">{`${held.length} of ${offered.length + gone.length} on`}</span>
-      {offered.length + gone.length === 0 ? <span class="lah-field-help">You have no connection an agent can use yet. Add one under Lumiverse's Connect.</span> : null}
+      {view !== null && offered.length + gone.length === 0 ? <span class="lah-field-help">{`The runtime has no connection yet. ${addConnectionWords("the Runtime page, under Connections")}`}</span> : null}
       {offered.map((x) => (
-        <Check key={x.id} checked={held.includes(x.id)} label={connectionLabel(x)} disabled={ctx.busy} onChange={(on) => set(x.id, on)} />
+        <Check key={x.id} checked={held.includes(x.id)} label={pickerLabel(x, view ?? { providers: [] })} disabled={ctx.busy} onChange={(on) => set(x.id, on)} />
       ))}
       {gone.map((id) => (
-        <Check key={id} checked label={<code>{id}</code>} help="None of your connections has this id now: untick it to take it out." disabled={ctx.busy} onChange={(on) => set(id, on)} />
+        <Check key={id} checked label={<code>{id}</code>} help={view !== null ? "None of the runtime's connections has this id now: untick it to take it out." : undefined} disabled={ctx.busy} onChange={(on) => set(id, on)} />
       ))}
+      <ConnectionsNote known={ctx.connections} />
     </div>
   );
 }
@@ -220,8 +233,23 @@ function LeafControl(props: { node: FormNode; control: Exclude<Control, { kind: 
       return <ChoiceControl node={node} options={c.options} ctx={ctx} />;
     case "connection": {
       const value = typeof node.value === "string" ? node.value : "";
-      const options = [...(node.nullable ? [{ value: "", label: node.none }] : []), ...ctx.connections.map((x) => ({ value: x.id, label: connectionLabel(x), disabled: x.loopback }))];
-      return <Select label={node.label} value={value} options={options} disabled={ctx.busy} invalid={ctx.problems.has(pathKey(node.path))} onChange={(id) => set(id === "" && node.nullable ? null : id)} />;
+      const known = ctx.connections;
+      const view = known.view;
+      // An id none of the runtime's connections has is offered as itself, said to be gone, so what is stored is never hidden.
+      const gone = goneWords(value === "" ? null : value, known);
+      const options = [...(node.nullable ? [{ value: "", label: noneWords(node.none, known) }] : []), ...(gone !== null ? [{ value, label: `${value} (no connection of the runtime's now)` }] : []), ...(view?.connections ?? []).map((x) => ({ value: x.id, label: pickerLabel(x, view ?? { providers: [] }) }))];
+      return (
+        <>
+          <Select label={node.label} value={value} options={options} disabled={ctx.busy} invalid={ctx.problems.has(pathKey(node.path))} onChange={(id) => set(id === "" && node.nullable ? null : id)} />
+          {gone !== null ? (
+            <span class="lah-line lah-is-warn" style={{ flexBasis: "100%" }} data-lah-gone>
+              <Icon name="alert" size={14} />
+              <span>{gone}</span>
+            </span>
+          ) : null}
+          <ConnectionsNote known={known} />
+        </>
+      );
     }
     case "model":
       return <ModelControl node={node} connection={c.connection} ctx={ctx} />;
@@ -289,6 +317,8 @@ function Leaf(props: { node: FormNode; control: Exclude<Control, { kind: "group"
               {`Default: ${defaultWords(node)}`}
             </Button>
           </div>
+        ) : ctx.defaults ? (
+          <span class="lah-field-help" data-lah-default>{`Default: ${defaultWords(node)}`}</span>
         ) : null}
       </div>
     </div>
@@ -306,12 +336,12 @@ function AddRow(props: { node: FormNode; control: Extract<Control, { kind: "tabl
     ctx.save([{ path: [...node.path, key], value: initialOf(c.row) }]);
     setName("");
   };
-  const free = ctx.connections.filter((x) => !taken.has(x.id));
+  const free = (ctx.connections.view?.connections ?? []).filter((x) => !taken.has(x.id));
   const tools = c.keys === "tool" && ctx.tools ? ctx.tools.filter((t) => !taken.has(t)) : null;
   return (
     <div class="lah-set-add" data-lah-add={node.path.join(".")}>
       {c.keys === "connection" ? (
-        <Select label={`A connection to add to ${node.label}`} value={name} options={[{ value: "", label: free.length === 0 ? "Every connection has a row" : "Choose a connection…" }, ...free.map((x) => ({ value: x.id, label: connectionLabel(x) }))]} disabled={ctx.busy} onChange={setName} />
+        <Select label={`A connection to add to ${node.label}`} value={name} options={[{ value: "", label: free.length > 0 ? "Choose a connection…" : ctx.connections.view === null ? "The runtime's connections show once one is linked" : "Every connection has a row" }, ...free.map((x) => ({ value: x.id, label: pickerLabel(x, ctx.connections.view ?? { providers: [] }) }))]} disabled={ctx.busy} onChange={setName} />
       ) : tools !== null ? (
         <Select label={`A tool to add to ${node.label}`} value={name} options={[{ value: "", label: tools.length === 0 ? "Every tool has a row" : "Choose a tool…" }, ...tools.map((t) => ({ value: t, label: t }))]} disabled={ctx.busy} onChange={setName} />
       ) : (
@@ -331,7 +361,7 @@ function Branch(props: { node: FormNode; ctx: FormCtx; top?: boolean }) {
   const c = node.control;
   const changed = changedCount(node);
   const problem = ctx.problems.get(pathKey(node.path)) ?? null;
-  const rowName = (key: string): string => (c.kind === "table" && c.keys === "connection" ? (ctx.connections.find((x) => x.id === key)?.name ?? key) : key);
+  const rowName = (key: string): string => (c.kind === "table" && c.keys === "connection" ? (ctx.connections.view?.connections.find((x) => x.id === key)?.name ?? key) : key);
   return (
     <div class="lah-set-group" data-lah-group={node.path.join(".")}>
       {props.top ? null : (

@@ -170,8 +170,8 @@ function scripted(s: Script): NonNullable<Parameters<typeof rig>[0]>["harness"] 
 }
 
 let open: Rig | null = null;
-afterEach(() => {
-  open?.close();
+afterEach(async () => {
+  await open?.close();
   open = null;
 });
 

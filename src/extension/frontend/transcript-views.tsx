@@ -8,24 +8,23 @@ import { errorWords, useApp } from "./app";
 import { Badge, Button, CopyButton, Disclosure, Empty, Section } from "./components";
 import { clock, compact, count, counted, duration, money } from "./format";
 import { Icon } from "./icons";
-import { AGENT_STATE_WORDS, type AgentTotals, agentLabel, type CallRow, costWords, heldLine, type Totals, totalCostWords, type TurnTotals, type TurnView } from "./live-model";
+import { AGENT_STATE_WORDS, type AgentTotals, agentLabel, type CallRow, costWords, heldLine, onConnection, promptFacts, type Totals, totalCostWords, type TurnTotals, type TurnView } from "./live-model";
 import { type Folds, TextBlock } from "./feed-parts";
 
 // ---------------------------------------------------------------- the exact prompt
 
 /** A message part as the prompt view shows it. */
 function partText(p: ModelPart): string {
-  const mark = p.cache ? "\n[cache breakpoint]" : "";
   switch (p.type) {
     case "text":
-      return `${p.text}${mark}`;
+      return p.text;
     case "tool_use":
-      return `→ ${p.name} ${JSON.stringify(p.input, null, 2)}${mark}`;
+      return `→ ${p.name} ${JSON.stringify(p.input, null, 2)}`;
     case "tool_result":
-      return `← ${p.isError ? "failed: " : ""}${p.content}${mark}`;
+      return `← ${p.isError ? "failed: " : ""}${p.content}`;
     case "media":
       // Base64 holds three bytes in four characters.
-      return `[${p.media}, ${p.mimeType}, about ${compact(Math.round((p.data.length * 3) / 4))} bytes]${mark}`;
+      return `[${p.media}, ${p.mimeType}, about ${compact(Math.round((p.data.length * 3) / 4))} bytes]`;
   }
 }
 
@@ -36,10 +35,9 @@ function messageText(m: ModelMessage): string {
 
 type PromptState = { status: "loading" } | { status: "ready"; prompt: CallPrompt } | { status: "failed"; message: string };
 
-/** A call's exact request, read when it opens: where it went, with what, and every message and tool it carried. */
-function PromptView(props: { hash: string; item: string; folds: Folds }) {
+/** A call's exact request, read when it opens: where it went, with what, and every message and tool it carried. `connection` names a connection as the runtime that plays the transcript's chat lists it, else by its id. */
+function PromptView(props: { hash: string; item: string; folds: Folds; connection(id: string): string }) {
   const app = useApp();
-  const connections = app.client.state.get()?.connections ?? [];
   const [state, setState] = useState<PromptState>({ status: "loading" });
   const [tries, setTries] = useState(0);
   useEffect(() => {
@@ -68,16 +66,7 @@ function PromptView(props: { hash: string; item: string; folds: Folds }) {
   const json = JSON.stringify(p, null, 2);
   const tools = p.tools ?? [];
   const chars = p.messages.reduce((n, m) => n + messageText(m).length, 0);
-  const facts = [
-    p.model ?? "the connection's model",
-    p.connectionId ? `on ${connections.find((c) => c.id === p.connectionId)?.name ?? p.connectionId}` : "on the default connection",
-    `effort ${p.effort ?? "inherit"}`,
-    `up to ${count(p.maxTokens)} tokens`,
-    p.stream ? "streamed" : "answered whole",
-    ...(p.parallelToolCalls === false ? ["one tool call an answer"] : []),
-    ...(p.thinkingDisplay ? [`thinking ${p.thinkingDisplay}`] : []),
-    ...Object.entries(p.params ?? {}).map(([k, v]) => `${k} ${JSON.stringify(v)}`),
-  ];
+  const facts = promptFacts(p, props.connection);
   return (
     <div class="lah-prompt" data-lah-prompt={props.hash}>
       <p class="lah-prompt-facts">{facts.join(" · ")}</p>
@@ -93,7 +82,7 @@ function PromptView(props: { hash: string; item: string; folds: Folds }) {
       {tools.length > 0 ? (
         <Disclosure summary={`${counted(tools.length, "tool")} offered`}>
           {tools.map((t) => (
-            <TextBlock key={t.name} item={`${props.item}:tool:${t.name}`} kind="told" title={t.name} text={`${t.description}\n\n${JSON.stringify(t.parameters, null, 2)}${t.cache ? "\n[cache breakpoint]" : ""}`} folds={props.folds} />
+            <TextBlock key={t.name} item={`${props.item}:tool:${t.name}`} kind="told" title={t.name} text={`${t.description}\n\n${JSON.stringify(t.parameters, null, 2)}`} folds={props.folds} />
           ))}
         </Disclosure>
       ) : null}
@@ -104,8 +93,8 @@ function PromptView(props: { hash: string; item: string; folds: Folds }) {
   );
 }
 
-/** The exact prompt of a call, on request. */
-export function PromptBlock(props: { hash: string; item: string; folds: Folds }) {
+/** The exact prompt of a call, on request; `connection` names the call's connection (`PromptView`). */
+export function PromptBlock(props: { hash: string; item: string; folds: Folds; connection(id: string): string }) {
   const { folds } = props;
   const open = folds.open(props.item, false);
   return (
@@ -118,7 +107,7 @@ export function PromptBlock(props: { hash: string; item: string; folds: Folds })
       </summary>
       {open ? (
         <div class="lah-block-body">
-          <PromptView hash={props.hash} item={props.item} folds={folds} />
+          <PromptView hash={props.hash} item={props.item} folds={folds} connection={props.connection} />
         </div>
       ) : null}
     </details>
@@ -189,7 +178,7 @@ function AgentRow(props: { t: AgentTotals }) {
   );
 }
 
-function CallRowView(props: { c: CallRow; role: string; start: number; span: number }) {
+function CallRowView(props: { c: CallRow; role: string; on: string; start: number; span: number }) {
   const { c } = props;
   const u = c.usage;
   const mark = (field: "in" | "cachedIn" | "out" | "reasoningOut" | "cost"): string => est(u.estimated.includes(field));
@@ -201,7 +190,7 @@ function CallRowView(props: { c: CallRow; role: string; start: number; span: num
     <div class="lah-trow" role="row" data-lah-call-totals={c.seq}>
       <span class="lah-tcell lah-is-lead" data-label="Call">{`${props.role} · call ${c.call}`}</span>
       <span class="lah-tcell" data-label="Model">
-        {c.model || "model"}
+        {c.model || "model"} <span class="lah-dim lah-small">{props.on}</span>
       </span>
       <span class="lah-tcell lah-is-n" data-label="Tokens in">{`${mark("in")}${count(u.in)}`}</span>
       <span class="lah-tcell lah-is-n" data-label="Of them cached">{`${mark("cachedIn")}${count(u.cachedIn)}`}</span>
@@ -227,7 +216,7 @@ function CallRowView(props: { c: CallRow; role: string; start: number; span: num
   );
 }
 
-/** The turn's totals: its figures, then each agent's, then each call's with where it sat in the turn's time. */
+/** The turn's totals: its figures, then each agent's, then each call's with where it sat in the turn's time and the connection it went on (`connection` names one as the runtime that plays the transcript's chat lists it, where the trace kept no name). */
 export function TotalsView(props: { turn: TurnView; totals: TurnTotals; connection(id: string): string }) {
   const { totals, turn } = props;
   const t = totals.turn;
@@ -291,7 +280,7 @@ export function TotalsView(props: { turn: TurnView; totals: TurnTotals; connecti
                 <span>When in the turn</span>
               </div>
               {totals.calls.map((c) => (
-                <CallRowView key={c.seq} c={c} role={role.get(c.agentId) ?? c.agentId} start={turn.view.startedAt} span={span} />
+                <CallRowView key={c.seq} c={c} role={role.get(c.agentId) ?? c.agentId} on={onConnection(c.on, props.connection)} start={turn.view.startedAt} span={span} />
               ))}
             </div>
             <p class="lah-legend">
@@ -305,7 +294,7 @@ export function TotalsView(props: { turn: TurnView; totals: TurnTotals; connecti
           </>
         )}
       </Section>
-      <p class="lah-lead lah-small">≈ marks a count the provider didn't report, which holds the runtime's estimate; a cost marked ≈ is worked out from the price settings. A cost is unknown where the provider named none and no price is set for the model.</p>
+      <p class="lah-lead lah-small">≈ marks a count the provider didn't report, which holds the runtime's estimate. A cost marked ≈ is no bill: it is worked out from your price for the model in Settings, else from the provider's published price where the runtime knows it. A cost is unknown where the provider named none and no price is known for the model.</p>
     </div>
   );
 }

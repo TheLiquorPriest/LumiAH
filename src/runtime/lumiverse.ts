@@ -6,12 +6,16 @@
 import { isRecord } from "../link/json";
 import type { SchedulerState } from "../link/contract";
 import { loopsBack } from "../link/contract";
+import { spanWords, transportWait } from "../link/waits";
+import type { SettingsOwner } from "../shared/timeouts";
 
 export interface HttpRequest {
   method: "GET" | "POST" | "PUT";
   url: string;
   headers: Record<string, string>;
   body?: string;
+  /** Ends the request when it aborts: the runtime's deadline for Lumiverse's answer (its Lumiverse wait). */
+  signal?: AbortSignal;
 }
 
 export interface HttpReply {
@@ -23,6 +27,30 @@ export interface HttpReply {
 /** One HTTP exchange; main.ts supplies Bun's fetch. */
 export type Http = (request: HttpRequest) => Promise<HttpReply>;
 
+/**
+ * The runtime's HTTP to Lumiverse with a deadline on each request (`waitMs`, read as each starts:
+ * the runtime's Lumiverse wait): past it the request is ended and rejects in words that name the
+ * setting and where it is (`owner`: the extension the runtime links to, as it last said, read when
+ * the words are made), whether or not the HTTP beneath heeds the signal.
+ */
+export function timedHttp(http: Http, waitMs: () => number, owner: () => SettingsOwner): Http {
+  return async (request) => {
+    const ms = waitMs();
+    const stop = new AbortController();
+    const { promise: late, reject } = Promise.withResolvers<never>();
+    const timer = setTimeout(() => {
+      const error = new Error(`Lumiverse didn't answer within ${spanWords(ms)}. ${transportWait(["runtime", "lumiverseMs"], owner())} says how long the runtime waits for it.`);
+      stop.abort(error);
+      reject(error);
+    }, ms);
+    try {
+      return await Promise.race([http({ ...request, signal: request.signal !== undefined ? AbortSignal.any([request.signal, stop.signal]) : stop.signal }), late]);
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
+
 export type LiveProblem = "login" | "locked" | "unreachable" | "forbidden" | "insecure" | "not_installed" | "not_running" | "too_old" | "timeout" | "closed" | "too_large" | "protocol";
 
 /** Why a call to Lumiverse failed, in words the user can act on. */
@@ -33,6 +61,14 @@ export class LiveError extends Error {
   ) {
     super(message);
     this.name = "LiveError";
+  }
+}
+
+/** A wait of the runtime's that ran out, in words that name its setting and where it is changed (`transportWait`): wherever it is told, it is told in its own words. */
+export class WaitError extends LiveError {
+  constructor(message: string) {
+    super("timeout", message);
+    this.name = "WaitError";
   }
 }
 

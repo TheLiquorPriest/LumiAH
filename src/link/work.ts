@@ -96,6 +96,14 @@ const PAGE_OPS: Readonly<Record<string, true>> = {
   "approvals.forget": true,
 };
 
+/** The ops `Work.ask` answers beside the page-facing methods, each a case of its own there (kept with those cases). */
+const RUN_OPS: Readonly<Record<string, true>> = { "run.say": true, "run.pause": true, "side.send": true, "job.resume": true, "chats.forget": true };
+
+/** Whether `Work.ask` answers an op, by its name: what the runtime's road for asks checks before it reads further. */
+export function isWorkOp(op: string): boolean {
+  return Object.hasOwn(RUN_OPS, op) || Object.hasOwn(PAGE_OPS, op);
+}
+
 function jobOf(raw: unknown): JobView | null {
   return isRecord(raw) && typeof raw.id === "string" && typeof raw.chatId === "string" && typeof raw.state === "string" ? (raw as unknown as JobView) : null;
 }
@@ -145,6 +153,13 @@ export class Work {
   /** The runs under way here: a runtime names them on its ping, and a run the extension shows that it no longer names is over. */
   ids(): string[] {
     return [...this.running.keys()];
+  }
+
+  /** How many of the runs under way are jobs, and how many side sessions' turns: what a restart would cut off now. */
+  runs(): { jobs: number; sides: number } {
+    let jobs = 0;
+    for (const running of this.running.values()) if (running.session === null) jobs++;
+    return { jobs, sides: this.running.size - jobs };
   }
 
   /** Whether the core was told of the user's hold since this place started: the first word goes whatever it says, since the core may still hold another from before a restart. */

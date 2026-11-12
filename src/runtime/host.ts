@@ -1,8 +1,9 @@
-// The core's host (DESIGN §4.2), implemented over the link: every port is a request to the extension,
-// which reaches Lumiverse for it (a model call on the user's connection, user storage, the chat, lore,
-// the preset, a tool that runs in the extension, the user's word on a held call). A model call's
-// answer comes back as a stream (streams.ts), and so does anything else that takes its time; the
-// trace goes out in batches (trace.ts). A host serves one user, the one the runtime signed in as.
+// The core's host (DESIGN §4.2): its model calls and connections are the runtime's own (the model
+// layer, models/), and the rest are requests over the link to the extension, which reaches Lumiverse
+// for them (user storage, the chat, lore, the preset, a tool that runs in the extension, the user's
+// word on a held call). Anything the extension answers that takes its time comes back as a stream
+// (streams.ts); the trace goes out in batches (trace.ts). A host serves one user, the one the
+// runtime signed in as.
 //
 // A read or a write whose socket closed under it is asked again: each is safe to repeat (a blob is
 // stored by its hash, a document and an anchor are written whole, a read changes nothing).
@@ -12,31 +13,24 @@
 // request too, and the runtime is the same for every extension.
 
 import type { AgentModelChoice, ChatClaim, ExtensionDefinitions, HarnessExtension } from "../core/extension";
-import type { ApprovalAnswer, HarnessHost, JobView, JsonValue, LogLevel, ModelDelta, ModelMessage, ModelRequest, ModelResult, TraceDelta, TraceRecord } from "../core/ports";
-import type { ActivatedEntry, LoreBookRead, TimedMessage } from "../core/recall/ports";
+import type { ApprovalAnswer, BlobsPort, ConnectionsPort, HarnessHost, JobView, JsonValue, LogLevel, ModelMessage, ModelsPort, StorePort, TraceDelta, TraceRecord } from "../core/ports";
+import type { ActivatedEntry, LoreBookRead, RecallChatPort, RecallLorePort, RecallPorts, TimedMessage } from "../core/recall/ports";
 import type { ExtensionMember, ExtensionOffer, LinkRequests, StreamChunk } from "../link/contract";
 import { isRecord } from "../link/json";
 import type { RuntimeTuning } from "../link/settings";
 import { LinkError } from "./connection";
 import type { AskType, Asked, RuntimeLink } from "./link";
+import { LOST_WAIT } from "./link";
 import { LiveError } from "./lumiverse";
 import type { Streams } from "./streams";
 import { problemOf } from "./streams";
 
-/** A model call that failed, with the provider's or Lumiverse's own words as its message and the link's code for what failed. */
-export class ModelCallError extends Error {
-  constructor(
-    message: string,
-    readonly code: string,
-  ) {
-    super(message);
-    this.name = "ModelCallError";
-  }
-}
-
 export interface HostDeps {
   link: RuntimeLink;
   streams: Streams;
+  /** The agents' model calls and connections: the runtime's model layer, which calls each provider itself. */
+  models: ModelsPort;
+  connections: ConnectionsPort;
   /** 128 random bits as hex: a stream's name. */
   id(): string;
   now(): number;
@@ -46,8 +40,6 @@ export interface HostDeps {
   trace(record: TraceRecord): void;
   /** Where a call's answer goes as it arrives, for the live view (trace.ts). */
   delta(delta: TraceDelta): void;
-  /** The run the caller works for, so the extension can end its calls when the run is stopped; null outside one. */
-  turn(): string | null;
   /** That run's chat: a preset's blocks are read as they are switched for it; null outside a run. */
   chat(): string | null;
   /** The core queued a job: the runtime runs it when its time comes (jobs.ts). */
@@ -105,13 +97,13 @@ function letGo<T>(work: () => Promise<T>, signal: AbortSignal | undefined): Prom
   return promise;
 }
 
-/** One request, asked again while its socket closes under it and the link's allowance lasts. */
+/** One request, asked again while its socket closes under it and the link's allowance (Extension lost after, which its words name when it runs out) lasts. */
 export async function asked<T extends AskType>(deps: Pick<HostDeps, "link" | "now" | "tuning">, type: T, fields: Asked<T>): Promise<LinkRequests[T]["result"]> {
   const first = deps.now();
   for (;;) {
     const wait = deps.tuning().lostMs;
     try {
-      return await deps.link.request(type, fields, wait);
+      return await deps.link.request(type, fields, wait, LOST_WAIT);
     } catch (error) {
       if (error instanceof LiveError && error.problem === "closed" && deps.now() - first < wait) continue;
       // The ports' callers read a failure's words, so they are the ones a person can act on.
@@ -120,13 +112,80 @@ export async function asked<T extends AskType>(deps: Pick<HostDeps, "link" | "no
   }
 }
 
-export function linkHost(deps: HostDeps): HarnessHost {
+/**
+ * The extension's storage, over the link (`doc.*`, `blob.*`): where the core's documents and blobs
+ * are kept for good. The runtime's working store (store/) keeps its own copy and mirrors it here, its
+ * writes naming the process that holds the mirror (`mirror`), which the extension takes only from
+ * that one; without `mirror`, they are the runtime's own, as a runtime that keeps no copy writes.
+ */
+export function linkStorage(deps: Pick<HostDeps, "link" | "now" | "tuning">, mirror?: string): { store: Required<StorePort>; blobs: Required<BlobsPort> } {
+  const ask = <T extends AskType>(type: T, fields: Asked<T>): Promise<LinkRequests[T]["result"]> => asked(deps, type, fields);
+  const as = mirror === undefined ? {} : { mirror };
+  return {
+    blobs: {
+      put: async (hash, text) => {
+        await ask("blob.put", { hash, text, ...as });
+      },
+      get: async (hash) => (await ask("blob.get", { hash })).text,
+      list: async (cursor) => {
+        const page = await ask("blob.list", { cursor: cursor ?? null });
+        return { blobs: page.blobs, next: page.next };
+      },
+      remove: async (hashes) => {
+        if (hashes.length > 0) await ask("blob.remove", { hashes: [...hashes], ...as });
+      },
+    },
+    store: {
+      read: async (path) => (await ask("doc.get", { path })).doc,
+      write: async (path, value) => {
+        await ask("doc.put", { path, doc: value, ...as });
+      },
+      remove: async (path) => {
+        await ask("doc.remove", { path, ...as });
+      },
+      list: async (prefix) => (await ask("doc.list", { prefix })).paths,
+    },
+  };
+}
+
+/** Whether the extension refused a write of the working copy's because this runtime doesn't hold the mirror (another does now, or none): the copy ends, as when the extension says so on a hello or a push. */
+export function withdrawn(error: unknown): boolean {
+  const cause: unknown = error instanceof Error ? error.cause : undefined;
+  return cause instanceof LinkError && cause.code === "conflict";
+}
+
+/**
+ * Whether the extension refused a request by a rule of its own that asking again doesn't change:
+ * a request it doesn't take (`bad_request`), or a frame larger than the largest it puts together
+ * (`too_large`). A lack of room just now (`unavailable`), a link that dropped and every other
+ * failure pass, and are asked again.
+ */
+export function refusedForGood(error: unknown): boolean {
+  const cause: unknown = error instanceof Error ? error.cause : undefined;
+  return cause instanceof LinkError && (cause.code === "bad_request" || cause.code === "too_large");
+}
+
+/**
+ * Whether the extension refused a storage request because it doesn't know this runtime any more
+ * (forgotten on the Runtime page, or registered anew by `lumiah up`): its secret speaks for nothing
+ * now, and no wait mends that while this process runs. A storage request carries no key, so its
+ * `forbidden` says nothing else.
+ */
+export function unknownRuntime(error: unknown): boolean {
+  const cause: unknown = error instanceof Error ? error.cause : undefined;
+  return cause instanceof LinkError && cause.code === "forbidden";
+}
+
+/** The core's host over the link, with the recall ports' lore and chat reads it always carries named: the runtime's copy answers those in its place (reads.ts). */
+export type LinkedHost = HarnessHost & { recall: RecallPorts & { lore: RecallLorePort; chat: RecallChatPort } };
+
+export function linkHost(deps: HostDeps): LinkedHost {
   const { link, streams } = deps;
   const ask = <T extends AskType>(type: T, fields: Asked<T>): Promise<LinkRequests[T]["result"]> => asked(deps, type, fields);
 
   /**
    * Something the extension answers on a stream: started by `send`, read by `take`, which settles it
-   * with the terminal chunk it is given. The signal gives it up: the stream is cancelled at the
+   * with the stream's one chunk. The signal gives it up: the stream is cancelled at the
    * extension, and the promise rejects with the signal's reason. `patient`: it waits on a person, so
    * silence is no stall.
    */
@@ -153,33 +212,6 @@ export function linkHost(deps: HostDeps): HarnessHost {
     return promise;
   }
 
-  function call(request: ModelRequest, signal: AbortSignal, onDelta?: (delta: ModelDelta) => void): Promise<ModelResult> {
-    const turn = deps.turn();
-    return streamed<ModelResult>(
-      signal,
-      (stream) => link.request("model.call", { stream, turn, request, chat: deps.chat() ?? "" }, deps.tuning().lostMs),
-      (chunk, settle) => {
-        switch (chunk.kind) {
-          case "content":
-            onDelta?.({ content: chunk.text });
-            return;
-          case "reasoning":
-            onDelta?.({ reasoning: chunk.text });
-            return;
-          case "done":
-            settle.resolve(chunk.result);
-            return;
-          case "value":
-            settle.reject(new ModelCallError(`LumiAH answered a model call with something that isn't a model's answer: ${SAME_BUILD}.`, "protocol"));
-            return;
-          case "error":
-            settle.reject(new ModelCallError(chunk.message, chunk.code));
-            return;
-        }
-      },
-    );
-  }
-
   /** Something that ends with one value: a tool's run in the extension, the user's word on a held call. */
   function valued<T>(what: string, signal: AbortSignal, send: (stream: string) => Promise<unknown>, read: (value: JsonValue) => T | null, patient: boolean): Promise<T> {
     return streamed<T>(
@@ -190,8 +222,7 @@ export function linkHost(deps: HostDeps): HarnessHost {
           const value = read(chunk.value);
           if (value === null) settle.reject(new Error(`LumiAH answered ${what} with something else: ${SAME_BUILD}.`));
           else settle.resolve(value);
-        } else if (chunk.kind === "error") settle.reject(new Error(chunk.message));
-        else if (chunk.kind === "done") settle.reject(new Error(`LumiAH answered ${what} with a model's answer: ${SAME_BUILD}.`));
+        } else settle.reject(new Error(chunk.message));
       },
       patient,
     );
@@ -213,35 +244,19 @@ export function linkHost(deps: HostDeps): HarnessHost {
   }
 
   return {
-    models: { call },
-    connections: {
-      list: async () => (await ask("connections.list", {})).connections,
-      // In a run of a chat, an agent with no connection of its own is lent the chat's (the extension says which).
-      get: async (connectionId) => (await ask("connections.get", { connection: connectionId, chat: deps.chat() ?? "" })).profile,
-    },
-    blobs: {
-      put: async (hash, text) => {
-        await ask("blob.put", { hash, text });
-      },
-      get: async (hash) => (await ask("blob.get", { hash })).text,
-      list: async (cursor) => {
-        const page = await ask("blob.list", { cursor: cursor ?? null });
-        return { blobs: page.blobs, next: page.next };
-      },
-      remove: async (hashes) => {
-        if (hashes.length > 0) await ask("blob.remove", { hashes: [...hashes] });
+    models: {
+      ...deps.models,
+      // What the model library kept for an agent's session is let go once its run has ended: housekeeping after the run's work, so a letting-go that throws is logged as such, and neither the run's end nor what follows it (the other sessions, its spend, its record) is touched.
+      ended: (session) => {
+        try {
+          deps.models.ended?.(session);
+        } catch (error) {
+          deps.log("warn", `what the model library kept for agent session ${session} couldn't be let go after its run (${error instanceof Error ? error.message : String(error)}). This is housekeeping only: the run stands as it ended.`);
+        }
       },
     },
-    store: {
-      read: async (path) => (await ask("doc.get", { path })).doc,
-      write: async (path, value) => {
-        await ask("doc.put", { path, doc: value });
-      },
-      remove: async (path) => {
-        await ask("doc.remove", { path });
-      },
-      list: async (prefix) => (await ask("doc.list", { prefix })).paths,
-    },
+    connections: deps.connections,
+    ...linkStorage(deps),
     chat: {
       path: async (chatId) => (await ask("chat.path", { chat: chatId })).messages,
       messages: async (chatId, from, to) => (await ask("chat.messages", { chat: chatId, from, to })).messages,
@@ -311,10 +326,10 @@ export function linkHost(deps: HostDeps): HarnessHost {
     },
     tools: {
       list: async (chatId) => (await ask("tools.list", { chat: chatId })).tools,
-      call: (toolCall, signal) => valued("a tool's call", signal, (stream) => link.request("tool.call", { stream, call: toolCall }, deps.tuning().lostMs), toolOutcomeOf, false),
+      call: (toolCall, signal) => valued("a tool's call", signal, (stream) => link.request("tool.call", { stream, call: toolCall }, deps.tuning().lostMs, LOST_WAIT), toolOutcomeOf, false),
     },
     approvals: {
-      ask: (held, signal) => valued("a held call", signal, (stream) => link.request("approval.ask", { stream, ask: held }, deps.tuning().lostMs), approvalAnswerOf, true),
+      ask: (held, signal) => valued("a held call", signal, (stream) => link.request("approval.ask", { stream, ask: held }, deps.tuning().lostMs, LOST_WAIT), approvalAnswerOf, true),
     },
     jobs: { queued: (job) => deps.jobQueued(job), changed: (job) => deps.jobChanged(job) },
     trace: { event: (record) => deps.trace(record), delta: (delta) => deps.delta(delta) },
@@ -376,7 +391,7 @@ export function linkExtension(deps: ExtensionDeps): HarnessExtension {
   async function once(member: ExtensionMember, arg: JsonValue): Promise<JsonValue | undefined> {
     if (!has(member)) return undefined;
     try {
-      const answer = await deps.link.request("extension.call", { member, arg }, deps.tuning().lostMs);
+      const answer = await deps.link.request("extension.call", { member, arg }, deps.tuning().lostMs, LOST_WAIT);
       return answer.supplied ? answer.value : undefined;
     } catch (error) {
       throw new Error(problemOf(error).message, { cause: error });

@@ -64,7 +64,7 @@ describe("blobs", () => {
 });
 
 describe("the exact prompt of a call", () => {
-  const request = (messages: ModelRequest["messages"]): ModelRequest => ({ messages, maxTokens: 800, connectionId: "conn-1", model: null, effort: "low", usage: true, tools: [{ name: "lookup", description: "Looks up.", parameters: { type: "object", properties: {} } }] });
+  const request = (messages: ModelRequest["messages"]): ModelRequest => ({ messages, maxTokens: 800, connectionId: "conn-1", model: null, effort: "low", tools: [{ name: "lookup", description: "Looks up.", parameters: { type: "object", properties: {} } }] });
 
   test("is read back whole, though each round stores only what it adds to the round before", async () => {
     const host = new MemoryHost();
@@ -72,9 +72,9 @@ describe("the exact prompt of a call", () => {
     const keeper = new PromptKeeper(blobs);
     const system = { role: "system" as const, content: "You look things up." };
     const long = { role: "user" as const, content: `The request: ${"a message of the chat. ".repeat(400)}` };
-    const first = request([system, { ...long, parts: [{ type: "text", text: long.content, cache: true }] }]);
-    // The next round sends the same messages again, the cache mark moved on to the latest.
-    const second = request([system, long, { role: "assistant", content: "lookup {}" }, { role: "user", content: "found it", parts: [{ type: "tool_result", toolUseId: "c1", content: "found it", cache: true }] }]);
+    const first = request([system, { ...long, parts: [{ type: "text", text: long.content }] }]);
+    // The next round sends the same messages again, the latest as its parts.
+    const second = request([system, long, { role: "assistant", content: "lookup {}" }, { role: "user", content: "found it", parts: [{ type: "tool_result", toolUseId: "c1", content: "found it", isError: true }] }]);
     const third = request([...second.messages.slice(0, 3), { role: "user", content: "found it", parts: [{ type: "tool_result", toolUseId: "c1", content: "found it" }] }, { role: "assistant", content: "lookup {}" }, { role: "user", content: "again" }]);
     const hashes = [await keeper.keep("agent_a", first), await keeper.keep("agent_a", second), await keeper.keep("agent_a", third)];
     expect(await readCallPrompt(host.blobs, hashes[0]!)).toEqual(first);

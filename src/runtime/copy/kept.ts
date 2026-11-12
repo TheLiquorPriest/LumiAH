@@ -9,10 +9,14 @@
 // the reads straight to Lumiverse), so an event may tell of a change a read already holds. Applied
 // again, a message or an entry would go back to what it was before: one whose revision is older than
 // the one held is left as it is.
+//
+// Two messages can share a place in a chat (nothing in Lumiverse keeps places apart). Lumiverse lists
+// a whole chat, or a range of it, by place with two at one place as it stored them, which is how the
+// copy keeps them; but it picks a tail by place, then by id, so the tail is cut here the same way.
 
-import type { HostBookRecord, HostChat } from "../../extension/backend/spindle";
+import type { HostBookRecord, HostChat } from "../../host/rows";
 import { isRecord } from "../../link/json";
-import { chatOf, entryChars, entryOf, jsonChars, messageChars, messageOf, sameMessage } from "./rows";
+import { chatOf, entryChars, entryOf, jsonChars, messageChars, messageOf, sameChat, sameMessage } from "./rows";
 import type { ChatSignature, SourceBook, SourceChat, SourceEntry, SourceMessage } from "./source";
 
 /** What was heard about a kept chat or book: one of Lumiverse's events, or a reason of the copy's own to read it again. */
@@ -60,23 +64,65 @@ export function bookCopyOf(read: SourceBook): BookCopy {
   return { read, book: read.book, entries: [...read.entries], byId: new Map(read.entries.map((e) => [e.row.id, e])), chars };
 }
 
-/** How the kept chat stands, as a source says how a chat stands: its fingerprint the one it was read with. */
-export function signatureOf(copy: ChatCopy): ChatSignature {
-  return { count: copy.messages.length, last: copy.messages.at(-1)?.row ?? null, ...(copy.fingerprint !== null ? { fingerprint: copy.fingerprint } : {}) };
+/**
+ * How the source's word on a chat differs from the copy, in words; null when it doesn't. The newest
+ * message the source names must be held as it is, at the newest place held: where two share that
+ * place, each source picks one by its own rule (Lumiverse's tail the greater id, a database reader
+ * the later stored), and either is held. A fingerprint changes with what events told of too, so a
+ * chat it is compared on is read again after any change: a source makes one only where a read costs
+ * little.
+ */
+export function differs(copy: ChatCopy, now: ChatSignature): string | null {
+  const count = copy.messages.length;
+  if (count !== now.count) return `the check before use found ${now.count} messages in the chat where the copy holds ${count}`;
+  const newest = copy.messages.at(-1);
+  if (now.last === null || newest === undefined) {
+    if (now.last !== null || newest !== undefined) return "the check before use found another newest message";
+  } else {
+    const held = copy.byId.get(now.last.id);
+    if (held === undefined || held.row.index !== newest.row.index) return "the check before use found another newest message";
+    if (!sameMessage(held.row, now.last)) return "the check before use found the newest message changed with no word from Lumiverse";
+  }
+  if (now.chat !== undefined && !sameChat(copy.chat, now.chat)) return "the check before use found the chat's own fields changed with no word from Lumiverse";
+  if (now.fingerprint !== undefined && now.fingerprint !== copy.fingerprint) return "the check before use found the chat changed since it was read";
+  return null;
 }
 
-/**
- * How the source's word on a chat differs from the copy's, in words; null when it doesn't. A
- * fingerprint changes with what events told of too, so a chat it is compared on is read again after
- * any change: a source makes one only where a read costs little.
- */
-export function differs(held: ChatSignature, now: ChatSignature): string | null {
-  if (held.count !== now.count) return `the check before use found ${now.count} messages in the chat where the copy holds ${held.count}`;
-  if (held.last === null || now.last === null) {
-    if (held.last !== now.last) return "the check before use found another newest message";
-  } else if (!sameMessage(held.last, now.last)) return held.last.id === now.last.id ? "the check before use found the newest message changed with no word from Lumiverse" : "the check before use found another newest message";
-  if (now.fingerprint !== undefined && now.fingerprint !== held.fingerprint) return "the check before use found the chat changed since it was read";
-  return null;
+/** What a check before use that found a chat as held looked at, and what it can't see (null: nothing a reader is given). */
+export function sightOf(now: ChatSignature): { saw: string; missed: string | null } {
+  if (now.fingerprint !== undefined) return { saw: "the number of messages, the newest message and the source's fingerprint of the whole chat", missed: null };
+  if (now.chat !== undefined) {
+    return {
+      saw: "the number of messages, the newest message and the chat's own fields",
+      missed: "a change Lumiverse makes with no event to a message before the newest (user messages renamed in bulk by persona, an extension's entry or hidden written in place) isn't seen until the chat is read again",
+    };
+  }
+  return {
+    saw: "the number of messages and the newest message",
+    missed: "a change Lumiverse makes with no event to a message before the newest, or to the chat's own fields, isn't seen until the chat is read again",
+  };
+}
+
+/** Two ids in the order Lumiverse's database sorts them: SQLite compares text by its bytes in UTF-8, the order of its code points, where JavaScript's own order is of UTF-16 units. */
+function byId(a: string, b: string): number {
+  for (let i = 0; i < a.length && i < b.length; ) {
+    const x = a.codePointAt(i) as number;
+    const y = b.codePointAt(i) as number;
+    if (x !== y) return x - y;
+    i += x > 0xffff ? 2 : 1;
+  }
+  return a.length - b.length;
+}
+
+/** The last `n` messages (one at least) as the host's tail gives them: picked by place and then by id, from the end, and listed so. */
+export function tailOf(messages: readonly SourceMessage[], n: number): readonly SourceMessage[] {
+  let from = Math.max(0, messages.length - n);
+  // Every message at the place the cut falls on is taken in: which of them make the tail is for their ids to say.
+  const cut = messages[from]?.row.index;
+  while (from > 0 && (messages[from - 1] as SourceMessage).row.index === cut) from--;
+  const end = messages.slice(from);
+  if (end.every((m, i) => i === 0 || m.row.index !== (end[i - 1] as SourceMessage).row.index)) return end;
+  return end.sort((a, b) => a.row.index - b.row.index || byId(a.row.id, b.row.id)).slice(-n);
 }
 
 /** The place of a held message in the chat, found by its place number first. */
@@ -166,8 +212,8 @@ export function applyToBook(copy: BookCopy, name: string, payload: Record<string
         copy.entries.splice(copy.entries.indexOf(held), 1);
         copy.chars -= entryChars(held.row);
       }
-      // Lumiverse lists a book's entries by their order, then by id.
-      const at = copy.entries.findIndex((e) => e.row.order > entry.row.order || (e.row.order === entry.row.order && e.row.id > entry.row.id));
+      // Lumiverse lists a book's entries by their order, then by id (as its database sorts text).
+      const at = copy.entries.findIndex((e) => e.row.order > entry.row.order || (e.row.order === entry.row.order && byId(e.row.id, entry.row.id) > 0));
       copy.entries.splice(at < 0 ? copy.entries.length : at, 0, entry);
       copy.byId.set(entry.row.id, entry);
       copy.chars += entryChars(entry.row);

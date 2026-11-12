@@ -8,7 +8,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHostCopy, type HostReads } from "../../../src/runtime/copy";
-import type { CopySource } from "../../../src/runtime/copy/source";
+import { type CopySource, Unanswered } from "../../../src/runtime/copy/source";
 import { type DbSource, preferDatabase } from "../../../src/runtime/db";
 import { Lumiverse } from "../copy/lumiverse";
 import { bookRows, chatRows, httpSource, LUMIAH, lumiverseFile, mirror, reader, removeFiles, USER } from "./rig";
@@ -39,14 +39,14 @@ function quay() {
 }
 
 describe("a chat's signature", () => {
-  test("is its count, its newest message as the read gives it, and the read's own fingerprint", async () => {
+  test("is its count, its newest message and its own row as the read gives them, and the read's own fingerprint", async () => {
     const { chat, file } = harbour();
     const { db } = reader(file.path);
 
     const read = await db.readChat(chat.id);
     const signature = await db.chatSignature(chat.id);
 
-    expect(signature).toEqual({ count: 7, last: read?.messages.at(-1)?.row ?? null, fingerprint: read?.fingerprint ?? "" });
+    expect(signature).toEqual({ count: 7, last: read?.messages.at(-1)?.row ?? null, chat: read?.chat, fingerprint: read?.fingerprint ?? "" });
     expect(signature?.last).toMatchObject({ content: "Ilse does, since the storm.", swipes: 2 });
   });
 
@@ -208,6 +208,22 @@ describe("the copy over the reader", () => {
     expect(copy.state().chats[0]).toMatchObject({ from: "database", read: { why: "the check before use found the chat changed since it was read" } });
   });
 
+  test("catches the chat's own fields changed with no event, saying so in the words it uses over HTTP", async () => {
+    const { lumiverse, chat, file } = harbour();
+    const { db } = reader(file.path);
+    const clock = { now: Date.UTC(2026, 10, 12, 9, 30, 0) };
+    const copy = copyOver(db, clock);
+    await copy.chats.messages(chat.id);
+
+    // Lumiverse's chat memory writes its config hash into the chat's metadata with no event and no new stamp.
+    Object.assign(lumiverse.chats.get(chat.id) ?? {}, { metadata: { ltcm_config_hash: "b2" } });
+    mirror(lumiverse, file);
+    clock.now += 1_000;
+
+    expect(await copy.chats.get(chat.id, USER)).toMatchObject({ id: chat.id, metadata: { ltcm_config_hash: "b2" } });
+    expect(copy.state().chats[0]).toMatchObject({ from: "database", read: { why: "the check before use found the chat's own fields changed with no word from Lumiverse" } });
+  });
+
   test("a file that says nothing changed spares the check before use its signature", async () => {
     const { chat, file } = harbour();
     const { db } = reader(file.path);
@@ -262,7 +278,8 @@ describe("the copy's source where the reader may be used", () => {
 
     db.close();
     expect(source.kind).toBe("http");
-    expect(bookRows(await source.readBook("book-nowhere", null))).toBeNull();
+    // HTTP's: Lumiverse's "not found" for a book is no answer of its route, where the closed reader would have said it was closed.
+    expect(await source.readBook("book-nowhere", null).catch((error: unknown) => error)).toBeInstanceOf(Unanswered);
     expect(chatRows(await source.readChat(chat.id))).toEqual(chatRows(await http.readChat(chat.id)));
   });
 

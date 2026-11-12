@@ -134,3 +134,13 @@ export function runtimeTrouble(state: Pick<UiState, "runtime" | "chats">): strin
   if (state.runtime.relays.length > 0 && !state.runtime.relays.some((r) => r.link === "linked")) return "Your runtime isn't linked. No chat is switched on, so nothing is lost yet.";
   return "No chat is answered until your runtime is set up: its steps are on the Runtime page.";
 }
+
+/** A runtime's build beside the extension's, as its row says it once it has said hello: `who` is the extension the pages are shown by (LumiAH, or the one LumiAH is built into), whose build the runtime is offered where `update` says it differs. */
+export function buildWords(runtimeBuild: string, update: boolean, extensionBuild: string, who: string): string {
+  return update ? `Build ${runtimeBuild}; ${who} is ${extensionBuild}.` : `Build ${runtimeBuild}, the same as ${who}'s.`;
+}
+
+/** Which of the user's connections `who` (as `buildWords`) takes as the loopback, each by its name in quotes: a connection may bear the extension's own name. */
+export function loopbackWords(who: string, loopbacks: readonly { name: string }[]): string {
+  return loopbacks.length === 0 ? "None of your connections is the loopback yet." : `${who} takes ${loopbacks.map((c) => `"${c.name}"`).join(", ")} as the loopback.`;
+}

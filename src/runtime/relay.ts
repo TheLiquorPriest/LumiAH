@@ -1,11 +1,16 @@
 // The runtime's loopback endpoint (DESIGN §2): an OpenAI-compatible endpoint for Lumiverse's Custom
 // connection. `POST /v1/chat/completions` with the interceptor's tag is a turn (turn.ts); one without
-// passes through to the writer's connection whole, streamed back as it comes, or is refused where
-// something in it can't be carried (openai.ts). `GET /v1/models` lists the loopback's model once
-// the key checks out; `GET /healthz` says how the runtime is (on an address other machines reach,
-// only that it is up, unless the runtime's own config asks). The key each request carries is
-// checked for its form before any of the request's body is read, goes to the extension with the
-// request, and is never kept.
+// passes through to the writer's connection whole, through the runtime's model layer (models/),
+// streamed back as it comes. A request passed through is refused before anything of it is answered
+// or sent where something in it can't be carried: what no call carries as the body reads
+// (openai.ts), then, once the extension says its key is the user's own, what can't reach the model
+// on the connection it goes to (the layer's `passing`). With no connection of the runtime's to call,
+// a turn and a request passed through are refused before any work, in words that say where to add
+// one. `GET /v1/models` lists the loopback's model once the key checks out; `GET /healthz` says how
+// the runtime is (on an address other machines reach, only that it is up, unless the runtime's own
+// config asks). The key each request carries is checked for its form before any of the request's
+// body is read, and the extension says whether it is the user's own (with the turn, or before
+// anything of a request passed through is told or sent); it is never kept.
 //
 // The handler takes and gives the web's Request and Response, so Bun.serve runs it (main.ts) and the
 // tests call it directly. Time comes from `now()`, and `tick()` (every second) keeps the answers'
@@ -14,15 +19,20 @@
 import type { JsonObject } from "../link/json";
 import { hasOwn, isRecord } from "../link/json";
 import { KEY_FORM, TAG_PARAM } from "../link/contract";
+import { ASK_PATH } from "../link/road";
 import type { RuntimeTuning } from "../link/settings";
+import { addConnectionWords } from "../shared/connections";
 import { LinkError } from "./connection";
 import type { RuntimeLink } from "./link";
 import { refusedReply } from "./link";
+import { LiveError } from "./lumiverse";
+import type { ModelLayer, Passing } from "./models";
+import { NoConnection, NotCarried } from "./models";
 import type { PassedRequest } from "./openai";
-import { passedRequest } from "./openai";
+import { notPassedWords, passedRequest } from "./openai";
+import { HealthProofs } from "./proof";
 import type { Answer, ReplyPiece } from "./sse";
 import { JsonAnswer, SSE_HEADERS, SseAnswer, errorJson, statusOf } from "./sse";
-import type { StreamReader, Streams } from "./streams";
 import { problemOf } from "./streams";
 
 export interface RelaySettings {
@@ -41,6 +51,8 @@ export interface RelayEnv {
   tuning(): RuntimeTuning;
   /** The relay's secret now: what a request must prove it holds (`healthProof`) to be told how the runtime is on an address other machines reach. */
   secret(): string;
+  /** The road for asks (`POST /x/ask`, asks.ts): handed every request on its path, once the Origin and the Host check out. */
+  ask?(req: Request): Promise<Response>;
 }
 
 /** A tagged request handed to the turn: its tag and key, the body as Lumiverse sent it (the tag taken out), where its reply goes, and the request's own end (Lumiverse's Stop closes it). */
@@ -77,34 +89,24 @@ function json(status: number, body: JsonObject, headers: Record<string, string> 
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", ...headers } });
 }
 
+/** The wait for the link the model list and a request passed through take ("Model list wait"), by its place in the transport's settings. */
+const MODELS_WAIT = ["runtime", "modelsWaitMs"] as const;
+
 const LOOPBACK_HOSTS: Record<string, true> = { "127.0.0.1": true, localhost: true, "[::1]": true, "::1": true };
 /** Addresses that listen on every one of the machine's: a runtime on one is reached by whatever names the machine has, so there is none to hold the Host to. */
 const WILDCARD_HOSTS: Record<string, true> = { "0.0.0.0": true, "::": true, "[::]": true };
 
-/**
- * The proof a request gives `GET /healthz` that it comes from whoever holds the runtime's config
- * (`lumiah status`, and `up` before it ends a running runtime's link): a hash of the relay's secret
- * under a label of its own. The secret itself is never sent to the endpoint, so a request that
- * reached something else on that port gives away nothing the extension takes.
- */
-export async function healthProof(secret: string): Promise<string> {
-  const bytes = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`lumiah healthz\n${secret}`)));
-  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-/** Whether two texts are the same, in a time that doesn't say where they first differ. */
-function same(a: string, b: string): boolean {
-  let differs = a.length ^ b.length;
-  for (let i = 0; i < a.length && i < b.length; i++) differs |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return differs === 0;
-}
-
 export class Relay {
   private readonly calls = new Map<string, Call>();
+  /** The proofs `GET /healthz` takes from the holder of the runtime's config (proof.ts): each once, and only near its time. */
+  private readonly proofs = new HealthProofs(
+    () => this.env.secret(),
+    () => this.env.now(),
+  );
 
   constructor(
     private readonly link: RuntimeLink,
-    private readonly streams: Streams,
+    private readonly layer: Pick<ModelLayer, "passing" | "connections">,
     private readonly turns: TurnRunner,
     private readonly settings: RelaySettings,
     private readonly env: RelayEnv,
@@ -137,6 +139,8 @@ export class Relay {
     // Lumiverse's own request sends no Origin; a page in a browser always does, so it never drives the runtime.
     if (req.headers.get("origin") !== null) return json(403, errorJson("LumiAH's runtime answers Lumiverse's server, not a browser.", "forbidden"));
     if (!this.hostAllowed(req.headers.get("host"))) return json(421, errorJson(`This is LumiAH's runtime at ${this.settings.listen}:${this.settings.port}; it answers requests addressed to it alone.`, "misdirected"));
+    // The asks' own road, reached through Lumiverse's proxy: its words are its own, and never say back what was asked.
+    if (url.pathname === ASK_PATH && this.env.ask !== undefined) return this.env.ask(req);
     const path = url.pathname.replace(/\/+$/, "").replace(/^\/v1(?=\/)/, "");
     if (path === "/healthz" && req.method === "GET") return this.health(req);
     if (path === "/models" && req.method === "GET") return this.models(req);
@@ -169,7 +173,7 @@ export class Relay {
     // The machine's own loopback: its names, and every address of 127.0.0.0/8.
     if (!hasOwn(LOOPBACK_HOSTS, listen) && !/^127(\.\d{1,3}){3}$/.test(listen)) {
       const shown = this.keyOf(req);
-      if (shown === null || !same(shown, await healthProof(this.env.secret()))) return json(200, { up: true });
+      if (shown === null || !(await this.proofs.holds(shown))) return json(200, { up: true });
     }
     // `link`: up, or why the extension is out of reach (down, silent, stopped, crashed), or refused.
     const out = this.link.out;
@@ -198,7 +202,7 @@ export class Relay {
     if (this.link.refused !== null) return json(503, errorJson(this.link.refused, "revoked"));
     if (!KEY_FORM.test(key)) return this.notAKey();
     try {
-      const { models } = await this.link.request("models", { key }, this.env.tuning().modelsWaitMs);
+      const { models } = await this.link.request("models", { key }, this.env.tuning().modelsWaitMs, MODELS_WAIT);
       return json(200, { object: "list", data: models.map((m) => ({ id: m.id, object: "model", created: 0, owned_by: "lumiah" })) });
     } catch (error) {
       const p = problemOf(error, this.link.backendName);
@@ -250,6 +254,18 @@ export class Relay {
     // A chat's reply is told what LumiAH does about it too; a request that is no chat's reply only why.
     const refused = "tag" in work ? refusedReply(this.link) : this.link.refused;
     if (refused !== null) return json(503, errorJson(refused, "revoked"));
+    // A reply with no connection of the runtime's to call is refused before anything of it starts. One the runtime can't read its connections for goes on: its agents say why.
+    if ("tag" in work && (await this.layer.connections.list().then((list) => list.length === 0, () => false))) return json(503, errorJson(this.noConnection("can't answer this reply"), "no_connection"));
+    // What starts the work once its answer is open: the turn, or the request passed through, which is made ready first. What refuses that is the answer, before anything of it is answered or sent.
+    let begin: (call: Call) => void;
+    if ("tag" in work) begin = (call) => this.turn(call, work.tag, key, forwarded);
+    else {
+      const passing = await this.ready(key, work);
+      if (passing instanceof Response) return passing;
+      // Lumiverse closed the request while it was being made ready: there is nobody to answer, and nothing of it starts.
+      if (req.signal.aborted) return json(503, errorJson("Lumiverse closed the request.", "closed"));
+      begin = (call) => this.passthrough(call, passing);
+    }
     const now = this.env.now();
     const id = this.env.id();
     const completion = { id: `chatcmpl-${id.slice(0, 24)}`, model: typeof body.model === "string" && body.model !== "" ? body.model : this.settings.model, created: Math.floor(now / 1000) };
@@ -257,7 +273,6 @@ export class Relay {
     const call: Call = { id, answer: jsonAnswer, settle: () => undefined, closed: () => undefined, ended: false };
     // Lumiverse's Stop force-closes the request: heard here, or as the body's cancel.
     req.signal.addEventListener("abort", () => this.close(call), { once: true });
-    const start = (): void => ("tag" in work ? this.turn(call, work.tag, key, forwarded) : this.passthrough(call, key, work));
     if (body.stream === true) {
       const stream = new ReadableStream<Uint8Array>({
         start: (controller) => {
@@ -284,7 +299,7 @@ export class Relay {
         },
         cancel: () => this.close(call),
       });
-      start();
+      begin(call);
       return new Response(stream, { status: 200, headers: SSE_HEADERS });
     }
     const { promise, resolve } = Promise.withResolvers<Response>();
@@ -292,7 +307,7 @@ export class Relay {
       const answer = jsonAnswer.answer;
       resolve(answer === null ? json(500, errorJson("The runtime ended this call without an answer.", "internal")) : json(answer.status, answer.body));
     };
-    start();
+    begin(call);
     return promise;
   }
 
@@ -333,42 +348,60 @@ export class Relay {
       });
   }
 
-  /** An untagged request (DESIGN §2): run as given on the writer's connection, answered in kind, tools and non-stream included. */
-  private passthrough(call: Call, key: string, passed: PassedRequest): void {
+  /** Where a person adds a connection, in words a reply or a request passed through ends with when the runtime has none to call. */
+  private noConnection(what: string): string {
+    const name = this.link.backendName ?? "LumiAH";
+    return `${name}'s runtime has no connection to call a model on, so it ${what}. ${addConnectionWords(`${name}'s Runtime page, under Connections`)}`;
+  }
+
+  /**
+   * A request passed through, made ready to go: the extension says its key is the user's own, then
+   * the layer makes its call on the connection it goes on, sending nothing. What refuses it is the
+   * answer, in OpenAI's error shape: a key that isn't the user's, what in it can't reach the model
+   * there, no connection to call.
+   */
+  private async ready(key: string, passed: PassedRequest): Promise<Passing | Response> {
+    try {
+      // Whether the key is this user's loopback key is the extension's to say, before anything of the request goes out or anything of the runtime's connections is told.
+      await this.link.request("models", { key }, this.env.tuning().modelsWaitMs, MODELS_WAIT);
+      return await this.layer.passing(passed);
+    } catch (error) {
+      if (error instanceof NotCarried) return json(400, errorJson(notPassedWords(error.message), "invalid_request"));
+      if (error instanceof NoConnection) return json(503, errorJson(this.noConnection("can't pass this request on"), "no_connection"));
+      // A key the extension refused reads as a bad key, as it does to the model list.
+      if (error instanceof LinkError && error.code === "forbidden") return json(401, errorJson(error.message, "invalid_api_key"));
+      if (error instanceof LinkError || error instanceof LiveError) {
+        const p = problemOf(error, this.link.backendName);
+        return json(statusOf(p.code), errorJson(p.message, p.code));
+      }
+      return json(statusOf("model_failed"), errorJson(error instanceof Error ? error.message : String(error), "model_failed"));
+    }
+  }
+
+  /** An untagged request (DESIGN §2), made ready (`ready`): run as given on the writer's connection (else the default), answered in kind, tools and non-stream included. */
+  private passthrough(call: Call, passing: Passing): void {
     this.calls.set(call.id, call);
-    const stream = this.env.id();
+    const stop = new AbortController();
+    call.closed = () => stop.abort(new Error("Lumiverse closed the request."));
     const answer = this.writer(call);
-    // Tool calls come whole with the answer's end; they go out as one fragment each, at their index.
-    const reader: StreamReader = {
-      chunk: (chunk) => {
-        const now = this.env.now();
-        switch (chunk.kind) {
-          case "content":
-          case "reasoning":
-            answer.piece({ kind: chunk.kind, text: chunk.text }, now);
-            return;
-          case "done": {
-            const calls = chunk.result.toolCalls ?? [];
-            if (calls.length > 0) answer.piece({ kind: "tool_calls", calls: calls.map((c, index) => ({ index, id: c.callId, name: c.name, arguments: JSON.stringify(c.args) })) }, now);
-            const piece: ReplyPiece = { kind: "finish", finish: chunk.result.finishReason || (calls.length > 0 ? "tool_calls" : "stop") };
-            // The usage as the provider gave it, whole.
-            if (chunk.result.usage !== undefined) piece.usage = chunk.result.usage;
-            answer.piece(piece, now);
-            return;
-          }
-          case "value":
-            answer.fail("LumiAH answered a request with something that isn't a model's answer: update the runtime and LumiAH to the same build.", "protocol", now);
-            return;
-          case "error":
-            answer.fail(chunk.message, chunk.code, now);
-            return;
-        }
-      },
+    const go = async (): Promise<void> => {
+      const result = await passing.run(stop.signal, (delta) => {
+        if (delta.content !== undefined) answer.piece({ kind: "content", text: delta.content }, this.env.now());
+        else if (delta.reasoning !== undefined) answer.piece({ kind: "reasoning", text: delta.reasoning }, this.env.now());
+      });
+      const now = this.env.now();
+      // Tool calls come whole with the answer's end; they go out as one fragment each, at their index.
+      const calls = result.toolCalls ?? [];
+      if (calls.length > 0) answer.piece({ kind: "tool_calls", calls: calls.map((c, index) => ({ index, id: c.callId, name: c.name, arguments: JSON.stringify(c.args) })) }, now);
+      const piece: ReplyPiece = { kind: "finish", finish: result.finishReason || (calls.length > 0 ? "tool_calls" : "stop") };
+      // The usage as the provider gave it, whole.
+      if (result.usage !== undefined) piece.usage = result.usage;
+      answer.piece(piece, now);
     };
-    call.closed = () => this.streams.cancel(stream, "closed");
-    this.streams.start(stream, reader, async () => {
-      const connection = await this.turns.writerConnection();
-      return this.link.request("passthrough", { key, stream, connection, ...passed }, this.env.tuning().lostMs);
+    void go().catch((error: unknown) => {
+      // Lumiverse closed the request: there is nobody left to answer.
+      if (stop.signal.aborted) return;
+      answer.fail(error instanceof Error ? error.message : String(error), "model_failed", this.env.now());
     });
   }
 

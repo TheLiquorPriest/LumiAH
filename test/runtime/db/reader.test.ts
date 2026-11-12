@@ -492,37 +492,9 @@ describe("a long chat read in pages", () => {
 
     expect(read?.messages).toHaveLength(10_000);
     expect(read?.messages.at(-1)?.row).toMatchObject({ index: 9_999, role: "assistant", swipes: 2, own: { v: 1, n: 9_999 } });
-    expect(signature).toEqual({ count: 10_000, last: read?.messages.at(-1)?.row ?? null, fingerprint: read?.fingerprint ?? "" });
+    expect(signature).toEqual({ count: 10_000, last: read?.messages.at(-1)?.row ?? null, chat: read?.chat, fingerprint: read?.fingerprint ?? "" });
     expect(readMs).toBeLessThan(3_000);
     expect(signatureMs).toBeLessThan(1_000);
-  });
-});
-
-describe("rows Lumiverse itself can't read", () => {
-  test("a message Lumiverse fails on fails its chat's read, naming it; the reader stays on", async () => {
-    const { lumiverse, chat, rows, file } = harbour();
-    const message = lumiverse.message(rows[2]?.id ?? "");
-    message.swipes = "null";
-    mirror(lumiverse, file);
-    const { db } = reader(file.path);
-
-    expect(await db.readChat(chat.id).catch((error: unknown) => error)).toMatchObject({
-      message: `Lumiverse itself can't read message ${message.id} of chat ${chat.id} (its swipes are null), so the chat isn't read from its database either.`,
-    });
-    expect(db.describe().on).toBe(true);
-  });
-
-  test("an entry Lumiverse fails on fails its book's read, naming it", async () => {
-    const lumiverse = new Lumiverse();
-    const book = lumiverse.newBook(USER);
-    const entry = lumiverse.addEntry(book.id, { comment: "Tide", content: "The quay floods." });
-    entry.key = "[tide";
-    const file = lumiverseFile();
-    mirror(lumiverse, file);
-
-    expect(await reader(file.path).db.readBook(book.id, null).catch((error: unknown) => error)).toMatchObject({
-      message: `Lumiverse itself can't read entry ${entry.id} of world book ${book.id} (its keys aren't JSON), so the book isn't read from its database either.`,
-    });
   });
 });
 

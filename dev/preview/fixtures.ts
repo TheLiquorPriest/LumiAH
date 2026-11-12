@@ -97,8 +97,8 @@ export class Trace {
     return this.push({ kind: "session", session, at: this.now });
   }
 
-  agent(a: { id: string; role: string; system: string; model?: string | null; connectionId?: string | null; effort?: ModelEffort; prefix?: string[]; history?: number; parent?: string; task?: string }): this {
-    const agent: AgentStarted = { id: a.id, role: a.role, connectionId: a.connectionId ?? null, model: a.model ?? null, effort: a.effort ?? "inherit", system: a.system, prefix: a.prefix ?? [], history: a.history ?? 0, ...(a.parent !== undefined ? { parent: a.parent } : {}), ...(a.task !== undefined ? { task: a.task } : {}), at: this.now };
+  agent(a: { id: string; role: string; system: string; model?: string | null; connectionId?: string | null; connectionName?: string; gone?: string; effort?: ModelEffort; prefix?: string[]; history?: number; parent?: string; task?: string }): this {
+    const agent: AgentStarted = { id: a.id, role: a.role, connectionId: a.connectionId ?? null, ...(a.connectionName !== undefined ? { connectionName: a.connectionName } : {}), ...(a.gone !== undefined ? { gone: a.gone } : {}), model: a.model ?? null, effort: a.effort ?? "inherit", system: a.system, prefix: a.prefix ?? [], history: a.history ?? 0, ...(a.parent !== undefined ? { parent: a.parent } : {}), ...(a.task !== undefined ? { task: a.task } : {}), at: this.now };
     this.agents.set(a.id, agent);
     this.tallies.set(a.id, noUsage());
     this.told.set(a.id, []);
@@ -232,9 +232,8 @@ export class Trace {
       maxTokens: agent?.role === "writer" ? 8192 : 16_000,
       effort: agent?.effort ?? "inherit",
       stream: true,
-      usage: true,
       ...(agent?.role === "writer" ? { params: { temperature: 0.9, top_p: 0.95 } } : {}),
-      messages: [{ role: "system", content: agent?.system ?? "", parts: [{ type: "text", text: agent?.system ?? "", cache: true }] }, ...told.map((text) => ({ role: "user" as const, content: text }))],
+      messages: [{ role: "system", content: agent?.system ?? "" }, ...told.map((text) => ({ role: "user" as const, content: text }))],
       ...(tools ? { tools: TOOL_DEFS } : {}),
     };
   }
@@ -245,7 +244,7 @@ const TOOL_DEFS: CallPrompt["tools"] = [
   { name: "lore_search", description: "Searches the world books that apply to this chat.", parameters: { type: "object", properties: { query: { type: "string" } }, required: ["query"] } },
   { name: "lore_read", description: "Reads one lore entry whole, by its id.", parameters: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
   { name: "preset_instructions", description: "The instruction blocks of the active preset: what the reply must achieve.", parameters: { type: "object", properties: {} } },
-  { name: "write_reply", description: "Hands the writer a brief and ends your work on this turn.", parameters: { type: "object", properties: { brief: { type: "string" } }, required: ["brief"] }, cache: true },
+  { name: "write_reply", description: "Hands the writer a brief and ends your work on this turn.", parameters: { type: "object", properties: { brief: { type: "string" } }, required: ["brief"] } },
 ];
 
 export const MAIN_SYSTEM = `You are the main agent of this chat. Each turn you are given the request Lumiverse assembled, as a document to read, and what you carry from earlier turns.
@@ -592,8 +591,6 @@ export const CONNECTIONS: ConnectionView[] = [
   { id: "conn-deepseek", name: "Deepseek", provider: "deepseek", model: "deepseek-v4-flash", loopback: false },
   { id: "conn-local", name: "Local llama", provider: "llamacpp", model: "llama-local", loopback: false },
 ];
-
-export const MODELS: Readonly<Record<string, string[]>> = { "conn-deepseek": ["deepseek-v4-flash", "deepseek-v4-pro"], "": ["deepseek-v4-flash", "deepseek-v4-pro"] };
 
 const LOOPBACK = { id: "conn-loopback", name: "LumiAH loopback", loopback: true };
 const OWN = { id: "conn-deepseek", name: "Deepseek", loopback: false };

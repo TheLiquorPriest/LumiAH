@@ -7,7 +7,7 @@ import { describe, expect, test } from "bun:test";
 import { MockBackend, type Scenario } from "../../dev/preview/mock-backend";
 import { sampleSettings } from "../../dev/preview/sections";
 import { PAGES } from "../../src/extension/frontend/app";
-import { asksWords, chatStanding, grantReason, neededPermissions, optionalPermissions, runtimeSteps, runtimeTrouble, setupDone, setupSteps } from "../../src/extension/frontend/setup-model";
+import { asksWords, buildWords, chatStanding, grantReason, loopbackWords, neededPermissions, optionalPermissions, runtimeSteps, runtimeTrouble, setupDone, setupSteps } from "../../src/extension/frontend/setup-model";
 import type { ChatView, PermissionNeed, RelayView, UiState } from "../../src/shared/ui";
 
 const T0 = Date.UTC(2026, 10, 10, 9, 0, 0);
@@ -129,6 +129,16 @@ describe("the runtime, which no chat is answered without", () => {
     const idle: UiState = { ...ready, runtime: { ...ready.runtime, relays: quiet, ready: false }, chats: [chat({ on: false, since: null })] };
     expect(runtimeTrouble(idle)).toBe("Your runtime isn't linked. No chat is switched on, so nothing is lost yet.");
     expect(runtimeTrouble({ ...fresh, runtime: { ...fresh.runtime, relays: [], ready: false }, chats: [] })).toBe("No chat is answered until your runtime is set up: its steps are on the Runtime page.");
+  });
+
+  test("a runtime's row and the loopback's line name the extension the pages are shown by, and a loopback connection by its name in quotes", () => {
+    expect(buildWords("1f0a6c33", true, "2a7d9e11", "LumiAH")).toBe("Build 1f0a6c33; LumiAH is 2a7d9e11.");
+    expect(buildWords("2a7d9e11", false, "2a7d9e11", "LumiRPEngine")).toBe("Build 2a7d9e11, the same as LumiRPEngine's.");
+    expect(buildWords("1f0a6c33", true, "2a7d9e11", "LumiRPEngine")).toBe("Build 1f0a6c33; LumiRPEngine is 2a7d9e11.");
+    // A connection may bear the extension's own name: quoted, the line still reads.
+    expect(loopbackWords("LumiRPEngine", [{ name: "LumiRPEngine" }])).toBe('LumiRPEngine takes "LumiRPEngine" as the loopback.');
+    expect(loopbackWords("LumiAH", [{ name: "LumiAH" }, { name: "Runtime on the desk" }])).toBe('LumiAH takes "LumiAH", "Runtime on the desk" as the loopback.');
+    expect(loopbackWords("LumiAH", [])).toBe("None of your connections is the loopback yet.");
   });
 });
 

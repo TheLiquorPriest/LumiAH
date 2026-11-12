@@ -8,10 +8,11 @@
 
 import { type ComponentChildren, Fragment } from "preact";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "preact/hooks";
-import type { ConnectionView, JsonValue, SettingPath, TextDef } from "../../../shared/ui";
+import type { JsonValue, ModelChoice, SettingPath, TextDef } from "../../../shared/ui";
 import { type App, errorWords, PREF_NUMBERS, PREF_SWITCHES, type Prefs, defaultPrefs, useApp } from "../app";
 import { UiRequestError } from "../client";
 import { Badge, Banner, Button, Check, Disclosure, Empty, IconButton, NumberField, SearchField, Section, Switch, useBusy } from "../components";
+import { useRuntimeConnections } from "../connections";
 import { clock, count, counted } from "../format";
 import { Icon } from "../icons";
 import { revealInScroller } from "../scroll";
@@ -19,9 +20,7 @@ import { allSections, backupJson, backupOf, besideNumber, changedCount, changesO
 import { createStore, type Store, useSelect } from "../store";
 import { FieldNode, Fields, type FormCtx } from "./settings-form";
 import { TextEditor, TextList } from "./texts";
-
-/** One empty list, so a page with no state yet doesn't see a new one at every look. */
-const NO_CONNECTIONS: readonly ConnectionView[] = [];
+import { TimeoutsPane } from "./timeouts";
 
 const DETAILS = new WeakMap<App, Store<boolean>>();
 
@@ -36,7 +35,7 @@ function detailsOf(app: App): Store<boolean> {
 }
 
 /** What Settings shows beside its list. */
-type Chosen = { kind: "section"; key: string } | { kind: "texts"; group: string } | { kind: "text"; id: string } | { kind: "device" } | { kind: "backup" };
+type Chosen = { kind: "section"; key: string } | { kind: "texts"; group: string } | { kind: "text"; id: string } | { kind: "timeouts" } | { kind: "device" } | { kind: "backup" };
 
 function PaneHead(props: { title: string; sub?: string | null; onBack(): void; back: string; aside?: ComponentChildren }) {
   return (
@@ -114,7 +113,7 @@ export function SettingsPage() {
   const app = useApp();
   const settings = useSelect(app.client.state, (s) => s?.settings ?? null);
   const texts = useSelect(app.client.state, (s) => s?.texts ?? null);
-  const connections = useSelect(app.client.state, (s) => s?.connections ?? NO_CONNECTIONS);
+  const connections = useRuntimeConnections();
   const form = useMemo(() => (settings ? formOf(settings) : null), [settings]);
   const nav = useMemo(() => (form ? navOf(form) : []), [form]);
   const sections = useMemo(() => allSections(nav), [nav]);
@@ -138,7 +137,7 @@ export function SettingsPage() {
   const picker = useRef<HTMLInputElement>(null);
   /** Saves wait their turn here, so two changes made in quick succession are both kept, in order. */
   const queue = useRef<Promise<unknown>>(Promise.resolve());
-  const modelLists = useRef(new Map<string, Promise<string[]>>());
+  const modelLists = useRef(new Map<string, Promise<ModelChoice[]>>());
   // A section picked from the list starts at its head: the panel may be scrolled far down the one shown before it or, in one column, far down the list.
   const [picked, setPicked] = useState(0);
   const details = useSelect(detailsOf(app), (on) => on);
@@ -151,8 +150,8 @@ export function SettingsPage() {
   useLayoutEffect(() => {
     if (found !== null && detail.current) revealInScroller(detail.current.querySelector("[data-lah-found]"), "center");
   }, [found, chosen]);
-  // The connections changed: a connection's models may have, too.
-  useEffect(() => modelLists.current.clear(), [connections]);
+  // The connections changed, or are another runtime's: a connection's models may have, too.
+  useEffect(() => modelLists.current.clear(), [connections.view]);
   // The tools' names, for the tables that hold a row per tool: read when the page shows and again when a definition changes. Where they can't be read a name is typed instead.
   const defsRev = useSelect(app.client.state, (s) => s?.defs ?? 0);
   const [tools, setTools] = useState<readonly string[] | null>(null);
@@ -220,10 +219,11 @@ export function SettingsPage() {
     at: (path) => valueAt(settings.values, path),
     ...(tools !== null ? { tools } : {}),
     models: (connectionId) => {
-      const key = connectionId ?? "";
+      const relay = connections.view?.relay.id;
+      const key = `${relay ?? ""} ${connectionId ?? ""}`;
       let list = modelLists.current.get(key);
       if (!list) {
-        list = app.client.request("lah.models.list", { connectionId }).then((r) => r.models);
+        list = app.client.request("lah.connections.models", { ...(relay !== undefined ? { relay } : {}), connectionId }).then((r) => r.models);
         modelLists.current.set(key, list);
         // A list that couldn't be read is asked for again next time.
         list.catch(() => modelLists.current.delete(key));
@@ -419,6 +419,14 @@ export function SettingsPage() {
                 );
               })}
             </Disclosure>
+            <div class="lah-navhead">Waits</div>
+            <button type="button" class="lah-navrow" data-lah-nav="timeouts" aria-current={shown.kind === "timeouts"} onClick={() => open({ kind: "timeouts" })}>
+              <span class="lah-navrow-text">
+                <span class="lah-navrow-title">Timeouts</span>
+                <span class="lah-navrow-sub">Every wait in one place: the runtime, the link, tools, model calls, the store</span>
+              </span>
+              <Icon name="chevron-right" size={16} class="lah-chev" />
+            </button>
             <div class="lah-navhead">Here</div>
             <button type="button" class="lah-navrow" data-lah-nav="device" aria-current={shown.kind === "device"} onClick={() => open({ kind: "device" })}>
               <span class="lah-navrow-text">
@@ -509,6 +517,11 @@ export function SettingsPage() {
               onSave={(body) => saveText(text, body)}
               onReset={() => resetText(text)}
             />
+          </>
+        ) : shown.kind === "timeouts" ? (
+          <>
+            <PaneHead title="Timeouts" sub={saving > 0 ? "Saving…" : status || null} back="Back to the settings" onBack={() => setOpened(false)} />
+            <TimeoutsPane form={form} ctx={ctx} />
           </>
         ) : shown.kind === "device" ? (
           <>

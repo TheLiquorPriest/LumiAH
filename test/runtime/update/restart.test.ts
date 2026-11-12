@@ -7,16 +7,18 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { handOver, nodeProcess, type ProcessControl, type Successor } from "../../../src/runtime/update/restart";
+import { HANDED_OVER, handOver, nodeProcess, type ProcessControl, type Successor } from "../../../src/runtime/update/restart";
 
 const NEXT: Successor = { command: "/opt/bun/bin/bun", args: ["/home/mara/.local/share/lumiah/lumiah.js", "serve", "--config", "/home/mara/.config/lumiah/mara.json"] };
 
-/** A process that records what it is asked: replaced (where `execve` is given), a program started beside it, its exit. */
-function processOn(platform: string, change: { execve?: ProcessControl["execve"]; spawn?: ProcessControl["spawn"] } = {}) {
+/** A process that records what it is asked: replaced (where `execve` is given), a program started beside it (with the names of its environment), its exit. */
+function processOn(platform: string, change: { execve?: ProcessControl["execve"]; spawn?: ProcessControl["spawn"]; env?: ProcessControl["env"] } = {}) {
   const asked: string[] = [];
+  const envs: Record<string, string>[] = [];
   const control: ProcessControl = {
     platform,
-    env: { HOME: "/home/mara", PATH: "/usr/bin", UNSET: undefined },
+    pid: 3141,
+    env: change.env ?? { HOME: "/home/mara", PATH: "/usr/bin", UNSET: undefined },
     execve:
       change.execve === undefined
         ? (file, args, env) => {
@@ -25,12 +27,13 @@ function processOn(platform: string, change: { execve?: ProcessControl["execve"]
         : change.execve,
     spawn:
       change.spawn ??
-      (async (command, args) => {
+      (async (command, args, env) => {
         asked.push(`spawn ${command} ${args.join(" ")}`);
+        envs.push(env);
       }),
     exit: (code) => void asked.push(`exit ${code}`),
   };
-  return { asked, control };
+  return { asked, envs, control };
 }
 
 let dir: string | null = null;
@@ -46,10 +49,17 @@ describe("handing the runtime's process to its successor", () => {
     expect(asked).toEqual([`execve /opt/bun/bin/bun /opt/bun/bin/bun ${NEXT.args.join(" ")} (HOME, PATH)`]);
   });
 
-  test("on Windows, which has no such thing, starts the successor on its own and leaves", async () => {
-    const { asked, control } = processOn("win32");
+  test("on Windows, which has no such thing, starts the successor on its own, marked as started by this process, and leaves", async () => {
+    const { asked, envs, control } = processOn("win32");
     await handOver(NEXT, control);
     expect(asked).toEqual([`spawn /opt/bun/bin/bun ${NEXT.args.join(" ")}`, "exit 0"]);
+    expect(envs).toEqual([{ HOME: "/home/mara", PATH: "/usr/bin", [HANDED_OVER]: "3141" }]);
+  });
+
+  test("a successor that replaces this process is not marked, though this process was started by one before it", async () => {
+    const { asked, control } = processOn("linux", { env: { HOME: "/home/mara", [HANDED_OVER]: "2718" } });
+    await handOver(NEXT, control);
+    expect(asked).toEqual([`execve /opt/bun/bin/bun /opt/bun/bin/bun ${NEXT.args.join(" ")} (HOME)`]);
   });
 
   test("where replacing the program fails, starts the successor beside it and leaves", async () => {
@@ -75,11 +85,11 @@ describe("handing the runtime's process to its successor", () => {
   test("the machine's own way starts a successor that runs on its own, and says when one can't start", async () => {
     dir = realpathSync(mkdtempSync(join(tmpdir(), "lumiah-successor-")));
     const mark = join(dir, "started");
-    await nodeProcess().spawn(process.execPath, ["-e", `require("node:fs").writeFileSync(${JSON.stringify(mark)}, String(process.pid))`]);
+    await nodeProcess().spawn(process.execPath, ["-e", `require("node:fs").writeFileSync(${JSON.stringify(mark)}, String(process.pid) + " " + process.env.${HANDED_OVER})`], { PATH: process.env.PATH ?? "", [HANDED_OVER]: "3141" });
     // The successor is cut loose from this process, which keeps no handle to await: the mark it writes on the disk once it runs is looked for until it shows.
     for (let waited = 0; !existsSync(mark) && waited < 200; waited++) await Bun.sleep(25);
-    expect(Number(readFileSync(mark, "utf8"))).not.toBe(process.pid);
+    expect(readFileSync(mark, "utf8").split(" ")).toEqual([expect.not.stringMatching(`^${process.pid}$`), "3141"]);
 
-    await expect(nodeProcess().spawn(join(dir, "no-such-bun"), [])).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(nodeProcess().spawn(join(dir, "no-such-bun"), [], {})).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

@@ -8,12 +8,13 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { recordOf } from "../../src/core/sessions";
 import { isRecord } from "../../src/link/json";
+import type { ModelLayer } from "../../src/runtime/models/index";
 import { toolCall } from "../support/fake-host";
 import { type Rig, rig, until, USER } from "../support/rig";
 
 let r: Rig | null = null;
-afterEach(() => {
-  r?.close();
+afterEach(async () => {
+  await r?.close();
   r = null;
 });
 
@@ -112,5 +113,47 @@ describe("a chat on the loopback connection", () => {
     expect(stored.view.turn).toBe(first.generationId);
     expect(stored.view.ended?.state).toBe("done");
     expect(stored.view.events.length).toBeGreaterThan(3);
+  });
+});
+
+describe("the end of a run, where the model library can't let go of an agent session", () => {
+  test("is logged as what it is, and the turn and the job end as they did, with nothing after them skipped", async () => {
+    // As on the test bed, where a fault of the bundle made the library's own letting-go throw.
+    const throwing = (made: ModelLayer): ModelLayer => ({
+      ...made,
+      models: {
+        ...made.models,
+        ended: (session) => {
+          made.models.ended?.(session);
+          throw new TypeError("cleanupSessionResources is not a function");
+        },
+      },
+    });
+    const it = (r = await rig({ layer: throwing }));
+    const chatId = await it.setUp();
+    it.host.script = [{ toolCalls: [toolCall("write_reply", { brief: "Okoro keeps the light." }, "c1")] }, "Okoro keeps it now.", "The chronicle holds what the chat said."];
+
+    const out = await it.generate(chatId);
+    expect(out.error).toBeNull();
+    expect(out.content).toBe("Okoro keeps it now.");
+    // What follows the run's end is done: its record on the reply, its end in the live view, its spend.
+    await until(() => it.host.message(chatId, out.messageId ?? "").own !== null, "the reply's record");
+    await until(() => it.backend.live.runningOf(USER).length === 0, "the turn's end in the live view");
+    const turned = (await it.page.request("lah.live.open", { stream: chatId })).live;
+    expect(turned?.ended?.state).toBe("done");
+
+    const { job } = await it.page.request("lah.job.start", { chatId, agent: "chronicler", task: "Bring the chronicle up to date.", when: "now" });
+    await until(() => it.backend.jobs.state(USER, false, false).active.length === 0, "the job's end");
+    await until(() => it.backend.live.runningOf(USER).length === 0, "the job's end in the live view");
+    expect((await it.page.request("lah.jobs.list", { chatId, cursor: null, limit: 10 })).jobs).toMatchObject([{ id: job.id, state: "done" }]);
+    const ran = (await it.page.request("lah.live.open", { stream: job.id })).live;
+    expect(ran?.ended?.state).toBe("done");
+    expect((await it.page.request("lah.spend.get", { days: 1 })).total.calls).toBe(3);
+
+    // Every agent's session was let go, each letting-go that threw is said to be housekeeping, and nothing is said to have failed.
+    const agents = [...(turned?.events ?? []), ...(ran?.events ?? [])].flatMap((e) => (e.event.kind === "agent_started" ? [e.event.agent.id] : []));
+    expect([...it.host.endedSessions].sort()).toEqual(agents.sort());
+    expect(it.logs.filter((line) => line.includes("couldn't be let go after its run (cleanupSessionResources is not a function). This is housekeeping only: the run stands as it ended."))).toHaveLength(agents.length);
+    expect(it.logs.filter((line) => /turn \S+ failed|failed to run|a turn failed/.test(line))).toEqual([]);
   });
 });

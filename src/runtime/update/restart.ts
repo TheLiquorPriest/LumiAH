@@ -14,27 +14,32 @@ export interface Successor {
   args: string[];
 }
 
+/** The variable a successor started beside the runtime (not in its place) is given: the old process's id. The Runtime page says such a runtime is no longer watched by what ran the old one. */
+export const HANDED_OVER = "LUMIAH_STARTED_BY";
+
 /** The process as a hand-over needs it; `nodeProcess()` is the one the runtime runs in. */
 export interface ProcessControl {
   platform: string;
+  pid: number;
   env: Readonly<Record<string, string | undefined>>;
   /** Replaces this process's program and keeps its id (execve(2)); null where the system has none. It returns only by throwing. */
   execve: ((file: string, args: string[], env: Record<string, string>) => void) | null;
-  /** Starts a program that outlives this process; resolves once it has started. */
-  spawn(command: string, args: readonly string[]): Promise<void>;
+  /** Starts a program that outlives this process, with `env` as its environment; resolves once it has started. */
+  spawn(command: string, args: readonly string[], env: Record<string, string>): Promise<void>;
   exit(code: number): void;
 }
 
 /**
  * Hands this process to its successor. When this process becomes it, nothing after that runs here;
- * when the successor is started beside it, this process exits. It returns by throwing only, when no
- * successor could be started, in words that say why and the line that starts the runtime by hand.
+ * when the successor is started beside it, this process exits, and the successor is marked
+ * (`HANDED_OVER`) so it can say that it was. It returns by throwing only, when no successor could be
+ * started, in words that say why and the line that starts the runtime by hand.
  */
 export async function handOver(next: Successor, process: ProcessControl): Promise<void> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) if (value !== undefined && key !== HANDED_OVER) env[key] = value;
   let replacing: unknown = null;
   if (process.execve !== null && process.platform !== "win32") {
-    const env: Record<string, string> = {};
-    for (const [key, value] of Object.entries(process.env)) if (value !== undefined) env[key] = value;
     try {
       process.execve(next.command, [next.command, ...next.args], env);
       // Replaced: the successor runs in this process now, and nothing else is to be done.
@@ -45,7 +50,7 @@ export async function handOver(next: Successor, process: ProcessControl): Promis
     }
   }
   try {
-    await process.spawn(next.command, next.args);
+    await process.spawn(next.command, next.args, { ...env, [HANDED_OVER]: String(process.pid) });
   } catch (error) {
     const why = [replacing, error].filter((e) => e !== null).map((e) => (e instanceof Error ? e.message : String(e)));
     throw new Error(`The runtime couldn't start its new build (${why.join("; ")}). Start it with: ${[next.command, ...next.args].map(shellWord).join(" ")}`);
@@ -58,12 +63,13 @@ export function nodeProcess(): ProcessControl {
   const own = globalThis.process;
   return {
     platform: own.platform,
+    pid: own.pid,
     env: own.env,
     execve: own.execve?.bind(own) ?? null,
-    spawn(command, args) {
+    spawn(command, args, env) {
       const { promise, resolve, reject } = Promise.withResolvers<void>();
       // Its own process group (on Windows, its own hidden console) and nothing shared with this one: it lives on when this one exits.
-      const child = spawn(command, [...args], { detached: true, stdio: "ignore", windowsHide: true });
+      const child = spawn(command, [...args], { detached: true, stdio: "ignore", windowsHide: true, env });
       child.once("error", reject);
       child.once("spawn", () => {
         child.unref();

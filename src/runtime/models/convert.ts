@@ -4,8 +4,9 @@
 // on an API that takes system messages mid-conversation (OpenAI's two, and a model whose catalogue
 // says it takes them), and is a user message elsewhere, as Lumiverse's Anthropic provider sent one;
 // a tool's result is pi-ai's tool result, named after the call it answers; an image is an image.
-// Audio and video have no place in pi-ai's messages, so a call holding either is refused in words
-// that say so: dropped, it would change what the model is told and nobody would know.
+// Audio and video have no place in pi-ai's messages, nor has media in a system message or in a
+// model's own turn, so a call holding any of them is refused in words that say so: dropped, it would
+// change what the model is told and nobody would know.
 //
 // Coming back, an answer's reasoning rides in the core's carriers so the next call of a tool loop
 // sends the assistant's turn back exactly as the model gave it (a thinking model must be shown its
@@ -69,6 +70,14 @@ const NO_USAGE: AssistantMessage["usage"] = { input: 0, output: 0, cacheRead: 0,
 /** A message's text: its text parts together, or its content when it has no parts. */
 function textOf(m: ModelMessage): string {
   return m.parts ? m.parts.flatMap((p) => (p.type === "text" ? [p.text] : [])).join("") : m.content;
+}
+
+/** Refuses a system message or a model's own turn that holds media, which neither carries to the model: only a user's message holds an image. */
+function refuseMedia(m: ModelMessage): void {
+  const media = m.parts?.find((p) => p.type === "media");
+  if (media === undefined) return;
+  const held = media.media === "image" ? "an image" : media.media === "audio" ? "audio" : "a video";
+  throw new NotCarried(m.role === "system" ? `A system message in this call holds ${held}, and the runtime's model calls carry a system message's text only.` : `One of the model's own turns in this call holds ${held}, and the runtime's model calls carry only the text, reasoning and tool calls of one.`);
 }
 
 function recordBlock(raw: unknown): RecordBlock | null {
@@ -199,15 +208,20 @@ function toolOf(t: CallTool): Tool {
 export function contextOf(messages: readonly ModelMessage[], tools: readonly CallTool[], target: CallTarget): Context {
   let lead = 0;
   const prompt: string[] = [];
-  for (; lead < messages.length && messages[lead]?.role === "system"; lead += 1) prompt.push(textOf(messages[lead] as ModelMessage));
+  for (; lead < messages.length && messages[lead]?.role === "system"; lead += 1) {
+    refuseMedia(messages[lead] as ModelMessage);
+    prompt.push(textOf(messages[lead] as ModelMessage));
+  }
   const out: Message[] = [];
   const callNames = new Map<string, string>();
   for (const m of messages.slice(lead)) {
     if (m.role === "assistant") {
+      refuseMedia(m);
       const turn = assistantOf(m, target);
       for (const b of turn.content) if (b.type === "toolCall") callNames.set(b.id, b.name);
       out.push(turn);
     } else if (m.role === "system") {
+      refuseMedia(m);
       out.push(target.systemInPlace ? { role: "system", content: textOf(m), timestamp: 0 } : { role: "user", content: textOf(m), timestamp: 0 });
     } else out.push(...userOf(m, callNames));
   }

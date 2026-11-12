@@ -13,6 +13,7 @@
 import type { TraceDelta, TraceRecord } from "../core/ports";
 import type { RuntimeTuning } from "../link/settings";
 import type { RuntimeLink } from "./link";
+import { LOST_WAIT } from "./link";
 import { LiveError } from "./lumiverse";
 import { problemOf } from "./streams";
 
@@ -115,7 +116,7 @@ export class TraceSink {
       for (;;) {
         const wait = this.env.tuning().lostMs;
         try {
-          await this.link.request("trace.push", { records: batch }, wait);
+          await this.link.request("trace.push", { records: batch }, wait, LOST_WAIT);
           break;
         } catch (error) {
           // The batch may or may not have arrived: sent again, the buffer takes each event once.

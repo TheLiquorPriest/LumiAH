@@ -128,7 +128,7 @@ describe("the extension, sent frames in parts", () => {
     expect(backend.server.joining(USER)).toEqual({ frames: 0, units: 0 });
   });
 
-  test("refuses an account past the frames it may have under way, whichever of its sessions sends them, and holds no more", async () => {
+  test("refuses an account past the frames it may have under way, whichever of its sessions sends them, as no room just now (it passes once they are done), and holds no more", async () => {
     const { backend, refusals } = await backendOf({ joinFrames: 2 });
     await backend.server.frame(part("a", 0, 2, "Low tide "), USER, SESSION);
     await backend.server.frame(part("b", 0, 2, "High tide "), USER, SESSION);
@@ -140,8 +140,8 @@ describe("the extension, sent frames in parts", () => {
     await backend.server.frame(part("d", 0, 2, "Spring tide "), USER, OTHER_SESSION);
     expect(backend.server.joining(USER)).toEqual(held);
     expect(refusals().map((r) => [r.id, r.code, r.session])).toEqual([
-      ["c", "too_large", SESSION],
-      ["d", "too_large", OTHER_SESSION],
+      ["c", "unavailable", SESSION],
+      ["d", "unavailable", OTHER_SESSION],
     ]);
     // The words say what holds it up and what to do.
     const words = refusals()[0]?.message ?? "";
@@ -155,7 +155,7 @@ describe("the extension, sent frames in parts", () => {
     expect(refusals()).toHaveLength(2);
   });
 
-  test("refuses the frame that would have it hold too much of an account's, and says which setting that is", async () => {
+  test("refuses the frame that would have it hold too much of an account's as no room just now, and says which setting that is", async () => {
     const { backend, refusals } = await backendOf({ joinHeldUnits: 1024 * 1024 });
     const piece = "x".repeat(400 * 1024);
     await backend.server.frame(part("a", 0, 4, piece), USER, SESSION);
@@ -163,8 +163,19 @@ describe("the extension, sent frames in parts", () => {
     await backend.server.frame(part("c", 0, 4, piece), USER, SESSION);
 
     expect(backend.server.joining(USER)).toEqual({ frames: 2, units: 2 * piece.length });
-    expect(refusals()).toMatchObject([{ id: "c", code: "too_large", session: SESSION }]);
+    expect(refusals()).toMatchObject([{ id: "c", code: "unavailable", session: SESSION }]);
     expect(refusals()[0]?.message).toContain('raise "Characters held while joining" (LumiAH → Settings → Transport → Link)');
+  });
+
+  test("refuses a frame larger than the largest it joins as too large, whatever else is under way, and says which setting that is", async () => {
+    const { backend, refusals } = await backendOf({ joinMaxUnits: 1024 * 1024 });
+    // Its parts say it is three of 512 Ki characters: past 1 Mi before any of it is held.
+    await backend.server.frame(part("a", 0, 3, "x".repeat(512 * 1024)), USER, SESSION);
+
+    expect(backend.server.joining(USER)).toEqual({ frames: 0, units: 0 });
+    expect(refusals()).toMatchObject([{ id: "a", code: "too_large", session: SESSION }]);
+    expect(refusals()[0]?.message).toContain("That frame is over 1 million characters");
+    expect(refusals()[0]?.message).toContain('Raise "Largest frame joined" (LumiAH → Settings → Transport → Link)');
   });
 
   test("lets go of the parts whose rest never came on its tick, for every session", async () => {

@@ -104,12 +104,28 @@ function absolute(path: string): boolean {
   return path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path);
 }
 
+/** A character that would break a line of a unit, a log line or a page's words, or hide in one: below 0x20, and DEL. */
+const CONTROL = /[\u0000-\u001f\u007f]/;
+
+/** Whether a path holds such a character: no unit is written with one, and a config that names one is read without it. */
+export function controlled(path: string): boolean {
+  return CONTROL.test(path);
+}
+
+/** A path a config may name: absolute, and no control character in it. */
+function usable(path: unknown): path is string {
+  return typeof path === "string" && absolute(path) && !controlled(path);
+}
+
+/** An extension's identifier, as `--extension` takes one and a config must hold one: it names a folder (`installedPath`) and a unit. */
+export const EXTENSION_FORM = /^[a-z][a-z0-9_]*$/;
+
 /** The unit a config names, as `up --systemd` wrote it; null for anything else. */
 function serviceOf(raw: unknown): SystemdService | null {
   if (!isRecord(raw) || raw.manager !== "systemd") return null;
   const { unit, file, bun, script } = raw;
   if (typeof unit !== "string" || !/^lumiah-[a-z0-9][a-z0-9_-]{0,39}\.service$/.test(unit)) return null;
-  if (typeof file !== "string" || typeof bun !== "string" || typeof script !== "string" || ![file, bun, script].every(absolute)) return null;
+  if (!usable(file) || !usable(bun) || !usable(script)) return null;
   return { manager: "systemd", unit, file, bun, script };
 }
 
@@ -135,13 +151,14 @@ export function configOf(text: string | null, path: string): SavedConfig {
   }
   // Read as the settings' own section is, so a value this build refuses falls back to its default.
   const tuning = isRecord(c.tuning) ? runtimeTuningOf({ [TRANSPORT_KEY]: { runtime: c.tuning } }) : { ...RUNTIME_DEFAULTS };
-  // A config written before the extension could be named links to LumiAH's own.
-  const extension = typeof c.extension === "string" && c.extension !== "" ? c.extension : EXTENSION_IDENTIFIER;
+  // A config written before the extension could be named links to LumiAH's own. The identifier names a folder and a unit: it is held to the form `--extension` takes.
+  if (c.extension !== undefined && (typeof c.extension !== "string" || !EXTENSION_FORM.test(c.extension))) throw new Error(`${path} isn't a runtime config this lumiah reads. Set the runtime up again with: lumiah up`);
+  const extension = typeof c.extension === "string" ? c.extension : EXTENSION_IDENTIFIER;
   // A config written before these were kept, or holding a value this build refuses, reads with their defaults.
   const setup: RuntimeSetup = {
     memory: typeof c.memory === "string" && memoryRefusal(c.memory) === null ? c.memory : SETUP_DEFAULTS.memory,
     autoUpdate: typeof c.autoUpdate === "boolean" ? c.autoUpdate : SETUP_DEFAULTS.autoUpdate,
-    source: typeof c.source === "string" && absolute(c.source) ? c.source : null,
+    source: usable(c.source) ? c.source : null,
     service: serviceOf(c.service),
   };
   return { name: c.name, base: c.base, extension, listen: c.listen, port: c.port, relay: c.relay, secret: c.secret, session: { username: s.username, token: s.token, savedAt: typeof s.savedAt === "number" ? s.savedAt : 0, ...(s.allowHttp === true ? { allowHttp: true } : {}) }, tuning, ...setup };

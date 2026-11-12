@@ -1,27 +1,29 @@
 // The loopback endpoint against the extension backend (DESIGN §2, §6): a request without a tag is
-// passed through to the writer's connection; a tag admits one request; a chunk lost on the way is
-// asked for again; a turn stops from either side, Lumiverse's or the live view's; a turn that never
-// ends is let go for the chat's next reply; a reply asked while the link is refused is told why and
-// what LumiAH does meanwhile; a request's key is checked before its body is read; and `/healthz`
-// says little on an address other machines reach.
+// passed through to the writer's connection, through the runtime's own model layer; a tag admits one
+// request; a turn stops from either side, Lumiverse's or the live view's; a turn that never ends is
+// let go for the chat's next reply; a reply asked while the link is refused is told why and what
+// LumiAH does meanwhile; a request's key is checked before its body is read; `/healthz` says little
+// on an address other machines reach; and a wait for a link that is down gives up at the setting the
+// user set, and names it.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import type { AgentUsage, JsonObject } from "../../src/core/ports";
 import { isRecord } from "../../src/core/ports";
 import type { HostGenerationType } from "../../src/extension/backend/spindle";
 import { KEY_FORM, LINK, LINK_VERSION, versionWords } from "../../src/link/contract";
-import { healthProof } from "../../src/runtime/relay";
+import { healthProof } from "../../src/runtime/proof";
 import type { Runtime } from "../../src/runtime/runtime";
 import { FakeLumiverse, type Generated } from "../support/fake-lumiverse";
 import { FakeHost, toolCall } from "../support/fake-host";
+import { plug } from "../support/plug";
 import { FAST, PORT, type Rig, type RigOptions, rig, runtimeFor, runtimeFrom, until, USER } from "../support/rig";
 
 let r: Rig | null = null;
 let alone: Runtime | null = null;
-afterEach(() => {
-  r?.close();
+afterEach(async () => {
+  await r?.close();
   r = null;
-  alone?.close();
+  await alone?.close();
   alone = null;
 });
 
@@ -73,36 +75,48 @@ describe("a request with no tag", () => {
     expect(it.host.calls).toHaveLength(0);
   });
 
-  test("carries a message's name, its prefix mark, its media and its tool calls across the link as they came", async () => {
+  test("carries a message's media and its tool calls to the writer's connection as they came", async () => {
     const it = (r = await rig({ harness: noTurns }));
     await it.setUp();
-    it.host.script = ["the light now."];
+    it.host.script = ["Okoro, at the lamp."];
     const body: JsonObject = {
       model: "lumiah",
       stream: true,
       max_tokens: 48,
       messages: [
-        { role: "user", name: "Mara", content: [{ type: "text", text: "Who is in this picture?" }, { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } }] },
+        { role: "user", content: [{ type: "text", text: "Who is in this picture?" }, { type: "image_url", image_url: { url: "data:image/png;base64,iVBORw0KGgo=" } }] },
         { role: "assistant", content: null, tool_calls: [{ id: "call_faces", type: "function", function: { name: "faces", arguments: '{"of":"the keeper"}' } }] },
         { role: "tool", tool_call_id: "call_faces", content: "Okoro, at the lamp." },
-        { role: "assistant", name: "Joss", content: "Okoro keeps", prefix: true },
       ],
       tools: [{ type: "function", function: { name: "faces", description: "Names the faces in a picture.", parameters: { type: "object", properties: { of: { type: "string" } } }, strict: true } }],
     };
 
     const out = await it.lumiverse.post(it.runtime.fetch, body, { key: it.key, port: PORT });
 
-    expect(out).toMatchObject({ status: 200, error: null, content: "the light now.", finish: "stop" });
+    expect(out).toMatchObject({ status: 200, error: null, content: "Okoro, at the lamp.", finish: "stop" });
     const passed = it.host.calls[0];
     if (passed?.kind !== "pass") throw new Error("a passed-through request was expected");
     expect(passed.request.messages).toEqual([
-      { role: "user", name: "Mara", content: [{ type: "text", text: "Who is in this picture?" }, { type: "media", media: "image", mimeType: "image/png", data: "iVBORw0KGgo=" }] },
+      { role: "user", content: [{ type: "text", text: "Who is in this picture?" }, { type: "media", media: "image", mimeType: "image/png", data: "iVBORw0KGgo=" }] },
       { role: "assistant", content: [{ type: "tool_use", id: "call_faces", name: "faces", input: { of: "the keeper" } }] },
       { role: "user", content: [{ type: "tool_result", toolUseId: "call_faces", content: "Okoro, at the lamp." }] },
-      { role: "assistant", name: "Joss", content: "Okoro keeps", prefix: true },
     ]);
     expect(passed.request.tools).toEqual([{ name: "faces", description: "Names the faces in a picture.", parameters: { type: "object", properties: { of: { type: "string" } } }, strict: true }]);
     expect(passed.request.parameters).toEqual({ max_tokens: 48 });
+    expect(it.host.providerCalls).toHaveLength(1);
+  });
+
+  test("is refused whole, in words, before anything of it starts, when a message names its speaker: the runtime's model calls have no place for a name", async () => {
+    const it = (r = await rig({ harness: noTurns }));
+    await it.setUp();
+    it.host.script = ["Never asked."];
+    const out = await it.lumiverse.post(it.runtime.fetch, { model: "lumiah", stream: true, messages: [{ role: "user", content: "Who keeps the light?" }, { role: "user", name: "Mara", content: "And who kept it before?" }] }, { key: it.key, port: PORT });
+    // Answered as a request refused, not as a stream that fails: nothing of it was answered or sent.
+    expect(out).toMatchObject({ status: 400, content: "", error: { code: "invalid_request" } });
+    expect(out.error?.message ?? "").toStartWith("LumiAH didn't pass this request on: message 2 names its speaker (`name`)");
+    expect(it.host.calls).toHaveLength(0);
+    expect(it.host.providerCalls).toHaveLength(0);
+    expect(it.runtime.relay.count).toBe(0);
   });
 
   test("is refused whole when something in it can't be carried: nothing of it reaches the writer's connection", async () => {
@@ -115,6 +129,123 @@ describe("a request with no tag", () => {
     // Sent on without the picture, the question would have been answered about nothing.
     expect(out).toMatchObject({ status: 400, content: "", error: { code: "invalid_request" } });
     expect(out.error?.message).toContain("message 1's part 2 is given by its address (https://harbour.example/boats/brann.png)");
+    expect(it.host.calls).toHaveLength(0);
+    expect(it.runtime.relay.count).toBe(0);
+  });
+
+  test("is refused whole, before anything of it starts, when it holds audio or a video: the runtime's model calls carry text and images only", async () => {
+    const it = (r = await rig({ harness: noTurns }));
+    await it.setUp();
+    it.host.script = ["Never asked."];
+    const parts: [JsonObject, string][] = [
+      [{ type: "input_audio", input_audio: { data: "UklGRiQAAAA=", format: "wav" } }, "audio"],
+      [{ type: "video_url", video_url: { url: "data:video/mp4;base64,AAAAIGZ0eXA=" } }, "a video"],
+    ];
+    for (const [part, what] of parts) {
+      const out = await it.lumiverse.post(it.runtime.fetch, { model: "lumiah", stream: true, messages: [{ role: "user", content: [{ type: "text", text: "What is said here?" }, part] }] }, { key: it.key, port: PORT });
+      expect(out).toMatchObject({ status: 400, content: "", error: { code: "invalid_request" } });
+      expect(out.error?.message).toBe(`LumiAH didn't pass this request on: message 1's part 2 is ${what}, and the runtime's model calls carry text and images only: leave it out, or give what it holds as text. A request that is no reply of a chat's goes to the writer's connection whole or not at all, so that nothing of a prompt is dropped on the way.`);
+    }
+    expect(it.host.calls).toHaveLength(0);
+    expect(it.host.providerCalls).toHaveLength(0);
+    expect(it.runtime.relay.count).toBe(0);
+  });
+
+  test("is refused whole, before anything of it starts, when it asks the model to call a tool: the runtime's model calls let the model choose or call none", async () => {
+    const it = (r = await rig({ harness: noTurns }));
+    await it.setUp();
+    it.host.script = ["Never asked."];
+    const tools = [{ type: "function", function: { name: "faces", description: "Names the faces in a picture.", parameters: { type: "object", properties: {} } } }];
+    for (const choice of ["required", { type: "function", function: { name: "faces" } }]) {
+      const out = await it.lumiverse.post(it.runtime.fetch, { model: "lumiah", messages: [{ role: "user", content: "Who is at the lamp?" }], tools, tool_choice: choice }, { key: it.key, port: PORT });
+      expect(out).toMatchObject({ status: 400, content: "", error: { code: "invalid_request" } });
+      expect(out.error?.message).toContain(`it asks the model to call a tool (\`tool_choice\`: ${JSON.stringify(choice)}), and the runtime's model calls let the model choose a tool or call none: set \`tool_choice\` to "auto" or "none", or leave it out`);
+    }
+    expect(it.host.calls).toHaveLength(0);
+    expect(it.host.providerCalls).toHaveLength(0);
+  });
+
+  /** A request whose model looked two things up, ending in a prefix for the model to go on from. */
+  const prefixed = (more: JsonObject = {}): JsonObject => ({
+    model: "lumiah",
+    stream: true,
+    messages: [
+      { role: "user", content: "Who keeps the light, and since when?" },
+      {
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          { id: "call_keeper", type: "function", function: { name: "lookup", arguments: '{"what":"keeper"}' } },
+          { id: "call_since", type: "function", function: { name: "lookup", arguments: '{"what":"since"}' } },
+        ],
+      },
+      { role: "tool", tool_call_id: "call_keeper", content: "Okoro." },
+      { role: "tool", tool_call_id: "call_since", content: "Last spring." },
+      { role: "assistant", content: "Okoro has kept it", prefix: true },
+    ],
+    tools: [{ type: "function", function: { name: "lookup", description: "Looks a thing up.", parameters: { type: "object", properties: { what: { type: "string" } } } } }],
+    ...more,
+  });
+  const CLAUDE = { id: "conn-claude", name: "Claude", provider: "anthropic", key: "sk-ant-made-up-0123456789abcdef" };
+
+  test("is refused whole, before anything of it starts, when it ends in a prefix the writer's connection can't continue: OpenAI's API can't, after the tools' results as anywhere", async () => {
+    const it = (r = await rig({ harness: noTurns }));
+    await it.setUp();
+    it.host.script = ["Never asked."];
+    const out = await it.lumiverse.post(it.runtime.fetch, prefixed(), { key: it.key, port: PORT });
+    expect(out).toMatchObject({ status: 400, content: "", error: { code: "invalid_request" } });
+    expect(out.error?.message).toBe(`LumiAH didn't pass this request on: the last message is a prefix to continue (\`prefix\`), and the connection "Main" (OpenAI, model-main) can't continue one: only Anthropic's API continues a message given to it. Take the mark off to send the message as one the model wrote before, or have the writer use a connection to an earlier Claude model than 4.6. A request that is no reply of a chat's goes to the writer's connection whole or not at all, so that nothing of a prompt is dropped on the way.`);
+    expect(it.host.calls).toHaveLength(0);
+    expect(it.host.providerCalls).toHaveLength(0);
+    expect(it.runtime.relay.count).toBe(0);
+  });
+
+  test("is refused whole, before anything of it starts, when it ends in a prefix Claude refuses: on Claude 4.6 and later, whatever it is asked", async () => {
+    const it = (r = await rig({ harness: noTurns, connections: [{ ...CLAUDE, model: "claude-opus-4-6" }] }));
+    await it.setUp();
+    it.host.script = ["Never asked."];
+    const out = await it.lumiverse.post(it.runtime.fetch, prefixed({ reasoning_effort: "none" }), { key: it.key, port: PORT });
+    expect(out).toMatchObject({ status: 400, content: "", error: { code: "invalid_request" } });
+    expect(out.error?.message).toContain('the last message is a prefix to continue (`prefix`), and the connection "Claude" (Anthropic, claude-opus-4-6) can\'t continue one: Anthropic refuses a prefix to Claude 4.6 and later.');
+    expect(it.host.providerCalls).toHaveLength(0);
+  });
+
+  test("ends in a prefix after the tools' results: Claude before 4.6, not asked to think, is sent the results and then the prefix last, and its answer goes on from it; asked to think, it is refused before anything starts", async () => {
+    const it = (r = await rig({ harness: noTurns, connections: [{ ...CLAUDE, model: "claude-sonnet-4-5" }] }));
+    await it.setUp();
+    it.host.script = ["since last spring."];
+    const out = await it.lumiverse.post(it.runtime.fetch, prefixed(), { key: it.key, port: PORT });
+    expect(out).toMatchObject({ status: 200, error: null, content: "since last spring.", finish: "stop" });
+    const sent = it.host.providerCalls[0];
+    expect(sent).toMatchObject({ provider: "anthropic", model: "claude-sonnet-4-5", reasoning: null });
+    // pi-ai hands its provider the system prompt (the tools with it) as a message of its own, first.
+    expect(sent?.messages.filter((m) => m.role !== "system").map((m) => m.role)).toEqual(["user", "assistant", "toolResult", "toolResult", "assistant"]);
+    expect(sent?.messages.at(-1)).toMatchObject({ role: "assistant", content: [{ type: "text", text: "Okoro has kept it" }] });
+
+    const thinking = await it.lumiverse.post(it.runtime.fetch, prefixed({ reasoning_effort: "high" }), { key: it.key, port: PORT });
+    expect(thinking).toMatchObject({ status: 400, content: "", error: { code: "invalid_request" } });
+    expect(thinking.error?.message).toContain('can\'t continue one while its model thinks, as the request asks it to (`reasoning_effort`: "high"): send "none" there instead');
+    expect(it.host.providerCalls).toHaveLength(1);
+  });
+
+  test("whose key the extension doesn't vouch for is refused as a key, and told nothing of the connection it would have gone on", async () => {
+    const it = (r = await rig({ harness: noTurns }));
+    await it.setUp();
+    // A key of the form the extension mints, which isn't this user's, on a request the writer's connection couldn't carry.
+    const out = await it.lumiverse.post(it.runtime.fetch, prefixed(), { key: `lah_${"0".repeat(64)}`, port: PORT });
+    expect(out).toMatchObject({ status: 401, content: "", error: { code: "invalid_api_key" } });
+    expect(out.error?.message).toContain("isn't this account's loopback key");
+    expect(out.error?.message).not.toContain("Main");
+    expect(it.host.calls).toHaveLength(0);
+  });
+
+  test("with no connection of the runtime's to go on, is refused before anything of it starts, in words that say where to add one", async () => {
+    const it = (r = await rig({ harness: noTurns, connections: [] }));
+    await it.setUp();
+    const out = await it.lumiverse.post(it.runtime.fetch, { model: "lumiah", stream: true, messages: [{ role: "user", content: "Where?" }] }, { key: it.key, port: PORT });
+    expect(out).toMatchObject({ status: 503, content: "", error: { code: "no_connection" } });
+    expect(out.error?.message).toContain("LumiAH's runtime has no connection to call a model on, so it can't pass this request on.");
+    expect(out.error?.message).toContain("Runtime page");
     expect(it.host.calls).toHaveLength(0);
     expect(it.runtime.relay.count).toBe(0);
   });
@@ -143,35 +274,6 @@ describe("a turn's tag", () => {
     const out = await it.lumiverse.post(it.runtime.fetch, { model: "lumiah", stream: true, messages: [{ role: "user", content: "Hello?" }], lumiah_turn: "0".repeat(32) }, { key: it.key, port: PORT });
     expect(out.error?.message).toContain("LumiAH doesn't know this reply's tag");
     expect(it.host.calls).toHaveLength(0);
-  });
-});
-
-describe("a stream with a gap", () => {
-  test("is asked for again from the missing chunk, and the reply arrives whole and in order", async () => {
-    const it = (r = await rig());
-    const chatId = await it.setUp();
-    it.host.script = BRIEFED;
-    // The third chunk of the writer's answer is lost on its way to the runtime, once.
-    let lost: { stream: unknown; seq: unknown } | null = null;
-    it.lumiverse.filter = (frame) => {
-      if (lost !== null || frame.type !== "chunk" || frame.seq !== 3) return true;
-      lost = { stream: frame.stream, seq: frame.seq };
-      return false;
-    };
-
-    const out = await it.generate(chatId);
-
-    expect(lost).not.toBeNull();
-    expect(out.error).toBeNull();
-    expect(out.content).toBe("Okoro keeps it now. Ilse handed him the keys last spring, before the storms.");
-    // The extension sent the lost chunk a second time, because the runtime asked for it.
-    const sentAgain = it.host.sent.filter((s) => {
-      const frame = s.message as { type?: unknown; stream?: unknown; seq?: unknown };
-      return frame.type === "chunk" && frame.stream === lost?.stream && frame.seq === 3;
-    });
-    expect(sentAgain.length).toBeGreaterThanOrEqual(2);
-    // Once acknowledged to its end, the stream is forgotten.
-    await until(() => it.backend.streams.size === 0, "the streams to be acknowledged");
   });
 });
 
@@ -388,9 +490,13 @@ describe("GET /healthz", () => {
     expect(await ask(elsewhere.fetch, there)).toEqual({ up: true });
     // The loopback key is no proof: it says who may send a request, not who may watch the runtime.
     expect(await ask(elsewhere.fetch, there, `Bearer ${it.key}`)).toEqual({ up: true });
-    // `lumiah status` and `up` show a hash of the secret in the runtime's config, and are told how it is.
-    expect(await ask(elsewhere.fetch, there, `Bearer ${await healthProof(it.registration.secret)}`)).toEqual({ ok: true, link: "down", backend: "LumiAH", turns: 0, requests: 0 });
-    elsewhere.close();
+    // `lumiah status` and `up` show a proof made now with the secret in the runtime's config, and are told how it is.
+    const proof = await healthProof(it.registration.secret, Date.now());
+    expect(await ask(elsewhere.fetch, there, `Bearer ${proof}`)).toEqual({ ok: true, link: "down", backend: "LumiAH", turns: 0, requests: 0 });
+    // Bound to its moment: shown again, or made long ago, it proves nothing to whoever caught it.
+    expect(await ask(elsewhere.fetch, there, `Bearer ${proof}`)).toEqual({ up: true });
+    expect(await ask(elsewhere.fetch, there, `Bearer ${await healthProof(it.registration.secret, Date.now() - 5 * 60_000)}`)).toEqual({ up: true });
+    await elsewhere.close();
 
     // On the machine's own loopback address, which only that machine reaches, whoever asks is told.
     expect(await ask(it.runtime.fetch, `127.0.0.1:${PORT}`)).toEqual({ ok: true, link: "up", backend: "LumiAH", turns: 0, requests: 0 });
@@ -475,5 +581,43 @@ describe("a reply asked of a runtime whose link is refused", () => {
   test("by the runtime itself, where LumiAH answered another link version and took the runtime as linked: says why and promises nothing", async () => {
     const told = await refusedWith({ type: "result", body: { relay: "relay-1", version: LINK_VERSION + 1, build: "newer-build", lost: [], settings: 0 } });
     expect(told.reply).toEqual({ message: versionWords(LINK_VERSION, LINK_VERSION + 1), code: "revoked" });
+  });
+});
+
+describe("a wait for a link that is down", () => {
+  const PLACE = "Model list wait (LumiAH's Settings → Timeouts → The link) says how long it waits for the link.";
+
+  /** A runtime linked once, whose link then drops with Lumiverse out of its reach; the user's Model list wait at its shortest, a second, as the runtime's config keeps it from its last read. */
+  async function cutOff(): Promise<Rig> {
+    const power = plug();
+    const it = (r = await rig({ harness: noTurns, wire: power.wire, tuning: { modelsWaitMs: 1_000 } }));
+    await it.backend.settings.change(USER, [{ path: ["transport", "runtime", "modelsWaitMs"], value: 1_000 }], []);
+    await it.setUp();
+    it.lumiverse.dropSockets();
+    power.pull();
+    return it;
+  }
+
+  // Real time, on purpose: what is shown is a wait the runtime keeps by the clock.
+  test("the model list Lumiverse's Test asks for gives up at Model list wait, and names it", async () => {
+    const it = await cutOff();
+    const asked = Date.now();
+    const answer = await it.runtime.fetch(new Request(`http://127.0.0.1:${PORT}/v1/models`, { headers: { authorization: `Bearer ${it.key}`, host: `127.0.0.1:${PORT}` } }));
+    const body: unknown = await answer.json();
+    const said = isRecord(body) && isRecord(body.error) ? String(body.error.message) : "";
+    expect(answer.status).toBe(504);
+    expect(said).toStartWith("The runtime's link to LumiAH didn't come up within 1 second.");
+    expect(said).toEndWith(PLACE);
+    // At the wait the user set, not the minute a request waits for its answer: with room for a slow machine.
+    expect(Date.now() - asked).toBeLessThan(4_000);
+  });
+
+  test("a request passed through gives up the check of its key at Model list wait, and names it", async () => {
+    const it = await cutOff();
+    const told = await it.lumiverse.post(it.runtime.fetch, { model: "lumiah", messages: [{ role: "user", content: "Who keeps the harbour light now?" }] }, { key: it.key, port: PORT });
+    expect(told.status).toBe(504);
+    expect(told.error?.code).toBe("timeout");
+    expect(told.error?.message).toStartWith("The runtime's link to LumiAH didn't come up within 1 second.");
+    expect(told.error?.message).toEndWith(PLACE);
   });
 });

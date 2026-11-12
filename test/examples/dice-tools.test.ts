@@ -24,8 +24,8 @@ interface DiceExample {
 const example: DiceExample = await import(resolve(ROOT, "examples/dice-tools/src/dice.ts"));
 
 let r: Rig | null = null;
-afterEach(() => {
-  r?.close();
+afterEach(async () => {
+  await r?.close();
   r = null;
 });
 

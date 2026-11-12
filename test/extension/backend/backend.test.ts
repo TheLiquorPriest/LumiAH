@@ -10,8 +10,8 @@ import { toolCall } from "../../support/fake-host";
 import { type Rig, rig, until, USER } from "../../support/rig";
 
 let r: Rig | null = null;
-afterEach(() => {
-  r?.close();
+afterEach(async () => {
+  await r?.close();
   r = null;
 });
 
@@ -96,7 +96,7 @@ describe("the settings", () => {
     // Reset puts the default back, and only what the user changed is stored.
     const reset = await it.page.request("lah.settings.set", { set: [], reset: [["transport", "history", "count"]] });
     expect(reset.settings.values).toMatchObject({ transport: { history: { count: 40 } } });
-    expect(it.host.stored(USER, "settings.json")).toMatchObject({ own: [{ path: ["transport", "streams", "coalesceMs"], value: 0 }] });
+    expect(it.host.stored(USER, "settings.json")).toEqual(expect.objectContaining({ own: [] }));
   });
 
   test("keep a text of the user's own only when it still has what the text can't work without", async () => {
@@ -114,22 +114,20 @@ describe("the settings", () => {
 
   test("pass over quietly a value kept at a setting this build took away, and leave it out of storage from the next change on", async () => {
     const it = (r = await rig());
-    const stored = it.host.stored(USER, "settings.json") as { own: { path: string[]; value: unknown }[] };
-    // As a build that could run a chat inside Lumiverse kept them: how near the reply its main agent was warned and how long a turn waited for its reply, and that way's own group of timings; beside them, a setting this build keeps.
-    stored.own.push({ path: ["core", "reply", "warnMs"], value: 30_000 }, { path: ["core", "reply", "pendingMs"], value: 600_000 }, { path: ["transport", "builtin"], value: { marginMs: 15_000 } }, { path: ["transport", "history", "count"], value: 12 });
-    it.host.files.set(`${USER}/settings.json`, JSON.stringify(stored));
+    // As a build that could run a chat inside Lumiverse kept them: how near the reply its main agent was warned and how long a turn waited for its reply, and that way's own group of timings; as one whose model calls crossed the link kept them: how long a stream's text was held back and how many chunks went by between acknowledgements; beside them, a setting this build keeps.
+    const own = [{ path: ["core", "reply", "warnMs"], value: 30_000 }, { path: ["core", "reply", "pendingMs"], value: 600_000 }, { path: ["transport", "builtin"], value: { marginMs: 15_000 } }, { path: ["transport", "streams", "coalesceMs"], value: 0 }, { path: ["transport", "runtime", "ackEvery"], value: 8 }, { path: ["transport", "history", "count"], value: 12 }];
+    it.host.files.set(`${USER}/settings.json`, JSON.stringify({ v: 1, rev: 1, own, texts: {} }));
     await it.restart();
 
     const { values } = (await it.page.request("lah.hello", {})).settings;
-    for (const gone of [["core", "reply", "warnMs"], ["core", "reply", "pendingMs"], ["transport", "builtin"]]) expect(values).not.toHaveProperty(gone);
+    for (const gone of [["core", "reply", "warnMs"], ["core", "reply", "pendingMs"], ["transport", "builtin"], ["transport", "streams", "coalesceMs"], ["transport", "runtime", "ackEvery"]]) expect(values).not.toHaveProperty(gone);
     expect(values).toMatchObject({ transport: { history: { count: 12 } } });
 
     // The next change is taken as any is, and what it stores holds nothing of what was taken away.
     await it.page.request("lah.settings.set", { set: [{ path: ["transport", "history", "count"], value: 20 }], reset: [] });
     await it.backend.settle();
     const after = it.host.stored(USER, "settings.json") as { own: { path: string[]; value: unknown }[] };
-    expect(after.own).toEqual(expect.arrayContaining([{ path: ["transport", "streams", "coalesceMs"], value: 0 }, { path: ["transport", "history", "count"], value: 20 }]));
-    expect(after.own).toHaveLength(2);
+    expect(after.own).toEqual([{ path: ["transport", "history", "count"], value: 20 }]);
   });
 });
 
@@ -210,10 +208,12 @@ describe("the per-chat switch and the secrets", () => {
     await until(() => it.logs.some((line) => line.includes("rotated this runtime's secret")), "the runtime to take the new secret");
     // The runtime goes on with the new one.
     expect(await it.runtime.link.request("settings.get", {}, 1_000)).toMatchObject({ revision: expect.any(Number) });
+    // Its store has reached the extension's storage first: one forgotten while its store still opens would wait the whole Storage wait as it stops, since its link hears it was forgotten only at its next ping.
+    await it.mirrored();
 
     const after = await it.page.request("lah.relay", { op: "forget", relay });
     expect(after.runtime.relays).toEqual([]);
-    expect(it.runtime.link.request("settings.get", {}, 1_000)).rejects.toThrow("LumiAH doesn't know this runtime");
+    await expect(it.runtime.link.request("settings.get", {}, 1_000)).rejects.toThrow("LumiAH doesn't know this runtime");
   });
 });
 

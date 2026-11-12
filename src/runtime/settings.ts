@@ -8,6 +8,7 @@ import type { SettingsSnapshot } from "../link/contract";
 import type { RuntimeTuning } from "../link/settings";
 import { runtimeTuningOf } from "../link/settings";
 import type { RuntimeLink } from "./link";
+import { LOST_WAIT } from "./link";
 
 export interface SettingsEnv {
   /** The limits and timings to start with: the config's, as last read. */
@@ -55,7 +56,7 @@ export class RuntimeSettings {
 
   private async read(): Promise<SettingsSnapshot> {
     const named = this.named;
-    const snapshot = await this.link.request("settings.get", {}, this.current.lostMs);
+    const snapshot = await this.link.request("settings.get", {}, this.current.lostMs, LOST_WAIT);
     this.held = snapshot;
     // What was just read is the latest, unless the extension named another revision while it was out.
     if (named === this.named) this.latest = snapshot.revision;

@@ -1,9 +1,10 @@
 // The rest of a made-up Lumiverse, for tests that run a runtime against the extension backend: the
-// HTTP routes the runtime calls, the event socket its link travels (to the fake host's backend and
-// back), pages that send the backend requests, and a generation as Lumiverse runs one: its start
-// event, the prompt through the interceptor, the request to the loopback connection, the reply read
-// as it streams, the message saved and the end event. Where the host has other extensions beside it
-// (fake-host.ts), all of them are listed, the socket carries each one's frames by its id, and a
+// HTTP routes the runtime calls (among them the ones its copy of chat and lore reads, served from the
+// very rows the extension's host reads: rows.ts), the event socket its link travels (to the fake host's
+// backend and back), pages that send the backend requests, and a generation as Lumiverse runs one: its
+// start event, the prompt through the interceptor, the request to the loopback connection, the reply
+// read as it streams, the message saved and the end event. Where the host has other extensions beside
+// it (fake-host.ts), all of them are listed, the socket carries each one's frames by its id, and a
 // generation goes through every one's interceptor and is told to every one.
 
 import { isRecord, type ChatRole, type JsonObject } from "../../src/core/ports";
@@ -12,11 +13,18 @@ import { LINK } from "../../src/link/contract";
 import type { OpenSocket, Socket } from "../../src/runtime/connection";
 import type { Http, HttpReply } from "../../src/runtime/lumiverse";
 import { UI_VERSION, type BackendToFrontend, type UiErrorMessage, type UiRequestType, type UiRequests } from "../../src/shared/ui";
+import { rowToBook, rowToChat, rowToEntry, rowToMessage, rowToMessageLight } from "../runtime/copy/lumiverse";
 import type { FakeHost, FakeMessage } from "./fake-host";
 
 const hex = (bytes: number): string => [...crypto.getRandomValues(new Uint8Array(bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
 
-const reply = (status: number, body: unknown): HttpReply => ({ status, header: () => null, text: typeof body === "string" ? body : JSON.stringify(body) });
+const reply = (status: number, body: unknown, etag: string | null = null): HttpReply => ({ status, header: (name) => (name.toLowerCase() === "etag" ? etag : null), text: typeof body === "string" ? body : JSON.stringify(body) });
+
+/** A page's limit and offset as Lumiverse reads them: the limit held between 1 and 1000. */
+function paged(url: URL): { limit: number; offset: number } {
+  const asked = Number.parseInt(url.searchParams.get("limit") ?? "50", 10);
+  return { limit: Number.isNaN(asked) ? 50 : Math.min(Math.max(asked, 1), 1000), offset: Math.max(0, Number.parseInt(url.searchParams.get("offset") ?? "0", 10) || 0) };
+}
 
 /** A page's request refused by the backend. */
 export class UiFailure extends Error {
@@ -90,8 +98,14 @@ export class FakeLumiverse {
   readonly extensionId = "ext-lumiah";
   readonly base = "http://127.0.0.1:7860";
   token = "session-token-mara";
-  /** Frames on their way to a runtime pass here first: false drops one (a chunk lost on the way). */
+  /** Frames on their way to a runtime pass here first: false drops one (lost on the way). */
   filter: (frame: Record<string, unknown>) => boolean = () => true;
+  /** Frames on their way to a runtime that pass `filter` come here next: true holds one back, with the ones held before it, until `letGo` sends them on in order (one push or answer coming later than another). */
+  holds: (frame: Record<string, unknown>) => boolean = () => false;
+  /** What `holds` held back, each sending its frame on. */
+  private readonly heldBack: (() => void)[] = [];
+  /** Every frame a runtime's socket carried, either way, as the text on the wire: what Lumiverse's socket sees of the link. */
+  readonly frames: { to: "runtime" | "lumiverse"; text: string }[] = [];
   /** The runtime sockets open now, by session. */
   readonly sockets = new Map<string, { close(code: number, reason: string): void }>();
   /** The keys put in connections, by connection. */
@@ -112,6 +126,10 @@ export class FakeLumiverse {
   readonly provided: { connectionId: string; body: JsonObject }[] = [];
   /** What Lumiverse logged of an interceptor that threw: it passes such a one over, unless it is required. */
   readonly interceptorErrors: { identifier: string; message: string }[] = [];
+  /** Every HTTP request the runtime made, as `METHOD path?query`, with the headers it carried. */
+  readonly asked: { line: string; headers: Record<string, string> }[] = [];
+  /** Which of the routes the runtime's copy reads (a chat's row and messages, a world book) this Lumiverse serves, by the path asked: one it doesn't answers 404, as a release that moved them, or a test bed that serves none, would. */
+  serves: (path: string) => boolean = () => true;
   private n = 0;
 
   constructor(
@@ -128,6 +146,7 @@ export class FakeLumiverse {
   readonly http: Http = async (request) => {
     const url = new URL(request.url);
     const path = url.pathname;
+    this.asked.push({ line: `${request.method} ${path}${url.search}`, headers: { ...request.headers } });
     if (request.headers.Authorization !== `Bearer ${this.token}` && path !== "/api/auth/sign-in/username") return reply(401, { error: "Unauthorized" });
     if (path === "/api/v1/spindle" && request.method === "GET") return reply(200, { extensions: this.host.extensions.map((host) => ({ id: this.idOf(host), identifier: host.identifier, version: "0.0.1", enabled: true, status: "running" })) });
     if (path === "/api/v1/ws-ticket" && request.method === "POST") return reply(200, { ticket: `ticket-${++this.n}` });
@@ -156,6 +175,32 @@ export class FakeLumiverse {
       held?.stop.abort();
       return reply(200, { stopped: held !== undefined });
     }
+    // The routes the runtime's copy of chat and lore reads, as its signed-in user: another user's chat or book isn't there, and none is where this Lumiverse doesn't serve them.
+    const chat = /^\/api\/v1\/chats\/([^/]+)(\/messages)?$/.exec(path);
+    const book = /^\/api\/v1\/world-books\/([^/]+)(\/entries)?$/.exec(path);
+    if ((chat !== null || book !== null) && !this.serves(path)) return reply(404, { error: "Not found" });
+    if (chat !== null && request.method === "GET") {
+      const rows = this.host.rows.chatRows(decodeURIComponent(chat[1] ?? ""));
+      if (rows === null || rows.chat.user_id !== this.userId) return reply(404, { error: "Chat not found" });
+      if (chat[2] === undefined) return reply(200, rowToChat(rows.chat));
+      const map = url.searchParams.get("full") === "true" ? rowToMessage : rowToMessageLight;
+      const { limit, offset } = paged(url);
+      const total = rows.messages.length;
+      // Lumiverse's tail: the last `limit` by place (the fake's places are each message's own).
+      if (url.searchParams.get("tail") === "true") return reply(200, { data: rows.messages.slice(-limit).map(map), total, limit, offset: Math.max(0, total - limit) });
+      return reply(200, { data: rows.messages.slice(offset, offset + limit).map(map), total, limit, offset });
+    }
+    if (book !== null && request.method === "GET") {
+      const rows = this.host.rows.bookRows(this.host.books, decodeURIComponent(book[1] ?? ""));
+      if (rows === null || rows.book.user_id !== this.userId) return reply(404, { error: "World book not found" });
+      const { limit, offset } = paged(url);
+      const listed = { data: rows.entries.slice(offset, offset + limit).map(rowToEntry), total: rows.entries.length, limit, offset };
+      // Lumiverse's ETag for the page: the book's stamp, its count, its newest entry's stamp, the sum of their revisions, and the page.
+      const signature = `${rows.book.id}-${rows.book.updated_at}-${rows.entries.length}-${Math.max(0, ...rows.entries.map((e) => e.updated_at))}-${rows.entries.reduce((sum, e) => sum + e.revision, 0)}-${limit}-${offset}`;
+      const tag = book[2] === undefined ? `"wb-${signature}"` : `"wb-entries-${signature}--"`;
+      if (request.headers["If-None-Match"] === tag) return reply(304, "", tag);
+      return reply(200, book[2] === undefined ? { ...rowToBook(rows.book), entries: listed } : listed, tag);
+    }
     return reply(404, { error: "Not found" });
   };
 
@@ -171,7 +216,14 @@ export class FakeLumiverse {
           if (!open) return;
           const frame = message as Record<string, unknown>;
           if (frame.link === LINK && !this.filter(frame)) return;
-          events.message(JSON.stringify({ event: "SPINDLE_FRONTEND_MSG", payload: { extensionId: this.idOf(host), data: message } }));
+          const send = (): void => {
+            if (!open) return;
+            const text = JSON.stringify({ event: "SPINDLE_FRONTEND_MSG", payload: { extensionId: this.idOf(host), data: message } });
+            this.frames.push({ to: "runtime", text });
+            events.message(text);
+          };
+          if (frame.link === LINK && this.holds(frame)) this.heldBack.push(send);
+          else send();
         },
       });
     }
@@ -188,6 +240,7 @@ export class FakeLumiverse {
     const socket: Socket = {
       send: (text) => {
         if (!open) return;
+        this.frames.push({ to: "lumiverse", text });
         const message = JSON.parse(text) as { type?: string; extensionId?: string; payload?: unknown };
         if (message.type === "SPINDLE_BACKEND_MSG") extensions.find((host) => this.idOf(host) === message.extensionId)?.deliver(message.payload, this.userId, session);
       },
@@ -204,6 +257,11 @@ export class FakeLumiverse {
   /** Lumiverse drops every runtime socket (a restart, a network blip). */
   dropSockets(): void {
     for (const socket of [...this.sockets.values()]) socket.close(1006, "");
+  }
+
+  /** Sends on every frame `holds` held back, in the order they came, to the sockets still open. */
+  letGo(): void {
+    for (const send of this.heldBack.splice(0)) send();
   }
 
   page(userId = this.userId): FakePage {
@@ -254,6 +312,8 @@ export class FakeLumiverse {
       /** The prompt has been through every interceptor and is about to be sent. */
       onPrompt?(body: JsonObject): void;
       onPiece?(text: string): void;
+      /** A piece of the reply's reasoning, as it arrives. */
+      onReasoning?(text: string): void;
     } = { key: "", port: 0 },
   ): Promise<Generated> {
     const { host, userId } = this;
@@ -416,7 +476,7 @@ export class FakeLumiverse {
    * a streamed completion piece by piece, a plain one whole, an error in its own words. An aborted
    * request gives what came before the abort.
    */
-  async post(fetch: (request: Request) => Promise<Response>, body: JsonObject, options: { key: string; port: number; signal?: AbortSignal; onPiece?(text: string): void }): Promise<Pick<Generated, "status" | "content" | "reasoning" | "error" | "finish" | "usage">> {
+  async post(fetch: (request: Request) => Promise<Response>, body: JsonObject, options: { key: string; port: number; signal?: AbortSignal; onPiece?(text: string): void; onReasoning?(text: string): void }): Promise<Pick<Generated, "status" | "content" | "reasoning" | "error" | "finish" | "usage">> {
     const out: Pick<Generated, "status" | "content" | "reasoning" | "error" | "finish" | "usage"> = { status: 0, content: "", reasoning: "", error: null, finish: null, usage: null };
     type Choice = { delta?: { content?: string; reasoning?: string }; message?: { content?: string }; finish_reason?: string | null };
     type Wire = { error?: { message?: string; code?: string }; choices?: Choice[]; usage?: JsonObject };
@@ -453,7 +513,10 @@ export class FakeLumiverse {
               out.content += choice.delta.content;
               options.onPiece?.(choice.delta.content);
             }
-            if (choice?.delta?.reasoning) out.reasoning += choice.delta.reasoning;
+            if (choice?.delta?.reasoning) {
+              out.reasoning += choice.delta.reasoning;
+              options.onReasoning?.(choice.delta.reasoning);
+            }
             if (choice?.finish_reason) out.finish = choice.finish_reason;
             if (piece.usage) out.usage = piece.usage;
           }

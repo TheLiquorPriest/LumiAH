@@ -3,12 +3,14 @@
 // gaps); the turn's transcript is `transcript.tsx`, and what the user can do to it while it runs
 // (answer a held tool call, say something, pause) is `runs.tsx`. A reply LumiAH works on in another
 // chat is said across the top, with the way to it; so is a chat whose runtime isn't answering, with
-// the way to the Runtime page, where its line is.
+// the way to the Runtime page, where its line is, and a runtime with no connection for the agents to
+// call, with the way to its Connections.
 
 import { chatAnswered, isReply } from "../../../shared/ui";
 import { useApp } from "../app";
 import { ChatBar, chatLabel, useChatView, useShownChat } from "../chat";
 import { Banner, Button, Empty, IconButton } from "../components";
+import { ConnectionsWanted } from "../connections";
 import { LiveTurn, useLive } from "../runs";
 import { useSelect } from "../store";
 
@@ -51,6 +53,7 @@ export function LivePage() {
           </Banner>
         </div>
       ) : null}
+      <ConnectionsWanted chatId={chatId} />
       {chatId === null ? (
         <Empty icon="message" title="No chat is open">
           Live shows the chat open in Lumiverse. Open one, or pick a chat LumiAH answers from the list above.

@@ -11,7 +11,7 @@
 
 import { describe, expect, test } from "bun:test";
 import { type AgentDeps, type AgentSpec, type AgentTrace, AgentTurn, type ApprovalGate, startAgent } from "../../src/core/loop";
-import type { ApprovalAnswer, ApprovalAsk, FileChange, JsonObject, ModelMessage, ModelRequest, TranscriptEntry } from "../../src/core/ports";
+import type { AgentStarted, ApprovalAnswer, ApprovalAsk, FileChange, JsonObject, ModelMessage, ModelRequest, TranscriptEntry } from "../../src/core/ports";
 import { AgentAccounts, AgentStop } from "../../src/core/provider";
 import { defaultSettings, type Settings } from "../../src/core/settings";
 import { SCRATCH_READ, TEXT, Texts } from "../../src/core/texts";
@@ -313,14 +313,14 @@ describe("budgets", () => {
     expect(await sending).toMatchObject({ status: "cancelled", code: "cancelled" });
   });
 
-  test("a loopback connection, or one that isn't there, stops the agent before any call, saying what to do", async () => {
-    const r = rig(["never"]);
-    const loop = await r.start({ connectionId: "conn-loopback" }).send("go");
-    expect(loop).toMatchObject({ status: "refused", code: "connection" });
-    expect(loop.reason).toContain("a call on it would come straight back here");
-    const gone = await r.start({ connectionId: "conn-gone" }).send("go");
-    expect(gone.reason).toBe("the connection conn-gone no longer exists: give this agent another in LumiAH's Settings");
-    expect(r.host.calls).toHaveLength(0);
+  test("a connection that isn't there runs on the default; with no default either, the agent stops before any call, saying what to do", async () => {
+    const r = rig(["done", "never"]);
+    expect(await r.start({ connectionId: "conn-gone" }).send("go")).toMatchObject({ status: "answered", text: "done" });
+    // The call named the default it ran on.
+    expect(r.host.calls.map((c) => c.connectionId)).toEqual([MAIN]);
+    r.host.defaultConnection = null;
+    expect(await r.start({ connectionId: "conn-gone" }).send("go")).toMatchObject({ status: "refused", code: "connection" });
+    expect(r.host.calls).toHaveLength(1);
   });
 });
 
@@ -408,25 +408,15 @@ describe("reasoning, caching and throttles", () => {
     expect(r.host.calls.map((c) => c.effort)).toEqual(["off", "high"]);
   });
 
-  test("on a provider that takes breakpoints, the opening and the conversation so far are marked, within its limit", async () => {
-    const r = rig([{ toolCalls: [call("lookup", {}, "c1")] }, "done"]);
-    r.host.profiles.push({ id: "conn-cache", name: "Cache", provider: "anthropic", model: "m", loopback: false, cache: { limit: 4, system: false, lastMessage: false, tools: false, automatic: false }, parallelTools: false });
-    await r.start({ connectionId: "conn-cache", tools: [tool("lookup")], prefix: ["Guidance for every agent."] }).send("go");
+  test("an agent's calls name its session and keep its cache as Settings say", async () => {
+    const r = rig([{ toolCalls: [call("lookup", {}, "c1")] }, "done"], (s) => (s.cache.retention = "long"));
+    await r.start({ tools: [tool("lookup")] }).send("go");
     const [first, second] = r.host.calls;
-    // All four of the provider's breakpoints are spent: the shared prefix, the opening, the last tool, and the conversation so far.
-    expect(first?.messages[0]?.parts).toEqual([
-      { type: "text", text: "Guidance for every agent.", cache: true },
-      { type: "text", text: "You look things up.", cache: true },
-    ]);
-    expect(first?.tools?.map((t) => t.cache === true)).toEqual([false, true]);
-    expect(first?.messages.at(-1)?.parts?.at(-1)).toMatchObject({ cache: true });
-    expect(second?.messages.at(-1)?.parts?.at(-1)).toMatchObject({ type: "tool_result", cache: true });
-    expect(first?.parallelToolCalls).toBe(false);
-    // Switched off in Settings, nothing is marked.
-    const off = rig(["done"], (s) => (s.cache.breakpoints = false));
-    off.host.profiles.push({ id: "conn-cache", name: "Cache", provider: "anthropic", model: "m", loopback: false, cache: { limit: 4, system: false, lastMessage: false, tools: false, automatic: false }, parallelTools: true });
-    await off.start({ connectionId: "conn-cache" }).send("go");
-    expect(off.host.calls[0]?.messages[0]).toEqual({ role: "system", content: "You look things up." });
+    expect(first?.session).toMatch(/^agent_/);
+    expect(second?.session).toBe(first?.session);
+    expect(r.host.calls.map((c) => c.cacheRetention)).toEqual(["long", "long"]);
+    // No breakpoint is marked by the core any more: the provider places its own.
+    expect(first?.messages[0]).toEqual({ role: "system", content: "You look things up." });
   });
 
   test("a connection's throttle makes a call wait for its minute, and refuses one bigger than the minute", async () => {
@@ -1023,6 +1013,32 @@ describe("what the trace is told", () => {
       { agent: main.id, connection: MAIN, model: "model-small" },
       { agent: writer.id, connection: WRITER, model: "scripted" },
     ]);
+  });
+
+  test("an agent's start names the connection its calls go on, by its id and its name, and the one its settings name where the runtime has none of that id", async () => {
+    const heard: string[] = [];
+    const started: AgentStarted[] = [];
+    const ran: string[] = [];
+    const trace: AgentTrace = { start: (agent) => void (started.push(agent), heard.push("start")), entry: (_agentId, entry) => void heard.push(entry.kind), usage: (_agentId, _call, _spent, on) => void ran.push(on.connection), idle: () => undefined, prompt: async () => undefined, delta: () => undefined };
+    const r = rig(["one", "two", "three", "never"], undefined, { turn: (s, host) => new AgentTurn(s.turn, host.clock.now(), trace) });
+    // One of Lumiverse's connections, named before the runtime kept its own: the default stands in for it.
+    await r.start({ connectionId: "c7c0f78d-from-lumiverse" }).send("go");
+    expect(heard).toEqual(["start", "message", "answer"]);
+    await r.start({ connectionId: null }).send("go");
+    await r.start({ connectionId: WRITER }).send("go");
+    expect(started.map(({ connectionId, connectionName, gone }) => ({ connectionId, connectionName, gone }))).toEqual([
+      { connectionId: MAIN, connectionName: "Main", gone: "c7c0f78d-from-lumiverse" },
+      { connectionId: MAIN, connectionName: "Main", gone: undefined },
+      { connectionId: WRITER, connectionName: "Writer", gone: undefined },
+    ]);
+    // Each call's spend is on the record against the connection it went on.
+    expect(ran).toEqual([MAIN, MAIN, WRITER]);
+    // With no default to stand in, the start names what its settings name, and its stop says why.
+    r.host.defaultConnection = null;
+    expect(await r.start({ connectionId: "c7c0f78d-from-lumiverse" }).send("go")).toMatchObject({ status: "refused", code: "connection" });
+    expect(started.at(-1)).toMatchObject({ connectionId: "c7c0f78d-from-lumiverse" });
+    expect(started.at(-1)?.connectionName).toBeUndefined();
+    expect(heard.slice(-3)).toEqual(["start", "message", "stop"]);
   });
 });
 

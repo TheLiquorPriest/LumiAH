@@ -1,50 +1,21 @@
-// The user's connections as the core's port and the pages see them (DESIGN §4.2 `connections`):
-// which exist, each one's provider and model, what the loop must know of it (its cache breakpoints,
-// whether it takes several tool calls in one answer), and which are loopbacks. A loopback connection
-// is one whose calls come back to one of this extension's runtimes: LumiAH answers a chat exactly
-// when the connection it generates on is one, and no agent's own call may go on one. The loopback
-// of another extension that has LumiAH built in is none of this one's (DESIGN §21).
+// The user's connections in Lumiverse as the pages see them: which exist, each one's provider and
+// model, and which are loopbacks. A loopback connection is one whose calls come back to one of this
+// extension's runtimes: LumiAH answers a chat exactly when the connection it generates on is one.
+// The loopback of another extension that has LumiAH built in is none of this one's (DESIGN §21).
+// The agents call their models on their runtime's own connections (runtime/models), never on
+// these: what "Copy from Lumiverse" takes from here is a connection's name, provider, address and
+// model, never its key.
 
-import type { ConnectionInfo, ConnectionProfile } from "../../core/ports";
 import { EXTENSION_IDENTIFIER, MODEL_ID, loopsBack } from "../../link/contract";
-import { isRecord } from "../../link/json";
-import type { ConnectionView } from "../../shared/ui";
+import type { ConnectionView, LumiverseConnection } from "../../shared/ui";
 import type { BackendHost, HostChat, HostConnection } from "./spindle";
 
 /** Lumiverse's provider for an OpenAI-compatible endpoint the user names: what a loopback connection is made as. */
 export const LOOPBACK_PROVIDER = "custom";
 
-/** Anthropic's most explicit cache breakpoints in one request, the connection's own included: a fifth fails the request. The provider's limit, so it can't be a setting. */
-const ANTHROPIC_CACHE_BREAKPOINTS = 4;
-
-/**
- * The explicit cache breakpoints a connection takes, as Lumiverse's own prompt caching reads its
- * `prompt_caching` (Lumiverse `src/services/caching/anthropic.ts`, `resolveConfig`): only Anthropic
- * reads `cache_control` on a part; when the connection caches, it marks the end of the leading
- * system messages unless told not to, the last message and the last tool (one breakpoint, however
- * many tools) only when told to, and its automatic mode is on unless switched off.
- */
-export function cacheBreakpoints(provider: string, metadata: unknown): ConnectionProfile["cache"] {
-  if (provider !== "anthropic") return null;
-  const caching = isRecord(metadata) ? metadata.prompt_caching : undefined;
-  const on = caching === true || isRecord(caching);
-  const own = isRecord(caching) ? caching : {};
-  const marks = isRecord(own.breakpoints) ? own.breakpoints : {};
-  return { limit: ANTHROPIC_CACHE_BREAKPOINTS, system: on && marks.system !== false, lastMessage: on && marks.messages === true, tools: on && marks.tools === true, automatic: on && own.automatic !== false };
-}
-
-/**
- * The providers that refuse `parallel_tool_calls`, by Lumiverse's own names for them: it is an
- * OpenAI-style parameter, Google rejects a top-level field it doesn't know and Anthropic says the
- * same thing another way. Lumiverse passes a parameter it doesn't know straight to the provider, so
- * a call on one of these goes without it. (Carried from LumiAgent's backend, see NOTICE.) The
- * providers' own behaviour, so it can't be a setting.
- */
-const NO_PARALLEL_FLAG: Readonly<Record<string, true>> = { google: true, google_vertex: true, anthropic: true };
-
-/** Whether a provider takes `parallel_tool_calls` in a request's body. */
-export function takesParallelFlag(provider: string): boolean {
-  return !Object.hasOwn(NO_PARALLEL_FLAG, provider);
+/** Whether a connection names the loopback model of LumiAH or of an extension that has it built in: every one is LumiAH's own or starts with it (`loopbackModel`). */
+function anyLoopbackModel(c: HostConnection): boolean {
+  return c.provider === LOOPBACK_PROVIDER && (c.model === MODEL_ID || c.model.startsWith(`${MODEL_ID}-`));
 }
 
 /**
@@ -65,8 +36,6 @@ export interface ConnectionsDeps {
   model: string;
   /** Where Lumiverse reaches each of the user's runtimes (`http://127.0.0.1:<port>/v1`). */
   bases(userId: string): Promise<string[]>;
-  /** The connections the user's settings say take one tool call per answer, by id. */
-  serialTools(userId: string): Promise<readonly string[]>;
 }
 
 export class Connections {
@@ -90,22 +59,20 @@ export class Connections {
     return c.provider === LOOPBACK_PROVIDER && loopsBack(c, this.deps.model, bases);
   }
 
-  private info(c: HostConnection, bases: readonly string[]): ConnectionInfo {
-    return { id: c.id, name: c.name, provider: c.provider, model: c.model === "" ? null : c.model, loopback: this.loops(c, bases) };
-  }
-
   /** The user's connections as Lumiverse lists them. */
   raw(userId: string): Promise<HostConnection[]> {
     return this.host.connections.list(userId);
   }
 
-  async list(userId: string): Promise<ConnectionInfo[]> {
+  async views(userId: string): Promise<ConnectionView[]> {
     const bases = await this.deps.bases(userId);
-    return (await this.raw(userId)).map((c) => this.info(c, bases));
+    return (await this.raw(userId)).map((c) => ({ id: c.id, name: c.name, provider: c.provider, model: c.model === "" ? null : c.model, loopback: this.loops(c, bases) }));
   }
 
-  async views(userId: string): Promise<ConnectionView[]> {
-    return (await this.list(userId)).map((c) => ({ id: c.id, name: c.name, provider: c.provider, model: c.model, loopback: c.loopback }));
+  /** Lumiverse's connections a runtime's may be copied from ("Copy from Lumiverse"): every one but a loopback (LumiAH's own or another extension's), by its name, Lumiverse's provider, its address and model; never its key. */
+  async lumiverse(userId: string): Promise<LumiverseConnection[]> {
+    const bases = await this.deps.bases(userId);
+    return (await this.raw(userId)).filter((c) => !this.loops(c, bases) && !anyLoopbackModel(c)).map((c) => ({ id: c.id, name: c.name, provider: c.provider, baseUrl: c.url === "" ? null : c.url, model: c.model === "" ? null : c.model }));
   }
 
   /**
@@ -117,14 +84,6 @@ export class Connections {
   async one(userId: string, connectionId: string | null): Promise<HostConnection | null> {
     if (connectionId !== null) return this.host.connections.get(connectionId, userId);
     return (await this.raw(userId)).find((c) => c.isDefault) ?? null;
-  }
-
-  /** `connections.get`: one connection as the loop needs it (null: the user's default). */
-  async profile(userId: string, connectionId: string | null): Promise<ConnectionProfile | null> {
-    const c = await this.one(userId, connectionId);
-    if (c === null) return null;
-    const serial = await this.deps.serialTools(userId);
-    return { ...this.info(c, await this.deps.bases(userId)), cache: cacheBreakpoints(c.provider, c.metadata), parallelTools: !serial.includes(c.id) };
   }
 
   /** The user's loopback connections. */
@@ -161,7 +120,7 @@ export class Connections {
   }
 
   /** The connection the user has selected in Lumiverse now (their active profile), by its id: Lumiverse's own word where it gives one, else the last word of a page of the user's; null where none is known. */
-  async selectedId(userId: string): Promise<string | null> {
+  private async selectedId(userId: string): Promise<string | null> {
     const said = await this.host.connections.active(userId);
     return said !== undefined ? said : (this.told.get(userId) ?? null);
   }

@@ -12,7 +12,7 @@
 // `toWorldBookEntryDTO`), which are applied here too.
 
 import type { ChatRole, JsonValue } from "../../core/ports";
-import type { HostBook, HostBookEntry, HostBookRecord, HostChat, HostEntryRecord, HostMessage } from "../../extension/backend/spindle";
+import type { HostBook, HostBookEntry, HostBookRecord, HostChat, HostEntryRecord, HostMessage } from "../../host/rows";
 import { hasOwn, isRecord, toJson, toJsonObject } from "../../link/json";
 import type { SourceEntry, SourceMessage } from "./source";
 
@@ -55,6 +55,22 @@ function roleOf(raw: Record<string, unknown>, extra: Record<string, unknown>): C
 }
 
 /**
+ * A message's swipes as the host reads them, lean. Lumiverse keeps whatever its `swipes` JSON parses
+ * to, nearly always a list; its lean form gives as many slots as that has (when more than one), the
+ * shown one as stored, and Spindle passes on only a list. A row stored as JSON text parses to a
+ * string, which the lean form spreads into that many slots, the shown one holding a single letter. A
+ * whole row (an event's) is read the same way, so it gives the host's count too.
+ */
+function swipesOf(raw: unknown, swipeId: number): readonly unknown[] {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw !== "string" || raw.length <= 1) return [];
+  const slots: unknown[] = new Array(raw.length).fill(null);
+  const shown = swipeId >= 0 && swipeId < raw.length ? swipeId : 0;
+  slots[shown] = raw[shown];
+  return slots;
+}
+
+/**
  * A message as Lumiverse sends it over HTTP or in an event, as the host gives it, with each swipe's
  * text the row carries and its revision; null when it isn't one. `identifier` is the extension whose
  * entry in the message's extension metadata is its own.
@@ -64,8 +80,8 @@ export function messageOf(raw: unknown, identifier: string): SourceMessage | nul
   const id = str(raw, "id");
   if (id === undefined) return null;
   const extra = isRecord(raw.extra) ? raw.extra : {};
-  const swipes: unknown[] = Array.isArray(raw.swipes) ? raw.swipes : [];
   const swipeId = num(raw, "swipe_id") ?? 0;
+  const swipes = swipesOf(raw.swipes, swipeId);
   const shown = swipes[swipeId];
   const content = str(raw, "content") ?? (typeof shown === "string" ? shown : "");
   const bag = extra.spindle_metadata;
@@ -145,6 +161,11 @@ export const entryOnly = (e: HostEntryRecord): HostBookEntry => ({ id: e.id, boo
 /** Whether two rows of a message say the same: every field the host gives. */
 export function sameMessage(a: HostMessage, b: HostMessage): boolean {
   return a.id === b.id && a.index === b.index && a.role === b.role && a.name === b.name && a.swipeId === b.swipeId && a.swipes === b.swipes && a.content === b.content && a.hidden === b.hidden && a.at === b.at && sameJson(a.own, b.own);
+}
+
+/** Whether two rows of a chat say the same: every field the host gives. */
+export function sameChat(a: HostChat, b: HostChat): boolean {
+  return a.id === b.id && a.name === b.name && a.characterId === b.characterId && sameJson(a.metadata, b.metadata);
 }
 
 /** Whether two JSON values are the same value. */

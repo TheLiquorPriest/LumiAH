@@ -2,11 +2,11 @@
 // extension a runtime's requests, the runtime the extension's answers and pushes. A frame that isn't
 // the link's (`link` missing or another value) reads as null and is left for whoever it is for.
 
-import type { ModelResult, ModelThinkingBlock, ModelToolCall, TraceDelta } from "../core/ports";
+import type { TraceDelta } from "../core/ports";
 import type { JsonObject, JsonValue } from "./json";
 import { hasOwn, isRecord } from "./json";
-import type { ChunkPush, ExtensionMember, ExtensionOffer, LinkedBackend, LinkErrorCode, LinkErrorFrame, LinkNotice, LinkPush, LinkRequest, LinkRequestType, LinkResultFrame, RuntimeReport, SchedulerState, StreamChunk } from "./contract";
-import { EXTENSION_MEMBERS, LINK, OWN_BACKEND } from "./contract";
+import type { ChunkPush, CopyOffer, ExtensionMember, ExtensionOffer, LinkedBackend, LinkErrorCode, LinkErrorFrame, LinkNotice, LinkPush, LinkRequest, LinkRequestType, LinkResultFrame, MirrorWord, RuntimeReport, SchedulerState, StreamChunk } from "./contract";
+import { COPY_PERMISSIONS, EXTENSION_MEMBERS, LINK, OWN_BACKEND } from "./contract";
 
 const text = (v: unknown): v is string => typeof v === "string";
 const count = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
@@ -19,10 +19,7 @@ const REQUEST_TYPES: Readonly<Record<LinkRequestType, true>> = {
   models: true,
   "turn.begin": true,
   "turn.commit": true,
-  passthrough: true,
-  "model.call": true,
   "stream.ack": true,
-  "stream.resend": true,
   "stream.cancel": true,
   "settings.get": true,
   "trace.push": true,
@@ -39,14 +36,13 @@ const REQUEST_TYPES: Readonly<Record<LinkRequestType, true>> = {
   "lore.entries": true,
   "lore.activated": true,
   "preset.blocks": true,
-  "connections.list": true,
-  "connections.get": true,
   "tools.list": true,
   "tool.call": true,
   "approval.ask": true,
   "extension.call": true,
   "blob.list": true,
   "blob.remove": true,
+  "mirror.release": true,
   "doc.list": true,
   "chat.info": true,
   "chat.anchors": true,
@@ -68,6 +64,9 @@ const REQUEST_TYPES: Readonly<Record<LinkRequestType, true>> = {
   "recall.web.enabled": true,
   "recall.web.search": true,
   "book.read": true,
+  "host.read": true,
+  "own.read": true,
+  "turn.lore": true,
 };
 
 /** Whether a frame is the link's at all. */
@@ -88,66 +87,10 @@ export function requestOf(raw: unknown): { request: LinkRequest } | { malformed:
   return { request: raw as unknown as LinkRequest };
 }
 
-function toolCallOf(raw: unknown): ModelToolCall | null {
-  if (!isRecord(raw) || !text(raw.callId) || !text(raw.name) || !isRecord(raw.args) || (raw.thoughtSignature !== undefined && !text(raw.thoughtSignature))) return null;
-  return { callId: raw.callId, name: raw.name, args: raw.args as JsonObject, ...(raw.thoughtSignature !== undefined ? { thoughtSignature: raw.thoughtSignature } : {}) };
-}
-
-function thinkingBlockOf(raw: unknown): ModelThinkingBlock | null {
-  if (!isRecord(raw) || (raw.type !== "thinking" && raw.type !== "redacted_thinking")) return null;
-  const block: ModelThinkingBlock = { type: raw.type };
-  if (text(raw.thinking)) block.thinking = raw.thinking;
-  if (text(raw.signature)) block.signature = raw.signature;
-  if (text(raw.data)) block.data = raw.data;
-  return block;
-}
-
-/** A model call's answer as it crossed, checked; null when it isn't one. */
-export function modelResultOf(raw: unknown): ModelResult | null {
-  if (!isRecord(raw) || !text(raw.content) || !text(raw.finishReason)) return null;
-  const result: ModelResult = { content: raw.content, finishReason: raw.finishReason };
-  if (raw.model !== undefined) {
-    if (!text(raw.model)) return null;
-    result.model = raw.model;
-  }
-  if (raw.reasoning !== undefined) {
-    if (!text(raw.reasoning)) return null;
-    result.reasoning = raw.reasoning;
-  }
-  if (raw.toolCalls !== undefined) {
-    if (!Array.isArray(raw.toolCalls)) return null;
-    const calls = raw.toolCalls.map(toolCallOf);
-    if (calls.some((c) => c === null)) return null;
-    result.toolCalls = calls as ModelToolCall[];
-  }
-  if (raw.thinkingBlocks !== undefined) {
-    if (!Array.isArray(raw.thinkingBlocks)) return null;
-    const blocks = raw.thinkingBlocks.map(thinkingBlockOf);
-    if (blocks.some((b) => b === null)) return null;
-    result.thinkingBlocks = blocks as ModelThinkingBlock[];
-  }
-  if (raw.reasoningDetails !== undefined) {
-    if (!Array.isArray(raw.reasoningDetails) || !raw.reasoningDetails.every(isRecord)) return null;
-    result.reasoningDetails = raw.reasoningDetails as JsonObject[];
-  }
-  if (raw.usage !== undefined) {
-    if (!isRecord(raw.usage)) return null;
-    result.usage = raw.usage as JsonObject;
-  }
-  return result;
-}
-
 /** A chunk as it crossed, checked; null when it isn't one. */
 export function chunkOf(raw: unknown): StreamChunk | null {
   if (!isRecord(raw)) return null;
   switch (raw.kind) {
-    case "content":
-    case "reasoning":
-      return text(raw.text) ? { kind: raw.kind, text: raw.text } : null;
-    case "done": {
-      const result = modelResultOf(raw.result);
-      return result === null ? null : { kind: "done", result };
-    }
     case "value":
       return raw.value === undefined ? null : { kind: "value", value: raw.value as JsonValue };
     case "error":
@@ -189,9 +132,47 @@ export function pushOf(raw: unknown): LinkPush | null {
       return text(raw.ref) && raw.ref !== "" && text(raw.key) && raw.key !== "" ? { link: LINK, type: "connection", ref: raw.ref, key: raw.key, ...(text(raw.name) && raw.name !== "" ? { name: raw.name } : {}) } : null;
     case "ask":
       return text(raw.ask) && raw.ask !== "" && text(raw.op) && raw.op !== "" && isRecord(raw.args) ? { link: LINK, type: "ask", ask: raw.ask, op: raw.op, args: raw.args as JsonObject } : null;
+    // What an offer must name is the update's to check (runtime/update): here it only has its three fields.
+    case "update":
+      return text(raw.build) && text(raw.path) && text(raw.sha256) ? { link: LINK, type: "update", build: raw.build, path: raw.path, sha256: raw.sha256 } : null;
+    case "greet":
+      return { link: LINK, type: "greet" };
+    case "event":
+      return count(raw.seq) && raw.seq >= 1 && text(raw.name) && raw.name !== "" && text(raw.userId) && raw.userId !== "" ? { link: LINK, type: "event", seq: raw.seq, name: raw.name, payload: (raw.payload ?? null) as JsonValue, userId: raw.userId } : null;
+    case "own":
+      return count(raw.seq) && raw.seq >= 1 && text(raw.chat) && raw.chat !== "" ? { link: LINK, type: "own", seq: raw.seq, chat: raw.chat } : null;
+    case "copy": {
+      const offer = count(raw.seq) && raw.seq >= 1 ? copyOfferOf(isRecord(raw.offer) ? { ...raw.offer, told: raw.seq } : null) : null;
+      if (offer === null) return null;
+      const { told: seq, ...rest } = offer;
+      return { link: LINK, type: "copy", seq, offer: rest };
+    }
+    case "mirror": {
+      const word = mirrorWordOf(raw);
+      return word === null ? null : { link: LINK, type: "mirror", ...word };
+    }
     default:
       return null;
   }
+}
+
+/** The extension's word on who holds the mirror (a hello's answer, a `mirror` push), checked: null where it says none (a backend from before the mirror had a holder: the runtime keeps no copy then) or isn't one. */
+export function mirrorWordOf(raw: unknown): MirrorWord | null {
+  if (!isRecord(raw) || typeof raw.held !== "boolean" || !(raw.holder === null || text(raw.holder)) || !count(raw.gen)) return null;
+  const word: MirrorWord = { held: raw.held, holder: raw.holder, gen: raw.gen };
+  const dropped = raw.dropped;
+  if (dropped === undefined) return word;
+  const names = (v: unknown): v is string[] => Array.isArray(v) && v.every(text);
+  return isRecord(dropped) && names(dropped.docs) && names(dropped.blobs) && typeof dropped.all === "boolean" ? { ...word, dropped: { docs: dropped.docs, blobs: dropped.blobs, all: dropped.all } } : null;
+}
+
+/** What a hello's answer says the runtime's copy of chat and lore may read, checked; null where it says nothing of it (a backend from before the copy), and the copy reads nothing then. */
+export function copyOfferOf(raw: unknown): CopyOffer | null {
+  if (!isRecord(raw) || !text(raw.identifier) || raw.identifier === "" || !Array.isArray(raw.granted) || typeof raw.ownElsewhere !== "boolean" || typeof raw.declinesLore !== "boolean" || !(raw.database === null || (text(raw.database) && raw.database !== "")) || !count(raw.told)) return null;
+  const records = raw.records === null ? null : isRecord(raw.records) && (raw.records.under === null || (text(raw.records.under) && raw.records.under !== "")) ? { under: raw.records.under } : undefined;
+  if (records === undefined) return null;
+  const granted = new Set<unknown>(raw.granted);
+  return { identifier: raw.identifier, granted: COPY_PERMISSIONS.filter((p) => granted.has(p)), ownElsewhere: raw.ownElsewhere, declinesLore: raw.declinesLore, records, database: raw.database, told: raw.told };
 }
 
 /** What a hello's answer says the extension supplies, checked: its name and the members this contract knows; null when it says none (LumiAH on its own, or a backend from before it could say). */
@@ -201,9 +182,10 @@ export function extensionOfferOf(raw: unknown): ExtensionOffer | null {
   return { name: raw.name, members: EXTENSION_MEMBERS.filter((m): m is ExtensionMember => said.has(m)) };
 }
 
-/** Who a register's or a hello's answer says the runtime is linked to, checked; LumiAH's own where it says none (a backend from before it could say). */
+/** Who a register's or a hello's answer says the runtime is linked to, checked; LumiAH's own where it says none (a backend from before it could say). A `settingsAt` that isn't words is left out. */
 export function linkedBackendOf(raw: unknown): LinkedBackend {
-  return isRecord(raw) && text(raw.name) && raw.name !== "" && text(raw.connection) && raw.connection !== "" ? { name: raw.name, connection: raw.connection } : OWN_BACKEND;
+  if (!(isRecord(raw) && text(raw.name) && raw.name !== "" && text(raw.connection) && raw.connection !== "")) return OWN_BACKEND;
+  return { name: raw.name, connection: raw.connection, ...(text(raw.settingsAt) && raw.settingsAt !== "" ? { settingsAt: raw.settingsAt } : {}) };
 }
 
 const ERROR_CODES: Readonly<Record<LinkErrorCode, true>> = { bad_request: true, forbidden: true, not_found: true, conflict: true, unavailable: true, version: true, too_large: true, internal: true };
@@ -211,10 +193,12 @@ const ERROR_CODES: Readonly<Record<LinkErrorCode, true>> = { bad_request: true, 
 /** An answer to a request as it crossed: its result, or its error with a code this contract knows (`internal` otherwise); null when it isn't one. */
 export function answerOf(raw: unknown): LinkResultFrame | LinkErrorFrame | null {
   if (!isLinkFrame(raw) || !text(raw.id)) return null;
-  if (raw.type === "result") return { link: LINK, type: "result", id: raw.id, body: raw.body };
+  // How long the extension worked on it, where it said: a whole number of ms, for the timing log.
+  const took = typeof raw.took === "number" && Number.isSafeInteger(raw.took) && raw.took >= 0 ? { took: raw.took } : {};
+  if (raw.type === "result") return { link: LINK, type: "result", id: raw.id, body: raw.body, ...took };
   if (raw.type === "error") {
     const code = text(raw.code) && hasOwn(ERROR_CODES, raw.code) ? (raw.code as LinkErrorCode) : "internal";
-    return { link: LINK, type: "error", id: raw.id, code, message: text(raw.message) ? raw.message : "LumiAH refused the request." };
+    return { link: LINK, type: "error", id: raw.id, code, message: text(raw.message) ? raw.message : "LumiAH refused the request.", ...took };
   }
   return null;
 }

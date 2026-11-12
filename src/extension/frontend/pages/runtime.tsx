@@ -6,13 +6,18 @@
 
 import type { ComponentChildren } from "preact";
 import { useState } from "preact/hooks";
-import { type ChatView, type LinkState, type RelayView, type SchedulerView, startLine, type UiState } from "../../../shared/ui";
+import { type ChatView, type LinkState, type RelayView, type RoadView, type SchedulerView, startLine, type UiState } from "../../../shared/ui";
 import { useApp } from "../app";
 import { chatLabel, useChatView } from "../chat";
 import { Badge, Banner, Button, CopyLine, Disclosure, Section, type Tone, useBusy } from "../components";
+import { ChatData } from "../chat-data";
+import { ConnectionsSection } from "../connections";
 import { ago, counted, dateTime } from "../format";
-import { type RuntimeStepId, runtimeSteps, runtimeTrouble } from "../setup-model";
+import { buildWords, loopbackWords, type RuntimeStepId, runtimeSteps, runtimeTrouble } from "../setup-model";
 import { ChatSwitch, Step } from "../setup-parts";
+import { RuntimeService } from "../runtime-service";
+import { StoreState } from "../store-state";
+import { RoadLine, RoadOffer, TimingsSection } from "../timings";
 import { useSelect } from "../store";
 
 const LINK_TONE: Readonly<Record<LinkState, Tone>> = { linked: "pos", quiet: "warn", refused: "neg", down: "neutral" };
@@ -20,7 +25,7 @@ const LINK_WORDS: Readonly<Record<LinkState, string>> = { linked: "linked", quie
 
 const SCHEDULER_WORDS: Readonly<Record<SchedulerView, string>> = {
   excluded: "Its address is kept out of your local-inference scheduler.",
-  missing: "Its address is missing from your local-inference scheduler's exclusions, and it couldn't add it. Before turning the scheduler on, add it there (Lumiverse → Settings → Inference scheduler): a turn would otherwise wait on its own calls.",
+  missing: "Its address is missing from your local-inference scheduler's exclusions, and it couldn't add it. Before turning the scheduler on, add it there (Lumiverse → Settings → Inference scheduler): a reply the runtime answers would otherwise hold the scheduler, and Lumiverse's local models wait, for as long as its agents work.",
   unavailable: "This Lumiverse has no local-inference scheduler, so there is nothing to keep it out of.",
   unknown: "It hasn't checked your local-inference scheduler yet.",
 };
@@ -32,8 +37,8 @@ function sessionWords(r: RelayView): string {
   return `Its Lumiverse session lasts until ${dateTime(r.session.endsAt)}; it renews it while it runs.`;
 }
 
-/** One runtime: how it stands, what it said of itself, and the line or button that mends what is wrong. */
-function Relay(props: { relay: RelayView; build: string; now: number; busy: boolean; onRotate(): void; onForget(): void }) {
+/** One runtime: how it stands, what it said of itself, and the line or button that mends what is wrong. `name`: who the pages are shown by (LumiAH, or the extension it is built into). */
+function Relay(props: { relay: RelayView; road: RoadView | undefined; build: string; name: string; now: number; busy: boolean; onRotate(): void; onForget(): void }) {
   const r = props.relay;
   const signIn = r.session.valid === false || ((r.link === "quiet" || r.link === "down") && r.seenAt !== null);
   return (
@@ -59,7 +64,7 @@ function Relay(props: { relay: RelayView; build: string; now: number; busy: bool
         </li>
         {r.build !== null ? (
           <li>
-            <span>{r.update ? `Build ${r.build}; LumiAH is ${props.build}.` : `Build ${r.build}, the same as LumiAH's.`}</span>
+            <span>{buildWords(r.build, r.update, props.build, props.name)}</span>
           </li>
         ) : null}
         {r.build !== null ? (
@@ -72,8 +77,11 @@ function Relay(props: { relay: RelayView; build: string; now: number; busy: bool
             <span>{sessionWords(r)}</span>
           </li>
         ) : null}
+        {r.link === "linked" ? <RoadLine road={props.road} /> : null}
       </ul>
-      {r.update && r.lines.update !== null ? <CopyLine id={`update-${r.name}`} label="Update and restart it" text={r.lines.update} help="Its build differs from this LumiAH's: run this on the machine it runs on." /> : null}
+      {r.link === "linked" ? <StoreState relay={r.id} now={props.now} name={props.name} /> : null}
+      {r.link === "linked" ? <ChatData relay={r.id} now={props.now} name={props.name} /> : null}
+      <RuntimeService relay={r} />
       {signIn && r.lines.login !== null ? <CopyLine id={`login-${r.name}`} label="Sign it in again" text={r.lines.login} help="It has gone quiet, or its Lumiverse session has ended: run this on the machine it runs on." /> : null}
       <div class="lah-actions">
         <Button size="sm" icon="key" disabled={props.busy || r.link !== "linked"} onClick={props.onRotate}>
@@ -158,7 +166,7 @@ export function RuntimePage() {
       const agreed = await app.host.confirm(
         op === "rotate"
           ? { title: `Rotate the secret of ${r.name}?`, message: "The runtime takes the new secret over its link, and the old one stops working. Nothing else changes.", confirm: "Rotate" }
-          : { title: `Forget the runtime ${r.name}?`, message: "It can no longer reach LumiAH until it registers again with its start line. A turn it is answering is lost.", confirm: "Forget it", danger: true },
+          : { title: `Forget the runtime ${r.name}?`, message: `It can no longer reach ${who} until it registers again with its start line. A turn it is answering is lost.`, confirm: "Forget it", danger: true },
       );
       if (!agreed) return;
       try {
@@ -283,6 +291,7 @@ export function RuntimePage() {
             {stepList}
           </Section>
         ) : null}
+        <ConnectionsSection />
         <Section title={switchedBy !== undefined ? `Which chats ${switchedBy} plays` : "Which chats LumiAH answers"} flush id="chats">
           <ul class="lah-facts lah-runtime-places" data-lah-places>
             <li>
@@ -300,14 +309,16 @@ export function RuntimePage() {
       </div>
       <div class="lah-runtime-col">
         <Section title="Runtimes" flush id="runtimes">
+          <RoadOffer road={runtime.road} />
           {runtime.relays.length === 0 ? (
             <p class="lah-lead" style={{ padding: "var(--lah-s3)" }}>
               None has registered yet. One shows here once its start line has run.
             </p>
           ) : (
-            runtime.relays.map((r) => <Relay key={r.id} relay={r} build={runtime.build} now={now} busy={busy} onRotate={() => relay("rotate", r)} onForget={() => relay("forget", r)} />)
+            runtime.relays.map((r) => <Relay key={r.id} relay={r} road={runtime.road.relays[r.id]} build={runtime.build} name={who} now={now} busy={busy} onRotate={() => relay("rotate", r)} onForget={() => relay("forget", r)} />)
           )}
         </Section>
+        {linked.length > 0 ? <TimingsSection now={now} name={who} /> : null}
         {steps[0]?.at === "now" ? null : (
           <Section title="Start another, or start it again" id="start">
             <Disclosure summary="The lines that start a runtime for this server">{startLines}</Disclosure>
@@ -329,8 +340,8 @@ export function RuntimePage() {
           {minted?.from === "card" ? mintedNote : null}
         </Section>
         <Section title="The loopback connection" id="connection">
-          <p data-lah-loopbacks={loopbacks.length}>{loopbacks.length === 0 ? "None of your connections is the loopback yet." : `${who} takes ${loopbacks.map((c) => c.name).join(", ")} as the loopback.`}</p>
-          <p class="lah-lead lah-small">A chat switched on generates on it. The agents themselves never run on the loopback, since a call there would come back to the runtime: each runs on the connection Settings name for it, else on the one its chat was on before it was pinned here, else on the connection selected in Lumiverse, else on your default connection.</p>
+          <p data-lah-loopbacks={loopbacks.length}>{loopbackWords(who, loopbacks)}</p>
+          <p class="lah-lead lah-small">A chat switched on generates on it: it is Lumiverse's way in to the runtime. The agents never call it. They call their providers straight from the runtime, each on one of the runtime's own connections (under Connections on this page): the one Settings names for it, else the runtime's default, which also takes an agent whose connection is gone.</p>
           <Disclosure summary="Make it by hand" defaultOpen={loopbacks.length === 0 && linked.length === 0 && steps.find((s) => s.id === "connection")?.at !== "now"}>
             <ConnectionSteps state={state} />
           </Disclosure>

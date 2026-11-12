@@ -5,7 +5,11 @@
 // request over the link: the extension's own code then runs in its backend, and the runtime that
 // holds the core stays the same for every extension. A member left out is something it doesn't
 // supply. The core waits for each call no longer than Settings allow and goes on without an answer
-// that doesn't come, or that fails: an extension can add to a turn, never hold it.
+// that doesn't come, or that fails: an extension can add to a turn, never hold it. Two answers it
+// can't do without: the claim on a chat (no run about the chat starts without it), and the
+// definitions, where the agent a claim names to lead the chat's replies is one of them (no reply
+// starts without that agent: nothing stands in for it). The run knows which asks got no answer,
+// and why (`Setup.unanswered`).
 //
 // Every member is told whom the call is for: the user (`userId`) and, where the call is about one,
 // the chat. One backend may serve every user of a Lumiverse (§25), and what an extension supplies
@@ -30,8 +34,9 @@ import type { StorySetting, StorySource } from "./story";
 export type GuidanceLevel = { name: string; path: string } | { name: string; text: string };
 
 /**
- * What an extension supplies for one chat it claims: the agent definition that answers it in place
- * of LumiAH's main agent; the middle level of guidance, in place of the character's; the tools
+ * What an extension supplies for one chat it claims: the agent definition that leads its replies in
+ * place of LumiAH's main agent (one that can't run, nothing stands in for: the reply doesn't start);
+ * the middle level of guidance, in place of the character's; the tools
  * of LumiAH's own it withdraws there, by name (none of this chat's agents is offered them); and its
  * word on what counts as the chat's story (§24.4), member by member: each member it gives stands
  * over the chat's own choice and the user's setting, and the pages show it as set by the extension.

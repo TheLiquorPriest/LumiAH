@@ -7,6 +7,7 @@
 // so an agent definition that names a tool keeps naming it while the server keeps its name.
 
 import type { JsonObject } from "../../core/ports";
+import { spanWords, transportWait } from "../../link/waits";
 import type { BackendHost, HostMcpServer } from "./spindle";
 
 /** What every MCP tool's name starts with. */
@@ -48,6 +49,12 @@ export interface McpDeps {
   on(userId: string): Promise<readonly string[]>;
   /** How long one call may take, as the user's settings say. */
   callMs(userId: string): Promise<number>;
+  /** Runs `fn` once after `ms`; what it returns cancels that. */
+  later(ms: number, fn: () => void): () => void;
+  /** The extension's name, as a call that runs out of time names where its setting is: `<name>'s Settings`. */
+  name: string;
+  /** Where its Settings are shown, where that isn't "<name>'s Settings" (`BackendIdentity.settingsAt`). */
+  settingsAt?: string;
 }
 
 /** A server's name as part of a tool's name: lowercase letters, digits and `-`; `server` for a name with none of them. The length is the most a tool's name leaves room for; a format, not a limit. */
@@ -135,7 +142,9 @@ export class Mcp {
   /**
    * Calls the tool `name` names, with `args`. Refused, in words the agent can act on, when the name
    * is no tool of a server that is on. The signal ends the wait; Lumiverse has no way to end the call
-   * itself, which then runs to its own end or its time limit.
+   * itself, which then runs to its own end or its time limit. That limit is the user's Call time,
+   * waited here too from before Lumiverse is asked, so a call that runs out of it says so in words
+   * that name the setting and where it is changed, ahead of Lumiverse's own.
    */
   async call(userId: string, name: string, args: JsonObject, signal: AbortSignal): Promise<string> {
     const named = mcpNameOf(name);
@@ -150,10 +159,13 @@ export class Mcp {
     const { promise, resolve, reject } = Promise.withResolvers<string>();
     const ended = (): void => reject(signal.reason instanceof Error ? signal.reason : new Error("The call was cancelled."));
     signal.addEventListener("abort", ended, { once: true });
-    this.host.mcp.call(server.id, named.tool, args, await this.deps.callMs(userId), userId).then(resolve, reject);
+    const callMs = await this.deps.callMs(userId);
+    const late = this.deps.later(callMs, () => reject(new Error(`The MCP tool ${name} didn't answer within ${spanWords(callMs)}. ${transportWait(["mcp", "callMs"], this.deps)} says how long one call may take.`)));
+    this.host.mcp.call(server.id, named.tool, args, callMs, userId).then(resolve, reject);
     try {
       return await promise;
     } finally {
+      late();
       signal.removeEventListener("abort", ended);
     }
   }

@@ -7,7 +7,8 @@
 //
 // One flow at a time for each provider (OpenAI's callback listens on one fixed port), and a flow
 // left open expires. The tokens a flow gets are kept with the book's secrets (book.ts), and pi-ai
-// renews them by itself as calls need them.
+// renews them by itself as calls need them. Why a flow ended without signing in is kept for a while,
+// so a page that asks how the runtime stands can say it.
 
 import type { AuthInteraction, MutableModels } from "@earendil-works/pi-ai";
 import type { Book } from "./book";
@@ -28,8 +29,12 @@ export interface SignInStart {
 export interface SignInState {
   provider: SignInProvider;
   signedIn: boolean;
+  /** Until when the current token holds (the runtime renews it by itself when a call finds it ran out); null when not signed in. */
+  until: number | null;
   /** The flow open for it, if one is. */
   flow: string | null;
+  /** Why its last flow ended without signing in (cancelled, left open too long, the provider's words, the port taken), for `ENDED_KEPT_MS`; null once a flow starts again or a sign-in holds. */
+  ended: string | null;
 }
 
 export interface SignIn {
@@ -47,11 +52,15 @@ export interface SignInDeps {
   book: Book;
   id(): string;
   uuid(): string;
+  now(): number;
   log(text: string): void;
   setTimeout(run: () => void, ms: number): unknown;
   clearTimeout(handle: unknown): void;
   signInMs: number;
 }
+
+/** How long the words of why a flow ended stay for `state`: long enough for a page that asks every few seconds, or one the user comes back to, to say why. */
+const ENDED_KEPT_MS = 10 * 60_000;
 
 /** The provider's name in words. */
 const NAMES: Readonly<Record<SignInProvider, string>> = { anthropic: "Anthropic", openai: "OpenAI" };
@@ -69,12 +78,15 @@ const AGENT_NAME = "LumiAH";
 
 /** Anthropic's token exchange says what went wrong inside a long report (its address, the request, a stack): its status and body are what a user can act on. */
 const EXCHANGE_FAILURE = /status=(\d{3}); url=[^;]*; body=([\s\S]*?)(?:; stack=|$)/;
+/** A report of an answer pi-ai took but couldn't read quotes that answer, and its parser's words after it quote it again: it may hold the new tokens. */
+const QUOTES_ANSWER = /\bbody=/;
 
-/** A failed sign-in's words: the provider's status and message where the flow reported them, with no secret in them. */
+/** A failed sign-in's words: the provider's status and message where the flow reported them, with no secret in them; of a report that quotes an answer it couldn't read, only its first sentence. */
 function failure(error: unknown, secrets: Iterable<string>): string {
   const text = errorWords(error);
   const exchange = EXCHANGE_FAILURE.exec(text);
-  const words = exchange ? failureWords(`${exchange[1]}: ${exchange[2]}`) : failureWords(text.split("; stack=")[0] ?? text);
+  const report = text.split("; stack=")[0] ?? text;
+  const words = exchange ? failureWords(`${exchange[1]}: ${exchange[2]}`) : failureWords(QUOTES_ANSWER.test(report) ? (report.split(" url=")[0] ?? report) : report);
   return redact(words, secrets);
 }
 
@@ -91,24 +103,45 @@ interface Flow {
 
 export function createSignIn(deps: SignInDeps): SignIn & { close(): void } {
   const flows = new Map<string, Flow>();
+  /** Each provider's latest flow: one started before it that ends later leaves no words over it. */
+  const latest = new Map<SignInProvider, string>();
+  /** Why each provider's latest flow ended without signing in, and when. */
+  const ended = new Map<SignInProvider, { why: string; at: number }>();
 
   const openFlow = (provider: SignInProvider): Flow | undefined => [...flows.values()].find((f) => f.provider === provider);
 
-  /** Ends a flow: its prompt and its flow are stopped with `why`, and it is no longer open. */
+  /** The words for a flow that ended without signing in, kept for `state` while it is its provider's latest. */
+  const endedWith = (flow: Flow, why: string): string => {
+    const words = `The ${NAMES[flow.provider]} sign-in didn't finish: ${why.replace(/[\s.]+$/, "")}. Start it again.`;
+    if (latest.get(flow.provider) === flow.id) ended.set(flow.provider, { why: words, at: deps.now() });
+    return words;
+  };
+
+  /** Ends a flow: its prompt and its flow are stopped with `why`, it is no longer open, and `state` says why at once. */
   const end = (flow: Flow, why: string): void => {
     if (flows.get(flow.id) !== flow) return;
     flows.delete(flow.id);
     deps.clearTimeout(flow.timer);
+    endedWith(flow, why);
     const reason = new Error(why);
     flow.pasted.reject(reason);
     flow.stop.abort(reason);
   };
 
-  const stateOf = async (provider: SignInProvider): Promise<SignInState> => ({ provider, signedIn: (await deps.book.signin(provider)) !== undefined, flow: openFlow(provider)?.id ?? null });
+  const stateOf = async (provider: SignInProvider): Promise<SignInState> => {
+    const credential = await deps.book.signin(provider);
+    const last = ended.get(provider);
+    if (last !== undefined && deps.now() - last.at >= ENDED_KEPT_MS) ended.delete(provider);
+    return { provider, signedIn: credential !== undefined, until: credential?.expires ?? null, flow: openFlow(provider)?.id ?? null, ended: ended.get(provider)?.why ?? null };
+  };
 
   return {
     async start(provider) {
       if (!isSignInProvider(provider)) throw new Error(`The runtime can sign in to Anthropic and to OpenAI, not to "${String(provider)}".`);
+      const id = deps.id();
+      // A new flow clears the words of the last one's end, and an earlier flow that ends from here on leaves none.
+      latest.set(provider, id);
+      ended.delete(provider);
       const earlier = openFlow(provider);
       if (earlier !== undefined) end(earlier, "A new sign-in was started in its place.");
       const device = await deps.book.device(deps.uuid);
@@ -135,7 +168,6 @@ export function createSignIn(deps: SignInDeps): SignIn & { close(): void } {
           if (event.type === "auth_url") address.resolve(event.url);
         },
       };
-      const id = deps.id();
       const flow: Flow = {
         id,
         provider,
@@ -153,6 +185,7 @@ export function createSignIn(deps: SignInDeps): SignIn & { close(): void } {
             flows.delete(id);
             deps.clearTimeout(flow.timer);
           }
+          ended.delete(provider);
           deps.log(`signed in to ${NAMES[provider]}`);
         },
         async (error: unknown) => {
@@ -161,7 +194,7 @@ export function createSignIn(deps: SignInDeps): SignIn & { close(): void } {
             flows.delete(id);
             deps.clearTimeout(flow.timer);
           }
-          throw new Error(`The ${NAMES[provider]} sign-in didn't finish: ${why.replace(/[\s.]+$/, "")}. Start it again.`);
+          throw new Error(endedWith(flow, why));
         },
       );
       // Read by `finish`, or by nobody when the flow is let go.

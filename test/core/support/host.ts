@@ -97,9 +97,9 @@ export class MemoryHost implements HarnessHost {
   readonly calls: ModelRequest[] = [];
   script: Script = [];
   readonly profiles: ConnectionProfile[] = [
-    { id: MAIN, name: "Main", provider: "openai", model: "model-main", loopback: false, cache: null, parallelTools: true },
-    { id: WRITER, name: "Writer", provider: "openai", model: "model-writer", loopback: false, cache: null, parallelTools: true },
-    { id: LOOPBACK, name: "LumiAH", provider: "custom", model: "lumiah", loopback: true, cache: null, parallelTools: true },
+    { id: MAIN, name: "Main", provider: "openai", model: "model-main", parallelTools: true },
+    { id: WRITER, name: "Writer", provider: "openai", model: "model-writer", parallelTools: true },
+    { id: LOOPBACK, name: "LumiAH", provider: "custom", model: "lumiah", parallelTools: true },
   ];
   /** The user's default connection. */
   defaultConnection: string | null = MAIN;
@@ -186,7 +186,7 @@ export class MemoryHost implements HarnessHost {
   };
 
   readonly connections = {
-    list: async (): Promise<ConnectionInfo[]> => this.profiles.map(({ cache: _cache, parallelTools: _parallel, ...info }) => info),
+    list: async (): Promise<ConnectionInfo[]> => this.profiles.map(({ parallelTools: _parallel, ...info }) => info),
     get: async (connectionId: string | null): Promise<ConnectionProfile | null> => this.profiles.find((p) => p.id === (connectionId ?? this.defaultConnection)) ?? null,
   };
 
@@ -243,7 +243,7 @@ export class MemoryHost implements HarnessHost {
     info: async (chatId: string): Promise<ChatInfo | null> => {
       const known = this.infos.get(chatId);
       if (!known && !this.chats.has(chatId)) return null;
-      return { id: chatId, name: known?.name ?? chatId, characterId: known?.characterId ?? null, characterName: known?.characterName ?? null, branchedFrom: known?.branchedFrom ?? null, ...(known?.connectionId !== undefined ? { connectionId: known.connectionId } : {}), ...(known?.story !== undefined ? { story: known.story } : {}), ...(known?.sovereignHand !== undefined ? { sovereignHand: known.sovereignHand } : {}) };
+      return { id: chatId, name: known?.name ?? chatId, characterId: known?.characterId ?? null, characterName: known?.characterName ?? null, branchedFrom: known?.branchedFrom ?? null, ...(known?.story !== undefined ? { story: known.story } : {}), ...(known?.sovereignHand !== undefined ? { sovereignHand: known.sovereignHand } : {}) };
     },
     anchors: async (cursor?: string): Promise<{ anchors: StoredAnchor[]; next: string | null }> => {
       const all: StoredAnchor[] = [];

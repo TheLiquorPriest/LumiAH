@@ -113,8 +113,8 @@ export const LIVE_CSS = `
 .lah-tool-label{display:flex;align-items:center;justify-content:space-between;gap:var(--lah-s2);font-size:var(--lah-fs-xs);font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--lah-muted);min-width:0}
 .lah-prompt{display:flex;flex-direction:column;gap:var(--lah-s2);min-width:0}
 .lah-prompt-facts{font-size:var(--lah-fs-sm);color:var(--lah-muted);overflow-wrap:anywhere}
-/* While a turn runs, its state and what the user can do to it stay at the top of what the panel shows, under the page bar (transcript.tsx measures it as --lah-pin-h for the search row under it): never at the foot, where the drawer lies over Lumiverse's own Send and Stop. */
-.lah-pin{position:sticky;top:calc(var(--lah-stick-top,0px) + var(--lah-bar-h,0px));z-index:6;display:flex;flex-direction:column;gap:var(--lah-s1);min-width:0}
+/* While a turn runs, its state and what the user can do to it stay at the top of what the panel shows, under the page bar: never at the foot, where the drawer lies over Lumiverse's own Send and Stop. It is a band of the bar's own ground across the turn, not a chip afloat over the steps, so nothing shows round it; and whatever else sticks under the bar sticks under it instead (transcript.tsx measures it as --lah-pin-h: the search row and, where the two columns show, the side column), so nothing rests beneath it. */
+.lah-pin{position:sticky;top:calc(var(--lah-stick-top,0px) + var(--lah-bar-h,0px));z-index:6;display:flex;flex-direction:column;gap:var(--lah-s1);min-width:0;padding:var(--lah-s1) 0;background:var(--lah-bar-bg)}
 /* What a turn came to for its reply: the brief as prose, the lore by name. */
 .lah-brief{display:flex;flex-direction:column;gap:var(--lah-s1);min-width:0}
 .lah-brief-text{overflow-wrap:anywhere}
@@ -207,7 +207,8 @@ export const LIVE_CSS = `
 .lah-turn-grid{display:grid;grid-template-columns:minmax(220px,var(--lah-side-w)) minmax(0,1fr);align-items:start;gap:var(--lah-s4)}
 /* Under the two columns the foot's buttons stand under the steps, not over the side column's outline and filters, which stick to the panel's foot too. */
 .lah-turn-grid~.lah-foot>.lah-follow{padding-left:calc(var(--lah-side-w) + var(--lah-s4))}
-.lah-turn-side{position:sticky;top:calc(var(--lah-stick-top,0px) + var(--lah-bar-h,0px) + var(--lah-s2));max-height:calc(var(--lah-fill-h,100vh) - var(--lah-bar-h,0px) - var(--lah-s3));overflow-y:auto;overscroll-behavior:contain;padding-right:2px}
+/* The side column sticks under the bar and under what a running turn pins there, and is no taller than the room between that and the turn's foot: taller, it would be pushed back up under them where the page ends. */
+.lah-turn-side{position:sticky;top:calc(var(--lah-stick-top,0px) + var(--lah-bar-h,0px) + var(--lah-pin-h,0px) + var(--lah-s2));max-height:calc(var(--lah-fill-h,100vh) - var(--lah-bar-h,0px) - var(--lah-pin-h,0px) - var(--lah-foot-h,0px) - var(--lah-s2) - 2 * var(--lah-s3));overflow-y:auto;overscroll-behavior:contain;padding-right:2px}
 .lah-outline{flex-direction:column;overflow-x:visible;padding-bottom:0}
 .lah-outline-row{flex:none;max-width:none;width:100%;margin-left:calc(min(var(--lah-depth,0),4) * var(--lah-s3));width:calc(100% - min(var(--lah-depth,0),4) * var(--lah-s3))}
 .lah-outline-name,.lah-outline-sub{white-space:normal;overflow-wrap:anywhere}

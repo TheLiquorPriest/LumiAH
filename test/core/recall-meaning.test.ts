@@ -14,6 +14,8 @@ import { Recall, recallOf } from "../../src/core/recall/recall";
 import { defaultSettings, type Settings } from "../../src/core/settings";
 import { CHAT_TOOLS } from "../../src/core/tools/chat";
 import { LORE_TOOLS } from "../../src/core/tools/lore";
+import { Storage } from "../../src/extension/backend/reads";
+import { DOC_PATH } from "../../src/link/contract";
 import { CHAT, DAY, FakeEmbedder, harbour, RecallHost, toolRig } from "./recall-support";
 
 const HOUR = 3_600_000;
@@ -30,7 +32,7 @@ const CONCEPTS = [
 
 /** How long the fake embedder's vectors are, and where they are kept: its connection, its model, and the model's own dimensions. */
 const DIMS = CONCEPTS.length + 8;
-const SPACE = "embed-1~fake-embed~own";
+const SPACE = "embed-1.fake-embed.own";
 const VECTORS = `recall/vectors/${SPACE}`;
 const COUNT = "recall/embedded.json";
 
@@ -240,6 +242,69 @@ describe("a text is embedded once", () => {
     expect(closeness("said-again")).toBe(closeness(owed.key));
   });
 
+  test("kept in the extension's storage through its own rule for a path, and read back from there after a restart", async () => {
+    const { host, embedder, settings } = setup();
+    // The model's id holds what a path can't: a `/` and a `.`.
+    embedder.info = { id: "embed-1", name: "Embedder", model: "acme/embed.v2", dimensions: null };
+    // The user's storage as the extension keeps it, reached through the extension's own reads and writes, with their rule for a document's path (the link's `DOC_PATH`).
+    const files = new Map<string, string>();
+    const storage = new Storage({
+      storage: {
+        read: async (path) => files.get(path) ?? null,
+        write: async (path, text) => void files.set(path, text),
+        remove: async (path) => void files.delete(path),
+        stat: async (path) => (files.has(path) ? { bytes: files.get(path)?.length ?? 0, writtenAt: 0 } : null),
+        list: async (dir) => [...files.keys()].filter((path) => path.startsWith(`${dir}/`)).map((path) => path.slice(dir.length + 1)),
+      },
+    });
+    host.store.read = (path) => storage.doc("user-1", path);
+    host.store.write = (path, value) => storage.putDoc("user-1", path, value);
+    host.store.remove = (path) => storage.removeDoc("user-1", path);
+    host.store.list = (prefix) => storage.docs("user-1", prefix);
+    const chat = await chatOf(host);
+
+    const first = new Meaning(host);
+    await first.status({ lore: [], chat, settings, start: true });
+    await first.settled();
+    expect(warnings(host)).toEqual([]);
+    const kept = [...files.keys()].filter((path) => path.startsWith("docs/recall/vectors/"));
+    expect(kept.length).toBeGreaterThan(0);
+    for (const path of kept) expect(path).toMatch(/^docs\/recall\/vectors\/embed-1\.acme_2fembed_2ev2\.own\/chat\/chat-1\/[0-9a-f]{2}\.json$/);
+    expect(kept.every((path) => DOC_PATH.test(path.slice("docs/".length)))).toBe(true);
+    // The name the vectors had before is one the rule refuses: no vector was ever kept under it.
+    expect(DOC_PATH.test("recall/vectors/embed-1~acme%2Fembed%2Ev2~own/chat/chat-1/0a.json")).toBe(false);
+    expect(embedder.stored).toHaveLength(12);
+
+    // A restart: what was kept is read back, and nothing is embedded again.
+    const restarted = new Meaning(host);
+    expect(await restarted.status({ lore: [], chat, settings, start: true })).toMatchObject({ messages: { embedded: 12, total: 12 }, pending: 0 });
+    expect((await restarted.search({ groups: [chat], queries: ["arrears"], settings })).matches[0]).toHaveLength(2);
+    await restarted.settled();
+    expect(embedder.stored).toHaveLength(12);
+    expect(warnings(host)).toEqual([]);
+  });
+
+  test("under a name the storage takes however long the model's id is, and apart for two ids that differ only at their end", async () => {
+    const { host, embedder, settings } = setup();
+    const chat = await groupOf("chat", "chat-1", { m1: "Okoro keeps the second key." });
+    const long = "a-very-long-model-name/".repeat(8);
+    for (const end of ["one", "two"]) {
+      embedder.info = { id: "embed-1", name: "Embedder", model: `${long}${end}`, dimensions: 1536 };
+      const meaning = new Meaning(host);
+      await meaning.status({ lore: [], chat, settings, start: true });
+      await meaning.settled();
+    }
+    const kept = [...host.documents.keys()].filter((path) => path.startsWith("recall/vectors/"));
+    const spaces = [...new Set(kept.map((path) => path.split("/")[2] ?? ""))];
+    expect(spaces).toHaveLength(2);
+    for (const space of spaces) {
+      expect(space.length).toBe(128);
+      expect(space).toMatch(/_h[0-9a-f]{16}$/);
+    }
+    expect(kept.every((path) => DOC_PATH.test(path))).toBe(true);
+    expect(embedder.stored).toHaveLength(2);
+  });
+
   test("where two keys share it, and where two owners wait for it at once", async () => {
     const { host, embedder, settings } = setup();
     const book = await groupOf("book", "book-notes", { first: "Okoro keeps the second key.", second: "Okoro keeps the second key." });
@@ -333,7 +398,7 @@ describe("vectors as stored", () => {
     await meaning.settled();
     const paths = [...host.documents.keys()].filter((path) => path !== COUNT);
     expect(paths.length).toBeGreaterThan(0);
-    for (const path of paths) expect(path).toMatch(/^recall\/vectors\/embed-1~fake-embed~own\/(chat\/chat-1|book\/book-coast|book\/book-people)\/[0-9a-f]{2}\.json$/);
+    for (const path of paths) expect(path).toMatch(/^recall\/vectors\/embed-1\.fake-embed\.own\/(chat\/chat-1|book\/book-coast|book\/book-people)\/[0-9a-f]{2}\.json$/);
     const owners: [string, MeaningGroup][] = [["chat/chat-1", chat], ...lore.map((group): [string, MeaningGroup] => [`book/${group.owner.id}`, group])];
     for (const [owner, group] of owners) {
       for (const text of group.texts) {
@@ -369,7 +434,7 @@ describe("vectors as stored", () => {
     expect(await search()).toEqual([]);
     expect(embedder.stored).toHaveLength(24);
     expect(await search()).toEqual(first);
-    const others = [...host.documents.keys()].filter((path) => path.startsWith("recall/vectors/embed-1~other%2Fembed%2Ev2~512/chat/chat-1/"));
+    const others = [...host.documents.keys()].filter((path) => path.startsWith("recall/vectors/embed-1.other_2fembed_2ev2.512/chat/chat-1/"));
     expect(others).toHaveLength(docs.length);
 
     embedder.info = { id: "embed-1", name: "Embedder", model: "fake-embed", dimensions: null };

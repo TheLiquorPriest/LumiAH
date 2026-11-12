@@ -48,7 +48,9 @@ and make the window about 360 px wide (or use the browser's device toolbar). The
 | `open` | a turn's index | Sessions opens that turn. |
 | `section` | a settings path (for example `core.recall.meaning`) | Settings opens that section. |
 
-`window.__lah` in the browser's console holds the stand-in backend, the stand-in host and the app's teardown, to drive by hand.
+`window.__lah` in the browser's console holds the stand-in backend, the stand-in host and the app's teardown, to drive by hand. `window.__lah.backend.finishSignIn("openai")` finishes an open OpenAI sign-in as if the browser ran on the runtime's own machine, so Runtime → Connections can be watched noticing it by itself.
+
+Runtime → Connections answers from a stand-in of the runtime's own book: in `ready` the runtime holds three connections (one signed in to an Anthropic account, one on a local server that asks for no key); in `fresh` it holds none once a runtime is linked (the preview's own "link a runtime" button), so the first steps can be walked. A key typed there is never kept by the stand-in: only that one is set and its last four characters. A sign-in takes any code of the right shape (Anthropic: `something#something`; OpenAI: an address with `code=` in it).
 
 ## What it is not
 

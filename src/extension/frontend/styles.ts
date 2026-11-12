@@ -4,6 +4,7 @@
 
 import { CHRONICLE_CSS } from "./styles/chronicle";
 import { COMPONENTS_CSS } from "./styles/components";
+import { CONNECTIONS_CSS } from "./styles/connections";
 import { DEFS_CSS } from "./styles/defs";
 import { HOME_CSS } from "./styles/home";
 import { JOBS_CSS } from "./styles/jobs";
@@ -16,4 +17,4 @@ import { TALK_CSS } from "./styles/talk";
 import { TOKENS_CSS } from "./styles/tokens";
 import { WORKSPACE_CSS } from "./styles/workspace";
 
-export const CSS = [TOKENS_CSS, COMPONENTS_CSS, SHELL_CSS, LIVE_CSS, PAGES_CSS, HOME_CSS, WORKSPACE_CSS, DEFS_CSS, JOBS_CSS, SPEND_CSS, TALK_CSS, LORE_CSS, CHRONICLE_CSS].join("\n");
+export const CSS = [TOKENS_CSS, COMPONENTS_CSS, SHELL_CSS, LIVE_CSS, PAGES_CSS, CONNECTIONS_CSS, HOME_CSS, WORKSPACE_CSS, DEFS_CSS, JOBS_CSS, SPEND_CSS, TALK_CSS, LORE_CSS, CHRONICLE_CSS].join("\n");

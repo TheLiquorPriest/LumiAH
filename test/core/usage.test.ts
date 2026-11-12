@@ -105,7 +105,7 @@ describe("the price a call's cost comes from, as a session asks for it", () => {
         return reported === undefined ? result : { ...result, model: reported };
       },
     };
-    const spec: CallSpec = { connectionId: MAIN, model, effort: "medium", system: "You read tide tables.", prefix: [], cache: settings.cache };
+    const spec: CallSpec = { connectionId: MAIN, model, effort: "medium", system: "You read tide tables.", prefix: [], cache: { ...settings.cache, session: "agent_test" } };
     const session = new ProviderSession({ host: { models, connections: host.connections, clock: host.clock }, settings, texts: new Texts(), accounts: new AgentAccounts(host) }, spec);
     const p = await session.prepare([{ role: "user", content: "When is high water?" }], []);
     return (await session.send(p, requestOf(spec, p, 500, settings), open)).usage;

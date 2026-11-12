@@ -13,7 +13,7 @@ import { DOC } from "./paths";
 import type { AgentUsage, JsonObject, ModelMessage, ReplySink, TurnStatus } from "./ports";
 import { isRecord } from "./ports";
 import { HarnessRefusal } from "./refusal";
-import { type Equipment, readSetup, Run, type Setup, type Shared } from "./run";
+import { agentsMissing, claimMissing, type Equipment, readSetup, Run, type Setup, type Shared } from "./run";
 import { AGENT } from "./settings";
 import type { SideDoc, SideRow, SidesDoc, SideTurnDoc } from "./stored";
 import { TEXT } from "./texts";
@@ -87,7 +87,13 @@ export class Sides {
     const setup = await readSetup(shared, chatId);
     const agent = input.agent ?? AGENT.main;
     // The writer's prompt is a chat's preset: outside a turn it has nothing to say.
-    if (agent === AGENT.writer || !setup.definitions.agent(agent)) throw new HarnessRefusal("not_found", `There is no agent "${agent}" to talk to: it may have been removed or switched off.`);
+    if (agent === AGENT.writer) throw new HarnessRefusal("not_found", `There is no agent "${agent}" to talk to: it may have been removed or switched off.`);
+    if (!setup.definitions.agent(agent)) {
+      // Missing because the extension's agents are, it may be there in a moment: the refusal says why.
+      const missing = setup.unanswered.definitions;
+      if (missing !== undefined && !setup.definitions.switchedOff(agent)) throw new HarnessRefusal("unavailable", `There is no agent "${agent}" to talk to now. ${agentsMissing(missing, setup.texts, shared.options)}.`);
+      throw new HarnessRefusal("not_found", `There is no agent "${agent}" to talk to: it may have been removed or switched off.`);
+    }
     const now = shared.host.clock.now();
     // Eight hex digits of a random id, as an agent's: a name, not a limit.
     const doc: SideDoc = { v: 1, kind: "side", id: `side_${crypto.randomUUID().slice(0, 8)}`, chatId, agent, title: "", createdAt: now, lastAt: now, turns: [] };
@@ -153,8 +159,13 @@ export class Sides {
       let reply = "";
       let finish = "stop";
       try {
+        // A chat whose extension never said whether it answers it itself isn't talked about as one of LumiAH's own.
+        if (setup.unanswered.claim !== undefined) throw new Error(claimMissing(setup.unanswered.claim, texts, shared.options));
         const resolved = run.resolve(doc.agent);
-        if (!resolved) throw new Error(`the agent "${doc.agent}" this session is with is gone or switched off`);
+        if (!resolved) {
+          const missing = setup.unanswered.definitions;
+          throw new Error(missing !== undefined && !setup.definitions.switchedOff(doc.agent) ? agentsMissing(missing, texts, shared.options) : `the agent "${doc.agent}" this session is with is gone or switched off`);
+        }
         await run.equip(await this.equipment(doc.chatId, shared, setup));
         const carried = await this.history(doc, run, signal);
         const about = doc.chatId === "" ? texts.render(TEXT.side.aboutNothing) : texts.render(TEXT.side.aboutChat, { chat: run.chat?.name ?? doc.chatId });

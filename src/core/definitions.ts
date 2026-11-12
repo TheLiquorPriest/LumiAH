@@ -385,6 +385,12 @@ export class Definitions {
     return view && !view.off ? view : undefined;
   }
 
+  /** An agent definition that is there but switched off, by its id; undefined for one that is on, and for none. */
+  switchedOff(id: string): AgentDefinition | undefined {
+    const view = this.agentRows.get(id);
+    return view?.off ? view : undefined;
+  }
+
   /** Where the agent definition `id` comes from, and what it stands over; undefined for none, and for one switched off. */
   sourced(id: string): Pick<Sourced, "source" | "over"> | undefined {
     const view = this.agentRows.get(id);

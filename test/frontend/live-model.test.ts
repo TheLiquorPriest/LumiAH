@@ -34,6 +34,8 @@ import {
   matchCounts,
   matchTotal,
   NO_FILTER,
+  onConnection,
+  promptFacts,
   promptHashes,
   sessionWords,
   stepWindow,
@@ -445,9 +447,9 @@ describe("copy and export", () => {
 
   test("tokens, time and cost per call as CSV, a call a row", () => {
     const lines = totalsCsv(turnTotals(turn, T0)).trimEnd().split("\n");
-    expect(lines[0]).toBe("agent,role,as,call,model,started,ms,in,cached_in,cache_write,out,reasoning_out,estimated,cost_usd,finish,tool_calls,tool_ms,prompt");
+    expect(lines[0]).toBe("agent,role,as,call,model,connection,started,ms,in,cached_in,cache_write,out,reasoning_out,estimated,cost_usd,finish,tool_calls,tool_ms,prompt");
     expect(lines.length).toBe(5);
-    expect(lines[1]).toStartWith("main-1,main,,1,deepseek-v4-flash,2026-11-10T09:00:00.040Z,2840,5120,3900,0,212,96,,");
+    expect(lines[1]).toStartWith("main-1,main,,1,deepseek-v4-flash,conn-deepseek,2026-11-10T09:00:00.040Z,2840,5120,3900,0,212,96,,");
     expect(lines[4]).toStartWith("writer-1,writer,,1,");
   });
 
@@ -739,5 +741,60 @@ describe("what the prompt held, and the lore the writer saw", () => {
     expect(md).toContain("What the prompt held: 3 lore entries (≈110 tokens) and 18 of the chat's 47 messages.");
     expect(md).toContain("- The harbour office (212 characters): a key matched: harbour office");
     expect(md).toContain("The main agent added 1 lore entry and left 1 out of this prompt; 1 entry it named was refused.\nAdded: The night key");
+  });
+});
+
+describe("a call's exact prompt", () => {
+  test("names the connection it ran on as the transcript names its agents' (the list of the runtime that plays the transcript's chat), not another runtime's; by its id where that list lacks it", () => {
+    // The transcript's chat plays on the runtime whose list names conn-2 "Night shift"; the chat open in Lumiverse plays on another, whose list names it otherwise.
+    const transcripts: Record<string, string> = { "conn-2": "Night shift" };
+    const named = (id: string): string => transcripts[id] ?? id;
+    const prompt = { connectionId: "conn-2", model: "claude-sonnet-4-5", effort: "low", maxTokens: 4_000, stream: true, messages: [{ role: "user", content: "Where is the key?" }] } as const;
+    expect(promptFacts({ ...prompt, messages: [...prompt.messages] }, named)).toEqual(["claude-sonnet-4-5", "on Night shift", "effort low", "up to 4,000 tokens", "streamed"]);
+    expect(promptFacts({ ...prompt, messages: [...prompt.messages], connectionId: "conn-gone" }, named)[1]).toBe("on conn-gone");
+    expect(promptFacts({ ...prompt, messages: [...prompt.messages], connectionId: null, parallelToolCalls: false, params: { temperature: 0.4 } }, named)).toEqual(["claude-sonnet-4-5", "on the default connection", "effort low", "up to 4,000 tokens", "streamed", "one tool call an answer", "temperature 0.4"]);
+  });
+});
+
+describe("the connection an agent ran on", () => {
+  /** A turn whose main agent and writer both name a connection the runtime doesn't have (one of Lumiverse's, from before this build), so both ran on the runtime's default. */
+  const stale = () => {
+    const t = new Trace("chat-mara", "turn-9", T0);
+    t.started("new", null).agent({ id: "main-1", role: "main", system: "s", connectionId: "rc-deepseek", connectionName: "Deepseek", gone: "c7c0f78d-from-lumiverse" }).message("main-1", "m").answer("main-1", { text: "a", in: 10, out: 2, ms: 100 });
+    t.agent({ id: "writer-1", role: "writer", system: "w", connectionId: "rc-deepseek", connectionName: "Deepseek", gone: "c7c0f78d-from-lumiverse", parent: "main-1" }).message("writer-1", "brief").answer("writer-1", { text: "the reply", in: 20, out: 4, ms: 200 });
+    t.idle("writer-1").idle("main-1").ended("done");
+    return turnView(viewOf(t));
+  };
+
+  test("its line names the connection its calls went on, by the name the trace kept, never the id its settings name", () => {
+    const turn = stale();
+    const listed = (id: string): string => (id === "rc-deepseek" ? "Deepseek (as listed now)" : id);
+    expect(turn.agents.map((a) => onConnection(a.start, listed))).toEqual(["on Deepseek", "on Deepseek"]);
+    // A transcript kept before names were: as the runtime lists the id, else the id; the default where its settings named none.
+    expect(onConnection({ connectionId: "rc-deepseek" }, listed)).toBe("on Deepseek (as listed now)");
+    expect(onConnection({ connectionId: null }, listed)).toBe("on the default connection");
+    const md = transcriptMarkdown(turn);
+    expect(md).toContain("deepseek-v4-flash on Deepseek · effort");
+    expect(md).not.toContain("on c7c0f78d");
+  });
+
+  test("that the connection its settings name isn't one of the runtime's, so the default stood in, is said once, plainly, and as no problem", () => {
+    const turn = stale();
+    const said = feedOf(turn, NO_FILTER).flatMap((f) => f.items.flatMap((i) => (i.kind === "notice" ? [[f.agent.start.id, i.text]] : [])));
+    expect(said).toEqual([["main-1", "The connection Settings name for Main agent and Writer (c7c0f78d-from-lumiverse) isn't one of the runtime's connections, so they ran on the default connection, Deepseek. Pick one of the runtime's connections for them in Settings to change that."]]);
+    expect(transcriptMarkdown(turn).split("isn't one of the runtime's connections").length).toBe(2);
+    expect(feedOf(turn, only({ problems: true })).flatMap((f) => f.items).some((i) => i.kind === "notice")).toBe(false);
+    // An agent on a connection the runtime has says nothing of the kind.
+    expect(feedOf(turnView(viewOf(finishedTurn("chat-mara", "turn-1", T0))), NO_FILTER).flatMap((f) => f.items).some((i) => i.kind === "notice")).toBe(false);
+  });
+
+  test("the totals name each call's connection the same way, and so does their CSV", () => {
+    const totals = turnTotals(stale(), T0);
+    expect(totals.calls.map((c) => onConnection(c.on))).toEqual(["on Deepseek", "on Deepseek"]);
+    const rows = totalsCsv(totals).trimEnd().split("\n");
+    expect(rows.slice(1).map((row) => row.split(",").slice(0, 6))).toEqual([
+      ["main-1", "main", "", "1", "deepseek-v4-flash", "Deepseek"],
+      ["writer-1", "writer", "", "1", "deepseek-v4-flash", "Deepseek"],
+    ]);
   });
 });

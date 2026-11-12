@@ -55,8 +55,8 @@ export const SHELL_CSS = `
 .lah-split-list,.lah-split-detail{display:flex;flex-direction:column;gap:var(--lah-s3);min-width:0}
 /* A column that scrolls on its own must scroll, not squeeze what it holds. */
 .lah-split-list>*,.lah-split-detail>*{flex-shrink:0}
-/* Where a pane's head comes to rest when it is brought to the top (scroll.ts): under the page bar, the page's own gap below it. */
-.lah-split-detail{scroll-margin-top:calc(var(--lah-bar-h,0px) + var(--lah-s3))}
+/* Where a pane's head comes to rest when it is brought to the top (scroll.ts): under the page bar, the page's own gap below it. A margin is written as a sticky top is, from where the bar sticks (--lah-stick-top: the host's own bar above ours, less the panel's top padding, which scroll.ts adds back). */
+.lah-split-detail{scroll-margin-top:calc(var(--lah-stick-top,0px) + var(--lah-bar-h,0px) + var(--lah-s3))}
 .lah-split[data-pane=list]>.lah-split-detail{display:none}
 .lah-split[data-pane=detail]>.lah-split-list{display:none}
 /* A head's title keeps room to be read: what stands beside it (a long-named button, say) goes under it where the two don't fit, rather than squeezing it to a letter a line. */

@@ -10,10 +10,12 @@ import type { JsonObject } from "../../core/ports";
 import { LINK, loopbackModel, runtimeBase, sameBase } from "../../link/contract";
 import { isRecord } from "../../link/json";
 import { CEILINGS, checkTransport, TRANSPORT_KEY, TRANSPORT_RETIRED, TRANSPORT_SCHEMA, transportDefaults } from "../../link/settings";
+import { Timings } from "../../link/timings";
 import type { PermissionNeed, RuntimeState, RuntimeView } from "../../shared/ui";
 import { Approvals } from "./approvals";
 import { Asks } from "./asks";
 import { type AnchorCodec, anchorsUnder, Chats, OWN_ANCHORS } from "./chat";
+import { CopyFeed, type OwnElsewhere } from "./copy";
 import { randomHex } from "./docs";
 import { Definitions } from "./defs";
 import { type BackendExtension, type BackendTools, RemoteTools } from "./extension";
@@ -21,12 +23,13 @@ import { Forgotten } from "./forget";
 import { JobsBoard } from "./jobs";
 import { Mcp } from "./mcp";
 import { Notices } from "./notices";
+import { CORS_PROXY, ProxyRoad } from "./proxy";
 import { OpenTurns } from "./open";
 import { Connections } from "./connections";
 import { wordsOf } from "./errors";
 import { Keys } from "./keys";
 import { LiveBuffer } from "./live";
-import { Models } from "./models";
+import { Mirrors } from "./mirror";
 import { Lore, Presets, Storage } from "./reads";
 import { Recall } from "./recall";
 import { RegistryStore } from "./registry";
@@ -49,6 +52,12 @@ export interface BackendEnv {
   later(ms: number, fn: () => void): () => void;
   /** The build this bundle came from: runtimes compare theirs with it. */
   build: string;
+  /**
+   * The runtime this build ships beside its backend (`dist/lumiah.js`): its sha256 (hex) and size,
+   * which the build writes in beside the build id. A runtime that says hello on another build is
+   * offered it. Absent, or not a whole hash and size (a development build): no runtime is offered it.
+   */
+  runtime?: { sha256: string; size: number };
 }
 
 /** The key the core's settings sit under, beside the transport's. */
@@ -97,7 +106,7 @@ export function settingsSections(scope?: (userId: string) => Promise<SettingsSco
 const NEEDS: readonly { id: string; needed: boolean; what: string; without: string }[] = [
   { id: "interceptor", needed: true, what: "see a reply's prompt before it is sent", without: "no reply is worked on" },
   { id: "chats", needed: true, what: "read a chat and switch itself on for it", without: "no chat can be switched on" },
-  { id: "generation", needed: true, what: "make its agents' model calls and hear when a reply starts and ends", without: "its agents can call no model" },
+  { id: "generation", needed: true, what: "hear when a reply starts, ends or is stopped", without: "no reply is worked on" },
   { id: "chat_mutation", needed: true, what: "read the chat's messages and write each reply's record on it", without: "no reply is worked on" },
   { id: "generation_parameters", needed: true, what: "tag the replies your runtime answers", without: "no reply is worked on" },
   { id: "world_books", needed: false, what: "read your world books", without: "agents can't look up lore" },
@@ -109,6 +118,7 @@ const NEEDS: readonly { id: string; needed: boolean; what: string; without: stri
   { id: "memories", needed: false, what: "read Lumiverse's Memory Cortex", without: "the memory tools aren't offered" },
   { id: "databanks", needed: false, what: "read your databanks", without: "the databank tools aren't offered" },
   { id: "web_search", needed: false, what: "search the web with your own provider", without: "web_search isn't offered" },
+  { id: CORS_PROXY, needed: false, what: "reach your runtime on this machine through Lumiverse's own proxy, so a page's request doesn't wait behind a reply's traffic on the link", without: "pages reach the runtime over the link alone" },
 ];
 
 export interface Backend {
@@ -130,6 +140,10 @@ export interface Backend {
   readonly asks: Asks;
   readonly jobs: JobsBoard;
   readonly defs: Definitions;
+  /** The asks' road through Lumiverse's proxy to each runtime, as it stands. */
+  readonly road: ProxyRoad;
+  /** This end of the timing log: the asks it sent its runtimes. */
+  readonly timings: Timings;
   /**
    * What each agent can really use in a chat, for the pages of an extension that builds LumiAH in:
    * each agent that can run there, the tools it holds, and each tool it names that it can't use,
@@ -181,6 +195,15 @@ export interface BackendOptions {
    * (the chronicle's upkeep and "Learn this story" are off without the chronicler). None by default.
    */
   withoutAgents?: readonly string[];
+  /**
+   * Where it keeps LumiAH's record of a message when not on the message itself (LumiRPEngine keeps it
+   * in its ledger, and its host's `chats.messages` puts it in as each message's `own`): a reader of a
+   * chat's records and a way to say they changed, which the runtime's copy of chat and lore reads and
+   * hears, so its rows are the ones that host gives.
+   */
+  ownElsewhere?: OwnElsewhere;
+  /** It gives LumiAH no lore (LumiRPEngine: its host's `lore` answers none): the runtime's copy keeps none either. */
+  declinesLore?: true;
 }
 
 export function createBackend(host: BackendHost, env: BackendEnv, options: BackendOptions = {}): Backend {
@@ -224,13 +247,15 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     build,
     identity,
     ...(options.ownSwitch === true ? { switchedBy: name } : {}),
+    ...(env.runtime !== undefined ? { runtime: env.runtime } : {}),
     send: (frame, userId, session) => made.server?.send(frame, userId, session),
     hasLoopback: async (userId) => ((await made.connections?.loopbacks(userId)) ?? []).length > 0,
   });
-  const streams = new StreamRegistry({ now, later, push: (userId, relay, push) => relays.push(userId, relay, push) });
-  const connections = new Connections(host, { model: loopbackModel(identity.identifier), bases: (userId) => relays.bases(userId), serialTools: async (userId) => (await settings.transport(userId)).connections.oneToolAtATime });
+  const streams = new StreamRegistry({ now, push: (userId, relay, push) => relays.push(userId, relay, push) });
+  const connections = new Connections(host, { model: loopbackModel(identity.identifier), bases: (userId) => relays.bases(userId) });
   made.connections = connections;
   // Lumiverse keys an extension's entry on a message by its identifier: that key means the entry itself, any other a place inside it.
+  const codec = options.anchor ?? (identity.anchorKey === identity.identifier ? OWN_ANCHORS : anchorsUnder(identity.anchorKey));
   const chats = new Chats(
     host,
     async (userId) => {
@@ -238,18 +263,20 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
       return { chats: pathsKept, ms: pathMs };
     },
     now,
-    options.anchor ?? (identity.anchorKey === identity.identifier ? OWN_ANCHORS : anchorsUnder(identity.anchorKey)),
+    codec,
   );
   // As many turns are kept across a restart as the account's own "Tags remembered" keeps in memory.
   const open = new OpenTurns(host, async (userId) => Math.min((await settings.transport(userId)).tags.held, CEILINGS.tagsHeld));
   /** The linked runtime a chat's replies reach: the one at the address of the loopback connection the chat generates on. Where no address matches (a connection kept by its model's name under another address), the one runtime linked, when there is just one. Null: that runtime isn't linked. */
-  const runtimeOf = async (userId: string, chatId: string): Promise<string | null> => {
+  const relayOf = async (userId: string, chatId: string): Promise<{ id: string; name: string } | null> => {
     const on = await connections.ofChat(userId, await chats.own(userId, chatId));
     const url = on === null ? undefined : (await connections.loopbacks(userId)).find((c) => c.id === on.id)?.url;
     if (url === undefined) return null;
     const linked = await relays.linked(userId);
-    return (linked.find((r) => sameBase(runtimeBase(r.listen, r.port), url)) ?? (linked.length === 1 ? linked[0] : undefined))?.id ?? null;
+    const found = linked.find((r) => sameBase(runtimeBase(r.listen, r.port), url)) ?? (linked.length === 1 ? linked[0] : undefined);
+    return found === undefined ? null : { id: found.id, name: found.name };
   };
+  const runtimeOf = async (userId: string, chatId: string): Promise<string | null> => (await relayOf(userId, chatId))?.id ?? null;
   /** What is being said of a reply's runtime now: `settle` waits for it. */
   const telling = new Set<Promise<void>>();
   /** A reply is about to go to a runtime that isn't linked. Nothing answers it there and nothing here does in its place (§25), so the user is told before it fails, wherever they are in Lumiverse. The prompt isn't held for it. */
@@ -285,38 +312,29 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     later,
   });
   const storage = new Storage(host);
+  // Which runtime holds each user's mirror of what the runtimes keep: one at a time keeps a copy of its own (mirror.ts).
+  const mirror = new Mirrors(host, { now, quietMs: async (userId) => (await settings.transport(userId)).link.quietMs, send: (push, userId, session) => made.server?.send(push, userId, session), name });
   const lore = new Lore(host, {
     persona: (userId, chatId) => turns.ofChat(userId, chatId)?.personaId,
     activatedBooks: (userId, chatId) => (turns.ofChat(userId, chatId)?.activated ?? []).flatMap((a) => (a.bookId !== null ? [a.bookId] : [])),
   });
   const presets = new Presets(host);
   const recall = new Recall(host, { chats, lore, activated: (userId, chatId, generationId) => turns.activatedInfo(userId, chatId, generationId), now });
+  const copy = new CopyFeed(host, { relays, registry, chats, turns, ...(options.ownElsewhere !== undefined ? { ownElsewhere: options.ownElsewhere } : {}), declinesLore: options.declinesLore === true, records: codec.reads ?? null, name });
   // A turn that fails while a permission LumiAH can't do without is missing fails for that: the live view says so beside the sentence.
   const live = new LiveBuffer(host, { now, transport: (userId) => settings.transport(userId), linkGoneFor: (userId, relay) => relays.goneFor(userId, relay), missing: () => permissions().some((need) => need.needed) });
-  // An agent of a chat that plays in a runtime, with no connection of its own, is lent the one the chat was on before its pin (the switch keeps it), else the default; never a loopback.
-  const models = new Models(host, {
-    connections,
-    streams,
-    settings,
-    registry,
-    name,
-    lend: async (userId, chatId) => {
-      await chats.own(userId, chatId);
-      return (await made.chatSwitch?.agentConnection(userId, chatId)) ?? null;
-    },
-  });
   const keys = new Keys(host, { registry, relays, settings, connectionName: identity.connectionName, now, later });
   /** The extension LumiAH is built into, whose claims say which chats it answers and how. */
   const claimer = options.extension;
   const chatSwitch = new ChatSwitch(host, {
     chats,
     connections,
-    runtimeLinked: async (userId, chatId) => (await runtimeOf(userId, chatId)) !== null,
+    runtimeOf: relayOf,
     blocked,
     identity,
     now,
     storySetting: async (userId) => settingsOf((await settings.values(userId))[CORE_KEY]).story,
-    // A claim that fails is none: the log says so, and the chat is set as any other meanwhile.
+    // A claim that fails is no answer, with why: the log says so, the story's page shows the chat's and the user's words, and the Agents page says who leads isn't known.
     ...(claimer?.claim !== undefined
       ? {
           claim: async (ask: ClaimAsk, userId: string) => {
@@ -325,20 +343,51 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
               return claim === null || claim === undefined ? null : { by: claimer.name, claim };
             } catch (error) {
               warn(`${claimer.name} gave no answer for chat ${ask.chatId}, so its claim on it isn't known`)(error);
-              return null;
+              return { by: claimer.name, failed: wordsOf(error) };
             }
           },
         }
       : {}),
   });
   made.chatSwitch = chatSwitch;
-  const sessions = new SessionsPage({ chats, storage, settings, now });
+  const sessions = new SessionsPage({
+    chats,
+    storage,
+    settings,
+    now,
+    name,
+    later,
+    // The runtime that writes the core's documents sends what it saved before they are read here; with none linked, the storage is all there is.
+    settle: async (userId, chatId) => {
+      if ((await relays.linked(userId)).length === 0) return false;
+      await asks.ask(userId, "store.settle", {}, chatId === null ? {} : { chat: chatId });
+      return true;
+    },
+  });
   const approvals = new Approvals({ id: () => randomHex(64) });
   const notices = new Notices(host, { now, id: () => randomHex(64), kept: async (userId) => (await settings.transport(userId)).pages.noticesKept });
   const jobs = new JobsBoard(notices, now, async (userId) => (await settings.transport(userId)).pages.noticeChars);
   // The MCP servers a user switched on are kept with their definitions, which list the servers through this.
-  const mcp: Mcp = new Mcp(host, { on: (userId) => defs.mcpOn(userId), callMs: async (userId) => (await settings.transport(userId)).mcp.callMs });
+  const mcp: Mcp = new Mcp(host, { on: (userId) => defs.mcpOn(userId), callMs: async (userId) => (await settings.transport(userId)).mcp.callMs, later, name, ...(identity.settingsAt !== undefined ? { settingsAt: identity.settingsAt } : {}) });
   const tools = new RemoteTools(options.tools, mcp, (level, message) => host.log(level, message));
+  /** This end of the timing log (Runtime → Timings): every ask it sends a runtime, by its op, road, size and time. */
+  const timings = new Timings();
+  // The asks' own road, where Lumiverse's proxy reaches a runtime on this machine (proxy.ts). The Runtime page says how it stands.
+  const road = new ProxyRoad({
+    host,
+    declined,
+    address: async (userId, relay) => {
+      const held = (await registry.read(userId)).relays[relay];
+      return held === undefined ? null : { listen: held.report?.listen ?? held.listen, port: held.report?.port ?? held.port };
+    },
+    transport: (userId) => settings.transport(userId),
+    now,
+    nonce: () => randomHex(128),
+    isLinked: (userId, relay) => relays.isLinked(userId, relay),
+    changed: (userId) => ui.touch(userId, "runtime"),
+    name,
+    ...(identity.settingsAt !== undefined ? { settingsAt: identity.settingsAt } : {}),
+  });
   const asks = new Asks({
     relays,
     settings,
@@ -348,8 +397,12 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     runtimeOf,
     userRuntime: async (userId) => (await relays.linked(userId))[0]?.id ?? null,
     name,
+    ...(identity.settingsAt !== undefined ? { settingsAt: identity.settingsAt } : {}),
+    now,
     later,
     id: () => randomHex(64),
+    road,
+    timings,
   });
   made.asks = asks;
   const forgotten = new Forgotten(host, { asks, isLinked: async (userId) => (await relays.linked(userId)).length > 0, now });
@@ -372,12 +425,15 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     approvals,
     notices,
     asks,
+    road,
+    timings,
     jobs,
     defs,
     coreKey: CORE_KEY,
     switch: chatSwitch,
     turns,
     sessions,
+    copy,
     keys,
     issues,
     permissions,
@@ -389,19 +445,21 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     registry,
     settings,
     streams,
-    models,
     turns,
     chats,
     chatSwitch,
     storage,
+    mirror,
     lore,
     presets,
     recall,
+    copy,
     connections,
     live,
     tools,
     approvals,
     asks,
+    road,
     jobs,
     extension: options.extension,
     connectionMade: (userId, ref, connection, problem) => {
@@ -417,6 +475,10 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     identity,
   });
   made.server = server;
+  // What a runtime's copy of chat and lore is told is heard from before any runtime says hello.
+  copy.start();
+  // The link server hears runtimes from here on: every runtime linked before this start says hello again now, not at its next ping.
+  relays.start();
 
   // ---------------------------------------------------------------- what changes the pages' state
 
@@ -426,6 +488,8 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     turns.unsure(userId);
     // What a runtime that is gone was asked will never be answered.
     asks.recheck(userId);
+    // A runtime whose link is gone takes its secret and its road with it.
+    road.sweep(userId);
     // A runtime that links now is handed the chats deleted while none was.
     forgotten.handOver(userId);
     tellRuntime(userId);
@@ -433,6 +497,7 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
   relays.onPing((userId, relay, named) => {
     live.named(userId, relay, named);
     forgotten.pinged(userId);
+    void mirror.pinged(userId, relay).catch(warn("a ping couldn't be noted for the runtime that keeps the storage"));
   });
   live.onChange((userId) => ui.touch(userId, "running", "chats", "setup"));
   approvals.onChange((userId) => ui.touch(userId, "approvals"));
@@ -454,6 +519,10 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
       .catch(warn("the runtimes weren't told of the new settings"));
   });
   host.onPermission(() => ui.touchAll("runtime", "permissions", "setup"));
+  // The asks' road follows its permission at once: granted, every linked runtime's address is checked; taken away, the link carries every ask from now.
+  host.onPermission((permission, granted) => {
+    if (permission === CORS_PROXY) road.permission(granted);
+  });
 
   // ---------------------------------------------------------------- turns
 
@@ -531,12 +600,13 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
   });
   host.frontend.onClosed((session) => {
     relays.sessionClosed(session);
+    mirror.sessionClosed(session);
     live.sessionClosed(session);
     server.sessionClosed(session);
   });
 
   /** Why the runtime isn't linked, in plain words that say what to do: a refused link's own words (which side to update, and how), else how to start it, or to set one up. */
-  const downWords = (view: RuntimeView, chatId: string | null): string => {
+  const downWords = (view: Pick<RuntimeView, "relays">, chatId: string | null): string => {
     const refused = view.relays.find((r) => r.link === "refused" && r.problem !== null);
     if (refused?.problem) return refused.problem;
     if (view.relays.length === 0) return `No runtime is set up for ${name} yet. Start one with the line on ${name}'s Runtime page.`;
@@ -566,6 +636,8 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
       await chatSwitch.settle();
       await open.settle();
       await forgotten.settle();
+      await mirror.settle();
+      await copy.settle();
       await ui.settle();
       await Promise.all(telling);
     },
@@ -583,6 +655,8 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     asks,
     jobs,
     defs,
+    road,
+    timings,
     agents: {
       held: async (userId, chatId) => heldView(await asks.ask(userId, "definitions.held", { chatId }, { chat: chatId })),
     },

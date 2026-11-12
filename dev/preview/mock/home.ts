@@ -13,7 +13,7 @@ const TODO = "Grant it in Lumiverse: Extensions, LumiAH, Permissions.";
 const ASKS: readonly PermissionNeed[] = [
   { id: "interceptor", what: "see a reply's prompt before Lumiverse sends it", without: "no reply is worked on", todo: TODO, needed: true },
   { id: "chats", what: "read a chat and switch itself on for it", without: "no chat can be switched on", todo: TODO, needed: true },
-  { id: "generation", what: "make its agents' model calls, and hear when a reply starts and ends", without: "its agents can't call a model", todo: TODO, needed: true },
+  { id: "generation", what: "hear when a reply starts, ends or is stopped", without: "no reply is worked on", todo: TODO, needed: true },
   { id: "chat_mutation", what: "read the chat's messages and write each reply's record on it", without: "no reply is worked on", todo: TODO, needed: true },
   { id: "generation_parameters", what: "tag the replies your runtime answers", without: "no reply is worked on", todo: TODO, needed: true },
   { id: "world_books", what: "read your world books", without: "agents can't look up lore", todo: TODO, needed: false },

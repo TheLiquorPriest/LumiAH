@@ -47,6 +47,8 @@ export interface RigOptions {
   /** The source the copy reads from; the HTTP source over the user's session when not given. */
   source?: (rig: { lumiverse: Lumiverse; waits: number[] }) => CopySource;
   parallel?: number;
+  /** The HTTP source's deadline for one request, in ms. */
+  requestMs?: number;
 }
 
 /** Counts each call the fallback answers. */
@@ -84,6 +86,7 @@ export function rigCopy(options: RigOptions = {}): CopyRig {
         waits.push(ms);
       },
       ...(options.parallel !== undefined ? { parallel: options.parallel } : {}),
+      ...(options.requestMs !== undefined ? { requestMs: options.requestMs } : {}),
     });
   const copy = createHostCopy({
     source,

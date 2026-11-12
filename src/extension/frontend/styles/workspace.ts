@@ -55,7 +55,7 @@ export const WORKSPACE_CSS = `
 .lah-ws-version[data-deleted=true]{background:transparent;border-style:dashed}
 .lah-ws-version-text{display:flex;flex-direction:column;gap:2px;min-width:0}
 .lah-ws-version-when{display:flex;flex-wrap:wrap;align-items:center;gap:var(--lah-s1) var(--lah-s2);min-width:0;font-weight:500;overflow-wrap:anywhere}
-.lah-ws-panel{display:flex;flex-direction:column;gap:var(--lah-s2);min-width:0;padding:var(--lah-s3);border:1px solid var(--lah-border);border-radius:var(--lah-r-xl);background:var(--lah-card);scroll-margin-top:calc(var(--lah-bar-h,0px) + var(--lah-s3))}
+.lah-ws-panel{display:flex;flex-direction:column;gap:var(--lah-s2);min-width:0;padding:var(--lah-s3);border:1px solid var(--lah-border);border-radius:var(--lah-r-xl);background:var(--lah-card);scroll-margin-top:calc(var(--lah-stick-top,0px) + var(--lah-bar-h,0px) + var(--lah-s3))}
 .lah-ws-panel>.lah-spread{flex-wrap:nowrap;align-items:flex-start}
 .lah-ws-panel>.lah-spread>strong{flex:1 1 0;min-width:0;overflow-wrap:anywhere}
 
@@ -73,7 +73,7 @@ export const WORKSPACE_CSS = `
 .lah-gd-start{display:flex;flex-wrap:wrap;align-items:center;gap:var(--lah-s2) var(--lah-s3);min-width:0;padding:var(--lah-s3);border:1px solid color-mix(in srgb,var(--lah-accent) 30%,transparent);border-radius:var(--lah-r-xl);background:var(--lah-accent-soft)}
 .lah-gd-start>span{flex:1 1 14em;min-width:0;overflow-wrap:anywhere}
 .lah-gd-example{display:flex;flex-direction:column;gap:var(--lah-s1);min-width:0}
-.lah-gd-level{scroll-margin-top:calc(var(--lah-bar-h,0px) + var(--lah-s3))}
+.lah-gd-level{scroll-margin-top:calc(var(--lah-stick-top,0px) + var(--lah-bar-h,0px) + var(--lah-s3))}
 
 @container lah (min-width:${WIDE_MIN_PX}px){
 .lah-ws-wide{display:inline-flex}

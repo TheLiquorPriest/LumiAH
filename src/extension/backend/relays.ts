@@ -1,16 +1,18 @@
 // A user's runtimes as the extension knows them now (DESIGN §6): which are registered (registry.ts
 // keeps that), where each one's pushes go (the session that last spoke with its secret), when it
 // last spoke and what it said of itself. Every request but `register` is authenticated here by its
-// secret, and the `hello` handshake checks the link version both ends speak.
+// secret, and the `hello` handshake checks the link version both ends speak. A runtime that says
+// hello on another build is offered the extension's own copy of the runtime (its update); and when
+// the extension starts, every runtime linked to it is asked to say hello again at once.
 
-import type { LinkFrame, LinkPush, LinkRequests, RuntimeReport } from "../../link/contract";
+import type { LinkFrame, LinkPush, LinkRequests, RuntimeReport, UpdatePush } from "../../link/contract";
 import { EXTENSION_IDENTIFIER, LINK, LINK_VERSION, RUNTIME_NAME, loopbackModel, runtimeBase, shellWord, versionWords } from "../../link/contract";
 import { REPORT_TEXT_MAX, runtimeReportOf } from "../../link/frames";
 import type { LinkState, RelayView, RuntimeView } from "../../shared/ui";
 import { URL_SLOT } from "../../shared/ui";
 import { randomHex, sha256 } from "./docs";
 import { LinkRefused } from "./errors";
-import type { BackendIdentity } from "./identity";
+import { type BackendIdentity, linkedBackend } from "./identity";
 import type { RegistryStore, RelayRecord } from "./registry";
 import type { SettingsStore } from "./settings";
 import type { BackendHost } from "./spindle";
@@ -44,6 +46,8 @@ export interface RelaysEnv {
   hasLoopback(userId: string): Promise<boolean>;
   /** The extension whose own pages switch a chat on (`BackendOptions.ownSwitch`): its name, which the pages say instead of offering a switch. Absent: LumiAH's pages switch a chat. */
   switchedBy?: string;
+  /** The runtime this build ships beside its backend (`BackendEnv.runtime`); absent: a development build, which offers none. */
+  runtime?: { sha256: string; size: number };
 }
 
 const SEP = "\u0000";
@@ -53,6 +57,9 @@ const short = (v: unknown): v is string => typeof v === "string" && v.length <= 
 
 /** What of a report is kept with the registration: how the runtime is installed, not how it is doing. */
 const installOf = (r: RuntimeReport | null): string => (r === null ? "" : JSON.stringify([r.name, r.build, r.runtime, r.host, r.listen, r.port]));
+
+/** A runtime's hash as the build writes it: what the offer names, and the runtime checks the file against. */
+const SHA256 = /^[0-9a-f]{64}$/;
 
 export class Relays {
   private readonly live = new Map<string, Live>();
@@ -69,9 +76,11 @@ export class Relays {
   private readonly goneAt = new Map<string, number>();
   private readonly changed: ((userId: string) => void)[] = [];
   private readonly pinged: ((userId: string, relay: string, turns: readonly string[]) => void)[] = [];
+  /** Each session's latest check of a request's secret, ended or refused: the next request's check ends after it (`authenticate`). Let go once it ended with no later one behind it. */
+  private readonly checking = new Map<string, Promise<void>>();
 
   constructor(
-    private readonly host: Pick<BackendHost, "install" | "log">,
+    private readonly host: Pick<BackendHost, "install" | "log" | "frontend">,
     private readonly registry: RegistryStore,
     private readonly settings: SettingsStore,
     private readonly env: RelaysEnv,
@@ -119,13 +128,33 @@ export class Relays {
   /**
    * The runtime behind a request's secret; the frame's session is where its pushes go from now on.
    * Refused (`forbidden`) for a secret that is no runtime's of this user, so a runtime carries only
-   * its own account's work.
+   * its own account's work. A session's requests leave here in the order they came: the secret's
+   * digest runs beside the other requests' (WebCrypto ends digests that run together in any order),
+   * and each check ends after the one before it on the same session, so a runtime's requests reach
+   * their handlers in the order it sent them (a job's changes, of which the pages keep the last).
    */
-  async authenticate(secret: unknown, userId: string, session: string): Promise<Caller> {
+  authenticate(secret: unknown, userId: string, session: string): Promise<Caller> {
+    const hashing = typeof secret === "string" && secret !== "" ? sha256(secret) : null;
+    // Read where it is waited for; a digest that failed in the meantime is no failure of its own.
+    void hashing?.catch(() => undefined);
+    const checked = (this.checking.get(session) ?? Promise.resolve()).then(() => this.check(hashing, userId, session));
+    const ended = checked.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.checking.set(session, ended);
+    void ended.then(() => {
+      if (this.checking.get(session) === ended) this.checking.delete(session);
+    });
+    return checked;
+  }
+
+  /** `authenticate`'s check, its turn come: `hashing` is the secret's digest under way (null: the request gave none). */
+  private async check(hashing: Promise<string> | null, userId: string, session: string): Promise<Caller> {
     const { name: shown } = this.env.identity;
     const refused = new LinkRefused("forbidden", `${shown} doesn't know this runtime (its registration was forgotten or replaced): run its start line on ${shown}'s Runtime page again.`);
-    if (typeof secret !== "string" || secret === "") throw refused;
-    const hash = await sha256(secret);
+    if (hashing === null) throw refused;
+    const hash = await hashing;
     const relays = (await this.registry.read(userId)).relays;
     let relay = Object.values(relays).find((r) => r.secret === hash);
     if (relay !== undefined) this.outgoing.delete(key(userId, relay.id));
@@ -187,25 +216,57 @@ export class Relays {
     }
     this.host.log("info", `[LumiAH] runtime "${name}" ${stands ? "set up again: its registration stands" : "registered"}`);
     this.tell(userId);
-    return { relay: id, secret: stands && typeof fields.secret === "string" ? fields.secret : secret, model: loopbackModel(identity.identifier), user: userId, backend: { name: identity.name, connection: identity.connectionName } };
+    return { relay: id, secret: stands && typeof fields.secret === "string" ? fields.secret : secret, model: loopbackModel(identity.identifier), user: userId, backend: linkedBackend(identity) };
   }
 
-  /** `hello`: the version checked, the runtime's report kept. Refused in words that name which side to update when the versions differ. */
+  /**
+   * The extension's own copy of the runtime, as an update offer: its path (beside the backend, in
+   * the folder the extension is installed in) and the hash its build wrote in. Null where this build
+   * carries none whole (a development build) or the folder isn't known: nothing is offered then. An
+   * offer names nothing a page or a runtime said.
+   */
+  private offer(): Omit<UpdatePush, "link" | "type"> | null {
+    const shipped = this.env.runtime;
+    const dir = this.host.install.dir;
+    if (shipped === undefined || dir === null || !SHA256.test(shipped.sha256) || !Number.isSafeInteger(shipped.size) || shipped.size <= 0) return null;
+    return { build: this.env.build, path: `${dir}/lumiah.js`, sha256: shipped.sha256 };
+  }
+
+  /** A runtime that said hello on a build other than this one is offered this one's, on the session it said it on (its own); it takes it or says why not. */
+  private offerTo(caller: Caller, report: RuntimeReport | null): void {
+    const offer = this.offer();
+    if (offer === null || report === null || report.build === this.env.build) return;
+    this.env.send({ link: LINK, type: "update", ...offer }, caller.userId, caller.session);
+  }
+
+  /** `hello`: the version checked, the runtime's report kept. Refused in words that name which side to update when the versions differ. Either way a runtime on another build is offered this one's: a runtime that can take it needs no line run to speak this link's version. */
   async hello(caller: Caller, fields: Record<string, unknown>): Promise<void> {
     const live = this.liveOf(caller.userId, caller.relay.id);
     const version = fields.version;
     if (typeof version !== "number" || !Number.isSafeInteger(version)) throw new LinkRefused("bad_request", `The runtime's hello names no link version: update the runtime with its start line on ${this.env.identity.name}'s Runtime page.`);
+    const report = runtimeReportOf(fields.report);
     if (version !== LINK_VERSION) {
       live.refused = versionWords(version, LINK_VERSION, this.env.identity.name);
       live.seenAt = this.env.now();
-      const report = runtimeReportOf(fields.report);
       if (report !== null) live.report = report;
       live.shown = "refused";
       this.tell(caller.userId);
+      this.offerTo(caller, report);
       throw new LinkRefused("version", live.refused);
     }
     live.refused = null;
     await this.heard(caller, fields.report);
+    this.offerTo(caller, report);
+  }
+
+  /**
+   * The extension started (a new worker: an update of it, a reload, Lumiverse starting again), and
+   * knows no runtime's session: every runtime linked to it is asked to say hello now, rather than at
+   * its next ping, which may be a minute away, so the pages know at once which are linked. The ask
+   * goes to every page and runtime the extension reaches, and holds nothing but itself.
+   */
+  start(): void {
+    this.host.frontend.everyone({ link: LINK, type: "greet" } satisfies LinkPush);
   }
 
   /** `ping`: the runtime is there, and says how it is doing and which turns it answers. */
@@ -347,8 +408,8 @@ export class Relays {
     return (this.live.get(key(userId, relay))?.session ?? null) !== null;
   }
 
-  /** The runtime as the Runtime page shows it. */
-  async view(userId: string, issues: string[]): Promise<RuntimeView> {
+  /** The runtime as the Runtime page shows it, but for the road the pages' requests take to each, which the asks' road (proxy.ts) says. */
+  async view(userId: string, issues: string[]): Promise<Omit<RuntimeView, "road">> {
     const quietMs = (await this.settings.transport(userId)).link.quietMs;
     const { bun, dir } = this.host.install;
     const { identity } = this.env;
@@ -397,6 +458,6 @@ export class Relays {
       });
     const missing = [...(bun === null ? ["the path of Lumiverse's Bun (use the full path of your own bun)"] : []), ...(script === null ? [`where this extension is installed (the runtime is dist/lumiah.js in ${identity.name}'s extension folder)`] : [])];
     const line = (systemd: boolean): string | null => (bun === null || script === null ? null : `${[bun, script, "up", "--url"].map(shellWord).join(" ")} ${[URL_SLOT, ...named.map(shellWord), ...(systemd ? ["--systemd"] : [])].join(" ")}`);
-    return { build: this.env.build, link: LINK_VERSION, model: loopbackModel(identity.identifier), relays, start: { service: line(true), foreground: line(false), missing }, issues, ready: await this.ready(userId), ...(this.env.switchedBy !== undefined ? { switchedBy: this.env.switchedBy } : {}) };
+    return { build: this.env.build, link: LINK_VERSION, model: loopbackModel(identity.identifier), relays, start: { service: line(true), foreground: line(false), missing }, issues, ready: await this.ready(userId), selfUpdate: this.offer() !== null, ...(this.env.switchedBy !== undefined ? { switchedBy: this.env.switchedBy } : {}) };
   }
 }

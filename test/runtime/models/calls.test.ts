@@ -124,7 +124,7 @@ describe("a tool loop, as the core's own session runs it", () => {
     const host = { models: r.layer.models, connections: r.layer.connections, clock, log: () => undefined };
     const deps: ProviderDeps = { host, settings, texts: new Texts(), accounts: new AgentAccounts(host) };
     const reasoning: string[] = [];
-    const spec: CallSpec = { connectionId: id, model: null, effort: "high", system: "You find things in the house.", prefix: [], cache: { breakpoints: true, key: "" }, onDelta: (d) => d.reasoning !== undefined && reasoning.push(d.reasoning) };
+    const spec: CallSpec = { connectionId: id, model: null, effort: "high", system: "You find things in the house.", prefix: [], cache: { session: "agent_keys", retention: "short", key: "" }, onDelta: (d) => d.reasoning !== undefined && reasoning.push(d.reasoning) };
     const session = new ProviderSession(deps, spec);
     let conversation: ModelMessage[] = [{ role: "user", content: "Which door do the keys open?" }];
     const replies: ModelReply[] = [];

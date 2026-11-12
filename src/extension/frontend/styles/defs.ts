@@ -18,7 +18,7 @@ export const DEFS_CSS = `
 .lah-defs-save-text>span{min-width:0}
 .lah-defs-save[data-state=refused]>.lah-defs-save-text{color:var(--lah-fg)}
 .lah-defs-reading{padding:var(--lah-s3);border:1px solid var(--lah-hairline);border-radius:var(--lah-r);background:var(--lah-well);font-family:inherit;font-size:inherit;line-height:1.55}
-.lah-defs-form{scroll-margin-top:calc(var(--lah-bar-h,0px) + var(--lah-s3))}
+.lah-defs-form{scroll-margin-top:calc(var(--lah-stick-top,0px) + var(--lah-bar-h,0px) + var(--lah-s3))}
 .lah-tools{display:flex;flex-direction:column;gap:var(--lah-s4);min-width:0;flex:1}
 .lah-tools-top{display:grid;grid-template-columns:minmax(0,1fr);gap:var(--lah-s3);min-width:0;align-items:start}
 .lah-tools[data-pane=detail]>.lah-tools-top{display:none}

@@ -38,10 +38,14 @@
 import type { AgentDefinition } from "../core/agents";
 import { type AgentStopCode, type AgentUsage, type ApprovalAnswer, type ApprovalAsk, type DefinitionSource, type FileAuthor, type FileChange, isRecord, type JobView, type JobWhen, type JsonObject, type JsonValue, type ModelRequest, type RunKind, type ToolTier, type TraceEvent, type TraceRecord, type TranscriptEntry, type TurnKind, type TurnStatus, type WorkspaceArea } from "../core/ports";
 import { citationsIn } from "../core/recall/cite";
+import type { TimingsView } from "../link/timings";
 import type { ChronicleCheck, CitedMessage, EmbedStatus, HeldWhy, LoreChange, LoreChanged, LoreHitView, LoreListing, LoreRow, LoreSearchView, PromptHeld, StoryStatus } from "../core/recall/shapes";
 import type { Skill } from "../core/skills";
 import { type StoryHolds, type StorySetting, STORY_MEMBERS, storyValue } from "../core/story";
 import { TOOL } from "../core/text-def";
+
+// The timing log is the link's: Runtime → Timings shows each end's as it sums it up.
+export type { Crossing, OpTimes, Outcome, Road, Spread, TimingsView } from "../link/timings";
 
 // The trace is core's: the live view renders the events core's agents trace, as core shapes them.
 // So are a job, a definition, a file's author and a file a tool changed: the pages show core's own.
@@ -266,8 +270,9 @@ export type LinkState = "linked" | "quiet" | "refused" | "down";
 
 /**
  * Whether a runtime's address is in its account's local-inference scheduler exclusions: `excluded`;
- * `missing` (it isn't, and the runtime couldn't add it: with the scheduler on, a turn would wait on
- * its own calls); `unavailable` (this Lumiverse has no scheduler); `unknown` (not asked yet).
+ * `missing` (it isn't, and the runtime couldn't add it: with the scheduler on, a reply the runtime
+ * answers holds the scheduler while its agents work); `unavailable` (this Lumiverse has no
+ * scheduler); `unknown` (not asked yet).
  */
 export type SchedulerView = "excluded" | "missing" | "unavailable" | "unknown";
 
@@ -315,6 +320,26 @@ export function startLine(line: string, origin: string): string {
   return line.replaceAll(URL_SLOT, BARE_ORIGIN.test(origin) ? origin : "<the address you open Lumiverse at>");
 }
 
+/** The road a page's requests take to one runtime: through Lumiverse's proxy (`proxy`, the faster road) or over the link; why not the proxy, in plain words (null when it is); and when that was found (null: not yet). */
+export interface RoadView {
+  road: "proxy" | "link";
+  why: string | null;
+  at: number | null;
+}
+
+/** How the pages' requests reach the user's runtimes (PI-BUILD-PLAN §4.7): whether this extension holds the permission the faster road needs, what granting it does while it doesn't (null once it does), and each runtime's road, by its id. */
+export interface RoadsView {
+  granted: boolean;
+  offer: string | null;
+  relays: Record<string, RoadView>;
+}
+
+/** The timing log as Runtime → Timings shows it: this extension's end (the asks it sent its runtimes) and each linked runtime's (the requests its link sent), each read whole once; `problem`: why a runtime's couldn't be read. */
+export interface TimingsPage {
+  extension: TimingsView;
+  runtimes: { id: string; name: string; timings: TimingsView | null; problem: string | null }[];
+}
+
 /** The runtime as the Runtime page shows it. */
 export interface RuntimeView {
   /** The extension's own build and the link version it speaks. */
@@ -333,8 +358,53 @@ export interface RuntimeView {
   issues: string[];
   /** A runtime is there to answer (§25): one is linked, the loopback key is minted and the loopback connection is made, so a chat switched on is answered now. */
   ready: boolean;
+  /** This build offers its own copy of the runtime to a runtime that says hello on another build, which then updates itself where it can (false for a development build, or where the extension's folder isn't known: each runtime's update line is the way then). */
+  selfUpdate: boolean;
   /** The extension that builds LumiAH in switches its chats on in its own pages (LumiRPEngine): its name. LumiAH's pages then offer no switch of their own, and say where it is. Absent for LumiAH. */
   switchedBy?: string;
+  /** How the pages' requests reach each runtime: the faster road through Lumiverse's proxy, or the link. */
+  road: RoadsView;
+}
+
+/** What is under way in a runtime, which a restart ends: the replies it is answering, every request from Lumiverse (the replies among them), its jobs and the side sessions' turns. */
+export interface UnderWay {
+  replies: number;
+  requests: number;
+  jobs: number;
+  sides: number;
+}
+
+/** How one runtime is run and kept, as it says itself (`lah.runtime.service.get`), with what is under way in it now. */
+export interface ServiceView {
+  /** The build it runs. */
+  build: string;
+  /** Its memory limit; and where nothing holds it to that limit, words that say so and what would (null: its systemd unit holds it). */
+  memory: string;
+  memoryNote: string | null;
+  /** It takes an update by itself once nothing is under way; else only from the page's button. */
+  autoUpdate: boolean;
+  /** What restarts it: its systemd unit, which `unit` names, or the runtime itself. */
+  runs: "systemd" | "itself";
+  unit: string | null;
+  /** The file it was set up from, the only one it takes an update from (null: set up before it could update itself); and the file it runs from. */
+  source: string | null;
+  installed: string;
+  /** The update that waits, for nothing to be under way or for the button, and since when. */
+  waiting: { build: string; since: number } | null;
+  /** Something is under way: updating or restarting now ends it. */
+  busy: boolean;
+  /** A limit changed since it started holds only once it restarts. */
+  restartNeeded: boolean;
+  /** It is updating or restarting now. */
+  updating: boolean;
+  /** Why its last update or change didn't take, and the line to run where it can't do it itself. */
+  problem: string | null;
+  line: string | null;
+  /** It was started by the runtime before it, which then left (a restart where a process can't be replaced in place: Windows), so whatever ran that one no longer watches this one. */
+  handedOver: boolean;
+  /** Another copy of it waits to serve on its port (one a task or service wrapper started while this one serves): its process and since when. */
+  waitingCopy: { pid: number; since: number } | null;
+  underWay: UnderWay;
 }
 
 /**
@@ -405,6 +475,8 @@ export interface ChatView {
   connection: { id: string; name: string; loopback: boolean } | null;
   /** Another extension that has LumiAH built into itself (or LumiAH itself, seen from one) answers this chat: its identifier and its name. This backend then offers no switch for the chat: `on` is false, and switching it on is refused with `unavailable` in words that name the other. Absent where no other does. */
   other?: { identifier: string; name: string };
+  /** The runtime that plays the chat while it is switched on and that runtime is linked: its relay id (`RelayView.id`) and its name. Its connections are the ones the chat's agents run on (`lah.connections.list` with this `relay`). Absent while the chat is off, or `away`. */
+  runtime?: { id: string; name: string };
   /** The chat is switched on, and the runtime its replies reach isn't linked now, so they fail until it is back (`on` stays true). */
   away?: true;
 }
@@ -433,6 +505,15 @@ export interface ChatStoryView {
   holds: StoryHolds;
 }
 
+/**
+ * Who leads a chat's replies, as the extension that answers this backend's chats claims it
+ * (`lah.chat.lead.get`): its name (`by`), the id of the agent its claim names to lead them (null: it
+ * names none, so LumiAH's main agent leads), and whether the reply is only what the agents release
+ * (`released`: no writer writes it). `unanswered`: it gave no answer for the chat, with why; a reply
+ * there doesn't start without one.
+ */
+export type ChatLeadView = { by: string; lead: string | null; released: boolean } | { by: string; unanswered: string };
+
 /** A run under way: a reply LumiAH is answering, a job, or a side session's turn. `paused`: the user holds its agents at their next round (§18). */
 export interface RunningTurn {
   stream: StreamId;
@@ -450,6 +531,132 @@ export interface ConnectionView {
   provider: string;
   model: string | null;
   loopback: boolean;
+}
+
+// ---------------------------------------------------------------- the runtime's connections (PI-BUILD-PLAN §4.3)
+//
+// The agents call their providers on a runtime's own connections, kept on that runtime's disk with
+// their keys and sign-ins. A user may have several runtimes linked, each with connections of its
+// own: every request about them under the same heading below names the runtime by its relay id
+// (`ToRuntime`: `RelayView.id`; left out, the user's runtime last heard from), and the list names
+// the runtime it is of (`ConnectionsView.relay`). The backend passes each to that runtime (its
+// `connections.*` and `signin.*` page ops), so each is refused with `unavailable`, in words that
+// say what to do, while it isn't linked. A key goes to the runtime once, in
+// `lah.connections.save`, and never comes back: a connection shows only whether it has one and its
+// last four characters. `lah.connections.lumiverse` is the backend's own: Lumiverse's connections
+// to copy from, never with a key. The list is read on request; the page that changes it takes the
+// answer, and a page reads it again when it comes back into view and when the runtimes linked
+// change.
+
+/** A request addressed to one of the user's runtimes by its relay id (`RelayView.id`); left out, to the user's runtime last heard from. */
+export interface ToRuntime {
+  relay?: string;
+}
+
+/** How a runtime's connection signs its calls: with its own key, with the runtime's sign-in to its provider, or with nothing (a local server that asks for none). */
+export type ConnectionAuth = "key" | "signin" | "none";
+
+/** The providers the runtime signs in to. */
+export type SignInProvider = "anthropic" | "openai";
+
+/** How much a connection's model thinks when an agent leaves it to the connection: not at all, or one of the levels up to the most its model allows. */
+export type ConnectionEffort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/** One of the runtime's connections as the pages show it: never its key, only whether one is set and its last four characters (null for a key too short to show any of); for one that signs in, whether the runtime is signed in to its provider. */
+export interface RuntimeConnection {
+  id: string;
+  name: string;
+  /** Its provider's id (`ProviderOffer.id`). */
+  provider: string;
+  auth: ConnectionAuth;
+  /** Where its calls go in place of the provider's own address: a compatible server's, or a proxy's. */
+  baseUrl?: string;
+  /** The API a compatible server speaks, where its provider offers more than one. */
+  api?: string;
+  /** Its model, for an agent that names none. */
+  model?: string;
+  /** Its own effort, for an agent whose effort is `auto` or `inherit`; absent: the provider's default. */
+  effort?: ConnectionEffort;
+  /** The headers every call on it sends, by name: never a value (one may hold a credential). `set` false: its value was dropped when the connection's provider or address changed, so it is sent no more until it is typed again. Absent: none. */
+  headers?: { name: string; set: boolean }[];
+  /** It is the default: an agent that names no connection, or one that is gone, runs on it. */
+  default: boolean;
+  /** Null for a connection that signs with no key. */
+  key: { set: boolean; last4: string | null } | null;
+  signedIn?: boolean;
+}
+
+/** A provider the runtime offers: how its connections may sign (the first, a new one's), the APIs a connection of it may speak (the first, its default), and whether it needs the address of the user's own server (a compatible one) rather than taking one in place of its own (a proxy). */
+export interface ProviderOffer {
+  id: string;
+  name: string;
+  auth: ConnectionAuth[];
+  apis: string[];
+  needsBaseUrl: boolean;
+}
+
+/** A runtime's connections, which one is the default (null: none is), the providers it offers, and the runtime they are of: its relay id and its name. */
+export interface ConnectionsView {
+  connections: RuntimeConnection[];
+  default: string | null;
+  providers: ProviderOffer[];
+  relay: { id: string; name: string };
+}
+
+/**
+ * A connection to save, whole: an `id` of one of the runtime's changes it, none makes one. Null or
+ * absent leaves an optional field out, but for `headers`: absent keeps the stored ones as they are;
+ * null takes them all away; a record is exactly the headers kept, by name, a text setting a value
+ * and null keeping the value stored under that name. A change of a connection's provider, or of its
+ * address's origin, takes its key away unless one comes with it, and unsets every header value the
+ * change doesn't give again (one may hold a gateway's credential for the old server), so nothing
+ * stored goes to a server it wasn't given for. A connection that signs in takes no address, and an
+ * address with a name and password in it is refused.
+ */
+export interface ConnectionInput {
+  id?: string;
+  name: string;
+  provider: string;
+  auth: ConnectionAuth;
+  baseUrl?: string | null;
+  api?: string | null;
+  model?: string | null;
+  effort?: ConnectionEffort | null;
+  headers?: Record<string, string | null> | null;
+}
+
+/** A test call's outcome: how long it took, and the model that answered or the provider's words. */
+export type ConnectionTest = { ok: true; ms: number; model: string } | { ok: false; ms: number; error: string };
+
+/** A model a connection offers: its id, which is what is stored, and its name. */
+export interface ModelChoice {
+  id: string;
+  name: string;
+}
+
+/** A sign-in begun: the flow to finish, the address to open, and what to know first, in the runtime's words. */
+export interface SignInStart {
+  flow: string;
+  url: string;
+  note: string;
+}
+
+/** How the runtime stands with a provider's sign-in: signed in, until when its current token holds (the runtime renews it by itself when a call finds it ran out; null when not signed in), the flow open for it, if one is, and why its last flow ended without signing in (cancelled, left open too long, the provider's words, the port taken; null once a flow starts again or a sign-in holds). */
+export interface SignInState {
+  provider: SignInProvider;
+  signedIn: boolean;
+  until: number | null;
+  flow: string | null;
+  ended: string | null;
+}
+
+/** One of Lumiverse's connection profiles, as "Copy from Lumiverse" lists it: never its key. `provider` is Lumiverse's own name for it; `baseUrl` null where the profile names none. */
+export interface LumiverseConnection {
+  id: string;
+  name: string;
+  provider: string;
+  baseUrl: string | null;
+  model: string | null;
 }
 
 // ---------------------------------------------------------------- settings and texts
@@ -470,9 +677,9 @@ export interface ConnectionView {
 //   `title`): one of several shapes, chosen by that property.
 // - A number's `minimum`, `maximum` and `multipleOf`, and `x-unit`, its unit in words ("tokens",
 //   "ms", "USD per million tokens"); a number in "ms" also shows as a length of time.
-// - A string's `maxLength`, and `format`: "connection" (the id of one of the user's connections),
+// - A string's `maxLength`, and `format`: "connection" (the id of one of the runtime's connections),
 //   "model" (a model's name: the page suggests the models of the connection the same object names
-//   in its `format: "connection"` property, read with `lah.models.list`), "multiline" (text of
+//   in its `format: "connection"` property, read with `lah.connections.models`), "multiline" (text of
 //   several lines).
 // - An array's `items`: choices (`enum` or `oneOf` of `const`) with `uniqueItems`, a set of them
 //   ticked; strings, a list the user adds to and removes from.
@@ -595,6 +802,8 @@ export interface SessionView {
   asked?: number | null;
   /** A rollback holds the notes as they are: they aren't summarized again until they have grown by Settings' margin, or the user asks. Absent: the backend doesn't say. */
   held?: boolean;
+  /** The session was read from the extension's storage before the runtime said it had sent everything it saved: why, and that what is shown may lack the newest. Absent: it had. */
+  behind?: string;
 }
 
 export interface TurnsPage {
@@ -961,6 +1170,111 @@ export interface HomeView {
   last: LastTurn | null;
 }
 
+/**
+ * A runtime's working store as Runtime → System shows it: the core's documents and blobs on the
+ * runtime's own disk, this extension's storage as their mirror. Whether it is open (it may read and
+ * save now); whether it keeps its own copy (`mode`: `held`), works without one straight on the
+ * storage (`direct`: another runtime, `holder`, keeps the storage; `lost`: since it lost it, to whom
+ * and with how many changes the storage never had), or waits to know which (`waiting`, `opening`);
+ * how many paths the storage doesn't have as they stand there and since when (null: none wait), the
+ * storage's last failure, when it last took a change, the bytes on the runtime's disk (`counting`:
+ * still being counted), the last time this runtime threw its copy away for the storage's, and the
+ * changes the storage refused for good, the latest first.
+ */
+export interface StoreStateView {
+  open: boolean;
+  mode: "waiting" | "opening" | "held" | "direct";
+  holder: string | null;
+  lost: { at: number; to: string | null; dropped: number } | null;
+  waiting: number;
+  behindSince: number | null;
+  lastError: { words: string; at: number } | null;
+  lastSent: number | null;
+  bytes: number;
+  counting: boolean;
+  takeover: { from: string | null; at: number; dropped: number } | null;
+  refused: { name: string; doc: boolean; words: string; at: number }[];
+}
+
+/** A chat or a world book the runtime's copy keeps, as Runtime → Chat data shows it. */
+export interface ChatDataKept {
+  id: string;
+  /** Where its rows were read from: `http` (Lumiverse, as the runtime's signed-in user) or `database` (Lumiverse's own file). */
+  from: string;
+  /** Its messages, or its entries. */
+  rows: number;
+  chars: number;
+  /** When it was last read whole, and why. */
+  read: { at: number; why: string };
+  /** When it was last found current, by a read or a check. */
+  checkedAt: number;
+  /** What that last read or check could see, and what it couldn't (null: all an agent reads of it). */
+  check: { saw: string; missed: string | null };
+  /** Why it is to be read again before it is next used; null: it is current. */
+  stale: string | null;
+}
+
+/** One read the database reader made, as it reports it. */
+export interface ChatDataReaderRead {
+  at: number;
+  what: string;
+  rows: number;
+  chars: number;
+  ms: number;
+  outcome: string;
+}
+
+/**
+ * The runtime's copy of chat and lore as Runtime → Chat data shows it for one linked runtime: where
+ * the agents' reads of chats and world books are answered now and why, the copy's source and why,
+ * the database reader's own state where the operator switched it on for this runtime, the runtime's
+ * sign-in to Lumiverse where it needs renewing, what the copy holds (each chat's and book's last read
+ * and why, what its last check could and couldn't see), what it found too large to keep beside all it
+ * may keep and the runtime's memory limit, the latest reads whole, every read it sent to this
+ * extension instead and why, and Lumiverse's events heard with every one found lost on the way.
+ */
+export interface ChatDataView {
+  /** `copy`: answered from the runtime's copy, by this extension wherever the copy can't vouch for one; `link`: every one by this extension. */
+  road: "copy" | "link";
+  /** Why, in plain words. */
+  why: string;
+  /** The copy's source now: `database` or `http`; null without a copy. */
+  source: string | null;
+  sourceWhy: string | null;
+  /** Words for the runtime's sign-in to Lumiverse when it needs renewing; null while it holds. */
+  signIn: string | null;
+  /** The direct database reader: null where it isn't switched on for this runtime. */
+  reader: { path: string; on: boolean; why: string | null; open: boolean; schema: { checkedAt: number | null; matches: boolean | null; difference: string | null }; lastRead: ChatDataReaderRead | null; lastCheck: ChatDataReaderRead | null } | null;
+  /** Characters kept and the most that may be, beside the runtime's memory limit and what holds it there. */
+  memory: { kept: number; most: number; limit: string; note: string | null };
+  chats: ChatDataKept[];
+  books: ChatDataKept[];
+  /** Found larger than all the copy may keep: read from this extension every time. */
+  tooLarge: { chats: { id: string; chars: number }[]; books: { id: string; chars: number }[] };
+  /** The latest reads whole, the newest last. */
+  reads: { at: number; what: "chat" | "book"; id: string; why: string; outcome: string }[];
+  /** Reads sent to this extension because the copy couldn't vouch for its answer: how many in all, and the latest, the newest last. */
+  fallbacks: { total: number; latest: { at: number; what: "chat" | "book"; id: string; why: string }[] };
+  /**
+   * Reads sent to this extension because one of Lumiverse's routes the copy reads didn't answer as the
+   * copy expects (they are no interface Lumiverse promises to keep): how many in all, and the latest,
+   * the newest last, each with the route, what it answered, and until when the copy asks it nothing
+   * (null: it is asked again at the next read).
+   */
+  routes: { total: number; latest: { at: number; what: "chat" | "book"; id: string; why: string; route: string; status: number; until: number | null }[] };
+  /** Lumiverse's events heard since the runtime started, and the times one was found lost on the way, when the copy was read again whole. */
+  events: { heard: number; gaps: number; lastGap: { at: number; why: string } | null };
+}
+
+/** The direct database reader's switch, as the user's page is shown it: only the operator is shown it, and only to them is the file named. */
+export interface DatabaseSwitchView {
+  /** The user is this Lumiverse's operator: the switch is theirs alone. */
+  operator: boolean;
+  on: boolean;
+  /** Lumiverse's database file; null for anyone but the operator, and where it can't be told from where the extension is installed. */
+  path: string | null;
+}
+
 // ---------------------------------------------------------------- lore (§24.1 to §24.5)
 //
 // These are core's own shapes (`src/core/recall/shapes.ts`) under the names the pages use: the
@@ -1146,6 +1460,8 @@ export interface UiRequests {
   "lah.chat.story.get": { body: { chatId: string }; result: { story: ChatStoryView } };
   /** The chat's own choice, whole: each member given stands over Settings for this chat, each left out follows them. A member the extension that answers the chat set is its to set: the chat's choice of it is kept, and doesn't hold while the extension's word does. */
   "lah.chat.story.set": { body: { chatId: string; story: Partial<StorySetting> }; result: { story: ChatStoryView } };
+  /** Who leads the chat's replies, as the extension that answers this backend's chats claims it; null where it doesn't claim the chat, or there is no such extension (LumiAH's main agent leads). */
+  "lah.chat.lead.get": { body: { chatId: string }; result: { lead: ChatLeadView | null } };
   /** Opens a live view (`StreamId`): its latest turn, or null when it has had none since the extension started; from then on the page hears `lah.live` and `lah.live.delta` for it. */
   "lah.live.open": { body: { stream: StreamId }; result: { live: LiveView | null; next: number | null } };
   /** A turn's events from `from` on, while it is the stream's live turn. */
@@ -1181,8 +1497,6 @@ export interface UiRequests {
    * kept or, when the settings refuse one (`invalid`, with `problems`), none.
    */
   "lah.settings.set": { body: { set: { path: SettingPath; value: JsonValue }[]; reset: SettingPath[] }; result: { settings: SettingsView } };
-  /** The models a connection offers, as its provider lists them (null: the user's default connection); `unavailable` where Lumiverse can't ask. */
-  "lah.models.list": { body: { connectionId: string | null }; result: { models: string[] } };
   /** The user's own text for `id`. */
   "lah.text.set": { body: { id: string; text: string }; result: { texts: TextsView } };
   /** Back to `id`'s default. */
@@ -1199,6 +1513,12 @@ export interface UiRequests {
   "lah.relay": { body: { op: "rotate" | "forget"; relay: string }; result: { runtime: RuntimeView } };
   /** Closes Lumiverse's drawer for this user, so the chat shows (on a phone the drawer covers it, and a page has no way to close it itself). `closed` false where the host has no such call. */
   "lah.drawer.close": { body: Record<string, never>; result: { closed: boolean } };
+  /** How one of the user's runtimes is run and kept, as it says itself: its build, its memory limit and what holds it there, whether it updates by itself, an update that waits and why, what is under way. Asked of that runtime alone: refused `unavailable` while it isn't linked. */
+  "lah.runtime.service.get": { body: { relay: string }; result: { service: ServiceView } };
+  /** Changes how it is kept: its memory limit, whether it updates by itself; `restart` restarts it where a limit holds only once it does. What the change did: it holds now (`none`), once it restarts (`needed`), or it is restarting. */
+  "lah.runtime.service.set": { body: { relay: string; memory?: string; autoUpdate?: boolean; restart?: boolean }; result: { service: ServiceView; restart: "none" | "needed" | "restarting" } };
+  /** Takes the update that waits, now, whatever is under way: what was (`cut`) ends with the restart. */
+  "lah.runtime.update.apply": { body: { relay: string }; result: { service: ServiceView; cut: UnderWay } };
 
   /** An area of the workspace as it stands (§11). `chatId` null reads the user's own area without a chat; the chat's area and `learned/` need one. */
   "lah.ws.list": { body: { chatId: string | null; area: WorkspaceArea }; result: WorkspaceView };
@@ -1278,6 +1598,14 @@ export interface UiRequests {
   // -------------------------------- home
   /** What the first screen shows of a chat (null: none is open): the chat with its switch, and its latest turn. */
   "lah.home.get": { body: { chatId: string | null }; result: HomeView };
+  /** A linked runtime's working store, by the runtime's relay id (Runtime → System). */
+  "lah.runtime.store": { body: { relay: string }; result: { state: StoreStateView } };
+  /** A linked runtime's copy of chat and lore, by the runtime's relay id, with the database reader's switch as this user is shown it (Runtime → Chat data). */
+  "lah.runtime.chatdata": { body: { relay: string }; result: { state: ChatDataView; database: DatabaseSwitchView } };
+  /** The operator switches the direct database reader on or off for their own runtimes; refused (`forbidden`) to anyone else. */
+  "lah.runtime.database": { body: { on: boolean }; result: { database: DatabaseSwitchView } };
+  /** Runtime → Timings: this extension's end of the timing log and each linked runtime's, one ask each, never one a row. */
+  "lah.timings.get": { body: Record<string, never>; result: TimingsPage };
 
   // -------------------------------- lore (§24)
   /** A chat's books and entries, each entry with its state for the last turn, and search by meaning as it stands. */
@@ -1298,6 +1626,37 @@ export interface UiRequests {
   // -------------------------------- learning a story (§22)
   /** The learning of a chat's story: its job, its plan, how far it has come, and what to start one with. */
   "lah.story.get": { body: { chatId: string }; result: StoryView };
+
+  // -------------------------------- the runtime's connections (PI-BUILD-PLAN §4.3)
+  /** The runtime's connections, which is the default, and the providers it offers. */
+  "lah.connections.list": { body: ToRuntime; result: ConnectionsView };
+  /**
+   * Adds a connection or changes one, whole, with its key: `key` a new one (it goes to the runtime
+   * and never comes back), null takes the one there is away, absent keeps it. `create` makes it under
+   * `connection.id` (a copy of one of Lumiverse's connections, which keeps its id). The first
+   * connection becomes the default. Refused with `invalid`, in words, where the runtime refuses what
+   * it holds. Answers the connection saved and the connections as they then stand.
+   */
+  "lah.connections.save": { body: ToRuntime & { connection: ConnectionInput; key?: string | null; create?: true }; result: { saved: RuntimeConnection; view: ConnectionsView } };
+  /** Takes a connection away, with its key; removing the default leaves none until another is chosen. */
+  "lah.connections.remove": { body: ToRuntime & { id: string }; result: ConnectionsView };
+  /** Makes a connection the default, or (null) none. */
+  "lah.connections.default": { body: ToRuntime & { id: string | null }; result: ConnectionsView };
+  /** One tiny call on a connection. */
+  "lah.connections.test": { body: ToRuntime & { id: string }; result: { test: ConnectionTest } };
+  /** The models a connection offers (null: the default), or a provider's own list before a connection of it is saved (none for a compatible server, whose list needs its address): for a picker. */
+  "lah.connections.models": { body: ToRuntime & ({ connectionId: string | null } | { provider: string }); result: { models: ModelChoice[] } };
+  /** Lumiverse's connection profiles, to copy from: never a key. The backend answers it itself, with no runtime. */
+  "lah.connections.lumiverse": { body: Record<string, never>; result: { connections: LumiverseConnection[] } };
+  /** Begins a sign-in: the address to open and what to know first. One flow at a time for a provider: beginning another ends the one open. */
+  "lah.signin.start": { body: ToRuntime & { provider: SignInProvider }; result: SignInStart };
+  /** Finishes a flow with what the user pasted back: the code the provider showed, or the address the browser was sent to. Refused with `invalid`, in the provider's words, where it fails. Answers the sign-in and the connections as they then stand. */
+  "lah.signin.finish": { body: ToRuntime & { flow: string; code: string }; result: { state: SignInState; view: ConnectionsView } };
+  "lah.signin.cancel": { body: ToRuntime & { flow: string }; result: { cancelled: true } };
+  /** Signs the runtime out of a provider: its tokens are forgotten. */
+  "lah.signin.out": { body: ToRuntime & { provider: SignInProvider }; result: { state: SignInState; view: ConnectionsView } };
+  /** How the runtime stands with a provider's sign-in: a page asks while a flow is open, since OpenAI's can finish by itself. */
+  "lah.signin.state": { body: ToRuntime & { provider: SignInProvider }; result: SignInState };
 }
 
 /** What one job may spend (DESIGN §22), as core has it: each member given stands in place of Settings' limit for each job (null: no limit). */
@@ -1381,6 +1740,16 @@ const isFilePath = (v: unknown): v is string => typeof v === "string" && v.lengt
 const inArea = (r: Fields): boolean => isArea(r.area) && (r.area === "user" ? isIdOrNull(r.chatId) : isId(r.chatId));
 const isPage = (r: Fields): boolean => isIdOrNull(r.cursor) && isCount(r.limit) && r.limit > 0;
 const isChoice = (v: unknown): v is ApprovalChoice => v === "allow" || v === "ask";
+const AUTHS: Readonly<Record<string, true>> = { key: true, signin: true, none: true };
+const EFFORTS: Readonly<Record<string, true>> = { off: true, minimal: true, low: true, medium: true, high: true, xhigh: true, max: true };
+const isSignInProvider = (v: unknown): v is SignInProvider => v === "anthropic" || v === "openai";
+/** Text a connection holds (its name, address, model, a header's value): bounded like a file's path, since none grows with use. Whether it is one the runtime takes is the runtime's to say, in words. */
+const isShort = (v: unknown): v is string => typeof v === "string" && v.length <= 1024;
+const isShortOrGone = (v: unknown): boolean => v === undefined || v === null || isShort(v);
+/** What a user pastes for a provider (a key, a sign-in's code or the address it sent the browser to): bounded well past any of them. */
+const isPasted = (v: unknown): v is string => typeof v === "string" && v.length > 0 && v.length <= 8192;
+/** The runtime a request about connections names, where it names one. */
+const toRuntime = (r: Fields): boolean => r.relay === undefined || isId(r.relay);
 
 /** Each request's body fields, checked. */
 const BODY: { [K in UiRequestType]: (r: Fields) => boolean } = {
@@ -1390,6 +1759,7 @@ const BODY: { [K in UiRequestType]: (r: Fields) => boolean } = {
   "lah.chat.takeover": (r) => isId(r.chatId),
   "lah.chat.story.get": (r) => isId(r.chatId),
   "lah.chat.story.set": (r) => isId(r.chatId) && isRecord(r.story) && Object.entries(r.story).every(([member, value]) => STORY_MEMBERS.includes(member as keyof StorySetting) && storyValue(member as keyof StorySetting, value)),
+  "lah.chat.lead.get": (r) => isId(r.chatId),
   "lah.live.open": (r) => isId(r.stream),
   "lah.live.events": (r) => isId(r.stream) && isId(r.turn) && isSeq(r.from),
   "lah.live.close": (r) => isId(r.stream),
@@ -1406,12 +1776,14 @@ const BODY: { [K in UiRequestType]: (r: Fields) => boolean } = {
   "lah.session.rollback": (r) => isId(r.chatId) && isId(r.messageId) && isCount(r.swipe),
   "lah.session.summarize": (r) => isId(r.chatId),
   "lah.settings.set": (r) => Array.isArray(r.set) && r.set.every((s) => isRecord(s) && isPath(s.path) && s.value !== undefined) && Array.isArray(r.reset) && r.reset.every(isPath),
-  "lah.models.list": (r) => r.connectionId === null || isId(r.connectionId),
   "lah.text.set": (r) => isId(r.id) && typeof r.text === "string",
   "lah.text.reset": (r) => isId(r.id),
   "lah.key": (r) => r.op === "mint" || r.op === "forget",
   "lah.relay": (r) => (r.op === "rotate" || r.op === "forget") && isId(r.relay),
   "lah.drawer.close": () => true,
+  "lah.runtime.service.get": (r) => isId(r.relay),
+  "lah.runtime.service.set": (r) => isId(r.relay) && (r.memory === undefined || (typeof r.memory === "string" && r.memory.length <= 32)) && (r.autoUpdate === undefined || typeof r.autoUpdate === "boolean") && (r.restart === undefined || typeof r.restart === "boolean"),
+  "lah.runtime.update.apply": (r) => isId(r.relay),
   "lah.ws.list": (r) => inArea(r),
   "lah.ws.read": (r) => inArea(r) && isFilePath(r.path) && (r.version === undefined || isId(r.version)),
   "lah.ws.write": (r) => inArea(r) && isFilePath(r.path) && isText(r.text) && isIdOrNull(r.base),
@@ -1446,6 +1818,10 @@ const BODY: { [K in UiRequestType]: (r: Fields) => boolean } = {
   "lah.upkeep.get": () => true,
   "lah.upkeep.sweep": () => true,
   "lah.home.get": (r) => isIdOrNull(r.chatId),
+  "lah.runtime.store": (r) => isId(r.relay),
+  "lah.runtime.chatdata": (r) => isId(r.relay),
+  "lah.runtime.database": (r) => typeof r.on === "boolean",
+  "lah.timings.get": () => true,
   "lah.lore.get": (r) => isId(r.chatId),
   "lah.lore.entry": (r) => isId(r.chatId) && isId(r.entryId),
   "lah.lore.search": (r) => isId(r.chatId) && Array.isArray(r.queries) && r.queries.length > 0 && r.queries.every((q) => isText(q) && q.trim() !== "") && (r.limit === undefined || (isCount(r.limit) && r.limit > 0)),
@@ -1453,6 +1829,24 @@ const BODY: { [K in UiRequestType]: (r: Fields) => boolean } = {
   "lah.chronicle.get": (r) => isId(r.chatId),
   "lah.chronicle.cited": (r) => isId(r.chatId) && Array.isArray(r.citations) && r.citations.length > 0 && r.citations.every(isId),
   "lah.story.get": (r) => isId(r.chatId),
+  "lah.connections.list": toRuntime,
+  "lah.connections.save": (r) => {
+    const c = r.connection;
+    if (!isRecord(c) || !(c.id === undefined || isId(c.id)) || !isShort(c.name) || !isId(c.provider) || typeof c.auth !== "string" || !Object.hasOwn(AUTHS, c.auth)) return false;
+    if (!isShortOrGone(c.baseUrl) || !isShortOrGone(c.api) || !isShortOrGone(c.model) || !(c.effort === undefined || c.effort === null || (typeof c.effort === "string" && Object.hasOwn(EFFORTS, c.effort)))) return false;
+    if (!(c.headers === undefined || c.headers === null || (isRecord(c.headers) && Object.entries(c.headers).every(([name, value]) => name.length > 0 && name.length <= 256 && (value === null || isPasted(value)))))) return false;
+    return toRuntime(r) && (r.key === undefined || r.key === null || isPasted(r.key)) && (r.create === undefined || (r.create === true && isId(c.id)));
+  },
+  "lah.connections.remove": (r) => toRuntime(r) && isId(r.id),
+  "lah.connections.default": (r) => toRuntime(r) && isIdOrNull(r.id),
+  "lah.connections.test": (r) => toRuntime(r) && isId(r.id),
+  "lah.connections.models": (r) => toRuntime(r) && (r.provider === undefined ? isIdOrNull(r.connectionId) : isId(r.provider) && r.connectionId === undefined),
+  "lah.connections.lumiverse": () => true,
+  "lah.signin.start": (r) => toRuntime(r) && isSignInProvider(r.provider),
+  "lah.signin.finish": (r) => toRuntime(r) && isId(r.flow) && isPasted(r.code),
+  "lah.signin.cancel": (r) => toRuntime(r) && isId(r.flow),
+  "lah.signin.out": (r) => toRuntime(r) && isSignInProvider(r.provider),
+  "lah.signin.state": (r) => toRuntime(r) && isSignInProvider(r.provider),
 };
 
 /**

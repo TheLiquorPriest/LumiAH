@@ -66,7 +66,7 @@ export interface RuntimeTuning {
   progressMs: number;
   /** A stream from the extension with nothing in it this long is given up. */
   stallMs: number;
-  /** How long the extension may stay out of reach under a stream or a turn before it ends. */
+  /** How long the extension may stay out of reach under a stream or a turn before it ends; and each request of a reply, a job or a page waits as long for the link to come up. */
   lostMs: number;
   /** How often the runtime pings while it reads streams or answers turns, naming them. */
   probeMs: number;
@@ -76,17 +76,11 @@ export interface RuntimeTuning {
   silentMs: number;
   /** After Lumiverse reports an error in the extension, how long silence makes it a crash. */
   crashMs: number;
-  /** How long a gap in a stream waits before its chunks are asked for again. */
-  resendMs: number;
-  /** How many times a gap is asked about before its stream is given up. */
-  resendTries: number;
-  /** Chunks between acknowledgements while a stream runs (its terminal chunk is always acknowledged). */
-  ackEvery: number;
   /** Each link request's wait for its answer. */
   requestMs: number;
   /** How often the event socket is pinged while open: Lumiverse closes one idle for two minutes. */
   socketPingMs: number;
-  /** How long `GET /v1/models` waits for the link to come up. */
+  /** How long `GET /v1/models`, and the check of the key of a request with no turn tag, wait for the link to come up. */
   modelsWaitMs: number;
   /** The largest request body the runtime reads from Lumiverse. */
   maxBodyBytes: number;
@@ -117,6 +111,18 @@ export interface RuntimeTuning {
   joinMaxUnits: number;
   /** How long a frame's first parts wait for the rest. */
   partStaleMs: number;
+  /** How long the runtime waits for this extension's storage to take what it saved, wherever something waits on it (a reply's record, a page that reads it, the runtime stopping). Past it that goes on without it: nothing is lost. */
+  storeWaitMs: number;
+  /** How long each request the runtime makes to Lumiverse over HTTP waits for its answer (finding the extension, the socket's ticket, the loopback connection, stopping a reply). */
+  lumiverseMs: number;
+  /** How long each request of the runtime's copy of chat and lore to Lumiverse waits for its answer; past it the read is given up and asked of this extension instead. */
+  copyReadMs: number;
+  /** The most characters of chats and world books the runtime's copy keeps in memory; a chat larger than that alone is read from this extension every time. 0 keeps none. */
+  copyChars: number;
+  /** How long testing one of the runtime's connections, or reading a server's list of its models, waits for the provider's answer. */
+  providerMs: number;
+  /** How long a model's answer, once begun, may go with nothing from its provider's server before the call is ended (and made again, as a dropped stream is); 0 for no limit. */
+  answerSilentMs: number;
 }
 
 /** What the transport does, as the user set it. */
@@ -134,8 +140,6 @@ export interface TransportSettings {
     known: number;
   };
   streams: {
-    /** How long a stream's text waits to be sent with what follows it. */
-    coalesceMs: number;
     /** How long a finished stream's chunks are kept for an acknowledgement that never came. */
     keepMs: number;
   };
@@ -158,6 +162,10 @@ export interface TransportSettings {
     askMs: number;
     /** How much of a job's opening a notice keeps. */
     noticeChars: number;
+    /** How long a page that reads what the runtime saved (Sessions, a transcript, a call's prompt) waits for the runtime to finish sending it to this extension's storage, before it shows what the storage holds and says so. */
+    settleMs: number;
+    /** How long a page's request waits on the proxy road alone (Lumiverse's proxy to the runtime's loopback server) before it is sent over the link as well; whichever road answers first is taken. At most `PROXY_HOP_MS`. */
+    proxyMs: number;
   };
   link: {
     /** How long without a hello or a ping before a runtime shows as quiet. */
@@ -213,9 +221,6 @@ export const RUNTIME_DEFAULTS: Readonly<RuntimeTuning> = Object.freeze({
   heartbeatMs: 60_000,
   silentMs: 45_000,
   crashMs: 10_000,
-  resendMs: 3_000,
-  resendTries: 5,
-  ackEvery: 64,
   requestMs: 60_000,
   socketPingMs: 45_000,
   modelsWaitMs: 10_000,
@@ -235,18 +240,25 @@ export const RUNTIME_DEFAULTS: Readonly<RuntimeTuning> = Object.freeze({
   stopAskMs: 5_000,
   joinMaxUnits: 32 * 1024 * 1024,
   partStaleMs: 60_000,
+  storeWaitMs: 60_000,
+  lumiverseMs: 60_000,
+  copyReadMs: 15_000,
+  copyChars: 32_000_000,
+  providerMs: 60_000,
+  // A model thinking between the pieces it shows, and a busy server, stay well inside five minutes; their pings and keep-alives count as something.
+  answerSilentMs: 5 * 60_000,
 });
 
 export const TRANSPORT_DEFAULTS: Readonly<TransportSettings> = Object.freeze({
   history: Object.freeze({ keep: "last" as const, count: 40 }),
   // The interceptor is never a required one and the manifest asks Lumiverse for five minutes, so no wait here fails a reply. The check stays short all the same: it is made before LumiAH knows a prompt is its own, so a reply of a chat that isn't answered here waits it out too, and gets nothing for the wait.
   tags: Object.freeze({ lifeMs: 2 * 60 * 60_000, held: 256, checkMs: 3_000, known: 1024 }),
-  streams: Object.freeze({ coalesceMs: 40, keepMs: 10 * 60_000 }),
+  streams: Object.freeze({ keepMs: 10 * 60_000 }),
   connections: Object.freeze({ oneToolAtATime: Object.freeze([]) as unknown as string[] }),
   // 30 seconds is Lumiverse's own default for a call it is given no time for.
   mcp: Object.freeze({ callMs: 30_000 }),
   jobs: Object.freeze({ paused: false }),
-  pages: Object.freeze({ noticesKept: 200, askMs: 30_000, noticeChars: 400 }),
+  pages: Object.freeze({ noticesKept: 200, askMs: 30_000, noticeChars: 400, settleMs: 5_000, proxyMs: 10_000 }),
   // A runtime sends a large frame's parts one after another, so one account seldom has two frames under way: eight, and twice the largest frame, leave room without letting an account fill the extension's memory.
   link: Object.freeze({ quietMs: 120_000, relays: 8, connectionMs: 15_000, joinMaxUnits: 32 * 1024 * 1024, partStaleMs: 60_000, joinFrames: 8, joinHeldUnits: 64 * 1024 * 1024 }),
   live: Object.freeze({ events: 20_000, page: 500, chats: 32, lostMs: 30_000 }),
@@ -263,10 +275,12 @@ const DAY_MS = 24 * 60 * 60_000;
 
 /**
  * Settings an earlier build had and this one took away, by path within the section: built-in mode's
- * own group (it runs on LumiAH's `main` branch, not here). A value a user kept there names nothing
- * now, and the settings' store passes over it quietly rather than refuse every later change for it.
+ * own group (it runs on LumiAH's `main` branch, not here), and what a model call's stream had over
+ * the link (its text held back, a gap asked for again, acknowledgements in batches), which went with
+ * the model calls to the runtime's own connections. A value a user kept there names nothing now, and
+ * the settings' store passes over it quietly rather than refuse every later change for it.
  */
-export const TRANSPORT_RETIRED: readonly (readonly string[])[] = [["builtin"]];
+export const TRANSPORT_RETIRED: readonly (readonly string[])[] = [["builtin"], ["streams", "coalesceMs"], ["runtime", "resendMs"], ["runtime", "resendTries"], ["runtime", "ackEvery"]];
 
 /** The section's schema, each setting in the order the Settings page shows it. */
 export const TRANSPORT_SCHEMA: JsonObject = {
@@ -307,17 +321,16 @@ export const TRANSPORT_SCHEMA: JsonObject = {
     streams: {
       type: "object",
       title: "Streams",
-      description: "How a model call's answer travels from this extension to the runtime.",
+      description: "How the outcome of a tool run in this extension, or of a tool call held for your word, travels from this extension to the runtime.",
       additionalProperties: false,
       properties: {
-        coalesceMs: ms("Text held back", "How long a stream's text waits to be sent with what follows it. Lower shows text sooner in more, smaller pieces.", 0, 2_000),
         keepMs: ms("Unacknowledged chunks kept", "How long a finished stream's chunks are kept for an acknowledgement that never came.", 10_000, CEILINGS.streamKeepMs),
       },
     },
     connections: {
       type: "object",
       title: "Connections",
-      description: "What LumiAH must know of a connection that Lumiverse doesn't say.",
+      description: "The agents run on the runtime's own connections (Runtime → Connections): an agent with none of its own, or whose connection is gone, runs on the runtime's default. What LumiAH must know of a connection that its provider doesn't say.",
       additionalProperties: false,
       properties: {
         oneToolAtATime: {
@@ -357,6 +370,9 @@ export const TRANSPORT_SCHEMA: JsonObject = {
         noticesKept: whole("Notices kept", "How many notices of jobs (finished, failed, interrupted, waiting on you) are kept until you dismiss them. Past it the oldest go first.", 10, 2_000),
         askMs: ms("Runtime wait", "How long a page waits for the runtime to do what it asked of it (write a file, start a job, read a list) before it says the runtime didn't answer.", 1_000, 600_000),
         noticeChars: whole("Notice length", "How much of a job's opening a notice keeps. The job's page shows it whole.", 40, 4_000, "characters"),
+        settleMs: ms("Wait for the runtime's saves", "How long a page that reads what your runtime saved (Sessions, a turn's transcript, a call's prompt) waits for the runtime to finish sending it to this extension's storage. Past it the page shows what the storage holds, and says so.", 500, 60_000),
+        // Lumiverse's proxy waits 30 seconds for a hop, whatever it is asked: no longer here either.
+        proxyMs: ms("Proxy road wait", "How long a page's request waits on the faster road (Lumiverse's own proxy to your runtime, used once you grant the permission cors_proxy) before it is sent over the link as well. Whichever answers first is taken, and the runtime does the work once. At most 30 seconds: Lumiverse's proxy waits no longer.", 1_000, 30_000),
       },
     },
     link: {
@@ -415,18 +431,15 @@ export const TRANSPORT_SCHEMA: JsonObject = {
       properties: {
         commentMs: ms("Keep-alive comment", "A comment goes out on a reply's stream after this much silence, so nothing between the runtime and Lumiverse closes it.", 1_000, 60_000),
         progressMs: ms("Progress line", "A progress line is restated in the thinking block after this long without a token, so Lumiverse sees the reply alive.", 5_000, 10 * 60_000),
-        stallMs: ms("Stream stalled after", "A model call with nothing from this extension for this long is given up.", 10_000, DAY_MS),
+        stallMs: ms("Stream stalled after", "A tool's run in this extension with nothing from it for this long is given up. A tool call held for your word waits as long as it takes.", 10_000, DAY_MS),
         lostMs: ms("Extension lost after", "How long this extension may stay out of the runtime's reach during a reply before the reply ends.", 5_000, 60 * 60_000),
         probeMs: ms("Ping while working", "How often the runtime pings while it answers a reply.", 1_000, 5 * 60_000),
         heartbeatMs: ms("Ping while idle", "How often the runtime pings while it answers none.", 5_000, 60 * 60_000),
         silentMs: ms("Silent after", "How long a request may go unanswered, with nothing heard meanwhile, before this extension counts as silent.", 5_000, 60 * 60_000),
         crashMs: ms("Crashed after", "After Lumiverse reports an error in this extension, how long silence makes it a crash.", 1_000, 5 * 60_000),
-        resendMs: ms("Ask again after", "How long a gap in a stream waits before the missing chunk is asked for again.", 500, 60_000),
-        resendTries: whole("Times to ask again", "How many times a gap is asked about before its stream is given up.", 1, 50, "times"),
-        ackEvery: whole("Chunks per acknowledgement", "How many chunks of a stream go by between acknowledgements.", 1, 4096, "chunks"),
         requestMs: ms("Request wait", "How long each request to this extension waits for its answer.", 5_000, 60 * 60_000),
         socketPingMs: ms("Socket ping", "How often the runtime pings Lumiverse's event socket. Lumiverse closes one idle for two minutes.", 5_000, 110_000),
-        modelsWaitMs: ms("Model list wait", "How long the connection's model list waits for the link to come up.", 1_000, 5 * 60_000),
+        modelsWaitMs: ms("Model list wait", "How long the connection's model list, and the key check of a request with no turn tag, wait for the link to come up.", 1_000, 5 * 60_000),
         maxBodyBytes: whole("Largest request", "The largest request the runtime reads from Lumiverse. A larger one is refused: lower the connection's context size, or the history cutoff.", 64 * 1024, 64 * 1024 * 1024, "bytes"),
         drainMs: ms("Wait before restart", "How long setting the runtime up again waits for replies under way before it restarts it.", 0, 60 * 60_000),
         drainPollMs: ms("Restart poll", "How often it asks meanwhile.", 500, 60_000),
@@ -442,6 +455,12 @@ export const TRANSPORT_SCHEMA: JsonObject = {
         stopAskMs: ms("Wait for Lumiverse's Stop", "How long Lumiverse may take to answer when the runtime asks it to stop a reply you stopped in the Live page, before the runtime ends the reply itself.", 500, 60_000),
         joinMaxUnits: whole("Largest frame joined", "The largest frame the runtime puts together from parts.", 1024 * 1024, 256 * 1024 * 1024, "characters"),
         partStaleMs: ms("Parts kept", "How long the first parts of a frame wait for the rest.", 1_000, 60 * 60_000),
+        storeWaitMs: ms("Storage wait", "How long the runtime waits for this extension's storage to take what it saved, wherever something waits on it: a reply's record, a page that reads it, the runtime stopping. Past it that goes on without it. Nothing is lost: it stays on the runtime's disk and goes to the storage as soon as it can.", 1_000, 60 * 60_000),
+        lumiverseMs: ms("Lumiverse wait", "How long each request the runtime makes to Lumiverse over HTTP waits for its answer: finding this extension, opening its link, putting the key in the loopback connection, asking Lumiverse to stop a reply. Past it the request fails, and says so.", 1_000, 10 * 60_000),
+        copyReadMs: ms("Chat data wait", "How long each request the runtime makes to Lumiverse for its own copy of your chats and world books waits for its answer: a page of a chat's messages or of a book's entries, a check of a chat before an agent reads it. Past it that read is given up, and the agent's read is asked of this extension instead.", 1_000, 10 * 60_000),
+        copyChars: whole("Chat data kept", "The most characters of your chats and world books the runtime keeps in memory, so an agent reads them without asking this extension. What was used least recently goes first; a chat larger than this alone is read from this extension every time. 0 keeps none.", 0, 1_000_000_000, "characters"),
+        providerMs: ms("Provider wait", "How long testing one of the runtime's connections (Runtime → Connections), or reading a server's list of its models for a model picker, waits for the provider to answer. Past it the page says the provider didn't answer.", 1_000, 10 * 60_000),
+        answerSilentMs: ms("Silent answer ends after", "How long a model's answer, once it has begun, may go with nothing at all from its provider's server before the call is ended and made again, as a dropped stream is. Before its answer begins a model may still be reading a long prompt or thinking unseen: that is never cut short. 0: no limit.", 0, DAY_MS),
       },
     },
   },

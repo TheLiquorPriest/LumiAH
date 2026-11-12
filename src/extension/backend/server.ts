@@ -12,15 +12,17 @@ import { type Joined, PartJoiner, needsParts, partOf, splitFrame } from "../../l
 import { CEILINGS, TRANSPORT_DEFAULTS, type TransportSettings } from "../../link/settings";
 import { type Approvals, holdCall } from "./approvals";
 import type { Asks } from "./asks";
+import type { ProxyRoad } from "./proxy";
 import type { Chats } from "./chat";
+import type { CopyFeed } from "./copy";
 import type { Connections } from "./connections";
 import { randomHex } from "./docs";
 import { LinkRefused, wordsOf, wrongKey } from "./errors";
 import { type BackendExtension, callExtension, offerOf, type RemoteTools } from "./extension";
-import type { BackendIdentity } from "./identity";
+import { type BackendIdentity, linkedBackend } from "./identity";
 import type { JobsBoard } from "./jobs";
 import type { LiveBuffer } from "./live";
-import type { Models } from "./models";
+import type { Mirrors } from "./mirror";
 import type { Lore, Presets, Storage } from "./reads";
 import type { Recall } from "./recall";
 import type { RegistryStore } from "./registry";
@@ -36,23 +38,28 @@ export interface ServerDeps {
   registry: RegistryStore;
   settings: SettingsStore;
   streams: StreamRegistry;
-  models: Models;
   turns: Turns;
   chats: Chats;
   /** A chat as the core reads it, with what decides its story (§24.4), and what a claim on it is asked with. */
-  chatSwitch: Pick<ChatSwitch, "info" | "claimAsk" | "agentConnection">;
+  chatSwitch: Pick<ChatSwitch, "info" | "claimAsk">;
   /** The built-in agents this backend leaves out (`BackendOptions.withoutAgents`): handed to a runtime's core with the user's definitions. */
   without: readonly string[];
   storage: Storage;
+  /** Which runtime holds the user's mirror: told of each hello, and each write to the storage goes through it (mirror.ts). */
+  mirror: Mirrors;
   lore: Lore;
   presets: Presets;
   /** What the lore and history tools read of Lumiverse, and a chat's book (DESIGN §23, §24). */
   recall: Recall;
+  /** What the runtime's copy of chat and lore is told and asks (copy.ts). */
+  copy: CopyFeed;
   connections: Connections;
   live: LiveBuffer;
   tools: RemoteTools;
   approvals: Approvals;
   asks: Asks;
+  /** The asks' road through Lumiverse's proxy: each request's secret, as its runtime shows it, is what that road's asks carry (kept in memory only). */
+  road: Pick<ProxyRoad, "heard">;
   jobs: JobsBoard;
   /** What the extension LumiAH is built into supplies to the core; absent for LumiAH on its own. */
   extension: BackendExtension | undefined;
@@ -167,14 +174,15 @@ export class LinkServer {
     next(0);
   }
 
-  private answer(id: string, userId: string, session: string | undefined, body: unknown): void {
-    const frame: LinkResultFrame = { link: LINK, type: "result", id, body };
+  /** Answers a request; `took`: how long it was worked on here, in ms, which the runtime's timing log keeps. */
+  private answer(id: string, userId: string, session: string | undefined, body: unknown, took?: number): void {
+    const frame: LinkResultFrame = { link: LINK, type: "result", id, body, ...(took !== undefined ? { took } : {}) };
     if (session === undefined) this.host.frontend.send(frame, userId);
     else this.send(frame, userId, session, id);
   }
 
-  private refuse(id: string, userId: string, session: string | undefined, code: LinkErrorCode, message: string): void {
-    const frame: LinkErrorFrame = { link: LINK, type: "error", id, code, message };
+  private refuse(id: string, userId: string, session: string | undefined, code: LinkErrorCode, message: string, took?: number): void {
+    const frame: LinkErrorFrame = { link: LINK, type: "error", id, code, message, ...(took !== undefined ? { took } : {}) };
     this.host.frontend.send(frame, userId, session);
   }
 
@@ -235,8 +243,8 @@ export class LinkServer {
       if (joiner.waiting === 0) this.joiners.delete(userId);
       if ("waiting" in joined) return true;
       if ("refused" in joined) {
-        // Past the bound all accounts share nothing of the sender's is too large: the extension has no room just now.
-        this.refuse(joined.id, userId, session, joined.over === "shared" ? "unavailable" : "too_large", `${joined.refused} ${joinAdvice(joined.over, this.deps.identity.name)}`);
+        // Only a frame larger than the largest joined is too large, however often it is sent. Past what the account's other frames under way, or every account's, leave room for, the extension has no room just now: that passes once they are done, and the sender may send it again.
+        this.refuse(joined.id, userId, session, joined.over === "frame" ? "too_large" : "unavailable", `${joined.refused} ${joinAdvice(joined.over, this.deps.identity.name)}`);
         return true;
       }
       try {
@@ -260,15 +268,17 @@ export class LinkServer {
       return true;
     }
     const request = read.request as unknown as Fields & { id: string; type: LinkRequestType };
+    const at = this.deps.now();
     try {
       // A runtime's pushes and answers go to its own socket: without the session a frame came from, there is nowhere to send them.
       if (session === undefined) throw new LinkRefused("unavailable", "This Lumiverse doesn't say which connection a runtime's requests come from, so LumiAH can't answer them: update Lumiverse.");
-      this.answer(request.id, userId, session, await this.serve(request.type, request, userId, session));
+      const body = await this.serve(request.type, request, userId, session);
+      this.answer(request.id, userId, session, body, this.deps.now() - at);
     } catch (error) {
-      if (error instanceof LinkRefused) this.refuse(request.id, userId, session, error.code, error.message);
+      if (error instanceof LinkRefused) this.refuse(request.id, userId, session, error.code, error.message, this.deps.now() - at);
       else {
         this.host.log("error", `[LumiAH] ${request.type} failed: ${wordsOf(error)}`);
-        this.refuse(request.id, userId, session, "internal", `LumiAH couldn't do that (${wordsOf(error)}).`);
+        this.refuse(request.id, userId, session, "internal", `LumiAH couldn't do that (${wordsOf(error)}).`, this.deps.now() - at);
       }
     }
     return true;
@@ -285,14 +295,17 @@ export class LinkServer {
     if (type === "register") return d.relays.register(r, userId);
     const caller: Caller = await d.relays.authenticate(r.secret, userId, session);
     const relay = caller.relay.id;
+    // The secret checked out: it is what this runtime's asks carry on the road through Lumiverse's proxy.
+    d.road.heard(userId, relay, session, r.secret as string);
     switch (type) {
       case "hello": {
         await d.relays.hello(caller, r);
-        return { relay, version: LINK_VERSION, build: d.build, lost: d.streams.resume(userId, relay, openOf(r.open)), settings: await d.settings.revision(userId), extension: offerOf(d.extension), backend: { name: d.identity.name, connection: d.identity.connectionName } };
+        return { relay, version: LINK_VERSION, build: d.build, lost: d.streams.resume(userId, relay, openOf(r.open)), settings: await d.settings.revision(userId), extension: offerOf(d.extension), backend: linkedBackend(d.identity), copy: await d.copy.offer(userId, relay), mirror: await d.mirror.hello(caller, r.mirror, r.report) };
       }
       case "ping": {
         await d.relays.ping(caller, r);
-        return { lost: d.streams.missing(userId, relay, strings(r.streams)) };
+        void d.copy.pinged(userId, relay);
+        return { lost: d.streams.missing(userId, relay, strings(r.streams)), told: d.copy.toldTo(userId, relay) };
       }
       case "models": {
         if (typeof r.key !== "string" || !(await d.registry.keyIs(userId, r.key))) throw wrongKey(d.identity.name);
@@ -302,14 +315,8 @@ export class LinkServer {
         return d.turns.begin(userId, relay, r.key, r.tag, r.request);
       case "turn.commit":
         return { anchoring: await d.turns.commit(userId, r.turn, r.chat, r.target, r.record) };
-      case "passthrough":
-        return d.models.pass(caller, r);
-      case "model.call":
-        return d.models.call(caller, r);
       case "stream.ack":
         return { done: d.streams.ack(userId, relay, streamId(r.stream), whole(r.seq, "chunk number")) };
-      case "stream.resend":
-        return { last: d.streams.resend(userId, relay, streamId(r.stream), whole(r.from, "chunk number")) };
       case "stream.cancel":
         return { cancelled: d.streams.cancel(userId, relay, streamId(r.stream), typeof r.reason === "string" ? r.reason : "") };
       case "settings.get": {
@@ -328,15 +335,15 @@ export class LinkServer {
       case "blob.get":
         return { text: await d.storage.blob(userId, r.hash) };
       case "blob.put":
-        await d.storage.putBlob(userId, r.hash, r.text);
+        await d.mirror.write(caller, r.mirror, { docs: [], blobs: [] }, () => d.storage.putBlob(userId, r.hash, r.text));
         return { stored: true };
       case "doc.get":
         return { doc: await d.storage.doc(userId, r.path) };
       case "doc.put":
-        await d.storage.putDoc(userId, r.path, r.doc);
+        await d.mirror.write(caller, r.mirror, { docs: typeof r.path === "string" ? [r.path] : [], blobs: [] }, () => d.storage.putDoc(userId, r.path, r.doc));
         return { written: true };
       case "doc.remove":
-        await d.storage.removeDoc(userId, r.path);
+        await d.mirror.write(caller, r.mirror, { docs: typeof r.path === "string" ? [r.path] : [], blobs: [] }, () => d.storage.removeDoc(userId, r.path));
         return { removed: true };
       case "chat.path":
         return { messages: await d.chats.path(userId, text(r.chat, "chat")) };
@@ -355,18 +362,6 @@ export class LinkServer {
       case "preset.blocks": {
         const chat = typeof r.chat === "string" && r.chat !== "" ? (await d.chats.own(userId, r.chat)).id : null;
         return { blocks: await d.presets.blocks(userId, r.preset, chat) };
-      }
-      case "connections.list":
-        return { connections: await d.connections.list(userId) };
-      case "connections.get": {
-        const named = typeof r.connection === "string" && r.connection !== "" ? r.connection : null;
-        // An agent of a chat's run, with no connection of its own, is lent the chat's: the one it was on before its pin, else the default, never a loopback (null when neither).
-        if (named === null && typeof r.chat === "string" && r.chat !== "") {
-          await d.chats.own(userId, r.chat);
-          const lent = await d.chatSwitch.agentConnection(userId, r.chat);
-          return { profile: lent === null ? null : await d.connections.profile(userId, lent.id) };
-        }
-        return { profile: await d.connections.profile(userId, named) };
       }
       // A runtime's frame names whatever chat it likes, and any account can register a runtime: a chat is the caller's own before a tool or the extension LumiAH is built into hears of it (`""`: no chat).
       case "tools.list":
@@ -404,8 +399,10 @@ export class LinkServer {
       case "blob.list":
         return d.storage.blobs(userId, r.cursor);
       case "blob.remove":
-        await d.storage.removeBlobs(userId, r.hashes);
+        await d.mirror.write(caller, r.mirror, { docs: [], blobs: strings(r.hashes) }, () => d.storage.removeBlobs(userId, r.hashes));
         return { removed: true };
+      case "mirror.release":
+        return { released: await d.mirror.release(caller, r.mirror) };
       case "doc.list":
         return { paths: await d.storage.docs(userId, r.prefix) };
       case "chat.info":
@@ -416,7 +413,7 @@ export class LinkServer {
         await d.jobs.took(userId, jobOf(r.job), relay);
         return { taken: true };
       case "ask.answer":
-        d.asks.answered(userId, relay, r.ask, r.value, r.refusal);
+        d.asks.answered(userId, relay, r.ask, r.value, r.refusal, r.took);
         return { taken: true };
       // The recall ports' reads and the book's, each checked and served where the ports are (recall.ts).
       case "recall.lore.read":
@@ -436,6 +433,12 @@ export class LinkServer {
       case "recall.web.search":
       case "book.read":
         return d.recall.serve(userId, type, r);
+      case "host.read":
+        return d.copy.read(userId, r.port, r.method, r.args);
+      case "own.read":
+        return d.copy.own(userId, r.chat);
+      case "turn.lore":
+        return d.copy.turnLore(userId, r.chat, r.character);
       default:
         throw new LinkRefused("bad_request", `There is no link request ${String(type)}.`);
     }

@@ -1,7 +1,9 @@
 // A call's usage comes back in the envelope the core already reads (core/usage.ts `parseUsage`),
 // read here by parseUsage itself: what was sent, what of it was read from the provider's cache and
-// written to it, what was written and how much of that was reasoning, and the cost where pi-ai
-// knows the model's price. A model it has no price for leaves the cost to the user's own Prices.
+// written to it, what was written and how much of that was reasoning, and the cost: the provider's
+// own bill where it sent one, else what pi-ai's published price for the model makes of the counts,
+// which is an estimate, never a bill. A model it has no price for leaves the cost to the user's own
+// Prices.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import type { Api, Model, Usage } from "@earendil-works/pi-ai";
@@ -28,15 +30,15 @@ function listed(models: readonly Model<Api>[], id: string): Model<Api> {
 }
 
 describe("a call's usage, read by parseUsage", () => {
-  test("Anthropic: everything sent, the cache's reads and writes, what was written, and the catalogue's price", async () => {
+  test("Anthropic: everything sent, the cache's reads and writes, what was written, and the catalogue's price as an estimate", async () => {
     r = rig({ script: () => eventStream(anthropicStream(anthropicTurn({ text: "At the quay.", usage: { input: 100, output: 40, cacheRead: 900, cacheWrite: 50, thinking: 12 } }))) });
     await r.layer.book.save({ name: "Claude", provider: "anthropic", auth: "key", model: "claude-sonnet-4-5" }, "sk-ant-api03-0123456789abcdef");
     const result = await r.layer.models.call(request({ messages: [{ role: "user", content: "Where is Ilse?" }] }), forever());
     const usage = parseUsage(result.usage, "anthropic", GUESS);
     const price = listed(anthropicProvider().getModels(), "claude-sonnet-4-5").cost;
     expect(usage).toMatchObject({ in: 1050, cachedIn: 900, cacheWrite: 50, out: 40 });
-    // Anthropic's reading never takes a reasoning count, as before: it is the runtime's guess.
-    expect(usage.estimated).toEqual(["reasoningOut"]);
+    // The published price is no bill, so the cost is an estimate; Anthropic's reading never takes a reasoning count, as before: it is the runtime's guess.
+    expect(usage.estimated).toEqual(["cost", "reasoningOut"]);
     expect(usage.cost).toBeCloseTo((100 * price.input + 40 * price.output + 900 * price.cacheRead + 50 * price.cacheWrite) / 1_000_000, 12);
   });
 
@@ -50,7 +52,7 @@ describe("a call's usage, read by parseUsage", () => {
     expect(priced(usage, ["served-model"], { "served-model": { in: 1, cachedIn: 0.1, out: 2 } })).toMatchObject({ cost: (400 * 1 + 600 * 0.1 + 200 * 2) / 1_000_000, pricedAs: "served-model", estimated: ["cost"] });
   });
 
-  test("DeepSeek: the catalogue's price comes with the counts", async () => {
+  test("DeepSeek: the catalogue's price comes with the counts, as an estimate", async () => {
     const usageChunk = { id: "chatcmpl-1", object: "chat.completion.chunk", created: 1, model: "deepseek-flash", choices: [], usage: { prompt_tokens: 2000, completion_tokens: 100, total_tokens: 2100, prompt_cache_hit_tokens: 1500 } };
     r = rig({ script: () => eventStream(chatStream([chunk({ role: "assistant", content: "Yes." }), chunk({}, "stop"), usageChunk])) });
     await r.layer.book.save({ name: "DeepSeek", provider: "deepseek", auth: "key", model: "deepseek-flash" }, "sk-deepseek-0123456789abcdef");
@@ -58,6 +60,7 @@ describe("a call's usage, read by parseUsage", () => {
     const usage = parseUsage(result.usage, "deepseek", GUESS);
     const price = listed(deepseekProvider().getModels(), "deepseek-flash").cost;
     expect(usage).toMatchObject({ in: 2000, cachedIn: 1500, out: 100 });
+    expect(usage.estimated).toContain("cost");
     expect(usage.cost).toBeCloseTo((500 * price.input + 100 * price.output + 1500 * price.cacheRead) / 1_000_000, 12);
   });
 });

@@ -31,8 +31,8 @@ function reads(host: HarnessHost): Reads {
 }
 
 let open: Rig | null = null;
-afterEach(() => {
-  open?.close();
+afterEach(async () => {
+  await open?.close();
   open = null;
 });
 
@@ -152,6 +152,9 @@ describe("a runtime's core reads lore and history through the link", () => {
   });
 });
 
+/** The runtime's model calls and connections, which these reads never touch. */
+const NO_MODELS = { models: { call: async (): Promise<never> => Promise.reject(new Error("These reads make no model call.")) }, connections: { list: async () => [], get: async () => null } };
+
 describe("a runtime linked to a backend from before the recall ports", () => {
   /** What the older requests give of a chat's lore and messages. */
   const OLDER: Partial<{ [K in AskType]: LinkRequests[K]["result"] }> = {
@@ -185,7 +188,7 @@ describe("a runtime linked to a backend from before the recall ports", () => {
       log: () => undefined,
       trace: () => undefined,
       delta: () => undefined,
-      turn: () => null,
+      ...NO_MODELS,
       chat: () => null,
       jobQueued: () => undefined,
       jobChanged: () => undefined,
@@ -234,7 +237,7 @@ describe("a runtime linked to a backend from before the recall ports", () => {
       },
       notify: () => undefined,
     };
-    const host = linkHost({ link, streams: new Streams(link, { now: () => 0, log: () => undefined, tuning: () => FAST }), id: () => "0".repeat(32), now: () => 0, tuning: () => FAST, log: () => undefined, trace: () => undefined, delta: () => undefined, turn: () => null, chat: () => null, jobQueued: () => undefined, jobChanged: () => undefined });
+    const host = linkHost({ link, streams: new Streams(link, { now: () => 0, log: () => undefined, tuning: () => FAST }), id: () => "0".repeat(32), now: () => 0, tuning: () => FAST, log: () => undefined, trace: () => undefined, delta: () => undefined, ...NO_MODELS, chat: () => null, jobQueued: () => undefined, jobChanged: () => undefined });
     const ports = reads(host);
     await expect(ports.memory.enabled("chat-gone")).rejects.toThrow("There is no such chat in this account.");
     await expect(ports.lore.read("chat-gone")).rejects.toThrow("There is no such chat in this account.");

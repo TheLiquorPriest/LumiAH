@@ -20,7 +20,8 @@
     "embeddings",
     "memories",
     "databanks",
-    "web_search"
+    "web_search",
+    "cors_proxy"
   ],
   "interceptorTimeoutMs": 300000,
   "entry_backend": "dist/backend.js",

@@ -218,14 +218,41 @@ const EMBEDDED = "recall/embedded.json";
 
 /**
  * The space an embedding connection's vectors are in, as a part of their path: the connection, its
- * model, and the dimensions it is set to (`own` where it leaves them to the model). Vectors of two
- * spaces are never compared. Each id is written as `docKey` writes one and without a `~`, which
- * joins the parts.
+ * model, and the dimensions it is set to (`own` where it leaves them to the model), joined by `.`.
+ * Vectors of two spaces are never compared. The name is one the extension's storage takes (the
+ * link's `DOC_PATH`: letters, digits, `.`, `_` and `-`, 128 at most): in each id, every character
+ * but a letter, a digit or `-` is written as `_` and the two hex digits of each of its UTF-8 bytes,
+ * so no id holds a `.` and two that differ never read the same; a name longer than the storage takes
+ * is cut, and ends with `_h` and a hash of it whole, which no name written whole holds. A stored
+ * format, so fixed. (Before, the parts were joined by `~`, which the storage refuses: nothing was
+ * ever stored under such a name, and nothing reads one.)
  */
 function spaceOf(info: EmbedderInfo): string {
   const { dimensions } = info;
-  const names = [info.id, info.model].map((id) => docKey(id).replace(/~/g, "%7E"));
-  return `${names.join("~")}~${typeof dimensions === "number" && Number.isSafeInteger(dimensions) && dimensions > 0 ? dimensions : "own"}`;
+  const name = `${spacePart(info.id)}.${spacePart(info.model)}.${typeof dimensions === "number" && Number.isSafeInteger(dimensions) && dimensions > 0 ? dimensions : "own"}`;
+  return name.length <= SPACE_CHARS ? name : `${name.slice(0, SPACE_CHARS - 18)}_h${fnv64(name)}`;
+}
+
+/** The most characters a name in a stored path may have (the link's `DOC_PATH`). */
+const SPACE_CHARS = 128;
+
+const SPACE_KEPT = /[A-Za-z0-9-]/;
+
+/** An id as a part of a space's name: letters, digits and `-` as they are, every other character as `_` and its UTF-8 bytes in hex. */
+function spacePart(id: string): string {
+  let out = "";
+  for (const char of id) {
+    if (SPACE_KEPT.test(char)) out += char;
+    else for (const byte of new TextEncoder().encode(char)) out += `_${byte.toString(16).padStart(2, "0")}`;
+  }
+  return out;
+}
+
+/** FNV-1a, 64 bits, of a text's UTF-8, in 16 hex digits: what tells two long names apart once they are cut. */
+function fnv64(text: string): string {
+  let h = 0xcbf29ce484222325n;
+  for (const byte of new TextEncoder().encode(text)) h = ((h ^ BigInt(byte)) * 0x100000001b3n) & 0xffffffffffffffffn;
+  return h.toString(16).padStart(16, "0");
 }
 
 const HEX_START = /^[0-9a-f]{2}/;

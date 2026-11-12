@@ -26,7 +26,7 @@ import { accessSync, closeSync, constants, openSync, readSync, type Stats, statS
 import { basename } from "node:path";
 import { textHash } from "../../core/hash";
 import type { LogLevel } from "../../core/ports";
-import type { HostBookRecord, HostMessage } from "../../extension/backend/spindle";
+import type { HostBookRecord, HostMessage } from "../../host/rows";
 import type { ChatSignature, CopySource, SourceBook, SourceChanges, SourceChat, SourceEntry, SourceMessage } from "../copy/source";
 import { type BookHead, bookFrom, type Cell, type ChatHead, chatFrom, type EntryRow, entryFrom, type MessageRow, messageFrom, Unreadable } from "./rows";
 import { columnsOf, differenceOf } from "./schema";
@@ -445,6 +445,7 @@ export function createDbSource(deps: DbSourceDeps): DbSource {
       const now = await step(what, (at) => chatNow(at.db, chatId));
       if (now === null) return null;
       tally.rows += now.prints.length + 1;
+      tally.chars += length(now.head.metadata);
       let last: HostMessage | null = null;
       if (now.newest !== null) {
         tally.chars += length(now.newest.content) + length(now.newest.swipes) + length(now.newest.extra);
@@ -454,7 +455,9 @@ export function createDbSource(deps: DbSourceDeps): DbSource {
           throw refusal(error, `message ${String(now.newest.id)} of chat ${chatId}`, "the chat");
         }
       }
-      return { count: now.prints.length, last, fingerprint: await chatPrint(now.head, now.prints) };
+      // The chat's own row too, as the HTTP check gives it: the fingerprint already moves with it, and
+      // with it the copy says which of the chat's own fields changed, in the words it uses over HTTP.
+      return { count: now.prints.length, last, chat: chatFrom(now.head).chat, fingerprint: await chatPrint(now.head, now.prints) };
     });
   }
 

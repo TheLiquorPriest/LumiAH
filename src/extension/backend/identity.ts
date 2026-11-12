@@ -7,7 +7,7 @@
 // Lumiverse gives each extension its own storage and its own entry on a message. The rest is what
 // the user reads.
 
-import { EXTENSION_IDENTIFIER, OWN_BACKEND } from "../../link/contract";
+import { EXTENSION_IDENTIFIER, type LinkedBackend, OWN_BACKEND } from "../../link/contract";
 
 export interface BackendIdentity {
   /** The extension's identifier in Lumiverse (its `spindle.json`): what its runtime links to (`lumiah up --extension <identifier>`), and what its start and update lines name. */
@@ -25,6 +25,14 @@ export interface BackendIdentity {
    * stays the extension's own.
    */
   anchorKey: string;
+  /**
+   * Where its Settings, which hold LumiAH's settings and the Timeouts page, are shown, said in place
+   * of "<name>'s Settings" (a timeout's words: "Runtime wait (<settingsAt> → Timeouts → Waiting for
+   * the runtime)"), for an extension that shows LumiAH's pages somewhere in its own and not as its
+   * own Settings (LumiRPEngine: "LumiRPEngine's Harness tab → System → Settings"). Absent: "<name>'s
+   * Settings".
+   */
+  settingsAt?: string;
 }
 
 /** LumiAH itself. */
@@ -35,5 +43,10 @@ export function identityOf(given: Partial<BackendIdentity> = {}): BackendIdentit
   const identifier = given.identifier ?? LUMIAH.identifier;
   const own = identifier === LUMIAH.identifier;
   const name = given.name ?? (own ? LUMIAH.name : identifier);
-  return { identifier, name, connectionName: given.connectionName ?? name, anchorKey: given.anchorKey ?? (own ? LUMIAH.anchorKey : identifier) };
+  return { identifier, name, connectionName: given.connectionName ?? name, anchorKey: given.anchorKey ?? (own ? LUMIAH.anchorKey : identifier), ...(given.settingsAt !== undefined ? { settingsAt: given.settingsAt } : {}) };
+}
+
+/** Who a runtime is told it is linked to, on `register` and on every `hello`: the identity as the runtime's words use it. */
+export function linkedBackend(identity: BackendIdentity): LinkedBackend {
+  return { name: identity.name, connection: identity.connectionName, ...(identity.settingsAt !== undefined ? { settingsAt: identity.settingsAt } : {}) };
 }

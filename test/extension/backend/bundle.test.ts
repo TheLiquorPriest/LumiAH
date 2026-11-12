@@ -21,7 +21,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
+import { LEFT_OUT } from "../../../scripts/bundle-flags";
 
 const ROOT = resolve(import.meta.dir, "../../..");
 
@@ -536,29 +537,35 @@ describe("the backend bundle", () => {
   let dir = "";
   let bundle = "";
   let built = "";
+  /** The files the bundle was made from, each by its path from the repository's root (Bun's metafile). */
+  let inputs: string[] = [];
 
   beforeAll(() => {
     dir = mkdtempSync(join(tmpdir(), "lumiah-bundle-"));
     const out = join(dir, "backend.js");
-    // As scripts/build.ts bundles it (`bun run build`), into a folder of its own: the same entry, target and defines (the build id, and the hash and size of the runtime it offers).
+    // As scripts/build.ts bundles it (`bun run build`), into a folder of its own: the same entry, target, packages left out and defines (the build id, and the hash and size of the runtime it offers), with its inputs listed.
     const defines = Object.entries({ LAH_BUILD_ID: "scan-test", LAH_RUNTIME_SHA256: "0".repeat(64), LAH_RUNTIME_SIZE: "1024" }).flatMap(([name, value]) => ["--define", `process.env.${name}=${JSON.stringify(value)}`]);
-    const run = Bun.spawnSync([process.execPath, "build", "src/extension/backend/main.ts", "--outfile", out, "--target", "bun", ...defines], { cwd: ROOT, stdout: "pipe", stderr: "pipe" });
+    const run = Bun.spawnSync([process.execPath, "build", "src/extension/backend/main.ts", "--outfile", out, "--target", "bun", ...LEFT_OUT.flatMap((name) => ["--external", name]), `--metafile=${join(dir, "meta.json")}`, ...defines], { cwd: ROOT, stdout: "pipe", stderr: "pipe" });
     built = run.exitCode === 0 ? "" : `bun build failed (${run.exitCode}): ${run.stderr.toString()}${run.stdout.toString()}`;
-    if (built === "") bundle = readFileSync(out, "utf8");
+    if (built === "") {
+      bundle = readFileSync(out, "utf8");
+      inputs = Object.keys(JSON.parse(readFileSync(join(dir, "meta.json"), "utf8")).inputs);
+    }
   }, 120_000);
 
   afterAll(() => {
     if (dir !== "") rmSync(dir, { recursive: true, force: true });
   });
 
-  test("is built here the way `bun run build` builds it", () => {
-    // What this test runs is read off the build script: when that changes, this must change with it.
-    const script = readFileSync(join(ROOT, "scripts/build.ts"), "utf8");
-    expect(script).toContain('bundle("src/extension/backend/main.ts", "dist/backend.js", "bun", [], { LAH_RUNTIME_SHA256: built.sha256, LAH_RUNTIME_SIZE: String(built.size) });');
-    expect(script).toContain('Object.entries({ LAH_BUILD_ID: id, ...constants }).flatMap(([name, value]) => ["--define", `process.env.${name}=${JSON.stringify(value)}`])');
-    expect(script).toContain('[process.execPath, "build", entry, "--outfile", out, "--target", target, ...flags, ...defines]');
+  test("builds here, with what `bun run build` leaves out of every bundle left out", () => {
     expect(built).toBe("");
     expect(bundle).toContain("scan-test");
+  });
+
+  test("takes no file from outside the repository, so it is the same wherever it is built", () => {
+    expect(built).toBe("");
+    expect(inputs.length).toBeGreaterThan(0);
+    expect(inputs.filter((path) => relative(ROOT, resolve(ROOT, path)).startsWith(".."))).toEqual([]);
   });
 
   test("holds nothing Lumiverse's install scan refuses, so it installs", () => {

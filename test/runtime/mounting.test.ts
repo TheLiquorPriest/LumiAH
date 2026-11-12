@@ -19,8 +19,8 @@ import { callsOf, live, startedAs, stepsOf } from "../support/live";
 import { type Rig, rig, until, USER } from "../support/rig";
 
 let r: Rig | null = null;
-afterEach(() => {
-  r?.close();
+afterEach(async () => {
+  await r?.close();
   r = null;
 });
 

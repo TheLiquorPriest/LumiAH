@@ -13,14 +13,16 @@ import type { Api, Model, Usage } from "@earendil-works/pi-ai";
 import type { JsonObject } from "../../core/ports";
 
 /**
- * The cost pi-ai knows: the provider's own bill where it reported one (OpenRouter), else what the
- * model's catalogue price makes of the counts. None for a model pi-ai has no price for (a
- * compatible server's), whose calls the user's own Prices then price.
+ * What a call cost as pi-ai knows it: the provider's own bill where it reported one (OpenRouter's),
+ * else what the model's published price in pi-ai's catalogue makes of the counts, which is no bill
+ * (the core shows it as an estimate, and a price the user set for the model stands over it). None
+ * for a model pi-ai has no price for (a compatible server's), whose calls the user's own Prices then
+ * price.
  */
-function knownCost(usage: Usage, model: Model<Api>): number | undefined {
-  if (usage.cost.totalFromProvider === true) return usage.cost.total;
+function costOf(usage: Usage, model: Model<Api>): { cost: number } | { list_cost: number } | Record<string, never> {
+  if (usage.cost.totalFromProvider === true) return { cost: usage.cost.total };
   const { input, output, cacheRead, cacheWrite } = model.cost;
-  return input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0 ? usage.cost.total : undefined;
+  return input > 0 || output > 0 || cacheRead > 0 || cacheWrite > 0 ? { list_cost: usage.cost.total } : {};
 }
 
 /**
@@ -30,7 +32,7 @@ function knownCost(usage: Usage, model: Model<Api>): number | undefined {
  */
 export function usageEnvelope(usage: Usage, provider: string, model: Model<Api>): JsonObject {
   const prompt = usage.input + usage.cacheRead + usage.cacheWrite;
-  const cost = knownCost(usage, model);
+  const cost = costOf(usage, model);
   const reportsWrites = model.api === "anthropic-messages" || usage.cacheWrite > 0;
   const own: JsonObject = {
     input_tokens: usage.input,
@@ -45,7 +47,7 @@ export function usageEnvelope(usage: Usage, provider: string, model: Model<Api>)
     prompt_tokens: prompt,
     completion_tokens: completion,
     total_tokens: prompt + usage.output,
-    ...(cost !== undefined ? { cost } : {}),
+    ...cost,
     provider_raw: own,
   };
 }
