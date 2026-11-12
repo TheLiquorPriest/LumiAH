@@ -5,10 +5,11 @@
 // always gave it, so the proxy road answers exactly the page ops the link does.
 //
 // An ask is done once, whichever road it came by. The extension may send one by the proxy and then
-// over the link as well (the proxy didn't answer in time, or its answer was too large for it): the
-// second joins the first while it is under way, and once it is over is answered from what it came
-// to, kept a short while for that. What is kept is bounded by count and by size; one whose answer
-// was let go for room is said to be answered already rather than done again.
+// over the link as well (the proxy didn't answer in time, or its answer was too large for it), and
+// the link's copy may be over before the proxy's arrives: the second joins the first while it is
+// under way, and once it is over is answered from what it came to, kept a short while for that
+// whichever road brought it. What is kept is bounded by count and by size; one whose answer was let
+// go for room is said to be answered already rather than done again.
 //
 // The route takes the relay's secret as a bearer, compared in a time that says nothing of it, and
 // never the loopback key. Every refusal is in fixed words: nothing of a request is said back, and
@@ -36,7 +37,7 @@ export interface AskOutcome {
   took: number;
 }
 
-/** How long an ask that came by the proxy is remembered once answered, so the same ask sent again over the link is answered from it. */
+/** How long an ask is remembered once answered, whichever road brought it, so the same ask arriving again by either road is answered from it. */
 export const ASKS_KEPT_MS = 2 * 60_000;
 /** The most answered asks remembered at once, and the most characters of their answers kept. */
 export const ASKS_KEPT = 1_024;
@@ -67,8 +68,6 @@ interface Kept {
   outcome: AskOutcome | null;
   /** The characters of its answer kept. */
   chars: number;
-  /** It came by the proxy: once over it is remembered for an ask again over the link. */
-  remembered: boolean;
 }
 
 const json = (status: number, body: JsonObject): Response => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
@@ -92,18 +91,17 @@ export class AskDesk {
 
   /**
    * One ask, by its id: done now, or joined to the same ask under way, or answered from what it came
-   * to when it came by the proxy and is still remembered. `road`: the road it came by now.
+   * to while it is still remembered. `road`: the road it came by now.
    */
   run(id: string, op: string, args: JsonObject, road: Road): Promise<AskOutcome> {
     const known = this.asks.get(id);
     if (known !== undefined) {
-      if (road === "proxy") known.remembered = true;
       if (known.endedAt === null) return known.done;
       if (known.outcome !== null) return Promise.resolve(known.outcome);
       return Promise.resolve({ value: null, refusal: { code: "unavailable", message: "The runtime answered this already, by the other road. Try again." }, took: 0 });
     }
     const started = this.deps.now();
-    const kept: Kept = { done: Promise.resolve({ value: null, refusal: null, took: 0 }), endedAt: null, outcome: null, chars: 0, remembered: road === "proxy" };
+    const kept: Kept = { done: Promise.resolve({ value: null, refusal: null, took: 0 }), endedAt: null, outcome: null, chars: 0 };
     kept.done = this.deps.answer(op, args).then(
       (value): AskOutcome => ({ value, refusal: null, took: this.deps.now() - started }),
       (error: unknown): AskOutcome => {
@@ -116,9 +114,10 @@ export class AskDesk {
     this.asks.set(id, kept);
     void kept.done.then((outcome) => {
       kept.endedAt = this.deps.now();
-      if (kept.remembered) kept.outcome = outcome;
-      else this.asks.delete(id);
-      this.prune();
+      kept.outcome = outcome;
+      // The proxy road counts its answer once it has the text (`fetch`); the link's is counted here.
+      if (road === "link") this.counted(id, JSON.stringify(outcome).length);
+      else this.prune();
     });
     return kept.done;
   }

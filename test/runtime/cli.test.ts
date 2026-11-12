@@ -6,8 +6,10 @@
 // it, so `up` signs in and registers for real.
 
 import { describe, expect, test } from "bun:test";
-import type { AgentUsage } from "../../src/core/ports";
+import type { AgentUsage, HarnessHost } from "../../src/core/ports";
 import { createBackend } from "../../src/extension/backend/backend";
+import { isRecord } from "../../src/link/json";
+import { PROBE_HEADER, roadProof } from "../../src/link/road";
 import { lumiah, type RuntimeIO } from "../../src/runtime/cli";
 import { configOf, configText, dataDir, installedPath, runtimeDir, SETUP_DEFAULTS } from "../../src/runtime/config";
 import { unitText } from "../../src/runtime/update/service";
@@ -536,21 +538,158 @@ describe("lumiah serve", () => {
   });
 
   test("where a copy of the runtime answers on its port already, serves nothing and waits, marking that it does; asked to stop, it leaves, and its mark with it", async () => {
+    const host = new FakeHost();
+    createBackend(host, ENV);
+    const lumiverse = new FakeLumiverse(host, USER);
+    const m = machineOn(lumiverse);
+    expect(await lumiah(UP, m.io)).toBe(0);
+    const config = configOf(m.files.get(CONFIG)?.text ?? null, CONFIG);
+    // The copy started first, from the same config, answers on the runtime's port.
+    const first = runtimeFrom(config, lumiverse, [], { harness: m.io.harness });
+    try {
+      const served = m.served.length;
+      const marks: string[] = [];
+      const io: RuntimeIO = {
+        ...m.io,
+        http: reaching(m, first, config.port),
+        files: { ...m.io.files, write: (path, text, mode, dirMode) => (path.endsWith("/waiting.json") ? void marks.push(text) : m.io.files.write(path, text, mode, dirMode)) },
+      };
+      expect(await lumiah(["serve"], io)).toBe(0);
+      expect(m.served).toHaveLength(served);
+      expect(m.err.join("\n")).toContain("another copy of this runtime serves on 127.0.0.1:7871: this one waits, and serves once that one stops");
+      expect(JSON.parse(marks[0] ?? "null")).toMatchObject({ pid: 4242 });
+      expect(m.err.at(-1)).toContain("stopping (SIGTERM) before it served");
+    } finally {
+      await first.close();
+    }
+  });
+
+  test("where something else answers on its port, even as a runtime would, it doesn't wait for it: it stops at once, saying the port is held, and serves nothing", async () => {
     const m = machine();
     expect(await lumiah(UP, m.io)).toBe(0);
     const served = m.served.length;
     const marks: string[] = [];
     const io: RuntimeIO = {
       ...m.io,
-      // The copy started first answers on the runtime's port.
-      http: async (request) => (new URL(request.url).port === "7871" ? { status: 200, header: () => null, text: JSON.stringify({ ok: true, link: "up", backend: "LumiAH", turns: 0, requests: 0 }) } : m.io.http(request)),
+      // Another program on the runtime's port says it is up, to whatever asks it anything.
+      http: async (request) => (new URL(request.url).port === "7871" ? { status: 200, header: () => null, text: JSON.stringify({ up: true, ok: true, link: "up", backend: "LumiAH", turns: 0, requests: 0 }) } : m.io.http(request)),
       files: { ...m.io.files, write: (path, text, mode, dirMode) => (path.endsWith("/waiting.json") ? void marks.push(text) : m.io.files.write(path, text, mode, dirMode)) },
     };
-    expect(await lumiah(["serve"], io)).toBe(0);
+    expect(await lumiah(["serve"], io)).toBe(1);
     expect(m.served).toHaveLength(served);
-    expect(m.err.join("\n")).toContain("another copy of this runtime serves on 127.0.0.1:7871: this one waits, and serves once that one stops");
-    expect(JSON.parse(marks[0] ?? "null")).toMatchObject({ pid: 4242 });
-    expect(m.err.at(-1)).toContain("stopping (SIGTERM) before it served");
+    expect(marks).toEqual([]);
+    expect(m.err.at(-1)).toContain("127.0.0.1:7871");
+  });
+
+  test("where something holds its port and never answers, it gives up asking within 5 seconds, and serves nothing", async () => {
+    const m = machine();
+    expect(await lumiah(UP, m.io)).toBe(0);
+    const served = m.served.length;
+    const io: RuntimeIO = {
+      ...m.io,
+      // Whatever holds the runtime's port takes each request and answers none.
+      http: (request) => {
+        if (new URL(request.url).port !== "7871") return m.io.http(request);
+        const { promise, reject } = Promise.withResolvers<never>();
+        request.signal?.addEventListener("abort", () => reject(request.signal?.reason), { once: true });
+        return promise;
+      },
+    };
+    expect(await lumiah(["serve"], io)).toBe(1);
+    expect(m.served).toHaveLength(served);
+  }, 15_000);
+
+  test("stopping, it keeps its port until its link has closed, and meanwhile answers nothing there but the road's probe", async () => {
+    const m = machine();
+    expect(await lumiah(UP, m.io)).toBe(0);
+    const config = configOf(m.files.get(CONFIG)?.text ?? null, CONFIG);
+    // Its port: the handler on it, whether it is held, and whether the runtime's link was still open when it was let go.
+    const port: { fetch: ((req: Request) => Promise<Response>) | null; held: boolean; freedWithLinkOpen: boolean | null } = { fetch: null, held: false, freedWithLinkOpen: null };
+    // Its link's sockets open now; and what it saves, held on its way to the extension's storage while `holding`.
+    let open = 0;
+    let holding = false;
+    const held: string[] = [];
+    let send: (text: string) => void = () => undefined;
+    const harness: { host: HarnessHost | null } = { host: null };
+    const stop = Promise.withResolvers<string>();
+    const io: RuntimeIO = {
+      ...m.io,
+      serve: (options) => {
+        port.fetch = options.fetch;
+        port.held = true;
+        return {
+          stop: () => {
+            port.held = false;
+            port.freedWithLinkOpen = open > 0;
+          },
+        };
+      },
+      stopped: () => stop.promise,
+      openSocket: (url, events) => {
+        const socket = m.io.openSocket(url, events);
+        open++;
+        send = (text) => socket.send(text);
+        return {
+          send: (text) => (holding && text.includes('"type":"doc.put"') ? void held.push(text) : socket.send(text)),
+          close: () => {
+            open--;
+            socket.close();
+          },
+        };
+      },
+      harness: (host, settings, extension, place) => {
+        harness.host = host;
+        return m.io.harness(host, settings, extension, place);
+      },
+    };
+    // A request on the road, as Lumiverse's proxy carries one to the runtime's port.
+    const onRoad = (headers: Record<string, string>, body: string): Promise<Response> => {
+      if (port.fetch === null) throw new Error("the runtime serves nothing");
+      return port.fetch(new Request(`http://127.0.0.1:${config.port}/x/ask`, { method: "POST", headers: { host: `127.0.0.1:${config.port}`, "content-type": "application/json", ...headers }, body }));
+    };
+    let asks = 0;
+    const storeState = (): Promise<Response> => onRoad({ authorization: `Bearer ${config.secret}` }, JSON.stringify({ ask: (asks++).toString(16).padStart(16, "0"), op: "store.state", args: {} }));
+    // What `up` logged as it served and stopped is behind: what follows is this serve's.
+    m.err.length = 0;
+    const serving = lumiah(["serve"], io);
+    // Linked, and keeping the extension's storage: what it saves goes to its own copy, then on to the storage.
+    let mode: unknown = null;
+    let asking = false;
+    await until(() => {
+      if (mode === "held") return true;
+      if (!asking && port.fetch !== null) {
+        asking = true;
+        void storeState()
+          .then((reply) => reply.json())
+          .then((said: unknown) => {
+            mode = isRecord(said) && isRecord(said.value) ? said.value.mode : null;
+          })
+          .finally(() => {
+            asking = false;
+          });
+      }
+      return false;
+    }, "the runtime to keep the extension's storage");
+    holding = true;
+    await harness.host?.store.write("jobs/job-1.json", { state: "running" });
+    await until(() => held.length > 0, "a save to be on its way to the storage");
+
+    stop.resolve("SIGTERM");
+    await until(() => m.err.some((line) => line.includes("stopping (SIGTERM)")), "the runtime to begin stopping");
+    // It waits for the storage to take the save, its link open: the port is still its own, an ask with its secret is refused there (the road then asks over the link), and the probe is answered with the proof its secret makes.
+    expect(port.held).toBe(true);
+    expect(open).toBe(1);
+    expect((await storeState()).status).toBe(503);
+    const nonce = "0123456789abcdef0123456789abcdef";
+    const probe = await onRoad({ [PROBE_HEADER]: nonce }, "{}");
+    expect(probe.status).toBe(200);
+    expect(await probe.json()).toEqual({ proof: await roadProof(config.secret, config.relay, nonce) });
+
+    holding = false;
+    for (const text of held.splice(0)) send(text);
+    expect(await serving).toBe(0);
+    expect(port.held).toBe(false);
+    expect(port.freedWithLinkOpen).toBe(false);
   });
 });
 

@@ -412,10 +412,10 @@ class Shelf<C extends { chars: number }> {
     slot.written.set(row, { at: this.env.now(), landed });
   }
 
-  /** A run begins on it: its next use checks it first, whenever it was last found current. */
+  /** A run begins on it: its next use checks it first, whenever it was last found current. Set while its first read is under way too: that read may have begun before what the run must see, and it answers the run only where it began after this. */
   due(id: string): void {
     const slot = this.slots.get(id);
-    if (slot !== undefined && slot.copy !== null) slot.due = ++this.dues;
+    if (slot !== undefined) slot.due = ++this.dues;
   }
 
   /** Why a kept one can't be answered from for a write of the runtime's own not told of yet; null when it can. A write the row as kept holds is told of; one untold of for too long has it read again. */

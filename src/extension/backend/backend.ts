@@ -4,7 +4,7 @@
 
 import type { ClaimAsk } from "../../core/extension";
 import type { HeldTools } from "../../core/definitions";
-import { checkSettings, defaultSettings, RETIRED_SETTINGS, SETTINGS_SCHEMA, type SettingsScope, settingsOf } from "../../core/settings";
+import { AGENT, CORE_AGENTS, CORE_TOOLS, checkSettings, defaultSettings, RETIRED_SETTINGS, SETTINGS_SCHEMA, type SettingsScope, settingsOf } from "../../core/settings";
 import { checkText, TEXT_DEFS } from "../../core/texts";
 import type { JsonObject } from "../../core/ports";
 import { LINK, loopbackModel, runtimeBase, sameBase } from "../../link/contract";
@@ -63,11 +63,25 @@ export interface BackendEnv {
 /** The key the core's settings sit under, beside the transport's. */
 export const CORE_KEY = "core";
 
+/** Why a change that names an agent or tool only the runtime knows is refused while no runtime says what the user's runs have. */
+const RUNTIME_JUDGES = "Only your runtime knows this agent or tool (your own agent, or an extension's or MCP server's tool), and it isn't linked now. Start the runtime (its line is on the Runtime page), then make this change again.";
+
+/** A scope that takes every agent and every tool `values` names: what a check under it still refuses is wrong whatever the user's runs have, so it needs no runtime to judge. */
+function namedScope(values: unknown): SettingsScope {
+  const agents = isRecord(values) && isRecord(values.agents) ? values.agents : {};
+  const tools = new Set(CORE_TOOLS);
+  for (const agent of Object.values(agents)) if (isRecord(agent) && Array.isArray(agent.tools)) for (const tool of agent.tools) if (typeof tool === "string") tools.add(tool);
+  // What an agent runs with by default is no part of what a check refuses.
+  const defaults = defaultSettings().agents[AGENT.main];
+  return { tools: [...tools], agents: Object.keys(agents).filter((id) => !CORE_AGENTS.includes(id)).map((id) => ({ id, label: id, note: "", defaults })) };
+}
+
 /**
  * The settings' sections: the core's and the transport's. An extension that uses LumiAH's pieces
  * adds its own beside them. `scope` gives what a user's runs have beyond the core's own (their
  * extension's and MCP servers' tools, their own agents): with it, a setting that names one of those
- * is taken; without it, only the core's own names are.
+ * is taken. Without it (no runtime is linked to say), what only the runtime can judge is judged
+ * only where a change sets or resets it, and is refused there in words that say the runtime is needed.
  */
 export function settingsSections(scope?: (userId: string) => Promise<SettingsScope | undefined>): SettingsSection[] {
   return [
@@ -76,13 +90,22 @@ export function settingsSections(scope?: (userId: string) => Promise<SettingsSco
       defaults: () => defaultSettings() as unknown as JsonObject,
       schema: SETTINGS_SCHEMA,
       retired: RETIRED_SETTINGS,
-      async check(values, userId) {
+      async check(values, userId, changed) {
         const known = await scope?.(userId);
         const plain = checkSettings(values);
-        if (known === undefined) return plain;
+        const key = (problem: { path: readonly (string | number)[] }): string => JSON.stringify(problem.path.map(String));
+        if (known === undefined) {
+          // Under a scope that takes every agent and tool the values name, what is still refused is wrong whatever the user's runs have. The rest is a name only the runtime knows: kept as it is when the change doesn't touch it, else refused for want of the runtime, never as "no such setting".
+          // Inside an agent only the runtime knows, the linked check refuses nothing deeper than the agent itself (its names aren't known there), so a value kept there refuses only a change that sets or resets it: else one such value would refuse every change until the runtime links.
+          const touched = (path: readonly (string | number)[]): boolean => changed.some((place) => place.every((k, i) => i >= path.length || String(path[i]) === k));
+          const all = checkSettings(values, namedScope(values));
+          const judged = new Set(all.map(key));
+          const named = all.filter((problem) => !(problem.path[0] === "agents" && problem.path.length > 1 && !CORE_AGENTS.includes(String(problem.path[1]))) || touched(problem.path));
+          return [...named, ...plain.filter((problem) => !judged.has(key(problem)) && touched(problem.path)).map((problem) => ({ path: problem.path, message: RUNTIME_JUDGES }))];
+        }
         // The user's scope is there to take more names, never fewer: a value is refused only when it is refused both ways. Checked by the scope alone, a tool the core has but this place doesn't offer just now (a port its Lumiverse lacks) would refuse the defaults that name it, and with them every change of any setting.
-        const refused = new Set(plain.map((problem) => JSON.stringify(problem.path)));
-        return checkSettings(values, known).filter((problem) => refused.has(JSON.stringify(problem.path)));
+        const refused = new Set(plain.map(key));
+        return checkSettings(values, known).filter((problem) => refused.has(key(problem)));
       },
       // The tools of an agent an extension keeps as its own are the extension's to set.
       async fixed(userId) {
@@ -300,6 +323,8 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
       }
     }
   };
+  /** The extension LumiAH is built into, whose claims say which chats it answers and how. */
+  const claimer = options.extension;
   const turns = new Turns(host, {
     chats,
     connections,
@@ -308,8 +333,13 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     open,
     toRuntime: warnAway,
     name,
+    settingsAt: identity.settingsAt,
     now,
     later,
+    // Where the extension claims chats, a reply whose connection can't be confirmed is stopped in a chat it leads rather than written by the writer alone. A claim that can't be read at all is no answer either.
+    ...(claimer?.claim !== undefined
+      ? { lead: async (userId: string, chatId: string) => (made.chatSwitch === null ? null : made.chatSwitch.lead(userId, chatId).catch((error: unknown) => ({ by: claimer.name, unanswered: wordsOf(error) }))) }
+      : {}),
   });
   const storage = new Storage(host);
   // Which runtime holds each user's mirror of what the runtimes keep: one at a time keeps a copy of its own (mirror.ts).
@@ -324,8 +354,6 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
   // A turn that fails while a permission LumiAH can't do without is missing fails for that: the live view says so beside the sentence.
   const live = new LiveBuffer(host, { now, transport: (userId) => settings.transport(userId), linkGoneFor: (userId, relay) => relays.goneFor(userId, relay), missing: () => permissions().some((need) => need.needed) });
   const keys = new Keys(host, { registry, relays, settings, connectionName: identity.connectionName, now, later });
-  /** The extension LumiAH is built into, whose claims say which chats it answers and how. */
-  const claimer = options.extension;
   const chatSwitch = new ChatSwitch(host, {
     chats,
     connections,
@@ -333,18 +361,23 @@ export function createBackend(host: BackendHost, env: BackendEnv, options: Backe
     blocked,
     identity,
     now,
+    later,
     storySetting: async (userId) => settingsOf((await settings.values(userId))[CORE_KEY]).story,
+    extensionWait: async (userId) => settingsOf((await settings.values(userId))[CORE_KEY]).extension.waitMs,
     // A claim that fails is no answer, with why: the log says so, the story's page shows the chat's and the user's words, and the Agents page says who leads isn't known.
     ...(claimer?.claim !== undefined
       ? {
-          claim: async (ask: ClaimAsk, userId: string) => {
-            try {
-              const claim = await claimer.claim?.(ask, userId);
-              return claim === null || claim === undefined ? null : { by: claimer.name, claim };
-            } catch (error) {
-              warn(`${claimer.name} gave no answer for chat ${ask.chatId}, so its claim on it isn't known`)(error);
-              return { by: claimer.name, failed: wordsOf(error) };
-            }
+          claimer: {
+            name: claimer.name,
+            claim: async (ask: ClaimAsk, userId: string) => {
+              try {
+                const claim = await claimer.claim?.(ask, userId);
+                return claim === null || claim === undefined ? null : { claim };
+              } catch (error) {
+                warn(`${claimer.name} gave no answer for chat ${ask.chatId}, so its claim on it isn't known`)(error);
+                return { failed: wordsOf(error) };
+              }
+            },
           },
         }
       : {}),

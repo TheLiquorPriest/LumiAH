@@ -11,7 +11,8 @@ import { cp, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { textHash } from "../../../src/core/hash";
-import { type Bench, bench, cleanUp, Cut, cutDisk, files, holderRelay, type Linked, linked, markCount, open, outcome, stopping, until } from "./rig";
+import type { JsonValue } from "../../../src/core/ports";
+import { type Bench, bench, cleanUp, Cut, cutDisk, files, holderRelay, holding, type Linked, linked, markCount, open, outcome, stopping, until } from "./rig";
 
 let b: Bench;
 /** Another machine's folder, and a backup's. */
@@ -96,14 +97,16 @@ describe("one runtime at a time keeps a copy", () => {
     expect(warnings()).toEqual([]);
   });
 
-  test("a runtime silent past the link's allowance loses the mirror to the next one that says hello; back, it is told at once, drops what it hadn't sent (each path in the log, and a settle told) and works straight on the storage, never asking for the mirror again", async () => {
+  test("review finding 1: a runtime silent past the link's allowance loses the mirror to the next one that says hello; back, what it saved and hadn't sent reaches the storage first, but for a path the other saved after it (dropped, named, counted, and a settle told), and it works straight on the storage, never asking for the mirror again", async () => {
     const path = "chats/c1/session.json";
+    const own = "chats/c1/learned.json";
     const a = run(await linked(b, "relay-a"));
     await a.store.store.write(path, { turns: 1 });
     await a.store.settle();
-    // Its link goes (the machine sleeps): what it saves stays on its disk.
+    // Its link goes (the machine sleeps): what it saves is acknowledged, and waits on its disk.
     a.drop();
     await a.store.store.write(path, { turns: 2 });
+    await a.store.store.write(own, { learned: 1 });
 
     // Not yet past the allowance: another runtime that says hello now works without a copy.
     b.clock.advance(60_000);
@@ -114,17 +117,23 @@ describe("one runtime at a time keeps a copy", () => {
     await two.store.settle();
     expect(two.store.state()).toMatchObject({ mode: "held", takeover: { from: "runtime one", dropped: 0 } });
     expect(await two.store.store.read(path)).toEqual({ turns: 1 });
+    // Saved after runtime one's save of the same path: the later stands.
     await two.store.store.write(path, { turns: 3 });
     await two.store.settle();
 
     // A settle that waits for what it saved meanwhile is told what became of it.
     const waited = outcome(a.store.settle());
     expect(await a.hello()).toMatchObject({ held: false, holder: "relay-b" });
-    expect(await waited).toBe("Another runtime (relay-b) keeps the extension's storage now, so this runtime stopped using its own copy, and a change it hadn't sent there was dropped (the log names each). It reads and writes the storage directly from now on.");
+    expect(await waited).toContain(path);
     expect(b.mirror.doc(path)).toEqual({ turns: 3 });
+    expect(b.mirror.doc(own)).toEqual({ learned: 1 });
+    // The holder was told of it as the storage took it: its next read is the storage's.
+    expect(await two.store.store.read(own)).toEqual({ learned: 1 });
     expect(await a.store.store.read(path)).toEqual({ turns: 3 });
-    expect(a.store.state()).toMatchObject({ mode: "direct", holder: "relay-b", lost: { to: "relay-b", dropped: 1 } });
-    expect(warnings()).toContain(`the runtime's store dropped the document ${path}, which the extension's storage never had: another runtime keeps the storage now`);
+    expect(a.store.state()).toMatchObject({ mode: "direct", holder: "relay-b", waiting: 0, lost: { to: "relay-b", dropped: 1 } });
+    expect(a.store.state().refused.map((one) => one.name)).toEqual([path]);
+    expect(warnings().filter((line) => line.includes(path) && line.includes("dropped"))).toHaveLength(1);
+    expect(warnings().filter((line) => line.includes(own) && line.includes("dropped"))).toEqual([]);
     expect(await outcome(a.store.settle())).toBe("done");
 
     // It saves straight on the storage now, and the holder reads that next.
@@ -135,27 +144,94 @@ describe("one runtime at a time keeps a copy", () => {
     b.clock.advance(200_000);
     expect(await a.hello()).toMatchObject({ held: false });
     expect(holderRelay(b)).toBe("relay-b");
+    await a.store.close();
     expect((await files(b.dir)).filter((file) => file.includes("/journal/") || file.includes("/docs/"))).toEqual([]);
   });
 
-  test("review finding 2: a settle asked while the copy is being thrown away, after the write it dropped, says so; the next is not held up by it", async () => {
-    const path = "jobs/all.json";
-    const stop = stopping();
-    const a = run(await linked(b, "relay-a", { disk: stop.disk }));
+  test("review finding 1, the second road: a runtime off past the allowance with saves unsent starts again without the mirror, sends them straight before anything else (but for a path another runtime saved after them), and holds the mirror again later with nothing of either lost", async () => {
+    const path = "chats/c1/session.json";
+    const own = "chats/c1/learned.json";
+    const a = run(await linked(b, "relay-a"));
+    await a.store.store.write(path, { turns: 1 });
     await a.store.settle();
     a.drop();
-    await a.store.store.write(path, { jobs: ["j1"] });
+    await a.store.store.write(path, { turns: 2 });
+    await a.store.store.write(own, { learned: 1 });
+    // The process stops: its journal holds both.
+    await a.store.close();
     b.clock.advance(120_001);
-    run(await linked(b, "relay-b", { dir: elsewhere }));
-    // The end of its copy is held as it starts the new one: the write is already dropped then.
-    stop.arm("rename", "/identity.json");
-    await a.hello();
-    await stop.reached;
-    const asked = outcome(a.store.settle());
-    expect(await asked).toContain("a change it hadn't sent there was dropped");
-    stop.go();
-    expect(b.mirror.doc(path)).toBeNull();
+    const two = run(await linked(b, "relay-b", { dir: elsewhere, owner: "runtime two" }));
+    await two.store.store.write(path, { turns: 3 });
+    await two.store.settle();
+
+    const again = run(await linked(b, "relay-a"));
+    expect(again.store.state().mode).toBe("direct");
+    expect(await again.store.store.read(own)).toEqual({ learned: 1 });
+    expect([b.mirror.doc(path), b.mirror.doc(own)]).toEqual([{ turns: 3 }, { learned: 1 }]);
+    expect(again.store.state().refused.map((one) => one.name)).toEqual([path]);
+    expect(warnings().filter((line) => line.includes(path) && line.includes("dropped"))).toHaveLength(1);
+    // The first settle after it is told; the next isn't held up by it.
+    expect(await outcome(again.store.settle())).toContain(path);
+    expect(await outcome(again.store.settle())).toBe("done");
+
+    // Given the mirror again (runtime two lets it go): it throws its copy away for the storage's.
+    await two.store.release();
+    expect(await again.hello()).toMatchObject({ held: true });
+    await again.store.settle();
+    expect(again.store.state()).toMatchObject({ mode: "held", waiting: 0, takeover: { from: "runtime two", dropped: 0 } });
+    expect(await again.store.store.read(path)).toEqual({ turns: 3 });
+    expect(await again.store.store.read(own)).toEqual({ learned: 1 });
+    expect([b.mirror.doc(path), b.mirror.doc(own)]).toEqual([{ turns: 3 }, { learned: 1 }]);
+  });
+
+  test("review finding 2: the holder's save of a path, unsent while its link was down, gives way to another runtime's later save of it: the later stands, the holder's is dropped, named and told to a settle, and its copy reads the later one", async () => {
+    const path = "chats/c1/session.json";
+    const a = run(await linked(b, "relay-a"));
+    const two = run(await linked(b, "relay-b", { dir: elsewhere }));
+    await a.store.store.write(path, { n: 0 });
+    await a.store.settle();
+    await two.store.store.write(path, { n: 1 });
+    a.drop();
+    await a.store.store.write(path, { n: 2 });
+    b.clock.advance(10_000);
+    await two.store.store.write(path, { n: 3 });
+    const waited = outcome(a.store.settle());
+    expect(await a.hello()).toMatchObject({ held: true });
+    // Its sender tries again after its wait.
+    b.clock.advance(1_000);
+    expect(await waited).toContain(path);
+    expect(b.mirror.doc(path)).toEqual({ n: 3 });
+    expect(await a.store.store.read(path)).toEqual({ n: 3 });
+    expect(a.store.state()).toMatchObject({ mode: "held", waiting: 0, lost: null });
+    expect(a.store.state().refused.map((one) => one.name)).toEqual([path]);
+    expect(warnings().filter((line) => line.includes(path) && line.includes("dropped"))).toHaveLength(1);
     expect(await outcome(a.store.settle())).toBe("done");
+  });
+
+  test("a runtime on its own never gives way to itself: its saves of one path made while its link was down, and one made while the first was being sent, reach the storage in the order made, the last standing, and nothing is refused", async () => {
+    const path = "chats/c1/session.json";
+    const a = run(await linked(b, "relay-a"));
+    await a.store.store.write(path, { n: 1 });
+    await a.store.settle();
+    a.drop();
+    for (let n = 2; n <= 3; n++) {
+      b.clock.advance(5_000);
+      await a.store.store.write(path, { n });
+    }
+    await a.hello();
+    const sending = holding(b.mirror, (what) => what === `write ${path}`);
+    const settled = a.store.settle();
+    await sending.reached;
+    b.clock.advance(5_000);
+    await a.store.store.write(path, { n: 4 });
+    sending.go();
+    await settled;
+    await a.store.settle();
+    expect(b.mirror.doc(path)).toEqual({ n: 4 });
+    expect(b.mirror.took.filter((change) => change === `write ${path}`)).toHaveLength(3);
+    expect(a.store.state()).toMatchObject({ mode: "held", waiting: 0, refused: [], lost: null });
+    // Its link was down, and the log says so: nothing was refused or dropped.
+    expect(warnings().filter((line) => line.includes("dropped") || line.includes("refused"))).toEqual([]);
   });
 
   test("the same copy, started again (an update, a crash), holds the mirror again at once and carries on: another runtime waits the allowance", async () => {
@@ -271,7 +347,7 @@ async function taking(at: Bench, cut: Cut): Promise<void> {
   const old = open(at, { limits: () => ({ markMs: Number.MAX_SAFE_INTEGER }) });
   await old.settle();
   at.mirror.down = "the extension isn't linked";
-  await old.store.write("chats/c1/stale.json", { never: "sent" });
+  await old.store.write("chats/c1/unsent.json", { saved: "here" });
   await old.close();
   at.mirror.down = null;
   // Another copy holds the storage now: its mark, and what it saved.
@@ -282,7 +358,7 @@ async function taking(at: Bench, cut: Cut): Promise<void> {
   await Promise.race([s.settle(), cut.died]);
 }
 
-/** Losing: the holder, its sends held back, saves twice, then hears another runtime holds the mirror. What the run cuts in is the loss: the steps before it are its set-up. */
+/** Losing: the holder, its sends held back, saves twice, then hears another runtime holds the mirror, and sends them straight. What the run cuts in is the loss: the steps before it are its set-up. */
 async function losing(at: Bench, cut: Cut): Promise<void> {
   cut.armed = false;
   cutAt(at, cut);
@@ -291,20 +367,21 @@ async function losing(at: Bench, cut: Cut): Promise<void> {
   at.mirror.down = "the extension isn't linked";
   await Promise.all([s.store.write("chats/c1/a.json", { n: 1 }), s.store.write("chats/c1/b.json", { n: 2 })]);
   at.mirror.docs.set("mirror.json", JSON.stringify({ v: 1, kind: "mirror", copy: "f".repeat(32), count: 0, owner: "relay-x", at: at.clock.now() }));
+  at.mirror.down = null;
   cut.armed = true;
   s.heard({ held: false, holder: "relay-x", gen: 0 });
-  await Promise.race([s.close(), cut.died]);
+  await Promise.race([s.settle().then(() => s.close()), cut.died]);
 }
 
-/** Started again on its folder, normally, and given the mirror (relay-x let it go): it opens, what its old copy never sent is nowhere, and it reads what the storage holds. */
-async function startAgain(at: Bench, stale: readonly string[]): Promise<void> {
+/** Started again on its folder, normally, and given the mirror (relay-x let it go): it opens, what its old copy never sent is in the storage, and it reads what the storage holds. */
+async function startAgain(at: Bench, saved: Record<string, JsonValue>): Promise<void> {
   at.mirror.hold = null;
   at.mirror.down = null;
   const s = open(at);
   await s.settle();
-  for (const path of stale) {
-    expect(at.mirror.doc(path)).toBeNull();
-    expect(await s.store.read(path)).toBeNull();
+  for (const [path, value] of Object.entries(saved)) {
+    expect(at.mirror.doc(path)).toEqual(value);
+    expect(await s.store.read(path)).toEqual(value);
   }
   expect(await s.store.read(BEFORE.path)).toEqual(at.mirror.doc(BEFORE.path));
   expect((await files(at.dir)).filter((file) => file.includes("/journal/") || file.includes("/tmp/"))).toEqual([]);
@@ -322,12 +399,12 @@ describe("a crash", () => {
   });
 
   for (let n = 0; n <= TAKING; n += 1) {
-    test(`taking the mirror, cut before change ${n}: started again, nothing of the stale copy reaches the storage`, async () => {
+    test(`taking the mirror, cut before change ${n}: started again, what the old copy hadn't sent reaches the storage`, async () => {
       const at = await bench();
       try {
         const cut = new Cut(n);
         await taking(at, cut);
-        await startAgain(at, ["chats/c1/stale.json"]);
+        await startAgain(at, { "chats/c1/unsent.json": { saved: "here" } });
       } finally {
         await cleanUp(at);
       }
@@ -335,14 +412,12 @@ describe("a crash", () => {
   }
 
   for (let n = 0; n <= LOSING; n += 1) {
-    test(`losing the mirror, cut before change ${n}: started again, what it dropped reaches the storage never`, async () => {
+    test(`losing the mirror, cut before change ${n}: started again, what it hadn't sent reaches the storage`, async () => {
       const at = await bench();
       try {
         const cut = new Cut(n);
         await losing(at, cut);
-        // Whatever the cut left, the copy's id is no longer the mark's: thrown away when it is given the mirror again.
-        if (at.mirror.doc("mirror.json") === null) at.mirror.docs.set("mirror.json", JSON.stringify({ v: 1, kind: "mirror", copy: "f".repeat(32), count: 0, owner: "relay-x", at: 0 }));
-        await startAgain(at, ["chats/c1/a.json", "chats/c1/b.json"]);
+        await startAgain(at, { "chats/c1/a.json": { n: 1 }, "chats/c1/b.json": { n: 2 } });
       } finally {
         await cleanUp(at);
       }

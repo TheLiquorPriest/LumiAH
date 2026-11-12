@@ -58,10 +58,13 @@ export interface Installed {
   /** Every program run, as one line, and the environment it was given; but a new build's version, which is in `checked`. */
   ran: string[];
   envs: Readonly<Record<string, string>>[];
-  /** Each build checked for whether it starts here, as `<bun> <file>`. */
+  /** Each build checked for whether it starts here, as `<bun> <file>`, and the time it was given to say its version. */
   checked: string[];
+  checkWaits: (number | undefined)[];
+  /** Runs while a build is checked: what happens on the runtime meanwhile. */
+  whileChecked: (() => void) | null;
   /** How a build answers `--version`: a whole one's words unless a test says it can't start. */
-  version: { code: number; out: string; err: string };
+  version: Ran;
   /** Another copy of the runtime that waits to serve on its port; none unless a test says so. */
   waiting: { pid: number; since: number } | null;
   /** What a program answers, by the verb it was run with (`restart`, `daemon-reload`); 0 and nothing else unless a test says so. */
@@ -125,6 +128,8 @@ export function installed(setting: Setting = {}): Installed {
     ran: [],
     envs: [],
     checked: [],
+    checkWaits: [],
+    whileChecked: null,
     version: { code: 0, out: "lumiah 0.0.2 (build 2222bbbb)\n", err: "" },
     waiting: null,
     answers: new Map(),
@@ -158,9 +163,11 @@ export function installed(setting: Setting = {}): Installed {
     env: { XDG_RUNTIME_DIR: "/run/user/1000" },
     uid: 1000,
     files: { ...nodeFiles, ...setting.files },
-    async run(command, args, env) {
+    async run(command, args, env, timeoutMs) {
       if (args.at(-1) === "--version") {
         at.checked.push(`${command} ${args.slice(0, -1).join(" ")}`);
+        at.checkWaits.push(timeoutMs);
+        at.whileChecked?.();
         return at.version;
       }
       at.ran.push([command, ...args].join(" "));
@@ -173,6 +180,9 @@ export function installed(setting: Setting = {}): Installed {
     now: () => 1_700_000_000_000,
     log: (text) => void at.logs.push(text),
     name: () => ext.name,
+    owner: () => ({ name: ext.name }),
+    // As serve reads it: the user's settings as the config keeps them.
+    buildStartMs: () => at.config.tuning.buildStartMs,
     handedOver: false,
     waitingCopy: () => at.waiting,
   };

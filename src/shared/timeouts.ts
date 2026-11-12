@@ -27,7 +27,7 @@ export const TIMEOUT_GROUPS: readonly TimeoutGroup[] = [
   {
     id: "runtime",
     label: "Waiting for the runtime",
-    about: "How long a page, a reply or a key waits for your runtime to do something.",
+    about: "How long a page, a reply or a key waits for your runtime to do something, and how long a new build of the runtime has to start before it updates to it.",
     rows: [
       ["transport", "pages", "askMs"],
       ["transport", "pages", "proxyMs"],
@@ -37,6 +37,7 @@ export const TIMEOUT_GROUPS: readonly TimeoutGroup[] = [
       ["transport", "runtime", "drainMs"],
       ["transport", "live", "lostMs"],
       ["transport", "link", "quietMs"],
+      ["transport", "runtime", "buildStartMs"],
     ],
   },
   {
@@ -73,8 +74,8 @@ export const TIMEOUT_GROUPS: readonly TimeoutGroup[] = [
   {
     id: "model",
     label: "A model call",
-    about: "How long an agent's calls, the agent, a turn or a job may take, how long a model's answer may go silent, how long a connection's test waits for its provider, and the wait before a failed call is made again.",
-    rows: [...AGENT_TIMES, ["core", "turn", "wallMs"], ["core", "jobs", "budget", "wallMs"], ["core", "loop", "retryWaitMs"], ["transport", "runtime", "answerSilentMs"], ["transport", "runtime", "providerMs"]],
+    about: "How long an agent's calls, the agent, a turn or a job may take, how long a model's answer may go silent, how long a connection's test waits for its provider, how long a sign-in stays open, and the wait before a failed call is made again.",
+    rows: [...AGENT_TIMES, ["core", "turn", "wallMs"], ["core", "jobs", "budget", "wallMs"], ["core", "loop", "retryWaitMs"], ["transport", "runtime", "answerSilentMs"], ["transport", "runtime", "providerMs"], ["transport", "runtime", "signInMs"]],
   },
   {
     id: "store",

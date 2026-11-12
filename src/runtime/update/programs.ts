@@ -16,12 +16,13 @@ export function programPath(command: string, exists: (path: string) => boolean):
   return null;
 }
 
-/** How a program that was run ended: what it said, its exit code (127: it couldn't be run, or it didn't end by itself), and the signal that ended it where something other than this process's own time limit did. */
+/** How a program that was run ended: what it said, its exit code (127: it couldn't be run, or it didn't end by itself), the signal that ended it where something other than this process's own time limit did, and whether that time limit ended it (`late`). */
 export interface Ran {
   code: number;
   out: string;
   err: string;
   signal?: string;
+  late?: true;
 }
 
 /** Runs a program with `env` over this process's environment, for at most `timeoutMs` when given; what it said and how it ended. */
@@ -33,7 +34,7 @@ export function runProgram(command: string, args: readonly string[], env?: Reado
     const code = error === null ? 0 : typeof error.code === "number" ? error.code : 127;
     const why = error !== null && error.killed === true ? `${command} was ended after ${Math.round((timeoutMs ?? 0) / 1000)} seconds` : error !== null && typeof error.code !== "number" ? error.message : "";
     const signal = error !== null && error.killed !== true && typeof error.signal === "string" ? error.signal : undefined;
-    resolve({ code, out, err: err || why, ...(signal !== undefined ? { signal } : {}) });
+    resolve({ code, out, err: err || why, ...(signal !== undefined ? { signal } : {}), ...(error !== null && error.killed === true ? { late: true as const } : {}) });
   });
   return promise;
 }

@@ -13,15 +13,20 @@
 // One runtime at a time keeps a working copy for a user and an extension: the extension says which
 // (its word comes on each hello's answer, and as a push when it changes: `heard`). Until it has said,
 // operations wait. A runtime that doesn't hold the mirror keeps no copy: every read and write goes
-// straight to the mirror, as before working copies. One that loses it stops using its copy at once,
-// drops what it hadn't sent (each path in the log; a `settle()` that covers any of it is told), and
-// never asks for the mirror again in the same process. The holder is told of each path another
-// runtime changed, and drops what its copy holds of it: its next read is the mirror's.
+// straight to the mirror, as before working copies, once what its journal names has gone there
+// first, as its own writes. One that loses it stops using its copy at once, sends what it hadn't sent
+// straight so, then throws the copy away, and never asks for the mirror again in the same process.
+// Each change sent says how long ago it was made: the extension refuses one older than another
+// runtime's later write of the path (`superseded`), and that change gives way, said as one refused
+// for good. The holder is told of each path another runtime changed, and drops what its copy holds of
+// it: its next read is the mirror's.
 //
 // The mirror carries a mark: the working copy it mirrors, and how many changes it took from it. A
 // copy is used, when its runtime is given the mirror, only when it is the mark's and not behind the
 // mark's count: one copied to another machine or restored from a backup has taken fewer, and is
-// thrown away for the mirror's, as is any other's. A copy thrown away starts again under a new id.
+// thrown away for the mirror's, journal and all (the copy it was taken from sent that), as is one
+// when the mirror has no mark. Another's mark: what the copy hadn't sent stays and is sent, and the
+// rest is thrown away. A copy thrown away starts again under a new id.
 //
 // On the disk, under `dir`, a folder for each identity (one user's data of one extension on one
 // Lumiverse), named by a hash of it:
@@ -98,14 +103,20 @@ export const STORE_DEFAULTS: StoreLimits = {
   absent: 10_000,
 };
 
+/** The extension's storage as the store reaches it: the core's ports, a document's write and removal saying how long ago (ms) the change they carry was made (`ago`; absent: now), so the extension keeps the later of two runtimes' writes of a path. */
+export interface StoragePorts {
+  store: Omit<Required<StorePort>, "write" | "remove"> & { write(path: string, value: JsonValue, ago?: number): Promise<void>; remove(path: string, ago?: number): Promise<void> };
+  blobs: Required<BlobsPort>;
+}
+
 export interface WorkingStoreDeps {
   /** The folder the runtime keeps its working copies in (`<runtimeDir>/store`). */
   dir: string;
   identity: StoreIdentity;
   /** The extension's storage, over the link: the mirror, its writes those of this runtime's working copy, made as the process that holds the mirror (`holding`). The extension takes them from that process only. */
-  remote: { store: Required<StorePort>; blobs: Required<BlobsPort> };
-  /** The same storage, written as a runtime that keeps no copy writes it: what this store does while the runtime doesn't hold the mirror. */
-  direct: { store: Required<StorePort>; blobs: Required<BlobsPort> };
+  remote: StoragePorts;
+  /** The same storage, written as a runtime that keeps no copy writes it: what this store does while the runtime doesn't hold the mirror, its journal's changes among them. */
+  direct: StoragePorts;
   /** This process's own id as it holds the mirror, which its writes to the mirror carry. */
   holding: string;
   /** This runtime as a person knows it (its name, and the machine it runs on): what the mark says to another runtime that finds it. */
@@ -127,10 +138,11 @@ export interface WorkingStoreDeps {
   waitsOwner?(): SettingsOwner;
   /**
    * Whether the mirror refused a change for good: by a rule it holds to (a path it doesn't take, a
-   * frame larger than it puts together), not a failure that passes. Such a change leaves the journal
-   * at once and the working copy with it, so the two agree again; the log and `state().refused` say
-   * so, a `settle()` that waited for it is told in the mirror's words, and nothing else waits on it.
-   * Absent: every failure is taken as one that passes, and tried again.
+   * frame larger than it puts together), or because another runtime's later write of the path stands
+   * (`superseded`), not a failure that passes. Such a change leaves the journal at once and the
+   * working copy with it, so the two agree again; the log and `state().refused` say so, a `settle()`
+   * that waited for it is told in the mirror's words, and nothing else waits on it. Absent: every
+   * failure is taken as one that passes, and tried again.
    */
   refusedForGood?(error: unknown): boolean;
   /** Whether the mirror refused a write of the working copy's because this runtime doesn't hold the mirror (another does now): the copy ends, as when the extension says so. Neither a failure that passes nor a refusal of the change itself. */
@@ -150,16 +162,16 @@ export interface WorkingStoreDeps {
   disk?: Disk;
 }
 
-/** Whether the store keeps a working copy: `waiting` for the extension's word, `opening` (the copy checked against the mirror's mark, or a holder's copy dropping what another runtime changed), `held` (it keeps the copy), `direct` (it keeps none: every read and write is the mirror's). */
+/** Whether the store keeps a working copy: `waiting` for the extension's word, `opening` (the copy checked against the mirror's mark, or a holder's copy dropping what another runtime changed), `held` (it keeps the copy), `direct` (it keeps none: every read and write is the mirror's, once what the journal names has gone there). */
 export type StoreMode = "waiting" | "opening" | "held" | "direct";
 
 export interface WorkingStoreState {
-  /** Whether operations run now: on the working copy, or straight on the mirror. */
+  /** Whether operations run now: on the working copy, or straight on the mirror (once what the journal names has gone there). */
   open: boolean;
   mode: StoreMode;
   /** The runtime that holds the mirror, as the extension said, when this one doesn't; null when none does, or it isn't known. */
   holder: string | null;
-  /** When this runtime lost the mirror to another (null: it hasn't, in this process), to whom (null: the extension didn't say), and how many changes the mirror never had went with its copy. */
+  /** When this runtime lost the mirror to another (null: it hasn't, in this process), to whom (null: the extension didn't say), and how many of the changes it hadn't sent the mirror refused for good since (another runtime's later write of the path stands). */
   lost: { at: number; to: string | null; dropped: number } | null;
   /** How many paths (documents and blobs) the mirror doesn't hold as they stand here. */
   waiting: number;
@@ -213,6 +225,8 @@ interface Entry {
   sending: number | null;
   /** The first change made while it was being sent, and when: what the mirror lacks first once that send lands. */
   again: { change: number; at: number } | null;
+  /** When the last change was made (one read from the journal: its first), which the extension weighs against another runtime's write of the path. */
+  made: number;
 }
 
 /** A `settle()` waiting: the changes it waits for are those numbered up to `upTo`, and what the mirror refused for good of them (or the copy's end dropped) meanwhile, in words. */
@@ -363,6 +377,8 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
   let opening: Promise<void> = Promise.resolve();
   /** The extension's words when it refused this runtime itself (`deps.disowned`): from then on nothing is sent, and nothing waits on the mirror. Null until then. */
   let shutOut: string | null = null;
+  /** Without the mirror, while what the journal names goes there first, as this runtime's own writes: operations wait meanwhile, so none lands before an older change of its own. */
+  let emptying = false;
 
   const backoff = (): number => {
     const { retryFirstMs, retryMostMs } = limits();
@@ -585,20 +601,42 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     return false;
   }
 
-  /** Takes the working copy off the disk (its documents, its blobs, its journal) and what was remembered of the mirror, and starts a new copy in its place under a new id. The queue is the caller's to empty first. */
-  async function wipe(gen: number): Promise<void> {
-    await disk.removeAll(JOURNAL);
-    await disk.removeAll(DOCS);
-    await disk.removeAll(BLOBS);
-    made.clear();
-    await disk.mkdir(JOURNAL);
-    made.add(TMP).add(JOURNAL);
+  /**
+   * Takes the working copy off the disk (its documents, its blobs, its journal) and what was
+   * remembered of the mirror, and starts a new copy in its place under a new id. `kept`: the paths
+   * whose changes the mirror hasn't had, which stay, with their journal, to be sent. The queue is the
+   * caller's to empty of the rest first.
+   */
+  async function wipe(gen: number, kept: ReadonlySet<string> = new Set()): Promise<void> {
+    if (kept.size === 0) {
+      await disk.removeAll(JOURNAL);
+      await disk.removeAll(DOCS);
+      await disk.removeAll(BLOBS);
+      made.clear();
+      await disk.mkdir(JOURNAL);
+      made.add(TMP).add(JOURNAL);
+      docs.clear();
+      blobs.clear();
+      // An empty copy has nothing left to count.
+      counting = false;
+      uncounted.clear();
+    } else {
+      for (const path of await localDocs()) {
+        if (kept.has(`d:${path}`)) continue;
+        await disk.remove(docFile(path));
+        docs.drop(path);
+        await prune(path);
+      }
+      for (const pair of await disk.entries(BLOBS)) {
+        if (!pair.folder) continue;
+        for (const file of await disk.entries(`${BLOBS}/${pair.name}`)) {
+          if (file.folder || kept.has(`b:${file.name}`)) continue;
+          await disk.remove(`${BLOBS}/${pair.name}/${file.name}`);
+          dropBlob(file.name);
+        }
+      }
+    }
     absent.clear();
-    docs.clear();
-    blobs.clear();
-    // An empty copy has nothing left to count.
-    counting = false;
-    uncounted.clear();
     await reborn(gen);
   }
 
@@ -619,10 +657,12 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
   /**
    * The runtime was given the mirror: its copy is checked against the mirror's mark. Its own mark,
    * with a count its copy isn't behind, and the copy carries on, after dropping what the extension
-   * says another runtime changed since. Else (another's mark, none while the copy holds something, or
-   * a count the copy is behind: copied elsewhere, or restored) the copy is thrown away, with what it
-   * hadn't sent, and the mark taken. Tried again, waiting longer each time, until the mirror can be
-   * reached, the runtime loses the mirror or the store closes.
+   * says another runtime changed since. Another's mark: what the copy hadn't sent is this runtime's
+   * saves, which stay and go to the mirror (where no later write of another runtime's stands), and the
+   * rest is thrown away. Else (none while the copy holds something, or a count the copy is behind:
+   * copied elsewhere, or restored, whose changes the copy it was taken from sent) the copy is thrown
+   * away with what it hadn't sent. The mark is taken. Tried again, waiting longer each time, until the
+   * mirror can be reached, the runtime loses the mirror or the store closes.
    */
   async function claim(word: MirrorWord): Promise<void> {
     await started;
@@ -644,11 +684,12 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
           return;
         }
         const held = queue.size > 0 || (await holdsFile(DOCS)) || (await holdsFile(BLOBS));
-        const dropped = [...queue.values()];
         const own = mark !== null && mark.copy === copy;
+        const kept = new Set(mark !== null && !own ? queue.keys() : []);
+        const dropped = [...queue.values()].filter((entry) => !kept.has(entry.key));
         if (found !== null || held) {
-          queue.clear();
-          await serial("", () => wipe(word.gen));
+          for (const entry of dropped) queue.delete(entry.key);
+          await serial("", () => wipe(word.gen, kept));
         } else if (seen !== word.gen) {
           seen = word.gen;
           await serial("", keepIdentity);
@@ -660,7 +701,7 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
           takeover = { from, at: deps.now(), dropped: dropped.length };
           const whose = mark === null ? "doesn't say which runtime keeps it" : own ? "has taken more from this runtime's copy than the copy holds (a copy from a backup, or from another machine)" : `is kept by another runtime (${from}, since ${new Date(mark.at).toISOString()})`;
           logDropped(dropped, "the copy was thrown away for the storage's");
-          deps.log("warn", `the extension's storage ${whose}: this runtime threw its own copy away${dropped.length > 0 ? `, with ${dropped.length} changes the storage never had,` : ""} and keeps the storage from now on`);
+          deps.log("warn", `the extension's storage ${whose}: this runtime threw its own copy away${dropped.length > 0 ? `, with ${dropped.length} changes the storage never had,` : ""}${kept.size > 0 ? ` but for the ${kept.size} changes it hadn't sent, which go to the storage,` : ""} and keeps the storage from now on`);
         }
         reached();
         return;
@@ -682,6 +723,7 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
 
   /** The runtime was given the mirror: operations wait while its copy is checked, then run on it. */
   function open(word: MirrorWord): void {
+    emptying = false;
     become("opening");
     opening = claim(word).then(
       () => {
@@ -706,9 +748,10 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
   /**
    * Another runtime holds the mirror now: this one stops using its copy at once (operations from now
    * on go straight to the mirror, and one begun on the copy that hadn't changed anything yet is done
-   * there instead), and never asks for the mirror again in this process. Once the work under way on
-   * the copy has ended, what it hadn't sent is dropped, path by path in the log, the copy is thrown
-   * away, and each `settle()` that waited for any of it is told; one that didn't is let go.
+   * there instead), and never asks for the mirror again in this process. What it hadn't sent goes to
+   * the mirror straight first, as this runtime's own writes, where no later write of another runtime's
+   * stands (one refused so is dropped, said as any change refused for good is, and counted with the
+   * loss); then the copy is thrown away (`drained`).
    */
   function lose(to: string | null): void {
     if (mode !== "held" && mode !== "opening") return;
@@ -721,22 +764,26 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     markLater?.();
     markLater = null;
     for (const wake of [...sleeps]) wake();
+    emptying = true;
     const who = to === null ? "Another runtime" : `Another runtime (${to})`;
-    deps.log("warn", `the runtime's store: ${who} keeps the extension's storage now, so this runtime stops using its own copy and reads and writes the storage directly until it starts again`);
+    deps.log("warn", `the runtime's store: ${who} keeps the extension's storage now, so this runtime stops using its own copy, sends the storage what it hadn't sent there, and reads and writes the storage directly until it starts again`);
+    if (queue.size === 0) drained();
+    else kick(true);
+  }
+
+  /** Without the mirror, the journal is empty: once the work under way on the copy has ended (a change it made meanwhile goes first), what waited for it is done straight on the mirror, and the copy of a runtime that lost the mirror is thrown away. */
+  function drained(): void {
     track(
       (async () => {
         await quiet();
-        const dropped = [...queue.values()];
-        queue.clear();
-        logDropped(dropped, "another runtime keeps the storage now");
-        const ended = lost;
-        if (ended !== null) ended.dropped = dropped.length;
-        if (dropped.length > 0) {
-          const words = `${who} keeps the extension's storage now, so this runtime stopped using its own copy, and ${dropped.length === 1 ? "a change" : `${dropped.length} changes`} it hadn't sent there ${dropped.length === 1 ? "was" : "were"} dropped (the log names each). It reads and writes the storage directly from now on.`;
-          tell({ from: Math.min(...dropped.map((entry) => entry.first)), until: null, words });
+        if (closed || mode !== "direct") return;
+        if (queue.size > 0) {
+          kick(true);
+          return;
         }
-        notify();
-        await serial("", () => wipe(0)).catch((error: unknown) => deps.log("warn", `the runtime's store couldn't take its old copy off the disk (${errorText(error)}): the next start throws it away`));
+        emptying = false;
+        become("direct");
+        if (lost !== null) await serial("", () => wipe(0)).catch((error: unknown) => deps.log("warn", `the runtime's store couldn't take its old copy off the disk (${errorText(error)}): the next start throws it away`));
       })(),
     );
   }
@@ -755,8 +802,8 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
   /**
    * Another runtime changed these in the mirror: what the copy holds of them goes, so the next read is
    * the mirror's (read so at once: they count as stale until their copy is gone). A change made here
-   * that the mirror hasn't had yet stays: it is the newer. `all`: every one the copy holds, while
-   * operations wait.
+   * that the mirror hasn't had yet stays: the extension weighs it against the other's when it is sent
+   * (`superseded`). `all`: every one the copy holds, while operations wait.
    */
   async function shed(dropped: NonNullable<MirrorWord["dropped"]>): Promise<void> {
     if (dropped.all) {
@@ -788,7 +835,7 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     );
   }
 
-  /** What the disk holds of one key goes, unless it is a change the mirror hasn't had yet. */
+  /** What the disk holds of one key goes, unless it is a change the mirror hasn't had yet (sent, and weighed there). */
   function forgo(key: string, doc: boolean, name: string): Promise<void> {
     return serial(key, async () => {
       if (closed || queue.has(key)) return;
@@ -826,21 +873,26 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     }
   }
 
-  /** Waits until operations may run, within `waitMs`: on the working copy (gives the epoch they begin in), or straight on the mirror while the runtime keeps no copy (null). */
+  /** Waits until operations may run, within `waitMs`: on the working copy (gives the epoch they begin in), or straight on the mirror while the runtime keeps no copy (null), once what the journal names has gone there. */
   async function ready(): Promise<number | null> {
     const until = deps.now() + limits().waitMs;
     for (;;) {
       if (closed) throw new Error(WORDS.closed);
-      if (mode === "direct") return null;
+      if (mode === "direct" && (!emptying || shutOut !== null)) return null;
       if (mode === "held") return epoch;
       // Refused by the extension, the copy can't be checked against the mirror: there is nothing to wait for.
       if (shutOut !== null) throw new Error(shutOutWords(shutOut));
       await within(turned.promise, Math.max(0, until - deps.now()), () => {
         // The mirror's last failure as the wait runs out: the likely reason.
         const cause = lastError === null ? "" : ` (${lastError.words})`;
-        return mode === "waiting"
-          ? new Error(`The runtime's store hasn't heard from the extension which runtime keeps its storage since it started${cause}, so it can't yet tell whether to use its own copy. Try again once the runtime is linked.`)
-          : new Error(`The runtime's store hasn't reached the extension's storage since it was given it${cause}, so it can't yet tell whether the copy it holds is still the one the extension keeps. Try again once the runtime is linked.`);
+        const setting = deps.waitsOwner === undefined ? "" : ` It waits as long as ${transportWait(["runtime", "storeWaitMs"], deps.waitsOwner())} says.`;
+        const why =
+          mode === "waiting"
+            ? `The runtime's store hasn't heard from the extension which runtime keeps its storage since it started${cause}, so it can't yet tell whether to use its own copy.`
+            : mode === "direct"
+              ? `The runtime's store hasn't yet sent the extension's storage what it saved there and hadn't sent${cause}, which goes first so that nothing is written over it.`
+              : `The runtime's store hasn't reached the extension's storage since it was given it${cause}, so it can't yet tell whether the copy it holds is still the one the extension keeps.`;
+        return new Error(`${why} Try again once the runtime is linked.${setting}`);
       });
     }
   }
@@ -875,7 +927,7 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
   // ---------------------------------------------------------------- changes, and the sender
 
   function fresh(key: string, doc: boolean, name: string, change: number, since: number): Entry {
-    return { key, doc, name, first: change, since, last: change, sending: null, again: null };
+    return { key, doc, name, first: change, since, last: change, sending: null, again: null, made: since };
   }
 
   /** Notes a change of a path in the journal before it is made (its file first when it has none), and moves the path behind every other in the queue. True when the path had no change waiting: `unenter` takes the note back when the change can't be made. */
@@ -891,6 +943,7 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     }
     if (entry.sending !== null && entry.again === null) entry.again = { change, at: deps.now() };
     entry.last = change;
+    entry.made = deps.now();
     queue.delete(key);
     queue.set(key, entry);
     return false;
@@ -942,13 +995,14 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
   }
 
   /**
-   * Starts a round of sending, unless one is under way or there is nothing to send (nor a mark due);
-   * `now`: also when it would wait out a try that failed. A path that failed alone (`lone`) may be the
-   * one path the mirror doesn't take for now, not the mirror: another path waiting isn't held back by
-   * its wait.
+   * Starts a round of sending, unless one is under way or there is nothing to send (nor, holding the
+   * mirror, a mark due); `now`: also when it would wait out a try that failed. A path that failed
+   * alone (`lone`) may be the one path the mirror doesn't take for now, not the mirror: another path
+   * waiting isn't held back by its wait.
    */
   function kick(now = false): void {
-    if (closed || shutOut !== null || mode !== "held" || round !== null || (queue.size === 0 && !markDue())) return;
+    if (closed || shutOut !== null || round !== null) return;
+    if (mode === "held" ? queue.size === 0 && !markDue() : mode !== "direct" || !emptying || queue.size === 0) return;
     if (retry !== null) {
       if (!now && (lone === null || ![...queue.keys()].some((key) => key !== lone))) return;
       retry();
@@ -960,16 +1014,19 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     });
   }
 
-  /** A round of sending: each path in the queue, oldest first, until none is left or the mirror fails; then the mark, when it is due (else a wait until it is). */
+  /** A round of sending: each path in the queue, oldest first, until none is left or the mirror fails; then, holding the mirror, the mark when it is due (else a wait until it is), and without it, what waited for the journal to empty goes on (`drained`). */
   async function send(): Promise<void> {
     const at = epoch;
+    const was = mode;
+    const ports = was === "held" ? remote : direct;
     try {
       let failedLast = false;
       for (;;) {
-        if (closed || epoch !== at || mode !== "held") return;
+        if (closed || epoch !== at || mode !== was) return;
         const entry = queue.values().next().value;
         if (entry === undefined) {
-          if (taken > markTaken) {
+          if (was === "direct") drained();
+          else if (taken > markTaken) {
             const wait = limits().markMs - (deps.now() - markAt);
             if (wait <= 0) await writeMark();
             else
@@ -981,7 +1038,7 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
           return;
         }
         try {
-          await sendOne(entry, at);
+          await sendOne(entry, at, ports);
         } catch (error) {
           // A second failure in a row is the mirror itself. A first may be this path alone (one the mirror refuses for now), so it goes behind the others and holds none of them up.
           if (failedLast || closed) {
@@ -1026,17 +1083,17 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
   }
 
   /** Sends what the disk holds of one path: read under the path's turn, sent outside it (a change of the path never waits on the mirror), and settled under it again. */
-  async function sendOne(entry: Entry, at: number): Promise<void> {
+  async function sendOne(entry: Entry, at: number, ports: StoragePorts): Promise<void> {
     const read = await serial(entry.key, async () => {
       if (closed || epoch !== at || queue.get(entry.key) !== entry) return undefined;
       const text = await disk.read(fileOf(entry));
       entry.sending = entry.last;
-      return { text };
+      return { text, made: entry.made };
     });
     if (read === undefined) return;
     let sent: boolean;
     try {
-      sent = await deliver(entry, read.text);
+      sent = await deliver(entry, read.text, ports, read.made);
     } catch (error) {
       // The mirror is another runtime's now: not this change's failure, nor one that passes.
       if (!closed && deps.withdrawn?.(error) === true) {
@@ -1078,6 +1135,8 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     }
     await disk.remove(markerOf(entry));
     queue.delete(entry.key);
+    // What the runtime hadn't sent as it lost the mirror, and the storage refused: counted with the loss.
+    if (lost !== null) lost.dropped += 1;
     await disk.remove(fileOf(entry));
     if (entry.doc) {
       docs.drop(entry.name);
@@ -1085,19 +1144,19 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     } else dropBlob(entry.name);
   }
 
-  /** Sends a path's text to the mirror; false when there is nothing that can be sent (cut off before it was in place, or damaged on the disk: said in the log), and the mirror keeps what it had. */
-  async function deliver(entry: Entry, text: string | null): Promise<boolean> {
+  /** Sends a path's text to the mirror (a document's saying how long ago it was made); false when there is nothing that can be sent (cut off before it was in place, or damaged on the disk: said in the log), and the mirror keeps what it had. */
+  async function deliver(entry: Entry, text: string | null, ports: StoragePorts, made: number): Promise<boolean> {
     if (text === null) return false;
     if (!entry.doc) {
       if ((await textHash(text)) !== entry.name) {
         deps.log("warn", `the runtime's copy of blob ${entry.name} doesn't match its hash any more, so it isn't sent`);
         return false;
       }
-      await remote.blobs.put(entry.name, text);
+      await ports.blobs.put(entry.name, text);
       return true;
     }
     if (text === "") {
-      await remote.store.remove(entry.name);
+      await ports.store.remove(entry.name, Math.max(0, deps.now() - made));
       return true;
     }
     const value = parseJson(text);
@@ -1105,7 +1164,7 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
       deps.log("warn", `the runtime's copy of ${entry.name} isn't JSON any more, so it isn't sent`);
       return false;
     }
-    await remote.store.write(entry.name, value as JsonValue);
+    await ports.store.write(entry.name, value as JsonValue, Math.max(0, deps.now() - made));
     return true;
   }
 
@@ -1564,7 +1623,7 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     state() {
       let behindSince: number | null = null;
       for (const entry of queue.values()) if (behindSince === null || entry.since < behindSince) behindSince = entry.since;
-      return { open: mode === "held" || mode === "direct", mode, holder, lost: lost === null ? null : { ...lost }, waiting: queue.size, behindSince, lastError, lastSent, bytes: docs.total + blobs.total, counting, takeover, refused: [...refused] };
+      return { open: mode === "held" || (mode === "direct" && (!emptying || shutOut !== null)), mode, holder, lost: lost === null ? null : { ...lost }, waiting: queue.size, behindSince, lastError, lastSent, bytes: docs.total + blobs.total, counting, takeover, refused: [...refused] };
     },
     async ask() {
       try {
@@ -1579,8 +1638,12 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
       if (word === null || !word.held) {
         holder = word?.holder ?? null;
         if (mode === "held" || mode === "opening") lose(holder);
-        else if (mode === "waiting") become("direct");
-        else if (lost !== null && lost.to === null) lost.to = holder;
+        else if (mode === "waiting") {
+          // What a start found in the journal goes straight to the mirror first, as this runtime's own writes.
+          emptying = queue.size > 0;
+          become("direct");
+          kick();
+        } else if (lost !== null && lost.to === null) lost.to = holder;
         return;
       }
       holder = null;

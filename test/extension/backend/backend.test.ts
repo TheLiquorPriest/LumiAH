@@ -129,6 +129,29 @@ describe("the settings", () => {
     const after = it.host.stored(USER, "settings.json") as { own: { path: string[]; value: unknown }[] };
     expect(after.own).toEqual([{ path: ["transport", "history", "count"], value: 20 }]);
   });
+
+  test("with no runtime linked, a change is kept though what is stored names an agent or a tool only the runtime knows; one that itself names such is refused for want of the runtime", async () => {
+    const it = (r = await rig());
+    // Set while a runtime was linked: an effort for an agent of the user's own, and an extension's tool for the main agent. And a value inside that agent the linked check passed over (its names weren't known there), which is wrong whatever the runtime says.
+    const own = [{ path: ["core", "agents", "harbour-pilot", "effort"], value: "off" }, { path: ["core", "agents", "harbour-pilot", "budget", "wallMs"], value: -5 }, { path: ["core", "agents", "main", "tools"], value: ["tide_tables"] }];
+    it.host.files.set(`${USER}/settings.json`, JSON.stringify({ v: 1, rev: 1, own, texts: {} }));
+    await it.restart();
+
+    const changed = await it.page.request("lah.settings.set", { set: [{ path: ["core", "extension", "waitMs"], value: 5_000 }], reset: [] });
+    expect(changed.settings.values).toMatchObject({ core: { extension: { waitMs: 5_000 }, agents: { "harbour-pilot": { effort: "off" }, main: { tools: ["tide_tables"] } } } });
+    // A reset of a Timeouts row is kept too.
+    await it.page.request("lah.settings.set", { set: [], reset: [["core", "extension", "waitMs"]] });
+
+    // A value the core can judge alone is still judged, wherever it is.
+    const bad = await it.page.request("lah.settings.set", { set: [{ path: ["core", "agents", "harbour-pilot", "effort"], value: "flat out" }], reset: [] }).catch((error: unknown) => error);
+    expect(bad instanceof UiFailure ? bad.error.problems : null).toContainEqual({ path: ["core", "agents", "harbour-pilot", "effort"], message: expect.any(String) });
+
+    // A change that names an agent only the runtime knows is refused, and the refusal says the runtime is needed.
+    const refused = await it.page.request("lah.settings.set", { set: [{ path: ["core", "agents", "lighthouse", "effort"], value: "off" }], reset: [] }).catch((error: unknown) => error);
+    expect(refused instanceof UiFailure ? refused.error : null).toMatchObject({ code: "invalid", problems: [{ path: ["core", "agents", "lighthouse"], message: expect.stringContaining("runtime") }] });
+    await it.backend.settle();
+    expect(it.host.stored(USER, "settings.json")).toMatchObject({ own });
+  });
 });
 
 describe("the per-chat switch and the secrets", () => {

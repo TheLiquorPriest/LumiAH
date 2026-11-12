@@ -322,6 +322,24 @@ describe("budgets", () => {
     expect(await r.start({ connectionId: "conn-gone" }).send("go")).toMatchObject({ status: "refused", code: "connection" });
     expect(r.host.calls).toHaveLength(1);
   });
+
+  test("a connection that isn't there runs on the default with the default's own model, not the one its settings chose for the gone connection, and its start says so", async () => {
+    const started: AgentStarted[] = [];
+    const trace: AgentTrace = { start: (agent) => void started.push(agent), entry: () => undefined, usage: () => undefined, idle: () => undefined, prompt: async () => undefined, delta: () => undefined };
+    const r = rig(["on the default", "on its own"], undefined, { turn: (s, host) => new AgentTurn(s.turn, host.clock.now(), trace) });
+    await r.start({ connectionId: "conn-gone", model: "model-of-the-gone" }).send("go");
+    // A connection the runtime has keeps the model its settings chose.
+    await r.start({ connectionId: WRITER, model: "model-chosen" }).send("go");
+    // Null: the connection's own model runs.
+    expect(r.host.calls.map((c) => [c.connectionId, c.model])).toEqual([
+      [MAIN, null],
+      [WRITER, "model-chosen"],
+    ]);
+    expect(started.map((s) => [s.connectionId, s.model])).toEqual([
+      [MAIN, "model-main"],
+      [WRITER, "model-chosen"],
+    ]);
+  });
 });
 
 describe("clipping and scratch_read", () => {

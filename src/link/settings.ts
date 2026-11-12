@@ -123,6 +123,10 @@ export interface RuntimeTuning {
   providerMs: number;
   /** How long a model's answer, once begun, may go with nothing from its provider's server before the call is ended (and made again, as a dropped stream is); 0 for no limit. */
   answerSilentMs: number;
+  /** How long a sign-in to a provider stays open for the user to finish it. */
+  signInMs: number;
+  /** How long a new build of the runtime is given to say its version before an update to it is refused as a build that can't start here. */
+  buildStartMs: number;
 }
 
 /** What the transport does, as the user set it. */
@@ -247,6 +251,9 @@ export const RUNTIME_DEFAULTS: Readonly<RuntimeTuning> = Object.freeze({
   providerMs: 60_000,
   // A model thinking between the pieces it shows, and a busy server, stay well inside five minutes; their pings and keep-alives count as something.
   answerSilentMs: 5 * 60_000,
+  // About as long as a provider's sign-in page keeps a code good, after which finishing it could only fail.
+  signInMs: 10 * 60_000,
+  buildStartMs: 30_000,
 });
 
 export const TRANSPORT_DEFAULTS: Readonly<TransportSettings> = Object.freeze({
@@ -461,6 +468,8 @@ export const TRANSPORT_SCHEMA: JsonObject = {
         copyChars: whole("Chat data kept", "The most characters of your chats and world books the runtime keeps in memory, so an agent reads them without asking this extension. What was used least recently goes first; a chat larger than this alone is read from this extension every time. 0 keeps none.", 0, 1_000_000_000, "characters"),
         providerMs: ms("Provider wait", "How long testing one of the runtime's connections (Runtime → Connections), or reading a server's list of its models for a model picker, waits for the provider to answer. Past it the page says the provider didn't answer.", 1_000, 10 * 60_000),
         answerSilentMs: ms("Silent answer ends after", "How long a model's answer, once it has begun, may go with nothing at all from its provider's server before the call is ended and made again, as a dropped stream is. Before its answer begins a model may still be reading a long prompt or thinking unseen: that is never cut short. 0: no limit.", 0, DAY_MS),
+        signInMs: ms("Sign-in stays open", "How long a sign-in to Anthropic or OpenAI (Runtime → Connections) stays open for you to sign in and paste back what the provider gave you. Past it the sign-in ends and says so: start it again. A provider keeps what it gives you good for about ten minutes, so a longer wait seldom helps.", 60_000, 60 * 60_000),
+        buildStartMs: ms("New build's start check", "How long a new build of the runtime is given to start and say its version before the runtime updates to it. Past it the build is taken as one that can't start here, and the runtime stays on the build it runs. A slow or busy machine may need longer.", 5_000, 10 * 60_000),
       },
     },
   },

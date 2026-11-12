@@ -85,4 +85,9 @@ describe("a program lumiah runs", () => {
   test("not in the system's folders isn't run, and says where it was looked for", async () => {
     expect(await runProgram("no-such-program-of-lumiah", [])).toEqual({ code: 127, out: "", err: "no-such-program-of-lumiah isn't in /usr/bin, /bin, /usr/sbin, /sbin" });
   });
+
+  test("one its time limit ends says so, and one that ends by itself doesn't", async () => {
+    expect(await runProgram("sleep", ["5"], undefined, 50)).toMatchObject({ code: 127, late: true });
+    expect((await runProgram("sleep", ["0"], undefined, 5_000)).late).toBeUndefined();
+  });
 });

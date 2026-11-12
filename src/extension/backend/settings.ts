@@ -19,8 +19,11 @@ export interface SettingsSection {
   key: string;
   defaults(): JsonObject;
   schema: JsonObject;
-  /** What the section refuses of its values, for a user: a section whose names depend on what that user has (the core's: their extension's tools, their own agents) may ask for it first. */
-  check(values: unknown, userId: string): UiProblem[] | Promise<UiProblem[]>;
+  /**
+   * What the section refuses of its values, for a user: a section whose names depend on what that user has (the core's: their extension's tools, their own agents) may ask for it first.
+   * `changed`: the places within the section the change sets or resets (an empty place: all of it). Where what the user has can't be read just then, a section judges again only what the change itself touches of what needs it.
+   */
+  check(values: unknown, userId: string, changed: readonly SettingPath[]): UiProblem[] | Promise<UiProblem[]>;
   /** The settings of the section that aren't the user's to set, for a user (the tools of an agent an extension keeps as its own): a change never stores a value there. */
   fixed?(userId: string): Promise<readonly SettingPath[]>;
   /** The settings an earlier build had and this one took away, each a path within the section: a value the user kept at one is passed over quietly, never refused. */
@@ -286,7 +289,11 @@ export class SettingsStore {
       }
     }
     const values = this.valuesOf(own);
-    for (const section of this.sections) for (const p of await section.check(values[section.key], userId)) problems.push({ path: [section.key, ...p.path], message: p.message });
+    const changed = [...reset, ...set.map((s) => s.path)];
+    for (const section of this.sections) {
+      const touched = changed.flatMap((path) => (path.length === 0 ? [[]] : path[0] === section.key ? [path.slice(1)] : []));
+      for (const p of await section.check(values[section.key], userId, touched)) problems.push({ path: [section.key, ...p.path], message: p.message });
+    }
     if (problems.length > 0) throw new SettingsRefused(`The settings refused ${problems.length === 1 ? "a value" : `${problems.length} values`}: nothing was changed.`, problems);
     const revision = await this.docs.change(userId, (doc) => {
       doc.own = own;

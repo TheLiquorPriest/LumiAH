@@ -24,6 +24,7 @@ import type { LinkedBackend, LinkRequests } from "../link/contract";
 import { EXTENSION_IDENTIFIER, RUNTIME_NAME, loopbackModel, runtimeBase, shellWord, unitName } from "../link/contract";
 import { linkedBackendOf } from "../link/frames";
 import { isRecord } from "../link/json";
+import { ASK_PATH, PROBE_HEADER, roadProof, sameSecret } from "../link/road";
 import { RUNTIME_DEFAULTS } from "../link/settings";
 import type { RuntimeConfig, SavedConfig, SystemdService } from "./config";
 import { EXTENSION_FORM, RUNTIME_DIR_MODE, SETUP_DEFAULTS, configDir, configOf, configPathOf, configText, dataDir, installedPath, runtimeDir } from "./config";
@@ -715,34 +716,50 @@ async function loopbackConnection(io: RuntimeIO, base: string, token: string, ur
 
 // ---------------------------------------------------------------- serve
 
-/** How often a copy of the runtime that waits for another to stop serving asks again, and renews its mark. */
+/** How often a copy of the runtime that waits for another to stop serving asks again, and renews its mark; and how long whatever answers on its port has to answer the probe. */
 const WAIT_MS = 5_000;
 /** A waiting copy's mark in the runtime's own folder: `{ pid, since, seen }`. */
 const WAITING = "waiting.json";
 
-/** Whether a runtime answers `GET /healthz` on this config's address now: another copy of this one serves there, or another runtime does. */
-async function answersThere(config: RuntimeConfig, io: RuntimeIO): Promise<boolean> {
+/**
+ * What serves on this config's address now, asked by the road's probe (link/road.ts), which carries
+ * no secret: a copy of this runtime, whose answer is a proof made with the config's secret; nothing,
+ * where nothing takes the request; or something else, which answered without that proof, or not
+ * within `WAIT_MS`.
+ */
+async function servingThere(config: RuntimeConfig, io: RuntimeIO): Promise<"this runtime" | "nothing" | "something else"> {
+  const nonce = [...crypto.getRandomValues(new Uint8Array(16))].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const late = AbortSignal.timeout(WAIT_MS);
+  const reply = await io.http({ method: "POST", url: `${runtimeBase(config.listen, config.port).replace(/\/v1$/, "")}${ASK_PATH}`, headers: { [PROBE_HEADER]: nonce, "Content-Type": "application/json" }, body: "{}", signal: late }).catch(() => null);
+  if (reply === null) return late.aborted ? "something else" : "nothing";
+  let said: unknown = null;
   try {
-    const body = await healthOf(config, io);
-    return isRecord(body) && (body.up === true || typeof body.link === "string");
+    said = JSON.parse(reply.text);
   } catch {
-    return false;
+    // Not JSON: no proof below.
   }
+  const proof = isRecord(said) && typeof said.proof === "string" ? said.proof : "";
+  return reply.status === 200 && (await sameSecret(proof, await roadProof(config.secret, config.relay, nonce))) ? "this runtime" : "something else";
 }
 
 /**
  * Never two copies of one runtime on its port. Where a restart starts the runtime as a new process
  * (Windows, which can't replace one in place), the task or service wrapper that ran the old process
- * may start one too. Whichever copy comes second finds the first answering on the port: it serves
- * nothing and links to nothing, waits until that one stops, and meanwhile keeps a mark in the
- * runtime's folder, which the one that serves shows on the Runtime page. Resolves null once the
- * port is this one's to take; with the signal's name when it is asked to stop while it waits.
+ * may start one too. Whichever copy comes second finds the first answering the probe on the port:
+ * it serves nothing and links to nothing, waits until that one stops, and meanwhile keeps a mark in
+ * the runtime's folder, which the one that serves shows on the Runtime page. Only a copy of this
+ * runtime is waited for: whatever else holds the port could keep it waiting for as long as it
+ * liked, so then it doesn't start, in words that say why. Resolves null once the port is this
+ * one's to take; with the signal's name when it is asked to stop while it waits.
  */
 async function waitForPort(config: RuntimeConfig, io: RuntimeIO, dir: string, log: (text: string) => void, stopping: Promise<string>): Promise<string | null> {
   const mark = `${dir}/${WAITING}`;
   let since: number | null = null;
   try {
-    while (await answersThere(config, io)) {
+    for (;;) {
+      const there = await servingThere(config, io);
+      if (there === "nothing") return null;
+      if (there === "something else") throw new Error(`Something other than this runtime holds ${config.listen}:${config.port}: what answers there can't prove it holds this runtime's secret, so the runtime doesn't wait for it. Stop what holds the port (another program, or a runtime set up there before under another registration), or set this runtime up again on another port with --port.`);
       const now = io.now();
       if (since === null) {
         since = now;
@@ -752,7 +769,6 @@ async function waitForPort(config: RuntimeConfig, io: RuntimeIO, dir: string, lo
       const stopped = await Promise.race([io.sleep(WAIT_MS).then(() => null), stopping]);
       if (stopped !== null) return stopped;
     }
-    return null;
   } finally {
     if (since !== null) io.files.remove(mark);
   }
@@ -845,6 +861,9 @@ export async function serve(config: SavedConfig, path: string, io: RuntimeIO): P
         now: io.now,
         log,
         name: () => runtime.link.backendName,
+        owner: () => runtime.link.owner,
+        // The user's settings as last read, which the config keeps.
+        buildStartMs: () => current.tuning.buildStartMs,
         handedOver: io.env[HANDED_OVER] !== undefined,
         waitingCopy: () => waitingCopy(io, dir),
       }),
@@ -862,11 +881,13 @@ export async function serve(config: SavedConfig, path: string, io: RuntimeIO): P
   const ended = await Promise.race([stopping, left.promise]);
   log(`stopping (${typeof ended === "string" ? ended : "to restart on its new build"})`);
   clearInterval(timer);
+  // From here the relay refuses every request but the road's probe.
   runtime.shutdown();
   // A moment for the error chunks and cancels to go out.
   await io.sleep(current.tuning.stopGraceMs);
-  server.stop();
+  // The port stays the runtime's until its link has closed: LumiAH sends the road's asks, the relay's secret with them, to the port for as long as it holds the link, and another program that took the port meanwhile would be sent them.
   await runtime.close();
+  server.stop();
   if (typeof ended === "string") return 0;
   try {
     await io.handOver(ended);

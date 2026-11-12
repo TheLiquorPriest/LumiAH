@@ -31,7 +31,7 @@ import type { ConnectionAuth } from "./kinds";
 import { KINDS, builtInProviders, kindOf } from "./kinds";
 import { passedJob } from "./pass";
 import type { SignIn } from "./signin";
-import { SIGN_IN_MS, createSignIn } from "./signin";
+import { createSignIn } from "./signin";
 import { REDIRECT_REFUSED, REDIRECT_WORDS, durationWords, errorWords, failureWords, redact } from "./words";
 
 export type { ConnectionInput, StoredConnection } from "./book";
@@ -61,8 +61,8 @@ export interface ModelLayerDeps {
   serialTools?(): readonly string[] | Promise<readonly string[]>;
   /** pi-ai providers that stand in for the built-in ones of the same id: tests give pi-ai's faux provider. */
   providers?: readonly Provider[];
-  /** How long a sign-in flow stays open; `SIGN_IN_MS` when not given. */
-  signInMs?: number;
+  /** How long a sign-in flow stays open: `SIGN_IN_MS` when not given. Asked as each flow starts, so a setting's change holds from the next. */
+  signInMs?(): number | Promise<number>;
   /** The runtime's environment, `process.env` when not given: what the SDKs under pi-ai would read in it for themselves (`STEERING`) is taken out as the layer is made. */
   env?: Record<string, string | undefined>;
   /** How long a call whose answer has begun may go with nothing at all from its server before it is ended: `SILENT_MS` when not given, 0 for no limit. Asked at each call, so a setting's change holds from the next. */
@@ -149,6 +149,8 @@ const TEST_PROMPT = "Reply with the word OK.";
 const TEST_ROOM = 64;
 /** How long a test call or a server's list of models may take unless the layer is told otherwise (the setting's own default): past that, the page is told the provider didn't answer. */
 const ASK_MS = RUNTIME_DEFAULTS.providerMs;
+/** How long a sign-in flow stays open unless the layer is told otherwise (the setting's own default). */
+const SIGN_IN_MS = RUNTIME_DEFAULTS.signInMs;
 /** The most of a server's list of models read: lists of hundreds of models run to a few megabytes, and an answer without end would otherwise grow until the runtime is restarted. */
 const LIST_MAX = 8 * 1024 * 1024;
 
@@ -245,7 +247,7 @@ export function createModelLayer(deps: ModelLayerDeps): ModelLayer {
   const pi = createModels({ credentials: book.credentials, authContext: NOWHERE });
   for (const provider of [...builtInProviders(), ...(deps.providers ?? [])]) pi.setProvider(provider);
   const callDeps: CallDeps = { pi, book, fetch: deps.fetch, now: deps.now, setTimeout: deps.setTimeout, clearTimeout: deps.clearTimeout, silentMs: async () => (await deps.silentMs?.()) ?? SILENT_MS, silentSetting: () => transportWait(["runtime", "answerSilentMs"], deps.owner?.() ?? OWN_BACKEND) };
-  const signIn = createSignIn({ pi, book, id: deps.id, uuid: deps.uuid, now: deps.now, log: deps.log, setTimeout: deps.setTimeout, clearTimeout: deps.clearTimeout, signInMs: deps.signInMs ?? SIGN_IN_MS });
+  const signIn = createSignIn({ pi, book, id: deps.id, uuid: deps.uuid, now: deps.now, log: deps.log, setTimeout: deps.setTimeout, clearTimeout: deps.clearTimeout, signInMs: async () => (await deps.signInMs?.()) ?? SIGN_IN_MS, owner: () => deps.owner?.() ?? OWN_BACKEND });
 
   /** A signal the layer's own wait ends after the provider wait (`askMs`, else `ASK_MS`), with words that say what didn't come in time (`late`, given the wait in words) and where that wait is changed; and its timer's release. */
   const deadline = async (late: (wait: string) => string): Promise<{ signal: AbortSignal; clear(): void }> => {

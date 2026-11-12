@@ -70,6 +70,8 @@ interface RuntimeOptions {
   own?: (chatId: string) => Promise<Record<string, JsonValue>>;
   /** The database reader the runtime opens on a file the offer names. */
   database?: () => DbSource;
+  /** Lumiverse's address as the runtime reaches it: its own loopback one unless the test gives another. */
+  base?: string;
   tuning?: Partial<RuntimeTuning>;
   /** Whose Settings hold the runtime's waits. */
   owner?: SettingsOwner;
@@ -164,9 +166,10 @@ function runtimeOver(made: Lumiverse, options: RuntimeOptions = {}): Runtime {
 
   // Lumiverse's HTTP as the runtime reaches it: the session's routes of the made-up Lumiverse, behind its check of the bearer.
   const session = made.session(USER);
+  const base = options.base ?? BASE;
   const http: Http = async (request) => {
     requests.push(request);
-    const path = request.url.slice(BASE.length);
+    const path = request.url.slice(base.length);
     if (request.headers.Authorization !== `Bearer ${lumiverse.token}`) return { status: 401, header: () => null, text: JSON.stringify({ error: "Unauthorized" }) };
     if (path === "/api/auth/get-session" && lumiverse.sessionFails) return { status: 503, header: () => null, text: "" };
     if (lumiverse.moved?.test(path) === true) return { status: 302, header: (name) => (name.toLowerCase() === "location" ? `https://elsewhere.example${path}` : null), text: "" };
@@ -179,7 +182,7 @@ function runtimeOver(made: Lumiverse, options: RuntimeOptions = {}): Runtime {
   const data = createChatData({
     link: runtimeLink,
     viaLink,
-    base: BASE,
+    base,
     credentials: () => ({ username: "mara", token: TOKEN, savedAt: 0 }),
     http,
     now: () => clock.now,
@@ -420,6 +423,39 @@ describe("the database reader", () => {
     expect(it.crossed.slice(from)).toEqual([]);
     expect(it.requests.slice(asked).some((r) => r.url.includes(`/api/v1/chats/${third.chatId}`))).toBe(true);
     expect(it.data.state(MEMORY).chats.find((c) => c.id === third.chatId)?.from).toBe("http");
+  });
+
+  test("isn't opened by a runtime that reaches Lumiverse at an address other than loopback, though it is given the file: on another machine the same path could hold an old copy of Lumiverse's data", async () => {
+    const lumiverse = new Lumiverse();
+    const one = harbour(lumiverse);
+    const rows = createHttpSource({ fetch: lumiverse.session(USER), identifier: LUMIAH, sleep: async () => undefined });
+    const path = "/srv/lumiverse/data/lumiverse.db";
+    // A reader of whatever file is at that path, which answers as Lumiverse's own.
+    const db: DbSource = {
+      kind: "database",
+      readChat: (chatId) => rows.readChat(chatId),
+      readBook: (bookId, held) => rows.readBook(bookId, held),
+      chatSignature: (chatId) => rows.chatSignature(chatId),
+      bookSignature: async (bookId, held) => (await rows.readBook(bookId, held))?.signature ?? null,
+      changedSince: async (mark) => ({ changed: mark !== String(lumiverse.version), mark: String(lumiverse.version) }),
+      describe: () => ({ path, on: true, why: null, open: true, schema: { checkedAt: null, matches: true, difference: null }, lastRead: null, lastCheck: null }),
+      close: () => undefined,
+    };
+    let opened = 0;
+    const it = runtimeOver(lumiverse, {
+      base: "https://lumiverse.example",
+      database: () => {
+        opened++;
+        return db;
+      },
+    });
+    it.hello({ database: path });
+    await copying(it);
+    expect(await contents(it, one.chatId)).toEqual(["Who keeps the harbour light now?", "Okoro keeps it."]);
+    expect(opened).toBe(0);
+    const state = it.data.state(MEMORY);
+    expect(state.chats.find((c) => c.id === one.chatId)?.from).toBe("http");
+    expect(state.reader).toBeNull();
   });
 });
 

@@ -261,7 +261,7 @@ describe("who keeps the copy, over the real link", () => {
     expect(b.store.state()).toMatchObject({ mode: "direct", lost: null });
   });
 
-  test("a runtime that loses the copy with a save under way: the extension refuses that save for good, the runtime stops using its copy, the save is dropped and said so, and the next save goes straight to the storage", async () => {
+  test("a runtime that loses the copy with a save under way: the extension refuses that save as the copy's, the runtime stops using its copy, sends the save straight (no other runtime saved the file since), and the next save goes straight to the storage too", async () => {
     const held: string[] = [];
     let holding = false;
     const socketOf: { send: ((text: string) => void) | null } = { send: null };
@@ -291,9 +291,10 @@ describe("who keeps the copy, over the real link", () => {
     await until(() => it.runtime.store.state().mode === "direct", "the runtime to stop using its copy");
     holding = false;
     for (const text of held.splice(0)) socketOf.send?.(text);
-    expect(await settled).toContain("keeps the extension's storage now, so this runtime stopped using its own copy, and a change it hadn't sent there was dropped");
-    expect(it.host.stored(USER, "docs/chats/chat-1/session.json")).toBeNull();
-    expect(it.runtime.store.state()).toMatchObject({ mode: "direct", lost: { dropped: 1 } });
+    expect(await settled).toBe("done");
+    expect(it.host.stored(USER, "docs/chats/chat-1/session.json")).toEqual({ turns: 1 });
+    expect(it.runtime.store.state()).toMatchObject({ mode: "direct", lost: { dropped: 0 } });
+    expect(await other.store.store.read("chats/chat-1/session.json")).toEqual({ turns: 1 });
     await it.runtime.store.store.write("chats/chat-1/session.json", { turns: 2 });
     expect(it.host.stored(USER, "docs/chats/chat-1/session.json")).toEqual({ turns: 2 });
     expect(await other.store.store.read("chats/chat-1/session.json")).toEqual({ turns: 2 });

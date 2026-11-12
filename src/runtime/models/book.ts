@@ -10,7 +10,8 @@
 // What was stored for one server goes to no other. A connection's key and its headers' values stay
 // only while its provider and its address's origin do: a change of either keeps only what comes
 // with it. A connection that signs in goes to its provider's own address, and an address holds no
-// name or password.
+// name or password. A key or a header's value shorter than `SECRET_FLOOR` is never kept: what a
+// server says back can't be cleaned of one so short (words.ts).
 //
 // The sign-ins' tokens are pi-ai's to keep fresh: they reach it through a `CredentialStore` over
 // the same secrets, whose `modify` runs one change of a provider's sign-in at a time and saves it
@@ -28,7 +29,7 @@ import type { Credential, CredentialStore, ModelThinkingLevel, OAuthCredential }
 import { isRecord } from "../../core/ports";
 import type { ConnectionAuth, ProviderKind } from "./kinds";
 import { kindOf } from "./kinds";
-import { errorWords } from "./words";
+import { errorWords, SECRET_FLOOR } from "./words";
 
 /** The files' format: one of another is read as no book, with words that say so. */
 const FORMAT = 1;
@@ -184,6 +185,7 @@ function headersOf(given: ConnectionInput["headers"], had: StoredConnection["hea
       continue;
     }
     if (/[\r\n\0]/.test(value)) throw new Error(`The header "${name}" can't hold a line break.`);
+    if (value.trim().length < SECRET_FLOOR) throw new Error(`The value of "${name}" needs ${SECRET_FLOOR} characters at least: the runtime takes a header's value out of whatever a server says back, as it does a key, and a shorter one can't be told from ordinary words.`);
     headers[name] = value;
   }
   return Object.keys(headers).length > 0 ? headers : undefined;
@@ -386,6 +388,7 @@ export class Book {
     if (!create && input.id !== undefined && at === -1) throw new Error("That connection is no longer there: reload the page.");
     const connection = checked(input, input.id ?? newId());
     if (key !== undefined && key !== null && (typeof key !== "string" || key.trim() === "")) throw new Error("A key can't be empty: leave it out to keep the one there is.");
+    if (typeof key === "string" && key.trim().length < SECRET_FLOOR) throw new Error(`A key needs ${SECRET_FLOOR} characters at least: the runtime takes a key out of whatever a server says back (some repeat a key they refuse), and a shorter one can't be told from ordinary words.`);
     const before = at === -1 ? undefined : s.connections[at];
     const carried = before !== undefined && before.provider === connection.provider && originOf(before.baseUrl) === originOf(connection.baseUrl);
     const headers = headersOf(input.headers, before?.headers, carried);

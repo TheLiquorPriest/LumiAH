@@ -405,7 +405,7 @@ class Agent implements AgentHandle {
     } catch {
       // Not lost: the first call takes this read, its failure too, and its stop says why.
     }
-    this.deps.turn?.trace?.start({ id: this.id, role: spec.role, ...on, model: spec.model, effort: spec.effort, system: spec.system, prefix: [...spec.prefix], history: spec.history?.length ?? 0, ...(spec.parent !== undefined ? { parent: spec.parent } : {}), ...(spec.task !== undefined ? { task: spec.task } : {}), ...(spec.as !== undefined ? { as: spec.as } : {}), at: this.now() });
+    this.deps.turn?.trace?.start({ id: this.id, role: spec.role, ...on, model: this.session.model, effort: spec.effort, system: spec.system, prefix: [...spec.prefix], history: spec.history?.length ?? 0, ...(spec.parent !== undefined ? { parent: spec.parent } : {}), ...(spec.task !== undefined ? { task: spec.task } : {}), ...(spec.as !== undefined ? { as: spec.as } : {}), at: this.now() });
   }
 
   private text(id: string, vars: Readonly<Record<string, string>> = {}): string {

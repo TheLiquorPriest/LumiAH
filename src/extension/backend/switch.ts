@@ -27,8 +27,12 @@
 
 import type { ChatClaim, ClaimAsk } from "../../core/extension";
 import type { ChatInfo, JsonValue } from "../../core/ports";
+import { settingTitle } from "../../core/settings";
 import { type StorySetting, storyHolds, storyWordOf } from "../../core/story";
+import { type Limit, limitOf, timerMs } from "../../core/util";
 import { isRecord } from "../../link/json";
+import { spanWords } from "../../link/waits";
+import { timeoutPlace } from "../../shared/timeouts";
 import type { ChatLeadView, ChatStoryView, ChatView } from "../../shared/ui";
 import type { Chats } from "./chat";
 import type { ChatConnection, Connections } from "./connections";
@@ -86,13 +90,17 @@ export interface SwitchDeps {
   runtimeOf(userId: string, chatId: string): Promise<{ id: string; name: string } | null>;
   /** Why LumiAH can answer no chat now, in words that say what to do (a permission it needs is missing); null when it can. */
   blocked(): string | null;
-  /** Who this backend is: its identifier keys its mark on a chat, and its name is what another backend's pages call it. */
-  identity: Pick<BackendIdentity, "identifier" | "name">;
+  /** Who this backend is: its identifier keys its mark on a chat, its name is what another backend's pages call it, and where its Settings are shown is where a wait's words send the user. */
+  identity: Pick<BackendIdentity, "identifier" | "name" | "settingsAt">;
   now(): number;
+  /** Runs `fn` once after `ms`; what it returns cancels that. */
+  later(ms: number, fn: () => void): () => void;
   /** The user's own setting of what counts as the story (Settings), which a chat's choice stands over. */
   storySetting(userId: string): Promise<StorySetting>;
-  /** What the extension that answers this backend's chats says of a chat: its claim, with its name. Null where it claims nothing; `failed`, with why, where it gave no answer. Absent where it supplies no claims. */
-  claim?(ask: ClaimAsk, userId: string): Promise<{ by: string; claim: ChatClaim } | { by: string; failed: string } | null>;
+  /** The user's Wait for the extension: how long a run waits for the extension's claim on a chat. */
+  extensionWait(userId: string): Promise<Limit>;
+  /** The extension that answers this backend's chats, by its name, and what it says of a chat: its claim; null where it claims nothing; `failed`, with why, where it gave no answer. Absent where it supplies no claims. */
+  claimer?: { name: string; claim(ask: ClaimAsk, userId: string): Promise<{ claim: ChatClaim } | { failed: string } | null> };
 }
 
 export class ChatSwitch {
@@ -199,9 +207,10 @@ export class ChatSwitch {
     const ask = await this.claimAsk(userId, chatId, setting);
     if (ask === null) throw new LinkRefused("not_found", "There is no such chat in this account.");
     const chosen = ask.chat.story ?? {};
-    const answered = this.deps.claim === undefined ? null : await this.deps.claim(ask, userId);
+    const { claimer } = this.deps;
+    const answered = claimer === undefined ? null : await claimer.claim(ask, userId);
     // A claim that gave no answer says nothing of the story here: the log says so, and the chat's and the user's words stand.
-    const said = answered !== null && "claim" in answered ? answered : null;
+    const said = claimer !== undefined && answered !== null && "claim" in answered ? { by: claimer.name, claim: answered.claim } : null;
     // What the page shows as the extension's word is what its claim says of the story: a claim that says nothing of it leaves the chat's and the user's to stand.
     const word = storyWordOf(said?.claim.story);
     const claimed = said !== null && Object.keys(word).length > 0 ? { by: said.by, story: word } : null;
@@ -216,15 +225,22 @@ export class ChatSwitch {
    */
   async lead(userId: string, chatId: string): Promise<ChatLeadView | null> {
     await this.deps.chats.own(userId, chatId);
-    if (this.deps.claim === undefined) return null;
+    const { claimer } = this.deps;
+    if (claimer === undefined) return null;
     const ask = await this.claimAsk(userId, chatId);
     if (ask === null) throw new LinkRefused("not_found", "There is no such chat in this account.");
-    const said = await this.deps.claim(ask, userId);
+    // A reply in this chat waits for the claim no longer than Wait for the extension, and doesn't start without it: a claim that comes later is no answer here either, so the page never shows a lead every reply would be refused under.
+    const ms = timerMs(limitOf(await this.deps.extensionWait(userId)));
+    const late = Promise.withResolvers<{ late: string }>();
+    const place = timeoutPlace(["core", "extension", "waitMs"], settingTitle(["extension", "waitMs"]), this.deps.identity);
+    const cancel = ms === null ? (): void => undefined : this.deps.later(ms, () => late.resolve({ late: `nothing within ${spanWords(ms)}; ${place} says how long a reply waits for it` }));
+    const said = await Promise.race([claimer.claim(ask, userId), late.promise]).finally(cancel);
     if (said === null) return null;
-    if ("failed" in said) return { by: said.by, unanswered: said.failed };
+    if ("late" in said) return { by: claimer.name, unanswered: said.late };
+    if ("failed" in said) return { by: claimer.name, unanswered: said.failed };
     // The claim is the extension's answer: only a name it gives is an agent's.
     const { mainAgent, reply } = said.claim as { mainAgent?: unknown; reply?: unknown };
-    return { by: said.by, lead: typeof mainAgent === "string" && mainAgent !== "" ? mainAgent : null, released: reply === "released" };
+    return { by: claimer.name, lead: typeof mainAgent === "string" && mainAgent !== "" ? mainAgent : null, released: reply === "released" };
   }
 
   /** `lah.chat.story.set`: the chat's own choice, whole (each member left out follows Settings), kept while the chat is off too. */

@@ -47,13 +47,14 @@ describe("the mark", () => {
     expect(b.mirror.doc("mirror.json")).toMatchObject({ v: 1, kind: "mirror", owner: "runtime one" });
   });
 
-  test("a runtime that finds another's mark throws its copy away, reads the mirror afresh and takes the mark", async () => {
+  test("a runtime that finds another's mark throws its copy away, reads the mirror afresh and takes the mark; what it hadn't sent goes to the mirror", async () => {
     const path = "chats/c1/session.json";
+    const unsent = "chats/c1/learned.json";
     const one = open(b);
     await one.store.write(path, { asked: 1 });
     await one.settle();
     b.mirror.down = "the extension isn't linked";
-    await one.store.write(path, { asked: 2 });
+    await one.store.write(unsent, { learned: 1 });
     await one.close();
     b.mirror.down = null;
 
@@ -65,12 +66,12 @@ describe("the mark", () => {
     await two.close();
 
     const back = keep(open(b));
+    // What its copy held of the mirror is gone: it reads runtime two's save.
     expect(await back.store.read(path)).toEqual({ asked: 3 });
-    expect(back.state().takeover).toMatchObject({ from: "runtime two", dropped: 1 });
+    expect(back.state().takeover).toMatchObject({ from: "runtime two", dropped: 0 });
     await back.settle();
-    // The write runtime one never sent was thrown away with its copy: it never lands over runtime two's.
+    expect(b.mirror.doc(unsent)).toEqual({ learned: 1 });
     expect(b.mirror.doc(path)).toEqual({ asked: 3 });
-    expect(b.mirror.took.filter((change) => change === `write ${path}`)).toHaveLength(2);
     expect(b.mirror.doc("mirror.json")).toMatchObject({ owner: "runtime one" });
     expect(b.logs.some((line) => line.level === "warn" && line.message.includes("is kept by another runtime (runtime two"))).toBe(true);
   });
@@ -122,6 +123,24 @@ describe("the mark", () => {
     b.clock.advance(60_000);
     await until(() => s.state().open, "the store to open");
     expect(await s.store.read("workspace/user.json")).toBeNull();
+  });
+
+  test("an operation that waits out the Storage wait (for the extension's word, for the copy to be checked, or for what a copy lost hadn't sent) names that setting and where it is changed", async () => {
+    const owner = { name: "LumiRPEngine", settingsAt: "LumiRPEngine's Harness tab → System → Settings" };
+    const limits = (): { waitMs: number } => ({ waitMs: 2_000 });
+    const lost = keep(open(b, { limits, waitsOwner: () => owner }));
+    await lost.settle();
+    b.mirror.down = "the extension isn't linked";
+    await lost.store.write("chats/c1/session.json", { turns: 1 });
+    lost.heard({ held: false, holder: "runtime two", gen: 0 });
+    const unsaid = keep(open(b, { dir: elsewhere, word: "none", limits, waitsOwner: () => owner }));
+    const given = keep(open(b, { dir: `${elsewhere}/given`, limits, waitsOwner: () => owner }));
+    const waits = [lost, unsaid, given].map((s) => outcome(s.store.read("workspace/user.json")));
+    b.clock.advance(2_000);
+    for (const words of await Promise.all(waits)) {
+      expect(words).toContain("Storage wait");
+      expect(words).toContain(owner.settingsAt);
+    }
   });
 });
 

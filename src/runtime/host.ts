@@ -13,7 +13,7 @@
 // request too, and the runtime is the same for every extension.
 
 import type { AgentModelChoice, ChatClaim, ExtensionDefinitions, HarnessExtension } from "../core/extension";
-import type { ApprovalAnswer, BlobsPort, ConnectionsPort, HarnessHost, JobView, JsonValue, LogLevel, ModelMessage, ModelsPort, StorePort, TraceDelta, TraceRecord } from "../core/ports";
+import type { ApprovalAnswer, ConnectionsPort, HarnessHost, JobView, JsonValue, LogLevel, ModelMessage, ModelsPort, TraceDelta, TraceRecord } from "../core/ports";
 import type { ActivatedEntry, LoreBookRead, RecallChatPort, RecallLorePort, RecallPorts, TimedMessage } from "../core/recall/ports";
 import type { ExtensionMember, ExtensionOffer, LinkRequests, StreamChunk } from "../link/contract";
 import { isRecord } from "../link/json";
@@ -24,6 +24,7 @@ import { LOST_WAIT } from "./link";
 import { LiveError } from "./lumiverse";
 import type { Streams } from "./streams";
 import { problemOf } from "./streams";
+import type { StoragePorts } from "./store";
 
 export interface HostDeps {
   link: RuntimeLink;
@@ -116,9 +117,10 @@ export async function asked<T extends AskType>(deps: Pick<HostDeps, "link" | "no
  * The extension's storage, over the link (`doc.*`, `blob.*`): where the core's documents and blobs
  * are kept for good. The runtime's working store (store/) keeps its own copy and mirrors it here, its
  * writes naming the process that holds the mirror (`mirror`), which the extension takes only from
- * that one; without `mirror`, they are the runtime's own, as a runtime that keeps no copy writes.
+ * that one, and how long ago each document's change was made (`ago`); without `mirror`, they are the
+ * runtime's own, as a runtime that keeps no copy writes.
  */
-export function linkStorage(deps: Pick<HostDeps, "link" | "now" | "tuning">, mirror?: string): { store: Required<StorePort>; blobs: Required<BlobsPort> } {
+export function linkStorage(deps: Pick<HostDeps, "link" | "now" | "tuning">, mirror?: string): StoragePorts {
   const ask = <T extends AskType>(type: T, fields: Asked<T>): Promise<LinkRequests[T]["result"]> => asked(deps, type, fields);
   const as = mirror === undefined ? {} : { mirror };
   return {
@@ -137,11 +139,11 @@ export function linkStorage(deps: Pick<HostDeps, "link" | "now" | "tuning">, mir
     },
     store: {
       read: async (path) => (await ask("doc.get", { path })).doc,
-      write: async (path, value) => {
-        await ask("doc.put", { path, doc: value, ...as });
+      write: async (path, value, ago) => {
+        await ask("doc.put", { path, doc: value, ...as, ...(ago === undefined ? {} : { ago }) });
       },
-      remove: async (path) => {
-        await ask("doc.remove", { path, ...as });
+      remove: async (path, ago) => {
+        await ask("doc.remove", { path, ...as, ...(ago === undefined ? {} : { ago }) });
       },
       list: async (prefix) => (await ask("doc.list", { prefix })).paths,
     },
@@ -156,13 +158,14 @@ export function withdrawn(error: unknown): boolean {
 
 /**
  * Whether the extension refused a request by a rule of its own that asking again doesn't change:
- * a request it doesn't take (`bad_request`), or a frame larger than the largest it puts together
- * (`too_large`). A lack of room just now (`unavailable`), a link that dropped and every other
- * failure pass, and are asked again.
+ * a request it doesn't take (`bad_request`), a frame larger than the largest it puts together
+ * (`too_large`), or a working copy's change older than another runtime's later write of the
+ * document (`superseded`). A lack of room just now (`unavailable`), a link that dropped and every
+ * other failure pass, and are asked again.
  */
 export function refusedForGood(error: unknown): boolean {
   const cause: unknown = error instanceof Error ? error.cause : undefined;
-  return cause instanceof LinkError && (cause.code === "bad_request" || cause.code === "too_large");
+  return cause instanceof LinkError && (cause.code === "bad_request" || cause.code === "too_large" || cause.code === "superseded");
 }
 
 /**

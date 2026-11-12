@@ -188,7 +188,7 @@ export function linkedBackendOf(raw: unknown): LinkedBackend {
   return { name: raw.name, connection: raw.connection, ...(text(raw.settingsAt) && raw.settingsAt !== "" ? { settingsAt: raw.settingsAt } : {}) };
 }
 
-const ERROR_CODES: Readonly<Record<LinkErrorCode, true>> = { bad_request: true, forbidden: true, not_found: true, conflict: true, unavailable: true, version: true, too_large: true, internal: true };
+const ERROR_CODES: Readonly<Record<LinkErrorCode, true>> = { bad_request: true, forbidden: true, not_found: true, conflict: true, unavailable: true, version: true, too_large: true, superseded: true, internal: true };
 
 /** An answer to a request as it crossed: its result, or its error with a code this contract knows (`internal` otherwise); null when it isn't one. */
 export function answerOf(raw: unknown): LinkResultFrame | LinkErrorFrame | null {

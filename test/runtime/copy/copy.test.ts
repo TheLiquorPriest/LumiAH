@@ -140,6 +140,47 @@ describe("a chat is read whole once, then kept by Lumiverse's events", () => {
     expect(all.map((m) => m.content)).toEqual([...lines(3), "A late line."]);
     expect(all).toEqual(await rig.host.chats.messages(chat.id));
   });
+
+  test("a run that begins while the chat's first read is under way is never answered by that read without the check before a run", async () => {
+    // The HTTP source's first read of the chat's messages, answered as the chat stood then and held on its way back.
+    const asked = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let held = false;
+    const rig = rigCopy({
+      source: ({ lumiverse }) => {
+        const session = lumiverse.session(USER);
+        return createHttpSource({
+          identifier: LUMIAH,
+          sleep: async () => undefined,
+          fetch: async (path, init) => {
+            const answer = await session(path, init);
+            if (!held && /\/messages\?limit=1000&offset=0$/.test(path)) {
+              held = true;
+              asked.resolve();
+              await release.promise;
+            }
+            return answer;
+          },
+        });
+      },
+    });
+    const { lumiverse } = rig;
+    const chat = lumiverse.newChat(USER);
+    lumiverse.say(chat.id, "Who keeps the harbour light now?", { user: true });
+    rig.forward();
+    // A job reads the chat whole: its pages hold the one message.
+    const job = rig.copy.chats.messages(chat.id);
+    await asked.promise;
+    // The user sends another, whose event is still on its way, and a turn begins on the chat.
+    lumiverse.say(chat.id, "And who kept it before the storm?", { user: true });
+    rig.copy.due(chat.id);
+    const run = rig.copy.chats.messages(chat.id);
+    release.resolve();
+
+    await job;
+    expect((await run).map((m) => m.content)).toEqual(["Who keeps the harbour light now?", "And who kept it before the storm?"]);
+    expect(await run).toEqual(await rig.host.chats.messages(chat.id));
+  });
 });
 
 describe("a chat is read again, never patched by guess", () => {

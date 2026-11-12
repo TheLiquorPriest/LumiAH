@@ -291,12 +291,15 @@ export interface LinkRequests {
   // `mirror` comes from a runtime's working copy as the process that holds the mirror (the hello's
   // `MirrorAsk.process`): the extension takes it only from the runtime it lets hold the mirror, and
   // refuses any other with `conflict`, for good. One without is a runtime's own (it keeps no copy):
-  // taken from any runtime of the user's, and the holder is told of the path (a `mirror` push).
+  // taken from any runtime of the user's, and the holder is told of the path (a `mirror` push). A
+  // working copy's write of a document says how long before the request its change was made (`ago`,
+  // ms): one older than a later write of the path by another runtime, as the extension knows it while
+  // it runs, is refused with `superseded`, for good. Without `ago`, a write is made now.
   "blob.get": { fields: { secret: string; hash: string }; result: { text: string | null } };
   "blob.put": { fields: { secret: string; hash: string; text: string; mirror?: string }; result: { stored: true } };
   "doc.get": { fields: { secret: string; path: string }; result: { doc: JsonValue | null } };
-  "doc.put": { fields: { secret: string; path: string; doc: JsonValue; mirror?: string }; result: { written: true } };
-  "doc.remove": { fields: { secret: string; path: string; mirror?: string }; result: { removed: true } };
+  "doc.put": { fields: { secret: string; path: string; doc: JsonValue; mirror?: string; ago?: number }; result: { written: true } };
+  "doc.remove": { fields: { secret: string; path: string; mirror?: string; ago?: number }; result: { removed: true } };
   /** The chat's active path, oldest first, each message with its anchor for the swipe it shows. */
   "chat.path": { fields: { secret: string; chat: string }; result: { messages: PathMessage[] } };
   /** The active path's messages whose index is `from` or more and less than `to`, with their text. */
@@ -394,8 +397,8 @@ export type LinkRequest = { [K in LinkRequestType]: { link: typeof LINK; type: K
 
 export type LinkRequestOf<K extends LinkRequestType> = Extract<LinkRequest, { type: K }>;
 
-/** Why the extension refused a request. `version`: the two ends speak different link versions. */
-export type LinkErrorCode = "bad_request" | "forbidden" | "not_found" | "conflict" | "unavailable" | "version" | "too_large" | "internal";
+/** Why the extension refused a request. `version`: the two ends speak different link versions. `superseded`: a working copy's change of a document is older than another runtime's later write of it, which stands. */
+export type LinkErrorCode = "bad_request" | "forbidden" | "not_found" | "conflict" | "unavailable" | "version" | "too_large" | "superseded" | "internal";
 
 export interface LinkResultFrame {
   link: typeof LINK;

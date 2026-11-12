@@ -165,6 +165,8 @@ export interface RigOptions {
   silentMs?: number;
   /** How long a connection's test or a server's list of models waits; the layer's default when not given. */
   askMs?: number;
+  /** How long a sign-in flow stays open; the layer's default when not given. */
+  signInMs?: number;
   /** Whose Settings show the layer's waits, as its words say them; LumiAH's own when not given. */
   owner?: SettingsOwner;
 }
@@ -208,6 +210,7 @@ export function rig(options: RigOptions = {}): Rig {
     ...(options.env ? { env: options.env } : {}),
     ...(options.silentMs !== undefined ? { silentMs: () => options.silentMs ?? 0 } : {}),
     ...(options.askMs !== undefined ? { askMs: () => options.askMs ?? 0 } : {}),
+    ...(options.signInMs !== undefined ? { signInMs: () => options.signInMs ?? 0 } : {}),
     ...(options.owner !== undefined ? { owner: () => options.owner ?? { name: "LumiAH" } } : {}),
   });
   return {

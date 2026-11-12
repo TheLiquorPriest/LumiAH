@@ -53,6 +53,8 @@ export function machine(lumiverse: FakeLumiverse, change: MachineChange = {}): M
     ask: async () => null,
     http: async (request) => {
       const url = new URL(request.url);
+      // Lumiverse's port, whatever name it is reached by, is the only one anything serves on here: a request to another (the runtime's own, while no test makes it answer) finds nobody, as a refused connection.
+      if (url.port !== new URL(lumiverse.base).port) throw new Error(`Unable to connect: nothing listens on ${url.host}`);
       m.asked.push(`${request.method} ${url.pathname}`);
       // Signing in is Lumiverse's own; everything after it is the fake's routes, with the session it gave.
       if (url.pathname === "/api/auth/sign-in/username") return { status: 200, header: () => null, text: JSON.stringify({ token: lumiverse.token }) };

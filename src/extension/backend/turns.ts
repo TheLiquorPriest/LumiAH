@@ -20,6 +20,8 @@ import { recordOf } from "../../core/sessions";
 import type { Anchoring, SourceMark, TurnFacts } from "../../link/contract";
 import { TAG_PARAM, contentMark } from "../../link/contract";
 import { CEILINGS, TRANSPORT_DEFAULTS, type TransportSettings } from "../../link/settings";
+import { transportWait } from "../../link/waits";
+import type { ChatLeadView } from "../../shared/ui";
 import type { Chats } from "./chat";
 import type { Connections } from "./connections";
 import { randomHex } from "./docs";
@@ -88,6 +90,8 @@ export interface Turn {
   target: Target | null;
   /** The user stopped it from LumiAH's live view. */
   stoppedHere: boolean;
+  /** It may not be answered, and why, in words Lumiverse shows: its tag only carries the refusal to the runtime, so the request isn't passed on untagged. */
+  refused?: string;
 }
 
 interface Pending {
@@ -138,11 +142,14 @@ export interface TurnsDeps {
   open: OpenTurns;
   /** A reply is about to go to a runtime (never a prompt preview): where that runtime isn't linked the user is told so, since nothing here answers in its place (§25). Not waited for. */
   toRuntime?(userId: string, chatId: string): void;
-  /** The extension as its pages show it, for the words a reply that couldn't start is given. */
+  /** The extension as its pages show it, for the words a reply that couldn't start is given, and where its Settings are shown, for the words of a wait that ran out. */
   name: string;
+  settingsAt?: string;
   now(): number;
   /** Runs `fn` once after `ms`; what it returns cancels that. */
   later(ms: number, fn: () => void): () => void;
+  /** Who leads a chat's replies, as the extension LumiAH is built into claims it (`ChatSwitch.lead`, bounded by Wait for the extension); null where it doesn't claim the chat. Absent where no extension claims chats. */
+  lead?(userId: string, chatId: string): Promise<ChatLeadView | null>;
 }
 
 /** The places of the history messages a prompt leaves out: all but the latest `count`, when only the latest are kept. */
@@ -495,10 +502,16 @@ export class Turns {
    * - not known: the check is waited for, a bounded time; failing or late, the prompt goes on untouched;
    * - known to be the runtime's: failing or late, the prompt is left untagged, in words Lumiverse
    *   shows: tagged blindly, a connection that is no loopback any more would be sent the tag. The
-   *   runtime passes an untagged request on to the writer, so the reply is still written.
+   *   runtime passes an untagged request on to the writer, so the reply is still written. Not in a
+   *   chat the extension LumiAH is built into claims, or whose claim can't be had in time: a reply
+   *   the writer wrote alone there would pass for one of that extension's, its own lead never having
+   *   run. That reply is stopped instead (`stop`): `intercept` tags it with a tag that carries only
+   *   why, unconfirmed, so where the connection was repointed and that wasn't heard yet, the tag
+   *   (`lumiah_turn`) reaches another provider in the request. That is the lesser fault: the other
+   *   is a reply written in that extension's place.
    * A chat that became LumiAH's since it was last seen is so answered from its second reply on.
    */
-  private async where(input: InterceptorInput): Promise<Verdict> {
+  private async where(input: InterceptorInput): Promise<Verdict | { stop: string }> {
     const account = this.of(input.userId);
     const key = `${input.connectionId ?? ""}\u0000${input.chatId}`;
     const held = account.mine.get(key);
@@ -527,7 +540,14 @@ export class Turns {
         this.host.log("warn", `[LumiAH] a reply's connection couldn't be checked (${wordsOf(error)}), so it was left as it is`);
         return false;
       }
-      throw new Error(`${this.deps.name} answers this chat in its runtime, and couldn't check its connection now (${wordsOf(error)}), so its agents had no part in this reply. Try again in a moment; if it keeps happening, see ${this.deps.name}'s Runtime page.`);
+      const why = wordsOf(error);
+      const lead = this.deps.lead === undefined ? null : await this.deps.lead(input.userId, input.chatId);
+      if (lead !== null) {
+        const whose = "unanswered" in lead ? `this chat may be ${lead.by}'s, which gave no word on it (${lead.unanswered})` : `${lead.by} answers this chat`;
+        const wait = transportWait(["tags", "checkMs"], { name: this.deps.name, ...(this.deps.settingsAt !== undefined ? { settingsAt: this.deps.settingsAt } : {}) });
+        return { stop: `${this.deps.name} couldn't confirm this chat's connection in time (${why}), so this reply wasn't written: ${whose}, and nothing else writes its replies. Send the message again; it usually works. ${wait} says how long a reply waits for that check.` };
+      }
+      throw new Error(`${this.deps.name} answers this chat in its runtime, and couldn't check its connection now (${why}), so its agents had no part in this reply. Try again in a moment; if it keeps happening, see ${this.deps.name}'s Runtime page.`);
     } finally {
       unwait();
     }
@@ -586,12 +606,23 @@ export class Turns {
    * The prompt interceptor (DESIGN §2 step 2, §25). A prompt that is none of LumiAH's is left as it
    * is. On a loopback, the messages the history cutoff hides are left out, and the generation is
    * tagged: the tag goes into the request's body, where the runtime finds it. A prompt preview (a
-   * dry run) shows the cutoff and nothing else, since nothing will be sent.
+   * dry run) shows the cutoff and nothing else, since nothing will be sent. A reply that must not be
+   * written (`where`) is tagged too, with a tag that carries only why: the runtime's `begin` answers
+   * the request with those words, and nothing is passed on untagged.
    */
   async intercept(input: InterceptorInput): Promise<InterceptorVerdict> {
     const kind = KINDS[input.type];
     if (kind === undefined) return {};
-    if (!(await this.where(input))) return {};
+    const where = await this.where(input);
+    if (where === false) return {};
+    if (where !== true) {
+      if (input.dryRun || !this.host.granted("generation_parameters")) throw new Error(where.stop);
+      const generation = this.generationOf(input);
+      if (generation === null) throw new Error(where.stop);
+      const turn = this.take(input, kind, generation, []);
+      turn.refused = where.stop;
+      return { parameters: { [TAG_PARAM]: turn.tag } };
+    }
     if (!input.dryRun) this.deps.toRuntime?.(input.userId, input.chatId);
     // Without the permission to set a request's parameters the tag can't travel, so nothing is changed and the reply is the connection's own, whole. The pages say what that permission is for.
     if (!this.host.granted("generation_parameters")) return {};
@@ -642,6 +673,7 @@ export class Turns {
     const settings = await this.deps.settings.revision(userId);
     const turn = this.accounts.get(userId)?.byTag.get(tag);
     if (turn === undefined || this.deps.now() - turn.at > lifeMs) throw new LinkRefused("not_found", `${name} doesn't know this reply's tag: the extension started again since the reply was asked for, or the tag is too old. Send the message again.`);
+    if (turn.refused !== undefined) throw new LinkRefused("unavailable", turn.refused);
     if (turn.request !== null && turn.request !== request) throw new LinkRefused("conflict", "This reply's tag was already used. A tag admits one request, so this one wasn't answered: send the message again.");
     if (turn.facts === null) {
       turn.request = request;

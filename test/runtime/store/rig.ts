@@ -15,7 +15,7 @@ import { LinkRefused } from "../../../src/host/refused";
 import type { MirrorWord } from "../../../src/link/contract";
 import { mirrorWordOf } from "../../../src/link/frames";
 import { type Disk, nodeDisk } from "../../../src/runtime/store/disk";
-import { createWorkingStore, type WorkingStore, type WorkingStoreDeps } from "../../../src/runtime/store/index";
+import { createWorkingStore, type StoragePorts, type WorkingStore, type WorkingStoreDeps } from "../../../src/runtime/store/index";
 
 /** A clock that stands still: its timers run, in order, when a test moves it on. */
 export class Clock {
@@ -238,6 +238,12 @@ export function withdrawnHere(error: unknown): boolean {
   return cause instanceof LinkRefused && cause.code === "conflict";
 }
 
+/** Whether the extension refused a change for good, as host.ts `refusedForGood` reads it over the bench's link: another runtime's later write of the document stands (`superseded`), or a rule of its own. */
+export function refusedHere(error: unknown): boolean {
+  const cause: unknown = error instanceof Error ? error.cause : undefined;
+  return cause instanceof LinkRefused && (cause.code === "superseded" || cause.code === "bad_request" || cause.code === "too_large");
+}
+
 /**
  * The extension's part that decides who holds each user's mirror (backend/mirror.ts, the real one),
  * over the bench's clock, its own files kept in memory as the user's storage keeps the backend's. A
@@ -305,22 +311,31 @@ export async function linked(b: Bench, relay: string, over: Partial<WorkingStore
   let session = `session-${b.ids++}`;
   let down = false;
   const caller = (): Caller => ({ userId: IDENTITY.user, relay: { id: relay, name: relay, secret: "", build: "", host: "", listen: "127.0.0.1", port: 1, registeredAt: 0, report: null }, session });
-  const through = (mark: string | undefined): { store: Required<StorePort>; blobs: Required<BlobsPort> } => {
-    const write = <T>(changed: { docs: string[]; blobs: string[] }, apply: () => Promise<T>): Promise<T> => {
+  const through = (mark: string | undefined): StoragePorts => {
+    const write = <T>(changed: { docs: string[]; blobs: string[] }, apply: () => Promise<T>, ago?: number): Promise<T> => {
       if (down) return Promise.reject(new Error("the extension isn't linked"));
       let out: T | undefined;
       return arbiter.mirrors
-        .write(caller(), mark, changed, async () => {
-          out = await apply();
-        })
-        .then(() => out as T, (error: unknown) => Promise.reject(refusedOverLink(error)));
+        .write(
+          caller(),
+          mark,
+          changed,
+          async () => {
+            out = await apply();
+          },
+          ago,
+        )
+        .then(
+          () => out as T,
+          (error: unknown) => Promise.reject(refusedOverLink(error)),
+        );
     };
     return {
-      store: { ...b.mirror.store, read: (path) => (down ? Promise.reject(new Error("the extension isn't linked")) : b.mirror.store.read(path)), list: (prefix) => (down ? Promise.reject(new Error("the extension isn't linked")) : b.mirror.store.list(prefix)), write: (path, value) => write({ docs: [path], blobs: [] }, () => b.mirror.store.write(path, value)), remove: (path) => write({ docs: [path], blobs: [] }, () => b.mirror.store.remove(path)) },
+      store: { ...b.mirror.store, read: (path) => (down ? Promise.reject(new Error("the extension isn't linked")) : b.mirror.store.read(path)), list: (prefix) => (down ? Promise.reject(new Error("the extension isn't linked")) : b.mirror.store.list(prefix)), write: (path, value, ago) => write({ docs: [path], blobs: [] }, () => b.mirror.store.write(path, value), ago), remove: (path, ago) => write({ docs: [path], blobs: [] }, () => b.mirror.store.remove(path), ago) },
       blobs: { ...b.mirror.blobs, get: (hash) => (down ? Promise.reject(new Error("the extension isn't linked")) : b.mirror.blobs.get(hash)), put: (hash, text) => write({ docs: [], blobs: [] }, () => b.mirror.blobs.put(hash, text)), remove: (hashes) => write({ docs: [], blobs: [...hashes] }, () => b.mirror.blobs.remove(hashes)) },
     };
   };
-  const store = open(b, { word: "none", holding, remote: through(holding), direct: through(undefined), withdrawn: withdrawnHere, release: async () => void (await arbiter.mirrors.release(caller(), holding)), ...over });
+  const store = open(b, { word: "none", holding, remote: through(holding), direct: through(undefined), withdrawn: withdrawnHere, refusedForGood: refusedHere, release: async () => void (await arbiter.mirrors.release(caller(), holding)), ...over });
   const runtime: Linked = {
     store,
     relay,

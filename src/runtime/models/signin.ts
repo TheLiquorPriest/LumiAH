@@ -11,13 +11,12 @@
 // so a page that asks how the runtime stands can say it.
 
 import type { AuthInteraction, MutableModels } from "@earendil-works/pi-ai";
+import { transportWait } from "../../link/waits";
+import type { SettingsOwner } from "../../shared/timeouts";
 import type { Book } from "./book";
 import type { SignInProvider } from "./kinds";
 import { isSignInProvider } from "./kinds";
-import { errorWords, failureWords, redact } from "./words";
-
-/** How long a flow stays open: about as long as a provider's sign-in page keeps a code good, after which finishing it could only fail. */
-export const SIGN_IN_MS = 10 * 60_000;
+import { durationWords, errorWords, failureWords, redact } from "./words";
 
 /** What a page shows to start a sign-in: the flow to finish, the address to open, and what to know first. */
 export interface SignInStart {
@@ -56,7 +55,10 @@ export interface SignInDeps {
   log(text: string): void;
   setTimeout(run: () => void, ms: number): unknown;
   clearTimeout(handle: unknown): void;
-  signInMs: number;
+  /** How long a flow stays open (the setting *Sign-in stays open*), asked as each flow starts, so a change holds from the next. */
+  signInMs(): number | Promise<number>;
+  /** Whose Settings show that wait: the words of a flow left open too long name it there. */
+  owner(): SettingsOwner;
 }
 
 /** How long the words of why a flow ended stay for `state`: long enough for a page that asks every few seconds, or one the user comes back to, to say why. */
@@ -145,6 +147,7 @@ export function createSignIn(deps: SignInDeps): SignIn & { close(): void } {
       const earlier = openFlow(provider);
       if (earlier !== undefined) end(earlier, "A new sign-in was started in its place.");
       const device = await deps.book.device(deps.uuid);
+      const openMs = await deps.signInMs();
       const stop = new AbortController();
       const pasted = Promise.withResolvers<string>();
       // A flow that ends before anything is pasted leaves this promise unread.
@@ -176,8 +179,8 @@ export function createSignIn(deps: SignInDeps): SignIn & { close(): void } {
         done: Promise.resolve(),
         timer: deps.setTimeout(() => {
           const open = flows.get(id);
-          if (open !== undefined) end(open, "The sign-in was left open too long.");
-        }, deps.signInMs),
+          if (open !== undefined) end(open, `The sign-in was left open longer than ${durationWords(openMs)}. ${transportWait(["runtime", "signInMs"], deps.owner())} says how long a sign-in stays open.`);
+        }, openMs),
       };
       flow.done = deps.pi.login(provider, "oauth", interaction, { getDeviceId: () => device, agentName: AGENT_NAME }).then(
         () => {

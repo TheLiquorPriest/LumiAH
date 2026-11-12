@@ -104,4 +104,34 @@ describe("who holds the mirror", () => {
     expect(await it.mirrors.release(caller("mara", "relay-b", "s2"), ID(4))).toBe(true);
     expect(JSON.parse(it.files.get("mara/mirror-holder.json") ?? "null")).toMatchObject({ holder: null });
   });
+
+  test("refuses as superseded, and doesn't do, a working copy's write of a document made before another runtime's later write of it, as it knows them while it runs; one with no age, one of the same runtime's, and one after it starts again are done as they come", async () => {
+    const it = arbiter();
+    const path = "chats/c1/session.json";
+    const applied: string[] = [];
+    const write = (relay: string, session: string, mark: string | undefined, what: string, ago?: number): Promise<string> =>
+      it.mirrors.write(caller("mara", relay, session), mark, { docs: [path], blobs: [] }, async () => void applied.push(what), ago).then(
+        () => "done",
+        (error: unknown) => (error instanceof LinkRefused ? error.code : String(error)),
+      );
+    await it.mirrors.hello(caller("mara", "relay-a", "s1"), ask(1, 2), null);
+    await it.mirrors.hello(caller("mara", "relay-b", "s2"), ask(3, 4), null);
+    // The holder's change made 30 s ago, another runtime's save 10 s ago: the holder's gives way.
+    it.advance(20_000);
+    expect(await write("relay-b", "s2", undefined, "b at 20 s")).toBe("done");
+    it.advance(10_000);
+    expect(await write("relay-a", "s1", ID(2), "a made at 0 s", 30_000)).toBe("superseded");
+    // Made after it, the holder's stands; and its own older change never gives way to it.
+    expect(await write("relay-a", "s1", ID(2), "a made at 25 s", 5_000)).toBe("done");
+    expect(await write("relay-a", "s1", ID(2), "a made at 22 s", 8_000)).toBe("done");
+    // A write that says no age is made now, as before.
+    expect(await write("relay-b", "s2", undefined, "b now")).toBe("done");
+    expect(await write("relay-a", "s1", undefined, "a now")).toBe("done");
+    // A runtime that lost the mirror writes what it hadn't sent as its own: given way where another's later save stands.
+    expect(await write("relay-b", "s2", undefined, "b made at 1 s", 29_000)).toBe("superseded");
+    // Started again, it knows of no write: one made long before is done.
+    it.restart();
+    expect(await write("relay-b", "s2", undefined, "b made at 2 s, after a restart", 28_000)).toBe("done");
+    expect(applied).toEqual(["b at 20 s", "a made at 25 s", "a made at 22 s", "b now", "a now", "b made at 2 s, after a restart"]);
+  });
 });

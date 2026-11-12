@@ -5,7 +5,9 @@
 // a chat a runtime answers says in words that it couldn't be tagged rather than tagging it wrongly.
 
 import { afterEach, describe, expect, test } from "bun:test";
+import type { ChatClaim } from "../../../src/core/extension";
 import { TAG_PARAM } from "../../../src/link/contract";
+import type { BackendOptions } from "../../../src/extension/backend/backend";
 import type { InterceptorInput, InterceptorVerdict } from "../../../src/extension/backend/spindle";
 import { TAGGED_TYPES } from "../../../src/extension/backend/turns";
 import { type Rig, rig, USER } from "../../support/rig";
@@ -16,9 +18,9 @@ afterEach(async () => {
   open = null;
 });
 
-/** A rig whose runtime answers no turn: these tests stop at the interceptor. */
-async function start(): Promise<{ it: Rig; chatId: string; loopback: string; intercept(input: Partial<InterceptorInput>): Promise<InterceptorVerdict> }> {
-  const it = await rig({ harness: () => ({ answer: async () => ({ status: "failed", reason: "no turn is answered in this test", record: null, reply: "", usage: { calls: 0, toolTurns: 0, in: 0, cachedIn: 0, out: 0, reasoningOut: 0, estimated: false, ms: 0 } }) }) });
+/** A rig whose runtime answers no turn: these tests stop at the interceptor. `backend`: what an extension that builds LumiAH in gives its backend. */
+async function start(backend?: BackendOptions): Promise<{ it: Rig; chatId: string; loopback: string; intercept(input: Partial<InterceptorInput>): Promise<InterceptorVerdict> }> {
+  const it = await rig({ ...(backend !== undefined ? { backend } : {}), harness: () => ({ answer: async () => ({ status: "failed", reason: "no turn is answered in this test", record: null, reply: "", usage: { calls: 0, toolTurns: 0, in: 0, cachedIn: 0, out: 0, reasoningOut: 0, estimated: false, ms: 0 } }) }) });
   open = it;
   const chatId = await it.setUp();
   const loopback = (await it.page.request("lah.hello", {})).connections.find((c) => c.loopback)?.id ?? "";
@@ -73,6 +75,20 @@ describe("a chat LumiAH answers", () => {
     const tagged = await intercept({ connectionId: loopback });
     expect(typeof tagged.parameters?.[TAG_PARAM]).toBe("string");
     breakConnections(it, "refuses");
+    await expect(intercept({ connectionId: loopback })).rejects.toThrow("couldn't check its connection now");
+  });
+
+  test("in a chat another extension leads, is stopped in words that name the wait, never passed on untagged, when its connection can no longer be checked; in one nobody claims, it is left untagged as before", async () => {
+    let claim: ChatClaim | null = { mainAgent: "author", reply: "released" };
+    const { it, loopback, intercept } = await start({ extension: { name: "Tide keeper", claim: async () => claim } });
+    expect(typeof (await intercept({ connectionId: loopback })).parameters?.[TAG_PARAM]).toBe("string");
+    breakConnections(it, "refuses");
+    // Tagged with a tag that carries only the refusal: the runtime's request is answered with its words, and no writer writes the reply.
+    const tag = (await intercept({ connectionId: loopback })).parameters?.[TAG_PARAM];
+    expect(typeof tag).toBe("string");
+    const refused = await it.backend.turns.begin(USER, "relay-harbour", it.key, tag, "request-1").catch((error: unknown) => error);
+    expect(refused instanceof Error ? refused.message : null).toContain("Loopback check");
+    claim = null;
     await expect(intercept({ connectionId: loopback })).rejects.toThrow("couldn't check its connection now");
   });
 

@@ -171,6 +171,40 @@ describe("when an update is taken", () => {
     await expect(update.applyNow()).rejects.toMatchObject({ code: "unavailable", message: expect.stringContaining(`The runtime at ${at.source} isn't the build LumiAH offers (2222bbbb).`) });
     expect(at.ran).toEqual([]);
   });
+
+  test("by itself, a reply that begins while the new build is checked isn't cut: the update waits, and is taken once the runtime is idle again", async () => {
+    for (const runs of ["copy", "source"] as const) {
+      const at = setUp(runs === "copy" ? { unit: true } : { runs });
+      // Running from the extension's own file, it started on the build before, which the extension's update then replaced.
+      if (runs === "source") writeFileSync(at.source, OLD);
+      const update = createUpdate(at.deps);
+      if (runs === "source") writeFileSync(at.source, NEW);
+      at.whileChecked = () => {
+        at.busy = true;
+      };
+
+      expect(await update.offer(offerOf(at))).toEqual({ taken: "waiting" });
+      expect(at.checked).toHaveLength(1);
+      expect(at.text(at.copy)).toBe(OLD);
+      // Nothing staged is left beside the copy, and nothing restarts.
+      expect(readdirSync(dirname(at.copy))).toEqual(["lumiah.js"]);
+      expect(at.ran).toEqual([]);
+      expect(at.left).toEqual([]);
+      expect(update.get()).toMatchObject({ waiting: { build: "2222bbbb" }, updating: false, problem: null });
+      await update.tick();
+      expect(at.checked).toHaveLength(1);
+
+      at.whileChecked = null;
+      at.busy = false;
+      await update.tick();
+      if (runs === "copy") {
+        expect(at.text(at.copy)).toBe(NEW);
+        expect(at.ran).toEqual([RESTART]);
+      } else expect(at.left).toEqual([{ command: BUN, args: [at.source, "serve", "--config", at.configPath] }]);
+      expect(update.get()).toMatchObject({ waiting: null, updating: true });
+      open?.close();
+    }
+  });
 });
 
 describe("putting the new build in place", () => {
@@ -316,5 +350,21 @@ describe("a new build that can't start here", () => {
     expect(at.checked).toEqual([`${BUN} ${at.copy}.mara.tmp`]);
     expect(at.text(at.copy)).toBe(NEW);
     expect(at.left).toEqual([{ command: BUN, args: [at.copy, "serve", "--config", at.configPath] }]);
+  });
+
+  test("is given as long as New build's start check says to say its version; one that says none in that time is refused, in words that name that setting and where it is changed", async () => {
+    const at = setUp({ unit: true });
+    at.config = { ...at.config, tuning: { ...at.config.tuning, buildStartMs: 2_000 } };
+    // Ended at its time limit, as `runProgram` reports it.
+    at.version = { code: 127, out: "", err: "bun was ended after 2 seconds", late: true };
+    const update = createUpdate(at.deps);
+
+    const outcome = await update.offer(offerOf(at));
+    expect(at.checkWaits).toEqual([2_000]);
+    expect(outcome).toEqual({ refused: expect.stringContaining("can't start here") });
+    expect(outcome).toEqual({ refused: expect.stringContaining("New build's start check (LumiAH's Settings → Timeouts → Waiting for the runtime)") });
+    expect(outcome).toEqual({ refused: expect.stringContaining("2 seconds") });
+    expect(at.text(at.copy)).toBe(OLD);
+    expect(at.ran).toEqual([]);
   });
 });

@@ -10,7 +10,9 @@
 // the runtime is (on an address other machines reach, only that it is up, unless the runtime's own
 // config asks). The key each request carries is checked for its form before any of the request's
 // body is read, and the extension says whether it is the user's own (with the turn, or before
-// anything of a request passed through is told or sent); it is never kept.
+// anything of a request passed through is told or sent); it is never kept. Once the runtime begins
+// to stop, everything but the road's probe is refused: it keeps its port until its link has closed
+// (cli.ts), and nothing meant for it is answered meanwhile.
 //
 // The handler takes and gives the web's Request and Response, so Bun.serve runs it (main.ts) and the
 // tests call it directly. Time comes from `now()`, and `tick()` (every second) keeps the answers'
@@ -19,7 +21,7 @@
 import type { JsonObject } from "../link/json";
 import { hasOwn, isRecord } from "../link/json";
 import { KEY_FORM, TAG_PARAM } from "../link/contract";
-import { ASK_PATH } from "../link/road";
+import { ASK_PATH, PROBE_HEADER } from "../link/road";
 import type { RuntimeTuning } from "../link/settings";
 import { addConnectionWords } from "../shared/connections";
 import { LinkError } from "./connection";
@@ -103,6 +105,8 @@ export class Relay {
     () => this.env.secret(),
     () => this.env.now(),
   );
+  /** Set by `shutdown()`: from then on every request but the road's probe is refused (`fetch`). */
+  private stopping = false;
 
   constructor(
     private readonly link: RuntimeLink,
@@ -125,8 +129,9 @@ export class Relay {
     for (const call of this.calls.values()) if (call.answer instanceof SseAnswer) call.answer.keepAlive(now, alive, tuning);
   }
 
-  /** The runtime is stopping: every request under way ends with words the chat shows. */
+  /** The runtime is stopping: every request under way ends with words the chat shows, and every one that comes after is refused but the road's probe. */
   shutdown(): void {
+    this.stopping = true;
     for (const call of [...this.calls.values()]) {
       call.closed();
       this.end(call, { message: "The runtime is restarting. Press Retry in a moment.", code: "unavailable" });
@@ -139,6 +144,8 @@ export class Relay {
     // Lumiverse's own request sends no Origin; a page in a browser always does, so it never drives the runtime.
     if (req.headers.get("origin") !== null) return json(403, errorJson("LumiAH's runtime answers Lumiverse's server, not a browser.", "forbidden"));
     if (!this.hostAllowed(req.headers.get("host"))) return json(421, errorJson(`This is LumiAH's runtime at ${this.settings.listen}:${this.settings.port}; it answers requests addressed to it alone.`, "misdirected"));
+    // Stopping: the runtime keeps its port until its link has closed, since LumiAH sends the road's asks, the relay's secret with them, to the port for as long as it holds the link, and another program that took the port would be sent them. Nothing is answered meanwhile but the road's probe, by which a copy of this runtime that starts now knows it (cli.ts); the road takes the refusal for a failure, and asks over the link.
+    if (this.stopping && (url.pathname !== ASK_PATH || req.headers.get(PROBE_HEADER) === null)) return json(503, errorJson("The runtime is restarting. Press Retry in a moment.", "unavailable"));
     // The asks' own road, reached through Lumiverse's proxy: its words are its own, and never say back what was asked.
     if (url.pathname === ASK_PATH && this.env.ask !== undefined) return this.env.ask(req);
     const path = url.pathname.replace(/\/+$/, "").replace(/^\/v1(?=\/)/, "");

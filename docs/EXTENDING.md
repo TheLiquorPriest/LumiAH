@@ -369,7 +369,7 @@ An agent runs on the runtime's connections. `agentModel` (asked as each agent st
 - **`place: "runtime"`** in `createBackend`'s options is gone: every chat plays only in the runtime. Pass `ownSwitch: true` where your own pages switch chats on; the Runtime page then names you (`RuntimeView.switchedBy`, which replaces `RuntimeView.only`).
 - **`ChatClaim.place`** is gone: leave it out of your claim.
 - **`Backend.builtin`** (`stop`, `runs`) is gone. Stop a run with the page request `lah.turn.stop`; there are no runs but the runtime's.
-- **`ChatView.place`** and **`ChatView.needsRuntime`** are gone. A chat is answered when it is on and pinned to the loopback: `chat.on && chat.connection?.loopback === true`. `lah.chat.set` takes `{ chatId, on }`; a `place` sent with it is passed over.
+- **`ChatView.place`** and **`ChatView.needsRuntime`** are gone. Whether a chat is answered is `chatAnswered(chat)` from `lumi-ah/shared`: it is when it generates on the loopback (`chat.connection?.loopback === true`), switched on or not, so a switched-off chat the user pinned to the loopback by hand is answered too. `lah.chat.set` takes `{ chatId, on }`; a `place` sent with it is passed over.
 - **Gone from `lumi-ah/shared`:** `RunPlace`, `NoPart`, `NoPartWhy`; the `place` and `replyBy` of `LiveView`, `RunningTurn` and `LastTurn`; the `place`, `noPart` and `recovered` of `TurnRow`; the causes `skipped` and `time`. A turn's record carries no `ran`.
 - **`generation_parameters`** is a permission LumiAH can't do without: ask for it in your manifest.
 - **`BackendEnv.runtime`** (`{ sha256, size }`) is new: pass what your build puts in, as above.

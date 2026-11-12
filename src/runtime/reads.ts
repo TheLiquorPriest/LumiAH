@@ -2,9 +2,11 @@
 // `chat.messages`, `lore.books` and `lore.entries`, `recall.lore.read` and `recall.chat.messages`,
 // answered by the very logic the extension's backend runs for them (src/host/), over the runtime's own
 // copy of chat and lore (copy/) instead of over the link. The copy reads Lumiverse's database file
-// itself where the instance's operator switched the reader on for this runtime and the file passed the
-// reader's check of the tables it reads (db/), else Lumiverse's HTTP routes as the runtime's signed-in
-// user; whatever it can't vouch for, it asks of the extension over the link.
+// itself where the instance's operator switched the reader on for this runtime, the runtime reaches
+// Lumiverse at a loopback address (so runs on Lumiverse's own machine, where that file is
+// Lumiverse's), and the file passed the reader's check of the tables it reads (db/); else
+// Lumiverse's HTTP routes as the runtime's signed-in user. Whatever it can't vouch for, it asks of
+// the extension over the link.
 //
 // It is told what it may read on every hello and whenever that changes; of every event Lumiverse sends
 // the extension about the user's chats and world books, in the order Lumiverse sent them, each push
@@ -30,6 +32,7 @@ import { LinkRefused } from "../host/refused";
 import type { HostChat, HostReads, LoreReads } from "../host/rows";
 import type { CopyOffer, CopyPush, EventPush, OwnPush, TurnBooks } from "../link/contract";
 import { isRecord } from "../link/json";
+import { isLoopback } from "../link/road";
 import type { RuntimeTuning } from "../link/settings";
 import type { SettingsOwner } from "../shared/timeouts";
 import type { ChatDataView } from "../shared/ui";
@@ -179,6 +182,8 @@ function listed(lore: LoreReads, books: TurnBooks, persona: string | null | unde
 export function createChatData(deps: ChatDataDeps): ChatData {
   const name = (): string => deps.link.backendName ?? "LumiAH";
   const link = { link: deps.link, now: deps.now, tuning: deps.tuning };
+  /** Whether the runtime reaches Lumiverse at a loopback address, so runs on Lumiverse's own machine: the only place the database's path names Lumiverse's own file. On another machine the same path could hold an old copy of the data folder, which would answer as current, so there the reader is never opened. */
+  const besideLumiverse = isLoopback(new URL(deps.base).hostname);
   /** What the copy may read, as the extension last said; null before a hello, and from a backend from before the copy. */
   let offer: CopyOffer | null = null;
   let greeted = false;
@@ -341,7 +346,7 @@ export function createChatData(deps: ChatDataDeps): ChatData {
       const codec = records === null ? null : records.under === null ? OWN_ANCHORS : anchorsUnder(records.under);
       built = { copy, reader: new ChatReader({ chats: copy.chats }, () => deps.pathKeeping(), deps.now, codec ?? OWN_ANCHORS), userId: user, identifier, ownElsewhere: said.ownElsewhere, declinesLore: said.declinesLore, records, codec };
     }
-    switchReader(said.database, user, said.identifier);
+    switchReader(besideLumiverse ? said.database : null, user, said.identifier);
   }
 
   /** Asks Lumiverse whose session the runtime holds: on every hello, and on a read while it isn't known, at most once per longest reconnect wait. */
@@ -462,6 +467,7 @@ export function createChatData(deps: ChatDataDeps): ChatData {
     const db = reader?.db.describe() ?? null;
     if (db !== null && db.on) return "The operator switched the database reader on for this runtime: the copy reads Lumiverse's own file, the runtime's user's rows alone.";
     if (db !== null) return `The copy reads Lumiverse as the runtime's signed-in user: the database reader is off (${db.why ?? "it was closed"}).`;
+    if (offer !== null && offer.database !== null && !besideLumiverse) return `The copy reads Lumiverse as the runtime's signed-in user: the operator switched the database reader on, but this runtime reaches Lumiverse at ${new URL(deps.base).host}, not at a loopback address, and the reader opens Lumiverse's file only where the runtime runs on Lumiverse's own machine.`;
     return "The copy reads Lumiverse as the runtime's signed-in user: the database reader isn't switched on for this runtime.";
   }
 

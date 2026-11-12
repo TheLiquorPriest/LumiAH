@@ -5,6 +5,7 @@
 
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ChatClaim } from "../../../src/core/extension";
+import { settingTitle } from "../../../src/core/settings";
 import type { BackendExtension } from "../../../src/extension/backend/extension";
 import { type Rig, rig } from "../../support/rig";
 
@@ -30,6 +31,21 @@ describe("who leads a chat's replies, as the pages read it", () => {
     expect(await lead()).toBeNull();
     answer = () => Promise.reject(new Error("the harbour office is shut"));
     expect(await lead()).toMatchObject({ by: "Tide keeper", unanswered: expect.stringContaining("the harbour office is shut") });
+  });
+
+  test("a claim that doesn't answer within Wait for the extension is no answer, in words that name that setting, whatever it says later", async () => {
+    let answer: () => Promise<ChatClaim | null> = async () => null;
+    const extension: BackendExtension = { name: "Tide keeper", claim: () => answer() };
+    const rigged = await rig({ backend: { extension } });
+    it = rigged;
+    const chatId = await rigged.setUp();
+    await rigged.page.request("lah.settings.set", { set: [{ path: ["core", "extension", "waitMs"], value: 20 }], reset: [] });
+    const late = Promise.withResolvers<ChatClaim | null>();
+    answer = () => late.promise;
+    const lead = (await rigged.page.request("lah.chat.lead.get", { chatId })).lead;
+    // It answers only once the page was told: a reply in the chat would have stopped waiting for it long before.
+    late.resolve({ mainAgent: "author" });
+    expect(lead).toMatchObject({ by: "Tide keeper", unanswered: expect.stringContaining(settingTitle(["extension", "waitMs"])) });
   });
 
   test("with no extension that claims chats, nobody claims the chat: LumiAH's main agent leads", async () => {

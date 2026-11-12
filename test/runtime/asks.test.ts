@@ -101,6 +101,15 @@ describe("one ask, done once", () => {
     expect(done).toEqual(["workspace.write"]);
   });
 
+  test("an ask over the link that is over before its proxy copy arrives is not done again: the proxy's is answered from it", async () => {
+    const { asks, done } = desk(async () => ({ started: "job-1" }));
+    expect(await asks.run(BODY.ask, "jobs.start", {}, "link")).toMatchObject({ value: { started: "job-1" }, refusal: null });
+    const late = await asks.fetch(ask({ ...BODY, op: "jobs.start" }));
+    expect(late.status).toBe(200);
+    expect(await late.json()).toMatchObject({ value: { started: "job-1" }, refusal: null });
+    expect(done).toEqual(["jobs.start"]);
+  });
+
   test("an answer too large for the proxy is kept, and the link's ask for it is answered from it", async () => {
     const big = "x".repeat(PROXY_MAX_BYTES);
     const { asks, done } = desk(async () => ({ text: big }));

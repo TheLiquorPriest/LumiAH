@@ -185,7 +185,7 @@ describe("signing in to Anthropic", () => {
 
     await r.layer.signIn.start("anthropic");
     r.timers.fireAll();
-    expect(await endedNow()).toBe("The Anthropic sign-in didn't finish: The sign-in was left open too long. Start it again.");
+    expect(await endedNow()).toEqual(expect.stringContaining("Sign-in stays open"));
     const refused = await r.layer.signIn.start("anthropic");
     // A new flow clears the last one's words.
     expect(await r.layer.signIn.state("anthropic")).toMatchObject({ flow: refused.flow, ended: null });
@@ -194,6 +194,30 @@ describe("signing in to Anthropic", () => {
 
     await signIn(r);
     expect(await r.layer.signIn.state("anthropic")).toMatchObject({ signedIn: true, flow: null, ended: null });
+  });
+
+  test("a flow stays open as long as Sign-in stays open says, read as each flow starts; one left open longer says so, naming that setting and where it is changed", async () => {
+    tokenEndpoint(anthropicTokens(3600));
+    // The setting as the runtime reads it at each use: the test changes it between two flows.
+    const options = { signInMs: 90_000, owner: { name: "LumiRPEngine", settingsAt: "LumiRPEngine's Harness tab → System → Settings" } };
+    const made = rig(options);
+    r = made;
+    // The layer's own default stands where the runtime gives none.
+    const shipped = rig();
+    await shipped.layer.signIn.start("anthropic");
+    expect([...shipped.timers.pending.values()].map((t) => t.ms)).toEqual([10 * 60_000]);
+    await shipped.done();
+
+    await made.layer.signIn.start("anthropic");
+    expect([...made.timers.pending.values()].map((t) => t.ms)).toEqual([90_000]);
+    made.timers.fireAll();
+    const ended = (await made.layer.signIn.state("anthropic")).ended;
+    expect(ended).toEqual(expect.stringContaining("Sign-in stays open (LumiRPEngine's Harness tab → System → Settings → Timeouts → A model call)"));
+    expect(ended).toEqual(expect.stringContaining("90 seconds"));
+
+    options.signInMs = 2 * 60_000;
+    await made.layer.signIn.start("anthropic");
+    expect([...made.timers.pending.values()].map((t) => t.ms)).toEqual([2 * 60_000]);
   });
 });
 

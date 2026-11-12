@@ -340,10 +340,10 @@ export class LinkServer {
       case "doc.get":
         return { doc: await d.storage.doc(userId, r.path) };
       case "doc.put":
-        await d.mirror.write(caller, r.mirror, { docs: typeof r.path === "string" ? [r.path] : [], blobs: [] }, () => d.storage.putDoc(userId, r.path, r.doc));
+        await d.mirror.write(caller, r.mirror, { docs: typeof r.path === "string" ? [r.path] : [], blobs: [] }, () => d.storage.putDoc(userId, r.path, r.doc), r.ago);
         return { written: true };
       case "doc.remove":
-        await d.mirror.write(caller, r.mirror, { docs: typeof r.path === "string" ? [r.path] : [], blobs: [] }, () => d.storage.removeDoc(userId, r.path));
+        await d.mirror.write(caller, r.mirror, { docs: typeof r.path === "string" ? [r.path] : [], blobs: [] }, () => d.storage.removeDoc(userId, r.path), r.ago);
         return { removed: true };
       case "chat.path":
         return { messages: await d.chats.path(userId, text(r.chat, "chat")) };

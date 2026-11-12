@@ -18,7 +18,9 @@
 import { createHash } from "node:crypto";
 import { EXTENSION_IDENTIFIER, shellWord } from "../../link/contract";
 import { isRecord } from "../../link/json";
+import { spanWords, transportWait } from "../../link/waits";
 import { OpRefused } from "../../link/work";
+import type { SettingsOwner } from "../../shared/timeouts";
 import type { RuntimeSetup, SavedConfig, SystemdService } from "../config";
 import { memoryRefusal } from "./memory";
 import type { Ran } from "./programs";
@@ -80,6 +82,10 @@ export interface UpdateDeps {
   log(text: string): void;
   /** The extension's name as words say it: LumiAH, or the extension LumiAH is built into. */
   name(): string;
+  /** Whose Settings show the runtime's waits: the words of a new build that didn't start in time name *New build's start check* there. */
+  owner(): SettingsOwner;
+  /** How long a new build is given to say its version (the setting *New build's start check*), read at each check. */
+  buildStartMs(): number;
   /** This process was started by the runtime before it, which then left: where a process can't be replaced in place (Windows), a restart is a new process, which the task or service wrapper that ran the old one doesn't watch. */
   handedOver: boolean;
   /** Another copy of this runtime that waits to serve on its port while this one serves (one that a task or service wrapper started meanwhile): its process and since when; null when none does. */
@@ -161,9 +167,6 @@ function offerOf(raw: unknown): UpdateOffer | null {
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
-
-/** How long a new build is given to say its version before it is taken as one that can't start here. */
-const STARTS_MS = 30_000;
 
 export function createUpdate(deps: UpdateDeps): Update {
   // The build this process runs, by what its file held as it started: an offer of that build is no update, whatever the offer calls it.
@@ -260,10 +263,12 @@ export function createUpdate(deps: UpdateDeps): Update {
     }
   }
 
-  /** Whether the runtime at `file` starts on `bun`, the Bun that would run it: null when it says its version, else what went wrong. */
+  /** Whether the runtime at `file` starts on `bun`, the Bun that would run it, within the setting's wait: null when it says its version, else what went wrong. */
   async function starts(bun: string, file: string): Promise<string | null> {
-    const said = await deps.run(bun, [file, "--version"], undefined, STARTS_MS);
+    const ms = deps.buildStartMs();
+    const said = await deps.run(bun, [file, "--version"], undefined, ms);
     if (said.code === 0 && /^lumiah /.test(said.out)) return null;
+    if (said.late === true) return `${shown(bun)} ${shown(file)} --version said no version within ${spanWords(ms)}; ${transportWait(["runtime", "buildStartMs"], deps.owner())} says how long a new build has to start`;
     const words = (said.err || said.out).split("\n").map((piece) => piece.trim()).filter((piece) => piece !== "").slice(-3).join(" ");
     return `${shown(bun)} ${shown(file)} --version ${said.code === 0 ? "said no version" : `ended with ${said.code}`}${words !== "" ? `: ${shown(words)}` : ""}`;
   }
@@ -279,11 +284,23 @@ export function createUpdate(deps: UpdateDeps): Update {
     return null;
   }
 
-  /** Takes the update that waits; null once the runtime is restarting onto it, else why it didn't. A build that can't start here never takes the place of the one that runs. */
-  async function apply(): Promise<{ refused: string } | null> {
+  /**
+   * Takes the update that waits; null once the runtime is restarting onto it, `{ taken: "waiting" }`
+   * where a reply or a job began while the new build was checked (it is taken at the next tick that
+   * finds nothing under way), else why it didn't. Only the page's button (`now`) ends what is under
+   * way. A build that can't start here never takes the place of the one that runs.
+   */
+  async function apply(now: boolean): Promise<{ refused: string } | { taken: "waiting" } | null> {
     const o = waiting;
     if (o === null || updating) return null;
     updating = true;
+    /** A reply or a job began while the build was checked: the update waits for the runtime to be idle again, since a restart would end it. */
+    const begun = (): boolean => {
+      if (now || !deps.busy()) return false;
+      updating = false;
+      deps.log(`build ${o.build} waits: a reply or a job began while it was checked`);
+      return true;
+    };
     // Not tried again by itself, whichever way it fails: the extension offers again when the runtime next says hello.
     const drop = (words: string, run: string | null = null): { refused: string } => {
       waiting = null;
@@ -316,6 +333,10 @@ export function createUpdate(deps: UpdateDeps): Update {
           discard(temp);
           return cannot(why);
         }
+        if (begun()) {
+          discard(temp);
+          return { taken: "waiting" };
+        }
         try {
           put(temp, deps.installed);
         } catch (error) {
@@ -325,6 +346,7 @@ export function createUpdate(deps: UpdateDeps): Update {
         // Running from the extension's own file, the new build is in place already: the restart is the update, and it is made only onto a build that starts.
         const why = await starts(bun, source);
         if (why !== null) return cannot(why);
+        if (begun()) return { taken: "waiting" };
       }
       waiting = null;
       clear();
@@ -419,19 +441,19 @@ export function createUpdate(deps: UpdateDeps): Update {
         deps.log(`build ${o.build} waits: ${autoUpdate ? "a reply or a job is under way" : "updates are taken from the Runtime page"}`);
         return { taken: "waiting" };
       }
-      return (await apply()) ?? { taken: "updating" };
+      return (await apply(false)) ?? { taken: "updating" };
     },
 
     async tick() {
       if (waiting === null || updating || !deps.config().autoUpdate || deps.busy()) return;
-      await apply();
+      await apply(false);
     },
 
     async applyNow() {
       if (updating) throw new OpRefused("unavailable", "The runtime is updating already: it is back in a moment.");
       if (waiting === null) throw new OpRefused("unavailable", problem ?? `There is no update to take: this runtime is on the build ${shown(deps.name())} offered, or ${shown(deps.name())} hasn't offered one since it started.`);
-      const refused = await apply();
-      if (refused !== null) throw new OpRefused("unavailable", refused.refused);
+      const outcome = await apply(true);
+      if (outcome !== null && "refused" in outcome) throw new OpRefused("unavailable", outcome.refused);
       return get();
     },
 

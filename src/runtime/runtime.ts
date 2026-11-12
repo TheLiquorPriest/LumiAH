@@ -173,9 +173,10 @@ export function createRuntime(config: RuntimeConfig, deps: RuntimeDeps): Runtime
     caching: async (request) => (request !== null ? { retention: request.cacheRetention ?? DEFAULT_CACHE_RETENTION, ...(request.session !== undefined ? { sessionId: request.session } : {}) } : { retention: passRetention((await held.get()).values) }),
     passConnection: async () => (turns === null ? null : turns.writerConnection()),
     serialTools: async () => transportOf((await held.get()).values[TRANSPORT_KEY]).connections.oneToolAtATime,
-    // Its two waits are the runtime's settings, read at each use; their words name them where the extension it links to shows its Settings.
+    // Its waits are the runtime's settings, read at each use; their words name them where the extension it links to shows its Settings.
     silentMs: () => tuning().answerSilentMs,
     askMs: () => tuning().providerMs,
+    signInMs: () => tuning().signInMs,
     owner: () => linkedBackendOf(link.hello?.backend),
   });
   const host = linkHost({

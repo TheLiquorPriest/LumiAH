@@ -16,6 +16,13 @@
 // user's count `gen` goes up; a holder whose copy took fewer drops, at its next hello, everything the
 // storage holds of it.
 //
+// Of two runtimes' writes of one document, the later stands. A working copy's write says how long ago
+// its change was made (`ago`): the change may be older than another runtime's write the storage took
+// meanwhile (its link was down; or it lost the mirror with changes unsent, which it then writes as
+// its own). Such a write is refused (`superseded`): the copy gives way. What decides is the last
+// write of each path as this worker saw it, which it forgets when it starts again: a write it knows
+// nothing against is taken, as every write was before.
+//
 // Who holds the mirror is kept in the user's storage (`mirror-holder.json`, beside the registry),
 // written before a grant is answered: after this worker starts again, the runtime that held it gets it
 // back at its hello, and another one only once the holder has been silent past the allowance, counted
@@ -49,6 +56,9 @@ interface HolderDoc {
 }
 
 const FILE = "mirror-holder.json";
+
+/** How many documents' last writes are kept for each user: past it the one written longest ago is forgotten, and a write of it is taken as one nothing is known against. */
+const STAMPS_KEPT = 10_000;
 
 const id = (v: unknown): v is string => typeof v === "string" && MIRROR_ID.test(v);
 
@@ -95,6 +105,10 @@ export class Mirrors {
   private readonly started: number;
   /** Raises of `gen` under way, which `settle` waits for. */
   private readonly raising = new Set<Promise<void>>();
+  /** Each user's documents written in this worker's life, by path: the runtime (its registration) whose write stands, and when its change was made, by this worker's clock. */
+  private readonly stamps = new Map<string, Map<string, { relay: string; at: number }>>();
+  /** The write of each user's document under way, chained: the check and the write it lets through are one step. */
+  private readonly writing = new Map<string, Promise<void>>();
 
   constructor(
     private readonly host: Pick<BackendHost, "storage" | "log">,
@@ -163,12 +177,16 @@ export class Mirrors {
    * that names a process (`mirror`) is the working copy's: done only for the process that holds the
    * mirror, else refused for good. One that names none is the runtime's own: done, and the holder told
    * of what it changed (or, where it can't be told now, made to drop everything at its next hello).
+   * A document's write that says how long ago its change was made (`ago`) is refused (`superseded`)
+   * when another runtime's later write of the path stands.
    */
-  async write(caller: Caller, mark: unknown, changed: { docs: string[]; blobs: string[] }, apply: () => Promise<void>): Promise<void> {
+  async write(caller: Caller, mark: unknown, changed: { docs: string[]; blobs: string[] }, apply: () => Promise<void>, ago?: unknown): Promise<void> {
     const { userId } = caller;
     const doc = await this.docs.get(userId);
     const held = doc.holder;
     const { name } = this.env;
+    const made = typeof ago === "number" && Number.isFinite(ago) && ago > 0 ? this.env.now() - ago : null;
+    const path = changed.docs.length === 1 && changed.blobs.length === 0 ? changed.docs[0] : undefined;
     if (mark !== undefined) {
       if (held === null || held.relay !== caller.relay.id || held.process !== mark) {
         throw new LinkRefused("conflict", `${held === null ? "No runtime keeps" : `Another runtime (${held.owner}) keeps`} ${name}'s storage now, so ${name} takes nothing from this runtime's own copy of it: this runtime reads and writes the storage directly from now on.`);
@@ -177,13 +195,48 @@ export class Mirrors {
       live.heardAt = this.env.now();
       // Started again, this worker learns where the holder's pushes go from its first word.
       live.session ??= caller.session;
-      await apply();
+      await this.ordered(userId, caller.relay.id, path, made, apply);
       return;
     }
     if (changed.docs.includes(MARK_PATH)) throw new LinkRefused("bad_request", `${MARK_PATH} is where the runtime that keeps ${name}'s storage notes its copy: no other runtime writes it.`);
-    await apply();
+    await this.ordered(userId, caller.relay.id, path, made, apply);
     // A blob stored again is the same text under the same hash: no copy of it can be out of date.
     if (changed.docs.length > 0 || changed.blobs.length > 0) await this.tell(userId, changed);
+  }
+
+  /**
+   * A document's write, after any other of the same path under way: refused when its change was made
+   * (`made`) before the write that stands there, by another runtime; else done, and noted as the one
+   * that stands (made now, where it doesn't say). Anything else is done as it comes.
+   */
+  private ordered(userId: string, relay: string, path: string | undefined, made: number | null, apply: () => Promise<void>): Promise<void> {
+    if (path === undefined) return apply();
+    const key = `${userId}\n${path}`;
+    const step = (this.writing.get(key) ?? Promise.resolve()).then(async () => {
+      const stood = this.stamps.get(userId)?.get(path);
+      if (made !== null && stood !== undefined && stood.relay !== relay && stood.at > made) {
+        throw new LinkRefused("superseded", `Another runtime saved ${path} in ${this.env.name}'s storage after this change was made, so the storage keeps that save.`);
+      }
+      const at = made ?? this.env.now();
+      await apply();
+      const stamps = this.stamps.get(userId) ?? new Map<string, { relay: string; at: number }>();
+      this.stamps.set(userId, stamps);
+      stamps.delete(path);
+      stamps.set(path, { relay, at });
+      for (const oldest of stamps.keys()) {
+        if (stamps.size <= STAMPS_KEPT) break;
+        stamps.delete(oldest);
+      }
+    });
+    const done = step.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.writing.set(key, done);
+    void done.then(() => {
+      if (this.writing.get(key) === done) this.writing.delete(key);
+    });
+    return step;
   }
 
   /** Another runtime changed the storage: the holder's copy drops what it holds of the paths, told at once where it can be; else `gen` goes up, once until the mirror is granted again, so its next hello drops everything. */

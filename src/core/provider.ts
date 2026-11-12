@@ -827,6 +827,8 @@ export interface PreparedCall {
   /** The connection the request names: the agent's own (null: the default), or the default's id where the agent's is gone. */
   connectionId: string | null;
   model: string;
+  /** The model the request names: the agent's own (null: its connection's), or null where the default stands in for a gone connection, so the default's own runs. */
+  modelId: string | null;
   /** The connection takes several tool calls in one answer. */
   parallel: boolean;
 }
@@ -837,7 +839,7 @@ export function requestOf(spec: CallSpec, p: PreparedCall, maxTokens: number, se
     messages: p.messages,
     maxTokens,
     connectionId: p.connectionId,
-    model: spec.model,
+    model: p.modelId,
     ...(p.tools.length > 0 ? { tools: p.tools } : {}),
     ...(p.tools.length > 0 && !p.parallel ? { parallelToolCalls: false as const } : {}),
     effort: callEffort(spec.effort, p.names.size > 0, settings.loop.thinkingInToolLoops),
@@ -915,6 +917,11 @@ export class ProviderSession {
     return this.profile !== undefined && this.spec.connectionId !== null && this.named !== this.spec.connectionId ? this.spec.connectionId : null;
   }
 
+  /** The model its calls name: the spec's own; where the default stands in for a gone connection, the default's own, since the spec's was chosen for the gone one; null for its connection's own before the connection is read. */
+  get model(): string | null {
+    return this.gone !== null ? (this.profile?.model ?? null) : this.spec.model;
+  }
+
   /** The connection as the host reads it, once: the agent's own, else, where that is gone, the default; an `AgentStop` when neither can be used. */
   private async connection(): Promise<ConnectionProfile> {
     if (this.profile !== undefined) return this.profile;
@@ -947,7 +954,8 @@ export class ProviderSession {
     const read = this.reading ?? this.connection();
     this.reading = null;
     const profile = await read;
-    const model = this.spec.model ?? profile.model ?? "";
+    const modelId = this.gone !== null ? null : this.spec.model;
+    const model = modelId ?? profile.model ?? "";
     // A session free to turn starts as text where this model of its connection was seen refusing native tools, for as long as that is remembered.
     if (this.toolCalls === "auto" && !this.textTools && tools.length > 0 && accounts.refusesTools(profile.id, model, settings.connections)) this.textTools = true;
     const wires = wireNames(tools);
@@ -964,7 +972,7 @@ export class ProviderSession {
     const messages = assemble(opening, conversation);
     // A provider reads a call's name by the same rule wherever the call stands, so the calls in the conversation go out under their tools' names on the wire with the tools as text too. `assemble` made this list for this call: a message is replaced in it, and the conversation's own is left as it is.
     for (const [i, m] of messages.entries()) messages[i] = onWire(m, wires.out);
-    return { messages, tools: offered, names: new Set(tools.map((t) => t.name)), called: wires.back, textTools: this.textTools && tools.length > 0, estimate: promptTokens(messages, offered, settings.loop.charsPerToken), connection: profile.id, connectionId: this.named, model, parallel: profile.parallelTools };
+    return { messages, tools: offered, names: new Set(tools.map((t) => t.name)), called: wires.back, textTools: this.textTools && tools.length > 0, estimate: promptTokens(messages, offered, settings.loop.charsPerToken), connection: profile.id, connectionId: this.named, model, modelId, parallel: profile.parallelTools };
   }
 
   /**

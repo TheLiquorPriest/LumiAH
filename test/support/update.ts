@@ -93,6 +93,8 @@ export function updating(config: RuntimeConfig, setting: { source?: string | nul
         now: () => Date.now(),
         log: () => undefined,
         name: () => "LumiAH",
+        owner: () => ({ name: "LumiAH" }),
+        buildStartMs: () => current.tuning.buildStartMs,
         handedOver: false,
         waitingCopy: () => null,
       }),

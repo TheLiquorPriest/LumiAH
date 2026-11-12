@@ -48,7 +48,7 @@ describe("a runtime's store on the Runtime page", () => {
     const lost = storeLines({ ...second, lost: { at: NOW - 180_000, to: "mara (laptop)", dropped: 2 } }, NOW, "LumiAH");
     expect(lost).toEqual([
       { text: "It runs without a copy of its own since 3 min ago: mara (laptop) keeps LumiAH's storage now, and one runtime at a time keeps a copy. It reads and saves straight in the storage, which is slower, until it starts again.", tone: "warn" },
-      { text: "2 changes it hadn't sent to the storage went with its copy (its log names each).", tone: "neg" },
+      { text: "2 changes it hadn't sent to the storage gave way there to another runtime's later save of the same file (its log names each).", tone: "neg" },
     ]);
     expect(storeLines({ ...settled, mode: "waiting", open: false }, NOW, "LumiAH")[0]).toEqual({ text: "It hasn't heard from LumiAH whether it keeps a copy of its own, so it doesn't yet read or save what the agents keep.", tone: "warn" });
     expect(storeLead(null, "LumiAH")).toContain("on its own disk first");
