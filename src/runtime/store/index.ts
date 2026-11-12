@@ -455,11 +455,19 @@ export function createWorkingStore(deps: WorkingStoreDeps): WorkingStore {
     return promise;
   }
 
-  /** Puts `text` at `path` at once: written whole beside it (given the time `at`, when one is given), then renamed into its place, so the time comes with the text. Its folder is made again where a removal left it empty and took it away meanwhile (`prune`). */
+  /** Whether the log has said that this disk won't take a file's time: said once, as every save would say it again. */
+  let timeless = false;
+
+  /** Puts `text` at `path` at once: written whole beside it (given the time `at`, when one is given), then renamed into its place, so the time comes with the text. A disk that won't take a file's time costs no save: the text then carries the time it was written, moments after the change, and the log says so. Its folder is made again where a removal left it empty and took it away meanwhile (`prune`). */
   async function place(path: string, text: string, at?: number): Promise<void> {
     const temp = `${TMP}/${deps.id()}`;
     await disk.write(temp, text);
-    if (at !== undefined) await disk.touch(temp, at);
+    if (at !== undefined) {
+      await disk.touch(temp, at).catch((error: unknown) => {
+        if (!timeless) deps.log("warn", `the runtime's store couldn't set the time of ${path} (${errorText(error)}): after a restart a change on this disk counts from when it was written`);
+        timeless = true;
+      });
+    }
     const folder = path.slice(0, path.lastIndexOf("/"));
     for (let tries = 0; ; tries++) {
       if (!made.has(folder)) {

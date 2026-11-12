@@ -481,6 +481,22 @@ describe("what the review found", () => {
     expect(again.state().waiting).toBe(0);
   });
 
+  test("a disk that won't take a file's time costs no save", async () => {
+    // A mount whose files belong to another owner lets the store write and rename, and refuses the time.
+    const refusing: Disk = { ...nodeDisk(), touch: () => Promise.reject(Object.assign(new Error("EPERM: operation not permitted, utime"), { code: "EPERM" })) };
+    const path = "chats/c1/session.json";
+    const s = keep(open(b, { disk: refusing }));
+    await s.store.write(path, { turns: 1 });
+    await s.store.write("chats/c1/gone.json", { turns: 0 });
+    await s.store.remove("chats/c1/gone.json");
+    expect(await s.store.read(path)).toEqual({ turns: 1 });
+    await s.settle();
+    expect(b.mirror.doc(path)).toEqual({ turns: 1 });
+    expect(b.mirror.doc("chats/c1/gone.json")).toBeNull();
+    expect(s.state().waiting).toBe(0);
+    expect(b.logs.some((l) => l.level === "warn" && l.message.includes(path) && l.message.includes("EPERM"))).toBe(true);
+  });
+
   test("forgetting a chat takes away the folders it left empty", async () => {
     const s = keep(open(b));
     await s.store.write("chats/c1/session.json", { turns: 1 });
