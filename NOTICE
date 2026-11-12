@@ -22,13 +22,6 @@ Design taken from LumiAgent by AMousePad (https://github.com/AMousePad/LumiAgent
     results clipped with the rest readable from scratch, a detector for repeated identical calls,
     and request and token throttles.
 
-Carried from LumiAgent by AMousePad (https://github.com/AMousePad/LumiAgent), under its licence,
-which is reproduced at the end of this file:
-
-  - The list of providers that refuse the parallel_tool_calls flag (LumiAgent src/backend.ts,
-    PARALLEL_TOOLS_INCOMPATIBLE_PROVIDERS) -> LumiAH src/extension/backend/connections.ts,
-    NO_PARALLEL_FLAG.
-
 Design taken from Warp by japolino (https://github.com/japolino/warp), with no Warp code retained:
 
   - The pattern of a per-swipe turn record kept in message metadata, with a path hash chained over
@@ -42,22 +35,11 @@ Studio code retained:
     touching the file system, by way of LumiRPEngine's command line.
 
 
-LumiAgent's licence
--------------------
+Third-party code in the built bundles
+-------------------------------------
 
-Copyright 2026 AMousePad
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the "Software"), to deal in the Software without restriction,
-including without limitation the rights to use, copy, modify, merge, publish, distribute,
-sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or
-substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT
-NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
-NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM,
-DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT
-OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+dist/lumiah.js, the runtime, contains pi-ai (@earendil-works/pi-ai, MIT) and the packages it
+brings along: among them the Anthropic SDK (MIT), the OpenAI SDK (Apache-2.0), and Google's Gen AI
+SDK and auth libraries (Apache-2.0). dist/frontend.js contains Preact (MIT). dist/backend.js
+contains no third-party code. Each package, its version, copyright notice and licence text are in
+THIRD-PARTY-NOTICES.md.
