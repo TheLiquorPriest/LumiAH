@@ -12102,9 +12102,9 @@ function createSpindleHost(identifier = EXTENSION_IDENTIFIER) {
 }
 
 // src/extension/backend/main.ts
-var BUILD = "389672bf";
-var RUNTIME_SHA256 = "77eab036b9a97e34d0b7aa787d071bbf242075c05b9454b9f71c20cb86e1a276";
-var RUNTIME_SIZE = "4655179";
+var BUILD = "1a8959ef";
+var RUNTIME_SHA256 = "fd05306466726f123a7ac0f6b1183996a24134503e0020c9980c5904c2bddc9d";
+var RUNTIME_SIZE = "4656343";
 var TICK_MS = 1000;
 var host = createSpindleHost();
 var backend = createBackend(host, {
