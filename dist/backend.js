@@ -501,7 +501,7 @@ var BUDGET_SCHEMA = {
   description: "What this agent may spend on one message it is sent. A limit that stops it says so in the live view.",
   type: "object",
   properties: {
-    callTokensIn: limit("Prompt per call", "The most one call may send, in tokens, as estimated before it is sent. A call past it isn't made.", "tokens"),
+    callTokensIn: limit("Prompt per call", "The most one call may send, in tokens, as estimated before it is sent. A call past it isn't made. A tool result that would take the next call past it reaches the model cut to the room left, and the rest waits for scratch_read.", "tokens"),
     callTokensOut: whole2("Answer per call", "The most one call may write, its reasoning included (max_tokens). The writer's is the request's own where the request names one.", 1, "tokens"),
     callMs: limit("Time per call", "How long one call may take before it is given up.", "ms"),
     callTools: limit("Tool calls per answer", "The most tools one answer may call. Calls past it aren't run, and the model is told.", "calls"),
@@ -617,7 +617,7 @@ var SETTINGS_SCHEMA = {
       type: "object",
       properties: {
         repeats: whole2("Loop detector", "An agent that makes the same tool call, on the same state, this many times in a row is stopped.", 2, "calls"),
-        clipChars: whole2("Tool results clipped past", "A tool result longer than this reaches the model clipped; scratch_read reads the rest.", 200, "characters"),
+        clipChars: whole2("Tool results clipped past", "A tool result longer than this reaches the model clipped; scratch_read reads the rest. A tool that bounds its own answer by a setting of its own, meant to be read in one go, is clipped only past that instead.", 200, "characters"),
         thinkingInToolLoops: flag2("Thinking in tool loops", "Let a model reason on calls that offer tools. Turn it off for a connection that fails when a reasoning model's thinking must be sent back after a tool call."),
         stream: flag2("Streaming", "Take every answer as the provider streams it, so a long answer's connection is never idle. The writer's reply streams either way."),
         charsPerToken: { title: "Characters per token", description: "For token estimates made before a provider reports its own count: budgets, and the length of the main agent's notes.", type: "number", minimum: 1, maximum: 8 },
@@ -1251,11 +1251,14 @@ var JOBS_TEXT = {
   objective: "jobs.objective",
   objectiveFiles: "jobs.objective.files",
   objectiveChat: "jobs.objective.chat",
+  objectiveFilesKept: "jobs.objective.files.kept",
+  objectiveChatKept: "jobs.objective.chat.kept",
   againNote: "jobs.again.note",
   againOffPath: "jobs.again.off_path",
   whyCutThinking: "jobs.why.cut_thinking",
   resumed: "jobs.resumed",
   resumedPlan: "jobs.resumed.plan",
+  resumedKept: "jobs.resumed.kept",
   allowance: "jobs.allowance",
   allowanceIn: "jobs.allowance.in",
   allowanceOut: "jobs.allowance.out",
@@ -1347,7 +1350,7 @@ var JOBS_TEXTS = [
     ].join(`
 
 `),
-    vars: [v("task", "the objective, as the user wrote it", true), v("allowance", "what the job may spend, as Its allowance writes it", true), v("files", "for an agent that can write files: its plan and where it keeps its files, as A long objective: files (or its form for the chat's own area) writes it; nothing for one that can't")]
+    vars: [v("task", "the objective, as the user wrote it", true), v("allowance", "what the job may spend, as Its allowance writes it", true), v("files", "for an agent that can write files: its plan and where it keeps its files, as A long objective: files writes it (or one of its forms: for the chat's own area, or for a plan its starter keeps); nothing for one that can't")]
   },
   {
     id: JOBS_TEXT.objectiveFiles,
@@ -1377,10 +1380,39 @@ var JOBS_TEXTS = [
 `),
     vars: [v("plan", "the plan file's path", true)]
   },
+  {
+    id: JOBS_TEXT.objectiveFilesKept,
+    group: JOBS,
+    label: "A long objective: files, with a plan its starter keeps",
+    note: "Fills {{files}} in A long objective, in place of A long objective: files, where whoever started the job keeps its plan file with tools of its own (an extension that starts jobs): their words of the plan stand where the agent would be asked to write one.",
+    text: [
+      " So keep what you learn in files as you go, never only in your head.",
+      "{{kept}}",
+      "Work in learned/ (kept with this chat whatever path its story takes) and ~/ (the user's own, shared by all their chats). You can read the chat's own area (/) and can't change it: it follows the story as swipes and edits do, and you belong to the chat, not to a turn. Keep a plain list of what you have not verified in learned/, beside what you have, and say in your report where your files are."
+    ].join(`
+
+`),
+    vars: [v("kept", "what whoever started the job tells its agent of the plan file they keep", true), v("plan", "the plan file's path")]
+  },
+  {
+    id: JOBS_TEXT.objectiveChatKept,
+    group: JOBS,
+    label: "A long objective: files, with the chat's own area and a plan its starter keeps",
+    note: "Fills {{files}} in A long objective, in place of its form for the chat's own area, where whoever started the job keeps its plan file with tools of its own (an extension's prepared start): their words of the plan stand where the agent would be asked to write one.",
+    text: [
+      " So keep what you learn in files as you go, never only in your head.",
+      "{{kept}}",
+      "You may write the chat's own area (/), as it stands at the chat's latest reply, and learned/ (kept with this chat whatever path its story takes) and ~/ (the user's own, shared by all their chats). Keep a plain list of what you have not verified beside what you have, and say in your report where your files are."
+    ].join(`
+
+`),
+    vars: [v("kept", "what whoever started the job tells its agent of the plan file they keep", true), v("plan", "the plan file's path")]
+  },
   { id: JOBS_TEXT.againNote, group: JOBS, label: "A job run again", note: "Ends the first message of a job the user ran again from the Jobs page: it is the same job, told what its first run was told, and why that run stopped.", text: "This is the same job run again. Its last run stopped: {{why}}.", vars: [v("why", "why the last run stopped, or how it stands", true)] },
   { id: JOBS_TEXT.againOffPath, group: GROUP.answers, label: "Run again: its reply is gone", note: "Why a job can't be run again from the Jobs page: the reply it was started from is no longer on the chat's path.", text: "Not run again: job {{id}} belongs to a reply that is no longer on the chat's path (it was swiped, edited away or deleted), so it would have no turn to work for. Show that reply again to run it, or start a new job.", vars: [v("id", "the job's id", true)] },
-  { id: JOBS_TEXT.resumed, group: JOBS, label: "A job carried on", note: "What a job's agent is sent when the job is carried on from its own session: the user granted it more after its allowance ran out, or resumed it after a restart had found it paused.", text: "This job was stopped and is carried on now, from where you left it. {{allowance}}{{plan}} Then go on.", vars: [v("allowance", "what is left of what the job may spend, as Its allowance writes it", true), v("plan", "where its plan is, as A job carried on: its plan writes it; nothing for a job that was asked for none")] },
+  { id: JOBS_TEXT.resumed, group: JOBS, label: "A job carried on", note: "What a job's agent is sent when the job is carried on from its own session: the user granted it more after its allowance ran out, or resumed it after a restart had found it paused.", text: "This job was stopped and is carried on now, from where you left it. {{allowance}}{{plan}} Then go on.", vars: [v("allowance", "what is left of what the job may spend, as Its allowance writes it", true), v("plan", "where its plan is, as A job carried on: its plan writes it (or its form for a plan its starter keeps); nothing for a job that was asked for none")] },
   { id: JOBS_TEXT.resumedPlan, group: JOBS, label: "A job carried on: its plan", note: "Fills {{plan}} for a job that was asked to keep a plan: one the user started.", text: " Read your plan ({{plan}}) and your files first: they say what is done and what is left.", vars: [v("plan", "the plan file's path", true)] },
+  { id: JOBS_TEXT.resumedKept, group: JOBS, label: "A job carried on: a plan its starter keeps", note: "Fills {{plan}} in A job carried on, in place of A job carried on: its plan, for a job whose starter keeps its plan file with tools of its own: their words of the plan.", text: " {{kept}}", vars: [v("kept", "what whoever started the job tells its agent of the plan file they keep", true), v("plan", "the plan file's path")] },
   { id: JOBS_TEXT.allowance, group: JOBS, label: "Its allowance", note: "How a job's agent is told what the job may still spend.", text: "What this job may still spend: {{parts}}.", vars: [v("parts", "each limit, as the four texts below write them, or that there is none", true)] },
   { id: JOBS_TEXT.allowanceIn, group: JOBS, label: "Its allowance: prompt tokens", note: "One part of Its allowance.", text: "{{tokens}} sent to models", vars: [v("tokens", 'the prompt tokens left, with the word: "600000 tokens"', true)] },
   { id: JOBS_TEXT.allowanceOut, group: JOBS, label: "Its allowance: answer tokens", note: "One part of Its allowance.", text: "{{tokens}} written by them", vars: [v("tokens", 'the answer tokens left, with the word: "60000 tokens"', true)] },
@@ -2476,7 +2508,9 @@ var TEXT = {
     notRun: "runtime.tool_not_run",
     oneEnding: "runtime.one_ending",
     clippedLost: "runtime.clipped_lost",
-    scratchLost: "runtime.scratch_lost"
+    scratchLost: "runtime.scratch_lost",
+    windowCut: "runtime.window_cut",
+    scratchFull: "runtime.scratch_full"
   },
   stop: {
     cancelled: "stop.cancelled",
@@ -2661,7 +2695,7 @@ var RUNTIME_TEXTS = [
   { id: TEXT.runtime.scratchRead, group: RUNTIME, label: "scratch_read: what it does", note: "The description of the built-in tool that reads the rest of a clipped tool result.", text: "Read more of a tool result that came back clipped. Give the scratch handle the clipped result names and where to start; you get the next part.", vars: [] },
   { id: TEXT.runtime.scratchHandle, group: RUNTIME, label: "scratch_read: handle", note: "The description of scratch_read's handle argument.", text: "The scratch handle the clipped result names, such as s1.", vars: [] },
   { id: TEXT.runtime.scratchOffset, group: RUNTIME, label: "scratch_read: offset", note: "The description of scratch_read's offset argument.", text: "The character to start from; 0 is the start.", vars: [] },
-  { id: TEXT.runtime.scratchLength, group: RUNTIME, label: "scratch_read: length", note: "The description of scratch_read's length argument.", text: "How many characters to read, at most {{max}}.", vars: [v("max", "the most one read returns: Tool results clipped past")] },
+  { id: TEXT.runtime.scratchLength, group: RUNTIME, label: "scratch_read: length", note: "The description of scratch_read's length argument.", text: "How many characters to read, at most {{max}}.", vars: [v("max", "the most one read returns: Tool results clipped past, or the most any of the agent's tools gives whole, where that is more")] },
   {
     id: TEXT.runtime.scratchPart,
     group: RUNTIME,
@@ -2721,7 +2755,16 @@ Arguments (JSON Schema): {{parameters}}`, vars: [v("name", "the tool's name", tr
   { id: TEXT.runtime.notRun, group: RUNTIME, label: "A tool call that never began", note: "The result of a tool call its round's end overtook before it began: the turn was stopped or a time limit passed while the call still waited for its place among the calls at once, or for your word.", text: "Not run: {{reason}}, before this call of {{name}} began. Nothing of it was started.", vars: [v("name", "the tool"), v("reason", "what ended the round, as the agent's stop says it", true)] },
   { id: TEXT.runtime.oneEnding, group: RUNTIME, label: "A second call that would end the work", note: "The result of a call to a tool whose result ends the agent's work (write_reply), where an earlier call of the same answer already does: only that first one is run.", text: "Not run: one answer may make one call that ends your work, and this answer's earlier call of {{first}} is that one. It stands, with what it was given. If its result says it failed, call {{name}} again in your next answer.", vars: [v("name", "the tool whose call wasn't run", true), v("first", "the tool whose earlier call stands")] },
   { id: TEXT.runtime.clippedLost, group: RUNTIME, label: "A clipped tool result whose rest couldn't be kept", note: "Follows the part of a long tool result that reaches the model when the whole couldn't be stored for scratch_read.", text: "[Clipped: the first {{shown}} of {{total}} characters. The rest couldn't be kept ({{error}}), so scratch_read can't give it. Call the tool again and ask for less at a time.]", vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("error", "why the whole couldn't be stored")] },
-  { id: TEXT.runtime.scratchLost, group: RUNTIME, label: "scratch_read: the result is no longer stored", note: "scratch_read's answer to a handle whose whole result is gone from storage.", text: "Scratch {{handle}} is no longer stored, so it can't be read. Call the tool that gave it again for what you need.", vars: [v("handle", "the handle asked for")] }
+  { id: TEXT.runtime.scratchLost, group: RUNTIME, label: "scratch_read: the result is no longer stored", note: "scratch_read's answer to a handle whose whole result is gone from storage.", text: "Scratch {{handle}} is no longer stored, so it can't be read. Call the tool that gave it again for what you need.", vars: [v("handle", "the handle asked for")] },
+  {
+    id: TEXT.runtime.windowCut,
+    group: RUNTIME,
+    label: "A tool result cut to the room left",
+    note: "Follows the part of a tool result that reaches the model when the whole would take the agent's next call past Prompt per call.",
+    text: "[Cut to fit: your prompt has room for only the first {{shown}} of {{total}} characters of this result (Prompt per call). The rest is in scratch {{handle}}; scratch_read gives it from offset {{shown}}, as much as your prompt still has room for. Once there is no room left, answer with what you have.]",
+    vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("handle", "where the whole result waits", true)]
+  },
+  { id: TEXT.runtime.scratchFull, group: RUNTIME, label: "scratch_read: no room left", note: "scratch_read's answer when the agent's prompt has no room left for any more of a result (Prompt per call).", text: "Your prompt has no room left for more of scratch {{handle}} (Prompt per call). Answer with what you have.", vars: [v("handle", "the handle asked for", true)] }
 ];
 var STOP_TEXTS = [
   stopText(TEXT.stop.cancelled, "Cancelled", "The agent was cancelled: the turn was stopped, or whoever started it stopped it.", "the agent was cancelled"),
@@ -3229,7 +3272,7 @@ var TRANSPORT_DEFAULTS = Object.freeze({
   link: Object.freeze({ quietMs: 120000, relays: 8, connectionMs: 15000, joinMaxUnits: 32 * 1024 * 1024, partStaleMs: 60000, joinFrames: 8, joinHeldUnits: 64 * 1024 * 1024 }),
   live: Object.freeze({ events: 20000, page: 500, chats: 32, lostMs: 30000 }),
   anchors: Object.freeze({ waitMs: 10 * 60000, held: 64 }),
-  sessions: Object.freeze({ previewChars: 120, page: 50, pathsKept: 16 }),
+  sessions: Object.freeze({ previewChars: 120, page: 50, pathsKept: 16, pathMs: 5 * 60000 }),
   runtime: RUNTIME_DEFAULTS
 });
 var ms = (title, description, minimum, maximum) => ({ type: "integer", title, description, minimum, maximum, "x-unit": "ms" });
@@ -3376,7 +3419,8 @@ var TRANSPORT_SCHEMA = {
       properties: {
         previewChars: whole3("Reply preview", "How much of a reply's opening the Sessions page shows to find it by.", 0, 2000, "characters"),
         page: whole3("Turns per page", "The most turns one page of the Sessions list holds.", 1, 500, "turns"),
-        pathsKept: whole3("Chats kept in memory", "The most chats whose list of messages (without their text) is kept in memory until the chat changes, so a reply reads its chat once. 0 keeps none: every read asks Lumiverse again.", 0, 1024, "chats")
+        pathsKept: whole3("Chats kept in memory", "The most chats whose list of messages (without their text) is kept in memory until the chat changes, so a reply reads its chat once. 0 keeps none: every read asks Lumiverse again.", 0, 1024, "chats"),
+        pathMs: ms("Keep a chat's list for", "How long such a list is kept at most, even while Lumiverse says nothing of the chat changing. After that the chat is read again. 0 keeps none: every read asks Lumiverse again.", 0, DAY_MS)
       }
     },
     runtime: {
@@ -5744,6 +5788,18 @@ function isTransient(error) {
   const texts = [errorText(error), error instanceof Error && error.cause !== undefined ? errorText(error.cause) : ""];
   return !texts.some((text) => LASTING.some((pattern) => pattern.test(text))) && texts.some((text) => TRANSIENT.some((pattern) => pattern.test(text)));
 }
+var REFUSED2 = [
+  /(?:^\s*|\b(?:status(?: code)?|http(?:\/[\d.]+)?|error|code)[\s:=#(]*)(?:401|403|404)\b/i,
+  /\b(?:unauthori[sz]ed|forbidden|permission[ _-]denied|access[ _-]denied|authentication (?:failed|error|required))\b/i,
+  /\b(?:invalid|incorrect|missing|expired|revoked)[ _-](?:x-)?(?:api[ _-]?)?key\b/i,
+  /\bapi[ _-]?key\b[^.\n]{0,30}\b(?:invalid|incorrect|missing|not valid|expired|revoked)\b/i,
+  /\b(?:model[ _]not[ _]found|no such model|unknown model|invalid model)\b/i,
+  /\bmodel\b[^.\n]{0,80}\b(?:not found|does(?: not|n't) exist|is not available|isn't available)\b/i
+];
+function isLasting(error) {
+  const texts = [errorText(error), error instanceof Error && error.cause !== undefined ? errorText(error.cause) : ""];
+  return texts.some((text) => LASTING.some((pattern) => pattern.test(text)) || REFUSED2.some((pattern) => pattern.test(text)));
+}
 function callEffort(effort, offersTools, thinkingInToolLoops) {
   return offersTools && !thinkingInToolLoops ? "off" : effort;
 }
@@ -6372,6 +6428,7 @@ class Agent {
   entries = [];
   total = emptyUsage();
   scratch = new Map;
+  room = Number.POSITIVE_INFINITY;
   startedAt = null;
   heldBefore = 0;
   waited = 0;
@@ -6611,6 +6668,8 @@ class Agent {
       used.toolTurns += 1;
       if (turn)
         turn.usage.toolTurns += 1;
+      const encoding = reply.written ? TEXT_TURNS : NATIVE_TURNS;
+      this.room = this.roomOf(prepared, encoding, reply);
       const tools = this.scope(signal, false);
       let round;
       try {
@@ -6618,7 +6677,6 @@ class Agent {
       } finally {
         tools.clear();
       }
-      const encoding = reply.written ? TEXT_TURNS : NATIVE_TURNS;
       this.conversation.push(encoding.assistant(reply), encoding.results(round.map((ran) => ran.result), this.deps.texts));
       if (tools.signal.aborted)
         return this.end(used, this.why(tools.signal.reason, tools.signal), said, finish);
@@ -6676,14 +6734,30 @@ ${text}`, ...last.parts ? { parts: [...last.parts, { type: "text", text }] } : {
 
 ${this.text(TEXT.runtime.budget, { rounds: this.deps.texts.counted(rounds, TEXT.word.round) })}`;
   }
-  warnRounds() {
+  roundsNotice() {
     const left = this.roundsLeft();
     const { warnRounds } = this.deps.settings.loop;
     if (warnRounds <= 0 || left > warnRounds)
+      return null;
+    return left === 0 ? this.text(TEXT.runtime.roundsSpent) : this.text(TEXT.runtime.roundsLeft, { rounds: this.deps.texts.counted(left, TEXT.word.round) });
+  }
+  warnRounds() {
+    const text = this.roundsNotice();
+    if (text === null)
       return;
-    const text = left === 0 ? this.text(TEXT.runtime.roundsSpent) : this.text(TEXT.runtime.roundsLeft, { rounds: this.deps.texts.counted(left, TEXT.word.round) });
     this.tell(text);
     this.record({ kind: "notice", text, at: this.now() });
+  }
+  roomOf(p, encoding, reply) {
+    const window = limitOf(this.spec.budget.callTokensIn);
+    if (!Number.isFinite(window))
+      return Number.POSITIVE_INFINITY;
+    const { charsPerToken } = this.deps.settings.loop;
+    const framing = messageText(encoding.results(reply.calls.map((call) => ({ call, text: "", error: true })), this.deps.texts)).length;
+    const line = this.roundsNotice();
+    const notice = line === null ? 0 : line.length + 2;
+    const after = p.estimate + tokensOf(messageText(encoding.assistant(reply)), charsPerToken) + 2;
+    return Math.max(0, Math.floor((window - after) * charsPerToken) - framing - notice);
   }
   timeUp() {
     const now = this.now();
@@ -6887,7 +6961,9 @@ ${this.text(TEXT.runtime.budget, { rounds: this.deps.texts.counted(rounds, TEXT.
       }
     }
     const ends = outcome.end === true && outcome.error !== true;
-    const kept = call.name === SCRATCH_READ || ends ? null : await this.clip(outcome.text, signal);
+    if (call.name === SCRATCH_READ)
+      this.room = Math.max(0, this.room - outcome.text.length);
+    const kept = call.name === SCRATCH_READ || ends ? null : await this.clip(outcome.text, tool?.wholeChars, signal);
     const text = kept?.text ?? outcome.text;
     const error = outcome.error === true;
     const scratch = kept?.scratch !== undefined ? { scratch: kept.scratch } : {};
@@ -6947,12 +7023,22 @@ ${this.text(TEXT.runtime.budget, { rounds: this.deps.texts.counted(rounds, TEXT.
         this.waited += this.now() - this.waitingSince;
     }
   }
-  async clip(text, signal) {
-    const max = this.deps.settings.loop.clipChars;
-    if (text.length <= max)
+  async clip(text, wholeChars, signal) {
+    const max = Math.max(wholeChars ?? 0, this.deps.settings.loop.clipChars);
+    const room = this.room;
+    if (text.length <= max && text.length <= room) {
+      this.room = room - text.length;
       return null;
-    const shown = cutAt(text, max);
-    const sizes = { shown: String(shown), total: String(text.length) };
+    }
+    const total = String(text.length);
+    const words = (id2) => this.text(id2, { shown: total, total, handle: "s000000" }).length + 1;
+    const fits = text.length > max && max + words(TEXT.runtime.clipped) <= room;
+    const id = fits ? TEXT.runtime.clipped : TEXT.runtime.windowCut;
+    const shown = cutAt(text, fits ? max : Math.max(0, room - words(TEXT.runtime.windowCut)));
+    this.room = Math.max(0, room - shown - words(id));
+    const sizes = { shown: String(shown), total };
+    const start = shown > 0 ? `${text.slice(0, shown)}
+` : "";
     const { blobs } = this.deps;
     let whole4 = { text };
     if (blobs) {
@@ -6962,17 +7048,15 @@ ${this.text(TEXT.runtime.budget, { rounds: this.deps.texts.counted(rounds, TEXT.
         const stopped = signal.aborted ? this.why(error, signal) : null;
         if (!stopped)
           this.deps.host.log("warn", `[LumiAH] the whole of a clipped tool result couldn't be stored (${errorText(error)}): the model has its start alone`);
-        return { text: `${text.slice(0, shown)}
-${this.text(TEXT.runtime.clippedLost, { ...sizes, error: stopped ? this.text(stopped.text.id, stopped.text.vars) : errorText(error) })}`, whole: null };
+        return { text: `${start}${this.text(TEXT.runtime.clippedLost, { ...sizes, error: stopped ? this.text(stopped.text.id, stopped.text.vars) : errorText(error) })}`, whole: null };
       }
     }
     const handle = `s${this.scratch.size + 1}`;
-    this.scratch.set(handle, whole4);
-    return { text: `${text.slice(0, shown)}
-${this.text(TEXT.runtime.clipped, { ...sizes, handle })}`, whole: whole4, scratch: "hash" in whole4 ? whole4.hash : handle };
+    this.scratch.set(handle, { whole: whole4, per: max });
+    return { text: `${start}${this.text(id, { ...sizes, handle })}`, whole: whole4, scratch: "hash" in whole4 ? whole4.hash : handle };
   }
   scratchRead() {
-    const max = this.deps.settings.loop.clipChars;
+    const max = Math.max(this.deps.settings.loop.clipChars, ...[...this.tools.values()].map((tool) => tool.wholeChars ?? 0));
     return {
       name: SCRATCH_READ,
       description: this.text(TEXT.runtime.scratchRead),
@@ -6990,13 +7074,17 @@ ${this.text(TEXT.runtime.clipped, { ...sizes, handle })}`, whole: whole4, scratc
         const kept = this.scratch.get(handle);
         if (kept === undefined)
           return { text: this.text(TEXT.runtime.scratchMissing, { handle, handles: [...this.scratch.keys()].join(", ") || this.text(TEXT.session.none) }), error: true };
-        const whole4 = "text" in kept ? kept.text : await this.deps.blobs?.get(kept.hash) ?? null;
+        const whole4 = "text" in kept.whole ? kept.whole.text : await this.deps.blobs?.get(kept.whole.hash) ?? null;
         if (whole4 === null)
           return { text: this.text(TEXT.runtime.scratchLost, { handle }), error: true };
         const from = Math.min(Math.max(0, wholeArg(args.offset) ?? 0), whole4.length);
-        const length = Math.min(Math.max(1, wholeArg(args.length) ?? max), max);
+        const total = String(whole4.length);
+        const room = this.room - this.text(TEXT.runtime.scratchPart, { handle, from: total, to: total, total, text: "" }).length;
+        if (room < 1 && from < whole4.length)
+          return { text: this.text(TEXT.runtime.scratchFull, { handle }) };
+        const length = Math.min(Math.max(1, wholeArg(args.length) ?? kept.per), kept.per, room);
         const to = cutAt(whole4, Math.min(whole4.length, from + length));
-        return { text: this.text(TEXT.runtime.scratchPart, { handle, from: String(from), to: String(to), total: String(whole4.length), text: whole4.slice(from, to) }) };
+        return { text: this.text(TEXT.runtime.scratchPart, { handle, from: String(from), to: String(to), total, text: whole4.slice(from, to) }) };
       }
     };
   }
@@ -7944,6 +8032,7 @@ function remoteDefinition(tool, host) {
         description: tool.description,
         parameters: tool.parameters,
         tier: tool.tier,
+        ...tool.wholeChars !== undefined ? { wholeChars: tool.wholeChars } : {},
         async run(args, ctx) {
           const { main = false, above = [] } = env.standing ?? {};
           const answer = await port.call({ name: tool.name, args, turn: env.run.id, chatId: env.run.chatId, agentId: ctx.agentId, role: ctx.role, callId: ctx.callId, kind: env.run.kind, main, above: above.map(({ agentId, role, as }) => ({ agentId, role, ...as !== undefined ? { as } : {} })), ...ctx.as !== undefined ? { as: ctx.as } : {} }, ctx.signal);
@@ -8470,7 +8559,8 @@ class ChatCorpus {
     this.index = new LexicalIndex(pieceChars);
   }
   sync(run, path, sizes, story) {
-    if (this.last?.run === run)
+    const key = pathKey(path);
+    if (this.last?.run === run && this.last.path === key)
       return this.last.done;
     const before = this.last?.done.then(() => {
       return;
@@ -8478,7 +8568,7 @@ class ChatCorpus {
       return;
     });
     const done = (before ?? Promise.resolve()).then(() => this.read(path, sizes, story));
-    const held = { run, done };
+    const held = { run, path: key, done };
     this.last = held;
     done.catch(() => {
       if (this.last === held)
@@ -8507,7 +8597,8 @@ class ChatCorpus {
     }
     const wanted = new Map(kept.map((m) => [m.id, m]));
     const stale = kept.filter((m) => this.docs.get(m.id)?.hash !== m.hash).map((m) => m.index);
-    for (const [from, to] of runsOf2(stale, Math.max(1, sizes.chatBatch), (index) => left.has(index))) {
+    const numbers = new Set(path.map((m) => m.index));
+    for (const [from, to] of runsOf2(stale, Math.max(1, sizes.chatBatch), (index) => left.has(index) || !numbers.has(index))) {
       const read2 = await this.texts(from, to);
       const given = [];
       for (const raw of Array.isArray(read2) ? read2 : []) {
@@ -8546,6 +8637,9 @@ class ChatCorpus {
     }
     return new ChatRun(messages, this.index, left);
   }
+}
+function pathKey(path) {
+  return path.map((m) => `${m.id}\x01${m.index}\x01${m.role}\x01${m.name}\x01${m.hash}\x01${m.hidden === true ? 1 : 0}`).join("\x00");
 }
 
 // src/core/recall/lore.ts
@@ -10038,6 +10132,7 @@ class RecallRun {
   available = null;
   readied = null;
   corpora;
+  pathRead = null;
   heldRead = null;
   arcsRead = null;
   embedded = new WeakMap;
@@ -10078,7 +10173,19 @@ class RecallRun {
   }
   async chat() {
     const { pieceChars, chatBatch } = this.env.settings.tools;
-    return this.corpora.chat.sync(this.env.run.id, await this.env.chat.path(), { pieceChars, chatBatch }, this.env.story);
+    return this.corpora.chat.sync(this.env.run.id, await this.path(), { pieceChars, chatBatch }, this.env.story);
+  }
+  path() {
+    if (this.env.turn && this.env.chat)
+      return this.env.chat.path();
+    if (this.pathRead)
+      return this.pathRead;
+    const read2 = this.host.chat.path(this.chatId).finally(() => {
+      if (this.pathRead === read2)
+        this.pathRead = null;
+    });
+    this.pathRead = read2;
+    return read2;
   }
   async activated(turn) {
     const port = this.host.recall?.lore;
@@ -10355,9 +10462,16 @@ async function remoteTools(host, chatId) {
   }
   return (Array.isArray(listed) ? listed : []).flatMap((tool) => {
     const ok = isRecord(tool) && typeof tool.name === "string" && tool.name !== "" && typeof tool.family === "string" && typeof tool.tier === "string" && TIERS.includes(tool.tier) && typeof tool.description === "string" && isRecord(tool.parameters) && (tool.source === "extension" || tool.source === "user");
-    if (!ok)
+    if (!ok) {
       host.log("warn", `[LumiAH] a tool the extension listed isn't one (${isRecord(tool) && typeof tool.name === "string" && tool.name !== "" ? tool.name : "no name"}): it isn't offered`);
-    return ok ? [tool] : [];
+      return [];
+    }
+    if (tool.wholeChars === undefined || Number.isSafeInteger(tool.wholeChars) && tool.wholeChars > 0)
+      return [tool];
+    host.log("warn", `[LumiAH] the extension's tool ${tool.name} names a length it reads whole that isn't a whole number of characters: its answers are clipped as any tool's`);
+    const rest = { ...tool };
+    delete rest.wholeChars;
+    return [rest];
   });
 }
 function claimOf(raw) {
@@ -10969,6 +11083,7 @@ class Jobs {
     let task;
     let again;
     let kept = {};
+    let keptWords;
     let same = null;
     if ("again" in input.what) {
       const old = await this.doc(input.what.again);
@@ -10980,6 +11095,7 @@ class Jobs {
       task = old.task;
       again = old.job.id;
       kept = { ...old.job.as !== undefined ? { as: old.job.as } : {}, ...old.job.area !== undefined ? { area: old.job.area } : {}, ...old.job.plan !== undefined ? { plan: old.job.plan } : {} };
+      keptWords = old.planWords;
       if (input.by.who === "user") {
         const basis = old.job.basis;
         if (basis !== null && !this.shared().runs.has(basis) && !(await pathTurns(await this.host.chat.path(input.chatId))).some((turn) => turn.onPath && turn.record.generationId === basis))
@@ -10994,6 +11110,7 @@ class Jobs {
     const due = input.due ?? same?.job.due;
     const area2 = by.who === "user" ? input.area ?? kept.area : undefined;
     const plan = by.who === "user" ? input.plan ?? kept.plan : undefined;
+    const planWords = plan !== undefined ? input.planWords ?? keptWords : undefined;
     const may = by.who === "user" ? definitions.agents().filter((d) => d.id !== AGENT.writer) : definitions.workers();
     if (!may.some((d) => d.id === agent))
       return { refused: definitions.without.has(agent) ? texts.render(TEXT.agents.notOffered, { agent: clip(agent, lineChars) }) : texts.render(TEXT.jobs.noAgent, { agent: clip(agent, lineChars), agents: may.map((d) => d.id).join(", ") }) };
@@ -11032,7 +11149,7 @@ class Jobs {
     this.forgotten.delete(input.chatId);
     const { starter } = input;
     const given = same ? { ...same.held !== undefined ? { held: same.held } : {}, ...same.depth !== undefined ? { depth: same.depth } : {} } : starter ? { held: [...starter.held], depth: starter.depth + 1 } : {};
-    await this.put({ v: 1, kind: "job", job, task, ...given });
+    await this.put({ v: 1, kind: "job", job, task, ...given, ...planWords !== undefined ? { planWords } : {} });
     port.queued(job);
     return job;
   }
@@ -11229,10 +11346,10 @@ class Jobs {
       if (!settings.jobs.enabled)
         return await this.stopped(doc, { state: "cancelled", reason: texts.render(TEXT.jobs.whyOff) });
       if (setup.claim?.place === "runtime" && shared.options.place === "builtin")
-        return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyRuntimeOnly) });
+        return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyRuntimeOnly), lasting: true });
       const resolved = setup.definitions.resolve(doc.job.agent, settings);
       if (!resolved)
-        return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyGone, { agent: doc.job.agent }) });
+        return await this.stopped(doc, { state: "failed", reason: texts.render(TEXT.jobs.whyGone, { agent: doc.job.agent }), lasting: true });
       if (!await this.stands(doc.job, settings.jobs.recordWaitMs, signal).catch(() => true))
         return await this.stopped(doc, { state: "off_path", reason: texts.render(this.ended.get(doc.job.basis ?? "")?.record === false ? TEXT.jobs.whyNoRecord : TEXT.jobs.whyOffPath) });
       const startedAt = host.clock.now();
@@ -11242,8 +11359,8 @@ class Jobs {
       let job = { ...carried, state: "running", startedAt: doc.job.startedAt ?? startedAt };
       let session = doc.session;
       let over = false;
-      const { held, depth } = doc;
-      const save = () => this.changed({ v: 1, kind: "job", job, task: doc.task, ...session !== undefined ? { session } : {}, ...held !== undefined ? { held } : {}, ...depth !== undefined ? { depth } : {} });
+      const { held, depth, planWords } = doc;
+      const save = () => this.changed({ v: 1, kind: "job", job, task: doc.task, ...session !== undefined ? { session } : {}, ...held !== undefined ? { held } : {}, ...depth !== undefined ? { depth } : {}, ...planWords !== undefined ? { planWords } : {} });
       const run = new Run(shared, setup, {
         info: { id: job.id, kind: "job", chatId: job.chatId },
         budget: jobBudget(job, settings),
@@ -11300,13 +11417,16 @@ class Jobs {
           }).catch((error) => host.log("warn", `[LumiAH] job ${job.id}'s session couldn't be kept (${errorText(error)})`));
         };
         const plan = job.by.who === "user" && (started.held.has(TOOL.workspaceWrite) || started.held.has(TOOL.workspaceEdit)) ? job.plan ?? planPath(job.id) : null;
+        const kept = plan !== null && planWords !== undefined ? planWords : null;
         const allowance = allowanceText(run.left(), texts);
         const first = job.again !== undefined && !history ? await this.doc(job.again) : null;
         const ranAgain = first ? `
 
 ${texts.render(TEXT.jobs.againNote, { why: first.job.reason ?? jobState(first.job, texts) })}` : "";
-        const opening = job.by.who === "user" ? texts.render(TEXT.jobs.objective, { task: doc.task, allowance, files: plan === null ? "" : texts.render(job.area === "chat" ? TEXT.jobs.objectiveChat : TEXT.jobs.objectiveFiles, { plan }) }) : texts.render(TEXT.jobs.task, { task: doc.task });
-        const message = history ? texts.render(TEXT.jobs.resumed, { allowance, plan: plan === null ? "" : texts.render(TEXT.jobs.resumedPlan, { plan }) }) : `${opening}${ranAgain}`;
+        const files = plan === null ? "" : kept !== null ? texts.render(job.area === "chat" ? TEXT.jobs.objectiveChatKept : TEXT.jobs.objectiveFilesKept, { plan, kept }) : texts.render(job.area === "chat" ? TEXT.jobs.objectiveChat : TEXT.jobs.objectiveFiles, { plan });
+        const opening = job.by.who === "user" ? texts.render(TEXT.jobs.objective, { task: doc.task, allowance, files }) : texts.render(TEXT.jobs.task, { task: doc.task });
+        const resumedPlan = plan === null ? "" : kept !== null ? texts.render(TEXT.jobs.resumedKept, { plan, kept }) : texts.render(TEXT.jobs.resumedPlan, { plan });
+        const message = history ? texts.render(TEXT.jobs.resumed, { allowance, plan: resumedPlan }) : `${opening}${ranAgain}`;
         const reply = await agent.send(lead === "" ? message : `${lead}
 
 ${message}`, signal);
@@ -11327,11 +11447,11 @@ ${message}`, signal);
         }
         if (reply.code !== undefined && (reply.code === DAY_STOP || ALLOWANCE_STOPS.includes(reply.code))) {
           const day = reply.code === DAY_STOP;
-          const files = [...new Set(run.wrote.map((file) => showPath(file.area, file.path)))];
+          const files2 = [...new Set(run.wrote.map((file) => showPath(file.area, file.path)))];
           const report2 = texts.render(day ? TEXT.jobs.dayReport : TEXT.jobs.spentReport, {
             reason: reply.reason ?? "",
             said: told === null ? "" : texts.render(TEXT.jobs.spentSaid, { text: told }),
-            files: files.length === 0 ? "" : texts.render(TEXT.jobs.spentFiles, { files: files.join(", ") }),
+            files: files2.length === 0 ? "" : texts.render(TEXT.jobs.spentFiles, { files: files2.join(", ") }),
             plan: plan === null ? "" : texts.render(TEXT.jobs.spentPlan, { plan })
           });
           if (run.agents.usage.calls > before.calls)
@@ -11339,12 +11459,12 @@ ${message}`, signal);
           return { state: "spent", ...reply.reason !== undefined ? { reason: reply.reason } : {}, stoppedAt: day ? "day" : "allowance", report: report2, at: at2 };
         }
         if (!whole4)
-          return { state: "failed", reason: reply.status === "answered" && cutShort(reply.finish) ? texts.render(said === "" ? TEXT.jobs.whyCutThinking : TEXT.agents.cut) : reply.reason ?? texts.render(TEXT.jobs.whyNoAnswer), report: told, at: at2 };
+          return { state: "failed", reason: reply.status === "answered" && cutShort(reply.finish) ? texts.render(said === "" ? TEXT.jobs.whyCutThinking : TEXT.agents.cut) : reply.reason ?? texts.render(TEXT.jobs.whyNoAnswer), report: told, at: at2, ...reply.code === "connection" || reply.code === "failed" && isLasting(reply.reason ?? "") ? { lasting: true } : {} };
         if (await this.stands(job, settings.jobs.recordWaitMs, hostSignal).catch(() => true))
           return { state: "done", report: told, at: at2 };
         return { state: "off_path", reason: texts.render(TEXT.jobs.whyOffPath), report: told, at: at2 };
       };
-      const { state: state2, reason, stoppedAt, report, at } = await worked().catch((error) => ({ state: live.cancelled !== null ? "cancelled" : "failed", reason: live.cancelled ?? errorText(error), report: null, at: host.clock.now() }));
+      const { state: state2, reason, lasting, stoppedAt, report, at } = await worked().catch((error) => ({ state: live.cancelled !== null ? "cancelled" : "failed", reason: live.cancelled ?? errorText(error), report: null, at: host.clock.now() }));
       over = true;
       const usage = { ...run.agents.usage };
       const ended = { status: state2 === "done" ? "done" : state2 === "failed" ? "failed" : "stopped", ...reason !== undefined ? { reason } : {}, at };
@@ -11357,6 +11477,7 @@ ${message}`, signal);
         usage,
         workedMs: workedBy(at),
         ...reason !== undefined ? { reason } : {},
+        ...lasting ? { lasting } : {},
         ...stoppedAt !== undefined ? { stoppedAt } : {}
       };
       try {
@@ -12692,9 +12813,7 @@ function recallPage(deps) {
   };
   const view = async (chatId) => {
     const { settings, texts, story } = await deps.setup(chatId);
-    let read2;
-    const path = () => read2 ??= host.chat.path(chatId);
-    return { run: recallOf({ host, run: { id: `page-${++asked}`, kind: "side", chatId }, settings, texts, chat: { path }, story }), settings, texts };
+    return { run: recallOf({ host, run: { id: `page-${++asked}`, kind: "side", chatId }, settings, texts, story }), settings, texts };
   };
   const status = async (run, settings, start) => recall.meaning.status({ lore: await run.loreGroups(), chat: await run.chatGroup(), settings, start });
   return {
@@ -18253,7 +18372,12 @@ function createHarness(host, options) {
         const plan = typeof input.plan === "string" && input.plan.trim() !== "" ? input.plan.trim() : null;
         if (plan !== null && plan.length > setup.settings.workspace.pathChars)
           throw new HarnessRefusal("invalid", `The plan's path is ${plan.length} characters, and a path may be ${setup.settings.workspace.pathChars} at most (Path length).`);
-        const started = await shared.jobs.createJob({ chatId: input.chatId, when: input.when === "now" ? "now" : "after_reply", what: { agent: input.agent, task: input.task }, by: { who: "user" }, basis: null, ...isRecord(input.allowance) ? { allowance: allowanceOf(input.allowance) } : {}, ...input.area === "chat" ? { area: "chat" } : {}, ...plan !== null ? { plan } : {} }, setup);
+        const planWords = typeof input.planWords === "string" && input.planWords.trim() !== "" ? input.planWords.trim() : null;
+        if (planWords !== null && plan === null)
+          throw new HarnessRefusal("invalid", "Words of a plan its starter keeps need the plan file they are about (plan).");
+        if (planWords !== null && planWords.length > setup.settings.jobs.taskChars)
+          throw new HarnessRefusal("invalid", `The plan's words are ${planWords.length} characters, and may be ${setup.settings.jobs.taskChars} at most (Task length).`);
+        const started = await shared.jobs.createJob({ chatId: input.chatId, when: input.when === "now" ? "now" : "after_reply", what: { agent: input.agent, task: input.task }, by: { who: "user" }, basis: null, ...isRecord(input.allowance) ? { allowance: allowanceOf(input.allowance) } : {}, ...input.area === "chat" ? { area: "chat" } : {}, ...plan !== null ? { plan } : {}, ...planWords !== null ? { planWords } : {} }, setup);
         if ("refused" in started)
           throw new HarnessRefusal("invalid", started.refused);
         return { job: started };
@@ -19223,16 +19347,30 @@ function anchorsUnder(key) {
   };
 }
 var TAIL_FIRST = 4;
+function placeOf2(rows, index) {
+  let low = 0;
+  let high = rows.length;
+  while (low < high) {
+    const mid = low + high >> 1;
+    if (rows[mid].index < index)
+      low = mid + 1;
+    else
+      high = mid;
+  }
+  return low;
+}
 
 class Chats {
   host;
   kept;
+  now;
   codec;
   writes = new KeyedQueue;
   paths = new Map;
-  constructor(host, kept, codec = OWN_ANCHORS) {
+  constructor(host, kept, now, codec = OWN_ANCHORS) {
     this.host = host;
     this.kept = kept;
+    this.now = now;
     this.codec = codec;
   }
   async own(userId, chatId) {
@@ -19253,15 +19391,17 @@ class Chats {
   }
   async path(userId, chatId) {
     await this.own(userId, chatId);
+    const keeping = await this.kept(userId);
     const held2 = this.paths.get(chatId);
-    if (held2?.fresh === true) {
+    if (held2?.fresh === true && this.now() - held2.at < keeping.ms) {
       const last = await this.last(chatId);
       const keptLast = held2.rows.at(-1);
       const same = last === null ? keptLast === undefined : keptLast !== undefined && keptLast.id === last.id && keptLast.index === last.index && keptLast.swipeId === last.swipeId && keptLast.mark === contentMark(last.role, last.content);
       if (same)
         return held2.rows.map(({ mark: _mark, ...row }) => row);
     }
-    const mine = held2 ?? { rows: [], fresh: false, changes: 0 };
+    const at = this.now();
+    const mine = held2 ?? { rows: [], fresh: false, changes: 0, at };
     if (held2 === undefined)
       this.paths.set(chatId, mine);
     const changes = mine.changes;
@@ -19273,13 +19413,12 @@ class Chats {
       const hash = old !== undefined && old.swipeId === m.swipeId && old.mark === mark ? old.hash : await textHash(m.content);
       return { id: m.id, index: m.index, role: m.role, name: m.name, swipeId: m.swipeId, chars: m.content.length, hash, anchor: this.codec.read(m.own, m.swipeId), mark };
     }));
-    const most = await this.kept(userId);
     const unchanged = this.paths.get(chatId) === mine && mine.changes === changes;
     this.paths.delete(chatId);
-    if (most > 0) {
-      this.paths.set(chatId, { rows: read2, fresh: unchanged, changes: mine.changes });
+    if (keeping.chats > 0) {
+      this.paths.set(chatId, { rows: read2, fresh: unchanged && keeping.ms > 0, changes: mine.changes, at });
       for (const oldest of this.paths.keys()) {
-        if (this.paths.size <= most)
+        if (this.paths.size <= keeping.chats)
           break;
         this.paths.delete(oldest);
       }
@@ -19288,12 +19427,25 @@ class Chats {
   }
   async messages(userId, chatId, from, to) {
     await this.own(userId, chatId);
+    return (await this.range(chatId, from, to)).map((m) => ({ id: m.id, index: m.index, role: m.role, name: m.name, swipeId: m.swipeId, content: m.content }));
+  }
+  async range(chatId, from, to) {
     if (to <= from)
       return [];
-    let rows = await this.host.chats.messages(chatId, { from, count: to - from });
-    if (rows.some((m, i) => m.index !== from + i))
-      rows = await this.host.chats.messages(chatId);
-    return rows.filter((m) => m.index >= from && m.index < to).map((m) => ({ id: m.id, index: m.index, role: m.role, name: m.name, swipeId: m.swipeId, content: m.content }));
+    const kept = this.paths.get(chatId)?.rows ?? [];
+    const last = kept.at(-1)?.index ?? -1;
+    const start = kept.length > 0 ? placeOf2(kept, from) : from;
+    const count2 = kept.length > 0 && last >= to ? placeOf2(kept, to) - start : to - from;
+    const rows = count2 > 0 ? await this.host.chats.messages(chatId, { from: start, count: count2 }) : [];
+    const placed = rows.every((m, i) => {
+      const held2 = kept[start + i];
+      if (kept.length === 0)
+        return m.index === from + i;
+      return held2 !== undefined ? held2.id === m.id : m.index > last;
+    });
+    if (placed)
+      return rows.filter((m) => m.index >= from && m.index < to);
+    return (await this.host.chats.messages(chatId)).filter((m) => m.index >= from && m.index < to);
   }
   async find(chatId, messageId) {
     const tail = await this.host.chats.messages(chatId, { tail: TAIL_FIRST });
@@ -21403,17 +21555,9 @@ class Recall2 {
       return { entryId: a.entryId, bookId: a.bookId ?? entry?.bookId ?? null, title: a.title !== "" ? a.title : entry?.title ?? "", how: a.how ?? null, ...a.score !== undefined ? { score: a.score } : {}, ...entry !== null ? { content: entry.content } : {} };
     }));
   }
-  async rows(chatId, from, to) {
-    if (to <= from)
-      return [];
-    let rows = await this.host.chats.messages(chatId, { from, count: to - from });
-    if (rows.some((m, i) => m.index !== from + i))
-      rows = await this.host.chats.messages(chatId);
-    return rows.filter((m) => m.index >= from && m.index < to);
-  }
   async messages(userId, chatId, from, to) {
     await this.deps.chats.own(userId, chatId);
-    return (await this.rows(chatId, from, to)).map((m) => ({ id: m.id, index: m.index, role: m.role, name: m.name, swipeId: m.swipeId, content: m.content, at: m.at }));
+    return (await this.deps.chats.range(chatId, from, to)).map((m) => ({ id: m.id, index: m.index, role: m.role, name: m.name, swipeId: m.swipeId, content: m.content, at: m.at }));
   }
   async embed(userId, texts, kind, signal) {
     if (texts.length === 0 || texts.length > EMBED_BATCH_MAX)
@@ -21497,7 +21641,7 @@ class Recall2 {
       return [];
     const first = kept.reduce((least2, k) => Math.min(least2, k.index), Number.POSITIVE_INFINITY);
     const last = kept.reduce((most, k) => Math.max(most, k.index), 0);
-    const now = new Map((await this.rows(chatId, first, last + 1)).map((m) => [m.index, m]));
+    const now = new Map((await this.deps.chats.range(chatId, first, last + 1)).map((m) => [m.index, m]));
     const out = [];
     for (const k of kept) {
       const m = now.get(k.index);
@@ -24577,7 +24721,10 @@ function createBackend(host, env, options = {}) {
   const streams = new StreamRegistry({ now, later, push: (userId, relay, push) => relays.push(userId, relay, push) });
   const connections = new Connections(host, { model: loopbackModel(identity.identifier), bases: (userId) => relays.bases(userId), serialTools: async (userId) => (await settings.transport(userId)).connections.oneToolAtATime });
   made.connections = connections;
-  const chats = new Chats(host, async (userId) => (await settings.transport(userId)).sessions.pathsKept, options.anchor ?? (identity.anchorKey === identity.identifier ? OWN_ANCHORS : anchorsUnder(identity.anchorKey)));
+  const chats = new Chats(host, async (userId) => {
+    const { pathsKept, pathMs } = (await settings.transport(userId)).sessions;
+    return { chats: pathsKept, ms: pathMs };
+  }, now, options.anchor ?? (identity.anchorKey === identity.identifier ? OWN_ANCHORS : anchorsUnder(identity.anchorKey)));
   const open = new OpenTurns(host, async (userId) => Math.min((await settings.transport(userId)).tags.held, CEILINGS.tagsHeld));
   const runtimeOf = async (userId, chatId) => {
     const on = await connections.ofChat(userId, await chats.own(userId, chatId));
@@ -25751,7 +25898,7 @@ function createSpindleHost(identifier = EXTENSION_IDENTIFIER) {
 }
 
 // src/extension/backend/main.ts
-var BUILD = "e5b45bb8";
+var BUILD = "b00bf33d";
 var TICK_MS = 1000;
 var host = createSpindleHost();
 var backend = createBackend(host, {
