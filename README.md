@@ -2,9 +2,9 @@
 
 **An agent does the reading before your model does the writing.**
 
-LumiAH is an extension for [Lumiverse](https://github.com/prolix-oc/Lumiverse). When you press Send, an agent reads the prompt Lumiverse built, works out what the reply needs that the prompt doesn't have, looks it up in your lore and your chat, and hands your model a short brief. Then your model writes the reply, on your connection, under your preset, as it does today.
+LumiAH is an extension for [Lumiverse](https://github.com/prolix-oc/Lumiverse). When you press Send, an agent reads the prompt Lumiverse built, works out what the reply needs that the prompt doesn't have, looks it up in your lore and your chat, and hands your model a short brief. Then your model writes the reply from the prompt your preset made.
 
-There is nothing to set up beside the extension. Switch it on for a chat and send a message.
+Beside the extension it needs its runtime: a program you start once beside Lumiverse, which runs the agents and calls your models on connections it keeps itself. Then switch LumiAH on for a chat and send a message.
 
 ![The Live page: one reply's work, step by step](docs/img/live.webp)
 
@@ -25,10 +25,10 @@ It is also a general agent harness, in the spirit of the command-line coding har
 2. The **main agent** reads it. Your preset's instructions are marked as what the reply must achieve. It is told which lore entries are in the prompt and which are not, and which of the chat's messages the prompt carries.
 3. It works: a search across the chat for what was last said about the brass key; the two lore entries on the lighthouse that didn't activate; a question handed to another agent.
 4. It calls `write_reply` with a brief. It may add lore entries to the prompt, word for word, and leave out ones that don't belong in this scene.
-5. **Your model writes the reply.** Same connection, same sampling, same streaming.
+5. **Your model writes the reply,** on the writer's connection, from your preset's prompt with its sampling, streaming into the chat.
 6. After the reply, background jobs it started carry on: keeping the story's chronicle up to date, for one.
 
-If LumiAH fails, runs out of time or is skipped, Lumiverse sends the prompt as it was. You always get a reply.
+If the agents fail before the brief, the writer writes from your prompt alone, and the Live page says why. If the runtime is down, the reply fails, and LumiAH tells you so as it goes.
 
 ## What you get
 
@@ -84,37 +84,42 @@ Every page is built for a 360-pixel phone first and for a desktop second.
 
 ## What it costs
 
-The agents' work is extra model calls, on a connection and model you choose (by default the chat's own). In my test runs on a small, cheap model a reply's work took 30 to 60 seconds and cost about a cent. A larger model costs more and may be faster or slower. Learning a long story costs more, and the page gives you an estimate before it starts. The **Spend** page shows what was spent by day, chat, agent and model, and you can cap it by day, by reply and by job. A cap stops the agents' work. It never stops your reply.
+The agents' work is extra model calls, on the connections and models you choose (by default, the runtime's default connection). In my test runs on a small, cheap model a reply's work took 30 to 60 seconds and cost about a cent. A larger model costs more and may be faster or slower. Learning a long story costs more, and the page gives you an estimate before it starts. The **Spend** page shows what was spent by day, chat, agent and model, and you can cap it by day, by reply and by job. A cap stops the agents' work. It never stops your reply.
 
 ## Install
 
-1. In Lumiverse, open **Extensions**, choose **Install from Source** and enter `https://github.com/TheLiquorPriest/LumiAH`. Grant the permissions it asks for (the list below says what each is for).
-2. Open a chat, open **LumiAH** in the drawer, and switch on **Use LumiAH in this chat**.
-3. Send a message.
+1. In Lumiverse, open **Extensions**, choose **Install from Source**, enter `https://github.com/TheLiquorPriest/LumiAH` and choose the branch `staging`. Grant the permissions it asks for (the list below says what each is for).
+2. Open **LumiAH** in the drawer, then **Runtime**. Run the line it shows on the machine Lumiverse runs on: on Linux as a service; on macOS and Windows once in a terminal, then under launchd or Task Scheduler ([docs/RUNTIME.md](docs/RUNTIME.md) has the steps). It signs in to Lumiverse as you, links to LumiAH, and makes the loopback connection your chats will use.
+3. On the same page, mint the loopback key, then add a connection under **Connections**: a provider and your key, a sign-in to your Claude or ChatGPT account, or a proxy or a model server of your own by its address. **Copy from Lumiverse** brings your Lumiverse connections over; you type each key again.
+4. Open a chat, go to LumiAH's **Home**, and switch on **Use LumiAH in this chat**.
+5. Send a message.
 
-LumiAH works inside Lumiverse, before each reply, for at most five minutes. It needs a Lumiverse recent enough to give extensions prompt interceptors with a long time limit (`staging` from late October 2026).
+The runtime needs Bun 1.4 or newer (the Bun Lumiverse runs on will do). LumiAH needs a Lumiverse recent enough to give extensions prompt interceptors (`staging` from late October 2026).
 
 ### Permissions
 
-Four are needed. The rest are optional: without one, the part that rests on it is quietly absent.
+Five are needed. The rest are optional: without one, the part that rests on it is quietly absent.
 
 | Permission | What LumiAH does with it |
 |---|---|
-| `interceptor` | Works on the prompt before a reply is written |
-| `generation` | Makes the agents' own model calls, and hears when a reply starts and ends |
+| `interceptor` | Sees the prompt before a reply is written, marks the replies the runtime answers, and leaves out what the history cutoff hides |
+| `generation` | Hears when a reply starts, ends or is stopped |
 | `chats` | Knows which chat is open, and keeps the switch on the chat |
 | `chat_mutation` | Reads the chat's messages (Lumiverse puts reading under this permission), and keeps each reply's record on the reply's own message, so swipes, edits and branches carry it |
+| `generation_parameters` | Puts the reply's mark in the request Lumiverse sends the runtime |
 | `world_books` (optional) | The lore tools, and adding and leaving out entries for the writer |
 | `presets` (optional) | Reads your preset's instructions as what the reply must achieve |
 | `characters`, `personas` (optional) | Their own lore books and their guidance |
 | `mcp_servers` (optional) | Calls the tools of the MCP servers you switch on for agents |
 | `embeddings` (optional) | Search by meaning, once you switch it on |
 | `memories`, `databanks`, `web_search` (optional) | Reads the Memory Cortex and your databanks; searches the web with your provider, for agents you give that tool |
-| `generation_parameters` (optional) | Only for the runtime below |
+| `cors_proxy` (optional) | Lets the pages reach a runtime on Lumiverse's own machine through Lumiverse's own proxy, so a page's request doesn't wait behind a reply's traffic on the link. Only an owner or an admin of the Lumiverse instance can grant it, and an update of LumiAH never does: grant it in Extensions → LumiAH → Permissions |
 
-### For long turns: the runtime (optional)
+### The runtime
 
-Built in, an agent has up to five minutes before a reply, and longer work goes to background jobs. For turns that need longer, for agents that write the reply themselves (passage by passage, or a character's answer streamed straight to you), or to have the agents' steps appear in the reply's thinking block, run LumiAH's runtime beside Lumiverse. It is one line, shown on the Runtime page, and runs on Linux (as a systemd service), macOS (under launchd) and Windows (under Task Scheduler). You choose it chat by chat. A chat set to the runtime depends on it: while the runtime is down its replies fail, LumiAH tells you so, and Home offers one tap to run the chat built in. An extension built on LumiAH may play its chats only in the runtime (LumiRPEngine does): those chats have no built-in way, and its pages say what to do while the runtime is down. The runtime links again by itself when Lumiverse restarts. See [docs/RUNTIME.md](docs/RUNTIME.md).
+The runtime is LumiAH's own program: one file that ships with the extension, run with Bun beside Lumiverse. Every chat LumiAH answers runs there: the agents, their tools and jobs, and their model calls, which go from it straight to your providers, on connections it keeps on your machine. It reads your chats and lore from Lumiverse as you, and keeps what the agents save on its own disk, with a copy in Lumiverse. It runs on Linux (as a systemd service), macOS (under launchd) and Windows (under Task Scheduler, a road not yet run on a Windows machine), and it updates itself when you update the extension. A chat switched on depends on it: while it is down, the chat's replies fail, and LumiAH tells you so. It links again by itself when Lumiverse restarts. See [docs/RUNTIME.md](docs/RUNTIME.md).
+
+**Where built-in mode went.** LumiAH's `main` branch can still run a chat inside Lumiverse with nothing to install: there the agents work while Lumiverse waits, and Lumiverse's own generation writes the reply. This branch has no such mode. Every chat runs in the runtime, and the agents run on the runtime's own connections, not on Lumiverse's. A chat you switched on that way on `main` reads as off here until you switch it on again.
 
 ## Build on it
 
@@ -129,7 +134,7 @@ Write an MCP server in any language, add it in Lumiverse, and switch it on for a
 [examples/mcp-tide-table](examples/mcp-tide-table) is one in a single file with no dependencies.
 
 ### 3. As a package: LumiAH inside your own extension
-An extension can build LumiAH into itself and supply its own tools (which run in its own backend), its own agents and skills, hooks on a run's start and end, its own main agent for the chats it claims, and its own pages beside LumiAH's.
+An extension can build LumiAH into itself and supply its own tools (which run in its own backend), its own agents and skills, hooks on a run's start and end, its own main agent for the chats it claims, and its own pages beside LumiAH's. It ships LumiAH's runtime beside its backend, and its users start it as LumiAH's users do.
 
 ```ts
 import { createBackend, createSpindleHost } from "lumi-ah/extension/backend";
@@ -165,7 +170,7 @@ const backend = createBackend(host, clock, {
 setInterval(() => void backend.tick(), 1_000);
 ```
 
-[examples/dice-tools](examples/dice-tools) is the whole extension in about 120 lines: one tool, one agent, one skill and a hook. [docs/EXTENDING.md](docs/EXTENDING.md) walks through it, and through what a tool call tells you about its caller.
+[examples/dice-tools](examples/dice-tools) is the whole extension in about 170 lines: one tool, one agent, one skill, a hook, and the build that ships the runtime. [docs/EXTENDING.md](docs/EXTENDING.md) walks through it, and through what a tool call tells you about its caller.
 
 [LumiRPEngine](https://github.com/TheLiquorPriest/LumiRPEngine) is built this way: a game engine whose author, characters and game master are LumiAH agents, with the engine's rules as their tools.
 
@@ -173,20 +178,23 @@ setInterval(() => void backend.tick(), 1_000);
 
 [docs/DESIGN.md](docs/DESIGN.md) is the contract the code is built to.
 
-- **Core** (`src/core`): the agent loop, sessions, compaction, the workspace, jobs, and the lore and history tools. It reaches the world only through ports, so the same code runs inside Lumiverse and in a process of its own.
-- **Extension** (`src/extension`): Lumiverse's side. Your chats, lore, presets and connections, and the pages.
-- **Runtime** (`src/runtime`, `src/link`): optional, for long turns.
+- **Core** (`src/core`): the agent loop, sessions, compaction, the workspace, jobs, and the lore and history tools. It reaches the world only through ports, so the tests run it over stand-ins for everything else.
+- **Extension** (`src/extension`): Lumiverse's side. Your chats, lore and presets, the storage that keeps a copy of what the agents keep, and the pages.
+- **Runtime** (`src/runtime`, `src/link`): the program that runs the agents. Their model calls, through pi-ai, on its own connections; the store of what they keep; its copy of your chats and lore; its own updates; the link to the extension.
+- **Host reads** (`src/host`): how a chat's path and its lore are read, the same code in the extension and in the runtime.
 
 The tests run on Bun, one file at a time: `bun test test/core/loop.test.ts`. `dev/preview` serves the pages over a stand-in backend, for working on them without a Lumiverse.
 
 ## Things to know
 
-- **A reply starts later.** The agent works first. Live shows how long it may take at most, and "Skip LumiAH for this reply" hands the prompt on as it was.
-- **LumiAH can't stop a reply that is being written.** Lumiverse lets an extension that works on a prompt hand it back or fail the reply, and nothing else. Lumiverse's own Stop does stop it, at any point.
-- **The runtime has no fallback.** That is why built in is the default.
-- **Messages you hide from the prompt in Lumiverse are left out of what the agents read.** Before, the agents' history tools still read them. To have them read again, set "Hidden messages" to "Read them" in Settings, or for one chat at Home.
+- **A reply starts later.** The agents work first. The reply's thinking block shows what they do meanwhile, and Live shows every step.
+- **The runtime has no fallback.** While it is down, the replies of the chats LumiAH is switched on for fail. LumiAH tells you as a reply goes, and Home says what to do.
+- **The agents need a connection of the runtime's.** Lumiverse's connections aren't used for agents: add one on the Runtime page, or copy yours from Lumiverse and type each key again.
+- **Calling providers from the runtime can't do all that Lumiverse's own generation did:** audio and video, a few fields of a request that isn't a reply, cache breakpoints set by hand, Lumiverse's connection profiles, some providers. [docs/RUNTIME.md](docs/RUNTIME.md#what-the-runtimes-model-calls-cant-do) lists each.
+- **Messages you hide from the prompt in Lumiverse are left out of what the agents read.** To have them read, set "Hidden messages" to "Read them" in Settings, or for one chat at Home.
+- **The runtime's copy of a chat can miss an edit Lumiverse makes without telling anyone,** to a message before the newest (renaming a persona's messages in bulk, say), until the chat is read again whole. The database reader, which the instance's operator can switch on for their own runtimes, sees it ([docs/RUNTIME.md](docs/RUNTIME.md#your-chats-and-lore-in-the-runtime)).
 - **Lumiverse's Sovereign Hand switch can't be followed yet.** Lumiverse doesn't tell extensions whether it is on, so "As Lumiverse" counts everyone's messages. To have only the model's replies count, choose "Replies only" in Settings, or for one chat at Home.
-- **It is new.** It is covered by about 1,800 tests and was read by two independent reviewers, whose serious findings were fixed. It has run live on one small model on a test instance. It has not yet had months of play, and the fixes have not had a second review.
+- **This branch is not finished.** Its parts are built and covered by tests, over 2,400 in all, and the findings of two early reviews (the model layer and the updater's security; the store and the copy) are fixed, but for one limit of pi-ai's own, which [docs/RUNTIME.md](docs/RUNTIME.md#connections) states. It has been played on a test bed with DeepSeek: replies, the Live page as they ran, the reply's thinking block, an agent on its own connection and effort, the runtime's copy following edits made in Lumiverse, the database reader, the faster road for pages, and a runtime updating itself. Not yet seen in play: a real call to Anthropic or OpenAI, a sign-in to a Claude or ChatGPT account taken to its end, and Windows. The branch as a whole has not yet had its final review.
 
 ## Credits
 
@@ -194,4 +202,4 @@ See [NOTICE](NOTICE). [LumiAgent](https://github.com/AMousePad/LumiAgent) by AMo
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The third-party code in the built bundles is under its own licences: see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).

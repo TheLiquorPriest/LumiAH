@@ -12,7 +12,7 @@ This is written for someone who has built a Lumiverse extension and has not seen
 
 ## What LumiAH is, in five lines
 
-- A **main agent** works before each reply: it reads the prompt Lumiverse assembled, looks things up with **tools**, and hands a brief to the **writer**, which writes the reply.
+- A **main agent** works before each reply, in LumiAH's runtime beside Lumiverse: it reads the prompt Lumiverse assembled, looks things up with **tools**, and hands a brief to the **writer**, which writes the reply.
 - An **agent** is a definition: a name, instructions, the tools it holds, and what it runs with. The main agent can hand a task to another agent.
 - A **skill** is a written procedure. An agent sees each skill's name and description, and loads the body when its work calls for it.
 - A **tool** has a name, a description, a JSON Schema for its arguments, and a **tier**: `read` (changes nothing), `write` (changes what LumiAH keeps), `external` (acts outside LumiAH).
@@ -82,9 +82,9 @@ That is all. What follows from it:
 
 ## 3. As a package
 
-LumiAH is also a package, `lumi-ah`. An extension of yours can build LumiAH into itself: it is then LumiAH under your extension's name, with what you add. Do this when a tool needs your extension's own state or Lumiverse's own data, when you want to ship agents and skills to other people, or when you want pages of your own beside LumiAH's.
+LumiAH is also a package, `lumi-ah`. An extension of yours can build LumiAH into itself: it is then LumiAH under your extension's name, with what you add. It ships LumiAH's runtime too, which its users start beside Lumiverse as LumiAH's users start LumiAH's. Do this when a tool needs your extension's own state or Lumiverse's own data, when you want to ship agents and skills to other people, or when you want pages of your own beside LumiAH's.
 
-[`examples/dice-tools`](../examples/dice-tools) is a complete one: a dice tool, an agent, a skill and a hook, in about a hundred lines.
+[`examples/dice-tools`](../examples/dice-tools) is a complete one: a dice tool, an agent, a skill, a hook, and the build that ships the runtime, in about a hundred and seventy lines.
 
 The package has three entries you use:
 
@@ -94,9 +94,11 @@ The package has three entries you use:
 | `lumi-ah/extension/frontend` | LumiAH's pages, to put in your drawer |
 | `lumi-ah/core` | The types of what you supply, and a few helpers |
 
+Your build also bundles one file of it: `src/runtime/main.ts`, LumiAH's runtime.
+
 ### The manifest
 
-Your extension has its own identifier. Lumiverse keeps each extension's storage and records under its identifier, so a user can have LumiAH and your extension installed side by side. Ask for the permissions LumiAH's own `spindle.json` asks for: its backend is in your bundle.
+Your extension has its own identifier. Lumiverse keeps each extension's storage and records under its identifier, so a user can have LumiAH and your extension installed side by side, each with a runtime of its own. Ask for the permissions LumiAH's own `spindle.json` asks for: its backend is in your bundle, and it can't answer a chat without `interceptor`, `chats`, `generation`, `chat_mutation` and `generation_parameters`. Ask for `cors_proxy` too: with it, your pages and your tools' asks reach a runtime on Lumiverse's own machine through Lumiverse's proxy, not behind the link's traffic. Only an owner or an admin can grant it, and an update never does, so tell your users where to; without it everything works over the link.
 
 ```json
 {
@@ -107,15 +109,51 @@ Your extension has its own identifier. Lumiverse keeps each extension's storage 
 
 ### The build
 
+Your build makes three bundles, as LumiAH's own does: LumiAH's runtime, your backend and your frontend. The runtime comes first, bundled from the package's own source. It carries LumiAH's model layer, pi-ai, which `lumi-ah` keeps among its development dependencies, so your `package.json` pins it as LumiAH does:
+
 ```json
   "scripts": {
-    "build": "bun build src/backend.ts --outfile dist/backend.js --target bun && bun build src/frontend.ts --outfile dist/frontend.js --target browser --minify",
+    "build": "bun build.ts",
     "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {
-    "lumi-ah": "github:TheLiquorPriest/LumiAH",
+    "lumi-ah": "github:TheLiquorPriest/LumiAH#staging",
     "preact": "^11.0.1"
   },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.5.2",
+```
+
+Then your backend, with the runtime's sha256 and size put in: your backend offers that file to a runtime of yours that says hello on another build, and the runtime updates itself from it. Every constant goes in when the bundle is made, never read at run time, since Lumiverse's install scan refuses a backend that reads the environment. The runtime's bundle needs one flag of its own, `--ignore-dce-annotations`: without it Bun's bundler leaves some modules of the runtime's model library unstarted, and the runtime fails at the end of an agent's session:
+
+```ts
+bundle("node_modules/lumi-ah/src/runtime/main.ts", "dist/lumiah.js", "bun", { LAH_BUILD_ID: BUILD }, ["--ignore-dce-annotations"]);
+// It must start under the Bun that built it.
+if (Bun.spawnSync([process.execPath, "dist/lumiah.js", "--version"]).exitCode !== 0) throw new Error("build: dist/lumiah.js doesn't start");
+const runtime = readFileSync("dist/lumiah.js");
+bundle("src/backend.ts", "dist/backend.js", "bun", { LAH_BUILD_ID: BUILD, LAH_RUNTIME_SHA256: createHash("sha256").update(runtime).digest("hex"), LAH_RUNTIME_SIZE: String(runtime.length) });
+bundle("src/frontend.ts", "dist/frontend.js", "browser", {}, ["--minify"]);
+```
+
+`dist/lumiah.js` sits beside `dist/backend.js`: that is where your Runtime page's lines look for it.
+
+A bundle holds the same code wherever it is built, so no bundle may take a file from outside your repository. Bun takes a package from any `node_modules` above the folder it builds in when it doesn't find it inside, and the runtime asks for one your folder leaves uninstalled on purpose: `supports-color`, which a library under the runtime's Google SDK asks for only to colour its own debug lines, and does without. So the build keeps it out of every bundle, lists each bundle's inputs, and fails when one lies outside the folder, as LumiAH's own build does:
+
+```ts
+function bundle(entry: string, out: string, target: "bun" | "browser", constants: Record<string, string>, flags: string[] = []): void {
+  const defines = Object.entries(constants).flatMap(([name, value]) => ["--define", `process.env.${name}=${JSON.stringify(value)}`]);
+  const left = LEFT_OUT.flatMap((name) => ["--external", name]);
+  const meta = `${out}.meta.json`;
+  const run = Bun.spawnSync([process.execPath, "build", entry, "--outfile", out, "--target", target, ...flags, ...left, `--metafile=${meta}`, ...defines], { stdout: "inherit", stderr: "inherit" });
+  if (run.exitCode !== 0) throw new Error(`build: ${entry} failed`);
+  const inputs = Object.keys(JSON.parse(readFileSync(meta, "utf8")).inputs as Record<string, unknown>);
+  rmSync(meta);
+  const outside = inputs.filter((path) => {
+    const from = relative(".", resolve(path));
+    return from.startsWith("..") || isAbsolute(from);
+  });
+  if (outside.length > 0) throw new Error(`build: ${out} took ${outside.join(", ")} from outside this folder: install it here, or add it to LEFT_OUT if nothing needs it`);
+}
 ```
 
 ### Mounting the backend
@@ -126,8 +164,11 @@ Your backend's entry makes LumiAH's backend over Lumiverse and hands it what you
 import { createBackend, createSpindleHost } from "lumi-ah/extension/backend";
 import { diceTools, IDENTIFIER } from "./dice";
 
-/** This build of the extension. A runtime linked to it says which build it is, and the Runtime page says when the two differ. */
-const BUILD = "dice-tools-0.1.0";
+/** This build of the extension (`build.ts` puts it in). A runtime linked to it says which build it is, and the Runtime page says when the two differ. */
+const BUILD: string = process.env.LAH_BUILD_ID ?? "dev";
+
+/** The runtime this build ships beside its backend (`dist/lumiah.js`): its sha256 and size, which `build.ts` puts in. A runtime on another build is offered that file, and updates itself from it. */
+const RUNTIME = { sha256: process.env.LAH_RUNTIME_SHA256 ?? "", size: Number(process.env.LAH_RUNTIME_SIZE ?? "0") };
 
 const host = createSpindleHost(IDENTIFIER);
 const backend = createBackend(
@@ -139,6 +180,7 @@ const backend = createBackend(
       return () => clearTimeout(timer);
     },
     build: BUILD,
+    runtime: RUNTIME,
   },
   diceTools({ random: Math.random, log: (line) => host.log("info", line) }),
 );
@@ -149,7 +191,13 @@ setInterval(() => {
 }, 1_000);
 ```
 
-The third argument is everything of yours. It has four parts, all optional: `identity` (who you are in Lumiverse), `tools`, `extension` (definitions, a claim on chats, hooks), and `anchor`.
+The second argument is the clock and the build, and the runtime your build ships (`runtime`: its sha256 and size). Without `runtime`, your users' runtimes don't update themselves: the Runtime page shows the line that updates one by hand.
+
+The third argument is everything of yours, all of it optional: `identity` (who you are in Lumiverse), `tools`, `extension` (definitions, a claim on chats, hooks) and `anchor`; and these choices: `declined` (the permissions your manifest doesn't ask for, which LumiAH's pages then never bring up), `ownSwitch` (your own pages switch a chat on and off: LumiAH's pages then offer no switch and say where it is), `withoutAgents` (built-in agents you leave out), `ownElsewhere` (you keep LumiAH's record of a message somewhere other than on the message, as a ledger: a reader of a chat's records and a way to say they changed, which the runtime's copy of the chat reads and hears) and `declinesLore` (you give LumiAH no lore, so the runtime's copy keeps none either).
+
+With `ownElsewhere`, call the listeners LumiAH hands its `onChanged` (with the chat's id and its user) wherever your records of a chat change: in your `setOwn`, when Lumiverse says a chat changed, and on your own pages' edits too. Each call has LumiAH's backend and the runtime's copy both read that chat's records again; one you leave out leaves them on the old records until they read the chat again for some other reason.
+
+Two more details. `identity.settingsAt` says where your users find LumiAH's Settings when that isn't "<your name>'s Settings" (LumiRPEngine: "LumiRPEngine's Harness tab → System → Settings"): every timeout's words, the runtime's own included, then name that place and its Timeouts page. And where your `anchor` keeps LumiAH's record in one of LumiAH's own forms, say so in it (`reads: { under: null }` for the record as the entry itself, `{ under: key }` for a member of it), so the runtime reads a chat's records from its own copy; without it, the runtime asks your backend for a chat's path every time.
 
 ### A tool
 
@@ -251,11 +299,19 @@ export function setup(ctx: SpindleFrontendContext): () => void {
 
 Dice Tools claims nothing, so LumiAH's own main agent answers every chat. An extension that wants some chats answered its own way supplies `claim`: it is asked about a chat at the start of every run, and answers `null` (not mine) or what it supplies there:
 
-- `mainAgent`: the id of one of its agent definitions, which answers the chat in place of LumiAH's main agent.
+- `mainAgent`: the id of one of its agent definitions, which leads the chat's replies in place of LumiAH's main agent.
 - `guidance`: its own middle level of guidance for the chat (a world's, say), in place of the character's.
 - `withdraw`: built-in tools no agent is offered in that chat.
 
 Claiming a chat is also what lets a tool of yours stand in for a built-in: a tool that bears a built-in's name (`lore_search`) replaces it in the chats you claim, and nowhere else.
+
+Nothing stands in for what your claim needs. Who leads a reply is settled before anything is sent to a model:
+
+- **The agent you name must be there.** Where it isn't (you supply no definition of that id, the user switched it off, or your `definitions` gave no answer within *Wait for the extension* or threw), the reply doesn't start: no model is called, and the user is told your name, the agent, why it can't run, and what to do. LumiAH's own main agent never answers in its place.
+- **Your `claim` must answer.** Where it gives no answer in time or throws, nobody knows whether you claim the chat, so no run about that chat starts: not a reply, not a job's run, not a conversation's turn. Answered as one of LumiAH's own chats, it could be answered wrongly.
+- **Your `definitions` are needed only where something names them.** A run that needs none of your agents goes on without them, and its live view says your agents and skills are missing, and why; a job or a conversation whose agent is yours fails with that, and can be started again.
+
+Answer both well inside the wait: ten seconds as LumiAH ships, a setting the user may change. Both are asked together at the start of every run, and also, `claim`, whenever the Agents page shows with one of your chats open, so it must be safe to answer outside a run. The Agents page marks the agent your claim names as the one that leads the chat's replies, and LumiAH's Main agent (and the Writer, where your claim says `reply: "released"`) as taking no part in them.
 
 LumiAH's own tests hold a sample extension that claims chats and supplies one of everything: `test/runtime/mounting.test.ts`.
 
@@ -273,7 +329,7 @@ runEnded: async (run) => {
 
 One more member, `writerRequest`, is handed the messages the writer is about to be sent, with the brief in place, and may return them rewritten: that is how an extension puts what it prepared where the user's preset expects it.
 
-Every member is waited for a bounded time (a setting, ten seconds as it ships). A hook that is slow or throws never costs the user a reply: the run goes on without its answer.
+Every member is waited for a bounded time (a setting, ten seconds as it ships). A hook that is slow or throws never costs the user a reply: the run goes on without its answer. `claim`, and `definitions` where your claim's lead needs them, are the exceptions above.
 
 ### What your backend may rely on
 
@@ -293,7 +349,7 @@ Nothing else in what you are handed is checked for you. A tool call's `args` are
 - **Don't keep one user's state for all.** A backend serves every user of the Lumiverse. Each member and each tool call is handed the id of the user it is for; key what you keep by it.
 - **Don't trust what a model sends.** A call's arguments are outside data, whatever your schema says.
 - **Don't write LumiAH's records.** It keeps one on each reply it answers. If your extension keeps a record of its own on a message, supply `anchor` to say where LumiAH's sits inside yours.
-- **Don't put in your backend what Lumiverse's install scan refuses.** LumiAH's code in your bundle reads no environment variable, evaluates no code and imports no `node:` module, and reaches Lumiverse only through the Spindle API. Hold your own code to the same.
+- **Don't put in your backend what Lumiverse's install scan refuses.** LumiAH's code in your bundle reads no environment variable, evaluates no code and imports no `node:` module, and reaches Lumiverse only through the Spindle API. Hold your own code to the same. A constant your build puts in (`--define`, as `build.ts` does) is replaced in the bundle, not read.
 - **Don't make the user wait on you.** Answer `list`, `definitions` and `claim` from memory where you can: they are asked on every run.
 
 ### Testing it
@@ -302,4 +358,25 @@ Nothing else in what you are handed is checked for you. A tool call's `args` are
 
 ### The runtime
 
-LumiAH runs a chat's turns built in, or in a runtime the user starts beside Lumiverse for turns that need longer. An extension with LumiAH built in gets both. The runtime is LumiAH's own program; it links to your extension by your identifier. [RUNTIME.md](RUNTIME.md), *Beside an extension that includes LumiAH*, covers it.
+Every chat LumiAH answers runs in its runtime: the agents, their tools and jobs, and their model calls, which go from it to the user's providers on connections it keeps itself. The user starts it once beside Lumiverse with the line your Runtime page shows, which names your identifier (`--extension`); it links to your extension by it, and updates itself from your `dist/lumiah.js` each time your extension is updated. [RUNTIME.md](RUNTIME.md), *Beside an extension that includes LumiAH*, covers the user's side.
+
+An agent runs on the runtime's connections. `agentModel` (asked as each agent starts) names one by its id, as the runtime's Connections section shows it; one the runtime doesn't have leaves the agent on the runtime's default. For a page of your own that picks an agent's connection, `lumi-ah/extension/frontend` gives the runtime's connections as a page knows them (`useRuntimeConnections(chatId)`: the connections of the runtime that plays that chat, else of the runtime heard from last), the section itself (`ConnectionsSection`), the notice Home and Live show while there is none (`ConnectionsWanted({ chatId })`, `leadToConnections`), and a picker's words (`pickerLabel`, `whoseWords`, `goneWords`, `noneWords`, `unlistedWords`, `modelsConnection`).
+
+### Coming from LumiAH's `main` branch
+
+`main` still runs a chat inside Lumiverse when the user asks (built-in mode). This branch doesn't: every chat runs in the runtime, the agents call their models from it on its own connections, and the runtime updates itself. What an extension built on `main` changes:
+
+- **`place: "runtime"`** in `createBackend`'s options is gone: every chat plays only in the runtime. Pass `ownSwitch: true` where your own pages switch chats on; the Runtime page then names you (`RuntimeView.switchedBy`, which replaces `RuntimeView.only`).
+- **`ChatClaim.place`** is gone: leave it out of your claim.
+- **`Backend.builtin`** (`stop`, `runs`) is gone. Stop a run with the page request `lah.turn.stop`; there are no runs but the runtime's.
+- **`ChatView.place`** and **`ChatView.needsRuntime`** are gone. A chat is answered when it is on and pinned to the loopback: `chat.on && chat.connection?.loopback === true`. `lah.chat.set` takes `{ chatId, on }`; a `place` sent with it is passed over.
+- **Gone from `lumi-ah/shared`:** `RunPlace`, `NoPart`, `NoPartWhy`; the `place` and `replyBy` of `LiveView`, `RunningTurn` and `LastTurn`; the `place`, `noPart` and `recovered` of `TurnRow`; the causes `skipped` and `time`. A turn's record carries no `ran`.
+- **`generation_parameters`** is a permission LumiAH can't do without: ask for it in your manifest.
+- **`BackendEnv.runtime`** (`{ sha256, size }`) is new: pass what your build puts in, as above.
+- **A host of your own** (most extensions take `createSpindleHost`, which has all of it) now gives `cors` (a request through Lumiverse's proxy), `role` (a user's role in Lumiverse), `database` (Lumiverse's database file, or null), `frontend.everyone(message)` (every page and runtime of the extension: Spindle's `sendToFrontend`) and `events.onLumiverse` (Lumiverse's events about chats and world books, for the runtime's copy); it no longer gives `interceptorMs`, `models` or `connections.models`.
+- **New options:** `ownElsewhere`, `declinesLore`, `identity.settingsAt` and `AnchorCodec.reads` (above). An extension that keeps LumiAH's records elsewhere and declines lore, as LumiRPEngine does, passes the first two.
+- **`agentModel`** names the runtime's connections by id, not Lumiverse's.
+- **`lah.models.list`** is gone: a picker asks `lah.connections.models`. New page requests: `lah.connections.list`, `.save`, `.remove`, `.default`, `.test`, `.models` and `lah.signin.start`, `.finish`, `.cancel`, `.out`, `.state` (each with `relay` to name one of the user's runtimes, else the runtime heard from last); `lah.connections.lumiverse`; `lah.runtime.service.get`, `.set`, `lah.runtime.update.apply`, `lah.runtime.store` and `lah.runtime.chatdata` (each with `relay`); `lah.runtime.database` (the operator's switch of the database reader); `lah.timings.get`. `backend.asks.ask` takes `{ relay }` the same way.
+- **The link's version is 2.** A runtime and a backend of different link versions refuse each other at hello; one built from the same `lumi-ah` as your backend, as *The build* makes it, always agrees with it.
+- **Your build** bundles the runtime with `--ignore-dce-annotations`, puts its sha256 and size into your backend, and takes no file from outside your repository (*The build*).
+- **A runtime run from your own entry.** One that calls `lumiah` or `serve` from `lumi-ah/runtime` with a `RuntimeIO` of its own (as `src/runtime/main.ts` makes LumiAH's) now gives it `updateFiles`, `handOver` and `pid`, a `files.folder`, and a `run` that takes a time limit and finds programs in the system's own folders; its `harness` is handed a fourth argument, `place` (where the user changes one of the core's settings), to pass to `createHarness` as `HarnessOptions.place`, so the core's waits that run out (*Wait for the extension* among them) name where they are changed. One that calls `createRuntime` itself passes `models` (`createModelLayer`), `dir` (the runtime's own folder, its owner's alone) and `update` (a function that gives `createUpdate(…)` for what says something is under way), and awaits `close()`, which now returns a promise. A runtime bundled from `src/runtime/main.ts`, as *The build* does, needs none of this.
