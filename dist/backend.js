@@ -10,6 +10,9 @@ function limitOf(limit) {
   return limit === null ? Number.POSITIVE_INFINITY : limit;
 }
 var TIMER_MAX_MS = 2147483647;
+function timerMs(left) {
+  return left >= TIMER_MAX_MS ? null : Math.max(0, left);
+}
 function cutAt(text, at) {
   const unit = text.charCodeAt(at - 1);
   return at > 0 && at < text.length && unit >= 55296 && unit <= 56319 ? at - 1 : at;
@@ -862,6 +865,12 @@ var RETIRED_SETTINGS = [
 ];
 function settingsSchema(scope) {
   return { ...SETTINGS_SCHEMA, properties: { ...SETTINGS_SCHEMA.properties, agents: agentsSchema(scope) } };
+}
+function settingTitle(path) {
+  let at = SETTINGS_SCHEMA;
+  for (const key of path)
+    at = isRecord(at) && isRecord(at.properties) ? at.properties[key] : undefined;
+  return isRecord(at) && typeof at.title === "string" ? at.title : path.join(".");
 }
 function shapeOf(scope) {
   const defaults = defaultSettings();
@@ -3158,7 +3167,9 @@ var RUNTIME_DEFAULTS = Object.freeze({
   copyReadMs: 15000,
   copyChars: 32000000,
   providerMs: 60000,
-  answerSilentMs: 5 * 60000
+  answerSilentMs: 5 * 60000,
+  signInMs: 10 * 60000,
+  buildStartMs: 30000
 });
 var TRANSPORT_DEFAULTS = Object.freeze({
   history: Object.freeze({ keep: "last", count: 40 }),
@@ -3352,7 +3363,9 @@ var TRANSPORT_SCHEMA = {
         copyReadMs: ms("Chat data wait", "How long each request the runtime makes to Lumiverse for its own copy of your chats and world books waits for its answer: a page of a chat's messages or of a book's entries, a check of a chat before an agent reads it. Past it that read is given up, and the agent's read is asked of this extension instead.", 1000, 10 * 60000),
         copyChars: whole3("Chat data kept", "The most characters of your chats and world books the runtime keeps in memory, so an agent reads them without asking this extension. What was used least recently goes first; a chat larger than this alone is read from this extension every time. 0 keeps none.", 0, 1e9, "characters"),
         providerMs: ms("Provider wait", "How long testing one of the runtime's connections (Runtime \u2192 Connections), or reading a server's list of its models for a model picker, waits for the provider to answer. Past it the page says the provider didn't answer.", 1000, 10 * 60000),
-        answerSilentMs: ms("Silent answer ends after", "How long a model's answer, once it has begun, may go with nothing at all from its provider's server before the call is ended and made again, as a dropped stream is. Before its answer begins a model may still be reading a long prompt or thinking unseen: that is never cut short. 0: no limit.", 0, DAY_MS)
+        answerSilentMs: ms("Silent answer ends after", "How long a model's answer, once it has begun, may go with nothing at all from its provider's server before the call is ended and made again, as a dropped stream is. Before its answer begins a model may still be reading a long prompt or thinking unseen: that is never cut short. 0: no limit.", 0, DAY_MS),
+        signInMs: ms("Sign-in stays open", "How long a sign-in to Anthropic or OpenAI (Runtime \u2192 Connections) stays open for you to sign in and paste back what the provider gave you. Past it the sign-in ends and says so: start it again. A provider keeps what it gives you good for about ten minutes, so a longer wait seldom helps.", 60000, 60 * 60000),
+        buildStartMs: ms("New build's start check", "How long a new build of the runtime is given to start and say its version before the runtime updates to it. Past it the build is taken as one that can't start here, and the runtime stays on the build it runs. A slow or busy machine may need longer.", 5000, 10 * 60000)
       }
     }
   }
@@ -3686,7 +3699,7 @@ var TIMEOUT_GROUPS = [
   {
     id: "runtime",
     label: "Waiting for the runtime",
-    about: "How long a page, a reply or a key waits for your runtime to do something.",
+    about: "How long a page, a reply or a key waits for your runtime to do something, and how long a new build of the runtime has to start before it updates to it.",
     rows: [
       ["transport", "pages", "askMs"],
       ["transport", "pages", "proxyMs"],
@@ -3695,7 +3708,8 @@ var TIMEOUT_GROUPS = [
       ["transport", "runtime", "turnWaitMs"],
       ["transport", "runtime", "drainMs"],
       ["transport", "live", "lostMs"],
-      ["transport", "link", "quietMs"]
+      ["transport", "link", "quietMs"],
+      ["transport", "runtime", "buildStartMs"]
     ]
   },
   {
@@ -3732,8 +3746,8 @@ var TIMEOUT_GROUPS = [
   {
     id: "model",
     label: "A model call",
-    about: "How long an agent's calls, the agent, a turn or a job may take, how long a model's answer may go silent, how long a connection's test waits for its provider, and the wait before a failed call is made again.",
-    rows: [...AGENT_TIMES, ["core", "turn", "wallMs"], ["core", "jobs", "budget", "wallMs"], ["core", "loop", "retryWaitMs"], ["transport", "runtime", "answerSilentMs"], ["transport", "runtime", "providerMs"]]
+    about: "How long an agent's calls, the agent, a turn or a job may take, how long a model's answer may go silent, how long a connection's test waits for its provider, how long a sign-in stays open, and the wait before a failed call is made again.",
+    rows: [...AGENT_TIMES, ["core", "turn", "wallMs"], ["core", "jobs", "budget", "wallMs"], ["core", "loop", "retryWaitMs"], ["transport", "runtime", "answerSilentMs"], ["transport", "runtime", "providerMs"], ["transport", "runtime", "signInMs"]]
   },
   {
     id: "store",
@@ -7014,6 +7028,7 @@ function runtimeReportOf(raw) {
 
 // src/extension/backend/mirror.ts
 var FILE2 = "mirror-holder.json";
+var STAMPS_KEPT = 1e4;
 var id = (v2) => typeof v2 === "string" && MIRROR_ID.test(v2);
 function holderDocOf(raw) {
   if (!isRecord2(raw) || raw.v !== 1 || typeof raw.gen !== "number" || !Number.isSafeInteger(raw.gen) || raw.gen < 0)
@@ -7039,6 +7054,8 @@ class Mirrors {
   sessions = new Map;
   started;
   raising = new Set;
+  stamps = new Map;
+  writing = new Map;
   constructor(host, env) {
     this.host = host;
     this.env = env;
@@ -7094,11 +7111,13 @@ class Mirrors {
     }
     return { held: true, holder: null, gen: doc.gen, ...ask.seen < doc.gen ? { dropped: { docs: [], blobs: [], all: true } } : {} };
   }
-  async write(caller, mark, changed, apply) {
+  async write(caller, mark, changed, apply, ago) {
     const { userId } = caller;
     const doc = await this.docs.get(userId);
     const held = doc.holder;
     const { name } = this.env;
+    const made = typeof ago === "number" && Number.isFinite(ago) && ago > 0 ? this.env.now() - ago : null;
+    const path = changed.docs.length === 1 && changed.blobs.length === 0 ? changed.docs[0] : undefined;
     if (mark !== undefined) {
       if (held === null || held.relay !== caller.relay.id || held.process !== mark) {
         throw new LinkRefused("conflict", `${held === null ? "No runtime keeps" : `Another runtime (${held.owner}) keeps`} ${name}'s storage now, so ${name} takes nothing from this runtime's own copy of it: this runtime reads and writes the storage directly from now on.`);
@@ -7106,14 +7125,48 @@ class Mirrors {
       const live = this.liveOf(userId);
       live.heardAt = this.env.now();
       live.session ??= caller.session;
-      await apply();
+      await this.ordered(userId, caller.relay.id, path, made, apply);
       return;
     }
     if (changed.docs.includes(MARK_PATH))
       throw new LinkRefused("bad_request", `${MARK_PATH} is where the runtime that keeps ${name}'s storage notes its copy: no other runtime writes it.`);
-    await apply();
+    await this.ordered(userId, caller.relay.id, path, made, apply);
     if (changed.docs.length > 0 || changed.blobs.length > 0)
       await this.tell(userId, changed);
+  }
+  ordered(userId, relay, path, made, apply) {
+    if (path === undefined)
+      return apply();
+    const key2 = `${userId}
+${path}`;
+    const step = (this.writing.get(key2) ?? Promise.resolve()).then(async () => {
+      const stood = this.stamps.get(userId)?.get(path);
+      if (made !== null && stood !== undefined && stood.relay !== relay && stood.at > made) {
+        throw new LinkRefused("superseded", `Another runtime saved ${path} in ${this.env.name}'s storage after this change was made, so the storage keeps that save.`);
+      }
+      const at2 = made ?? this.env.now();
+      await apply();
+      const stamps = this.stamps.get(userId) ?? new Map;
+      this.stamps.set(userId, stamps);
+      stamps.delete(path);
+      stamps.set(path, { relay, at: at2 });
+      for (const oldest of stamps.keys()) {
+        if (stamps.size <= STAMPS_KEPT)
+          break;
+        stamps.delete(oldest);
+      }
+    });
+    const done = step.then(() => {
+      return;
+    }, () => {
+      return;
+    });
+    this.writing.set(key2, done);
+    done.then(() => {
+      if (this.writing.get(key2) === done)
+        this.writing.delete(key2);
+    });
+    return step;
   }
   async tell(userId, changed) {
     const doc = await this.docs.get(userId);
@@ -8340,10 +8393,10 @@ class LinkServer {
       case "doc.get":
         return { doc: await d.storage.doc(userId, r.path) };
       case "doc.put":
-        await d.mirror.write(caller, r.mirror, { docs: typeof r.path === "string" ? [r.path] : [], blobs: [] }, () => d.storage.putDoc(userId, r.path, r.doc));
+        await d.mirror.write(caller, r.mirror, { docs: typeof r.path === "string" ? [r.path] : [], blobs: [] }, () => d.storage.putDoc(userId, r.path, r.doc), r.ago);
         return { written: true };
       case "doc.remove":
-        await d.mirror.write(caller, r.mirror, { docs: typeof r.path === "string" ? [r.path] : [], blobs: [] }, () => d.storage.removeDoc(userId, r.path));
+        await d.mirror.write(caller, r.mirror, { docs: typeof r.path === "string" ? [r.path] : [], blobs: [] }, () => d.storage.removeDoc(userId, r.path), r.ago);
         return { removed: true };
       case "chat.path":
         return { messages: await d.chats.path(userId, text6(r.chat, "chat")) };
@@ -9232,9 +9285,12 @@ class SettingsStore {
       }
     }
     const values = this.valuesOf(own);
-    for (const section of this.sections)
-      for (const p of await section.check(values[section.key], userId))
+    const changed = [...reset, ...set.map((s) => s.path)];
+    for (const section of this.sections) {
+      const touched = changed.flatMap((path) => path.length === 0 ? [[]] : path[0] === section.key ? [path.slice(1)] : []);
+      for (const p of await section.check(values[section.key], userId, touched))
         problems.push({ path: [section.key, ...p.path], message: p.message });
+    }
     if (problems.length > 0)
       throw new SettingsRefused(`The settings refused ${problems.length === 1 ? "a value" : `${problems.length} values`}: nothing was changed.`, problems);
     const revision = await this.docs.change(userId, (doc) => {
@@ -9533,26 +9589,36 @@ class ChatSwitch {
     if (ask === null)
       throw new LinkRefused("not_found", "There is no such chat in this account.");
     const chosen = ask.chat.story ?? {};
-    const answered = this.deps.claim === undefined ? null : await this.deps.claim(ask, userId);
-    const said2 = answered !== null && "claim" in answered ? answered : null;
+    const { claimer } = this.deps;
+    const answered = claimer === undefined ? null : await claimer.claim(ask, userId);
+    const said2 = claimer !== undefined && answered !== null && "claim" in answered ? { by: claimer.name, claim: answered.claim } : null;
     const word2 = storyWordOf(said2?.claim.story);
     const claimed = said2 !== null && Object.keys(word2).length > 0 ? { by: said2.by, story: word2 } : null;
     return { chatId, chosen, setting, claimed, sovereignHand: ask.sovereignHand, holds: storyHolds({ claim: claimed?.story ?? null, chat: chosen, user: setting, sovereignHand: ask.sovereignHand }) };
   }
   async lead(userId, chatId) {
     await this.deps.chats.own(userId, chatId);
-    if (this.deps.claim === undefined)
+    const { claimer } = this.deps;
+    if (claimer === undefined)
       return null;
     const ask = await this.claimAsk(userId, chatId);
     if (ask === null)
       throw new LinkRefused("not_found", "There is no such chat in this account.");
-    const said2 = await this.deps.claim(ask, userId);
+    const ms2 = timerMs(limitOf(await this.deps.extensionWait(userId)));
+    const late = Promise.withResolvers();
+    const place = timeoutPlace(["core", "extension", "waitMs"], settingTitle(["extension", "waitMs"]), this.deps.identity);
+    const cancel = ms2 === null ? () => {
+      return;
+    } : this.deps.later(ms2, () => late.resolve({ late: `nothing within ${spanWords(ms2)}; ${place} says how long a reply waits for it` }));
+    const said2 = await Promise.race([claimer.claim(ask, userId), late.promise]).finally(cancel);
     if (said2 === null)
       return null;
+    if ("late" in said2)
+      return { by: claimer.name, unanswered: said2.late };
     if ("failed" in said2)
-      return { by: said2.by, unanswered: said2.failed };
+      return { by: claimer.name, unanswered: said2.failed };
     const { mainAgent, reply } = said2.claim;
-    return { by: said2.by, lead: typeof mainAgent === "string" && mainAgent !== "" ? mainAgent : null, released: reply === "released" };
+    return { by: claimer.name, lead: typeof mainAgent === "string" && mainAgent !== "" ? mainAgent : null, released: reply === "released" };
   }
   async setStory(userId, chatId, story) {
     await this.deps.chats.own(userId, chatId);
@@ -9973,7 +10039,14 @@ class Turns {
         this.host.log("warn", `[LumiAH] a reply's connection couldn't be checked (${wordsOf(error)}), so it was left as it is`);
         return false;
       }
-      throw new Error(`${this.deps.name} answers this chat in its runtime, and couldn't check its connection now (${wordsOf(error)}), so its agents had no part in this reply. Try again in a moment; if it keeps happening, see ${this.deps.name}'s Runtime page.`);
+      const why = wordsOf(error);
+      const lead = this.deps.lead === undefined ? null : await this.deps.lead(input.userId, input.chatId);
+      if (lead !== null) {
+        const whose = "unanswered" in lead ? `this chat may be ${lead.by}'s, which gave no word on it (${lead.unanswered})` : `${lead.by} answers this chat`;
+        const wait = transportWait(["tags", "checkMs"], { name: this.deps.name, ...this.deps.settingsAt !== undefined ? { settingsAt: this.deps.settingsAt } : {} });
+        return { stop: `${this.deps.name} couldn't confirm this chat's connection in time (${why}), so this reply wasn't written: ${whose}, and nothing else writes its replies. Send the message again; it usually works. ${wait} says how long a reply waits for that check.` };
+      }
+      throw new Error(`${this.deps.name} answers this chat in its runtime, and couldn't check its connection now (${why}), so its agents had no part in this reply. Try again in a moment; if it keeps happening, see ${this.deps.name}'s Runtime page.`);
     } finally {
       unwait();
     }
@@ -10031,8 +10104,19 @@ class Turns {
     const kind = KINDS3[input.type];
     if (kind === undefined)
       return {};
-    if (!await this.where(input))
+    const where = await this.where(input);
+    if (where === false)
       return {};
+    if (where !== true) {
+      if (input.dryRun || !this.host.granted("generation_parameters"))
+        throw new Error(where.stop);
+      const generation2 = this.generationOf(input);
+      if (generation2 === null)
+        throw new Error(where.stop);
+      const turn2 = this.take(input, kind, generation2, []);
+      turn2.refused = where.stop;
+      return { parameters: { [TAG_PARAM]: turn2.tag } };
+    }
     if (!input.dryRun)
       this.deps.toRuntime?.(input.userId, input.chatId);
     if (!this.host.granted("generation_parameters"))
@@ -10076,6 +10160,8 @@ class Turns {
     const turn = this.accounts.get(userId)?.byTag.get(tag);
     if (turn === undefined || this.deps.now() - turn.at > lifeMs)
       throw new LinkRefused("not_found", `${name} doesn't know this reply's tag: the extension started again since the reply was asked for, or the tag is too old. Send the message again.`);
+    if (turn.refused !== undefined)
+      throw new LinkRefused("unavailable", turn.refused);
     if (turn.request !== null && turn.request !== request)
       throw new LinkRefused("conflict", "This reply's tag was already used. A tag admits one request, so this one wasn't answered: send the message again.");
     if (turn.facts === null) {
@@ -10842,6 +10928,19 @@ class Ui {
 
 // src/extension/backend/backend.ts
 var CORE_KEY = "core";
+var RUNTIME_JUDGES = "Only your runtime knows this agent or tool (your own agent, or an extension's or MCP server's tool), and it isn't linked now. Start the runtime (its line is on the Runtime page), then make this change again.";
+function namedScope(values) {
+  const agents = isRecord2(values) && isRecord2(values.agents) ? values.agents : {};
+  const tools = new Set(CORE_TOOLS);
+  for (const agent of Object.values(agents))
+    if (isRecord2(agent) && Array.isArray(agent.tools)) {
+      for (const tool of agent.tools)
+        if (typeof tool === "string")
+          tools.add(tool);
+    }
+  const defaults = defaultSettings().agents[AGENT.main];
+  return { tools: [...tools], agents: Object.keys(agents).filter((id2) => !CORE_AGENTS.includes(id2)).map((id2) => ({ id: id2, label: id2, note: "", defaults })) };
+}
 function settingsSections(scope) {
   return [
     {
@@ -10849,13 +10948,19 @@ function settingsSections(scope) {
       defaults: () => defaultSettings(),
       schema: SETTINGS_SCHEMA,
       retired: RETIRED_SETTINGS,
-      async check(values, userId) {
+      async check(values, userId, changed) {
         const known = await scope?.(userId);
         const plain = checkSettings(values);
-        if (known === undefined)
-          return plain;
-        const refused2 = new Set(plain.map((problem) => JSON.stringify(problem.path)));
-        return checkSettings(values, known).filter((problem) => refused2.has(JSON.stringify(problem.path)));
+        const key4 = (problem) => JSON.stringify(problem.path.map(String));
+        if (known === undefined) {
+          const touched = (path) => changed.some((place) => place.every((k, i) => i >= path.length || String(path[i]) === k));
+          const all = checkSettings(values, namedScope(values));
+          const judged = new Set(all.map(key4));
+          const named2 = all.filter((problem) => !(problem.path[0] === "agents" && problem.path.length > 1 && !CORE_AGENTS.includes(String(problem.path[1]))) || touched(problem.path));
+          return [...named2, ...plain.filter((problem) => !judged.has(key4(problem)) && touched(problem.path)).map((problem) => ({ path: problem.path, message: RUNTIME_JUDGES }))];
+        }
+        const refused2 = new Set(plain.map(key4));
+        return checkSettings(values, known).filter((problem) => refused2.has(key4(problem)));
       },
       async fixed(userId) {
         const known = await scope?.(userId);
@@ -10955,6 +11060,7 @@ function createBackend(host, env, options = {}) {
       }
     }
   };
+  const claimer = options.extension;
   const turns = new Turns(host, {
     chats,
     connections,
@@ -10963,8 +11069,10 @@ function createBackend(host, env, options = {}) {
     open,
     toRuntime: warnAway,
     name,
+    settingsAt: identity.settingsAt,
     now,
-    later
+    later,
+    ...claimer?.claim !== undefined ? { lead: async (userId, chatId) => made.chatSwitch === null ? null : made.chatSwitch.lead(userId, chatId).catch((error) => ({ by: claimer.name, unanswered: wordsOf(error) })) } : {}
   });
   const storage = new Storage(host);
   const mirror = new Mirrors(host, { now, quietMs: async (userId) => (await settings.transport(userId)).link.quietMs, send: (push, userId, session) => made.server?.send(push, userId, session), name });
@@ -10977,7 +11085,6 @@ function createBackend(host, env, options = {}) {
   const copy = new CopyFeed(host, { relays, registry, chats, turns, ...options.ownElsewhere !== undefined ? { ownElsewhere: options.ownElsewhere } : {}, declinesLore: options.declinesLore === true, records: codec.reads ?? null, name });
   const live = new LiveBuffer(host, { now, transport: (userId) => settings.transport(userId), linkGoneFor: (userId, relay) => relays.goneFor(userId, relay), missing: () => permissions().some((need) => need.needed) });
   const keys = new Keys(host, { registry, relays, settings, connectionName: identity.connectionName, now, later });
-  const claimer = options.extension;
   const chatSwitch = new ChatSwitch(host, {
     chats,
     connections,
@@ -10985,15 +11092,20 @@ function createBackend(host, env, options = {}) {
     blocked,
     identity,
     now,
+    later,
     storySetting: async (userId) => settingsOf((await settings.values(userId))[CORE_KEY]).story,
+    extensionWait: async (userId) => settingsOf((await settings.values(userId))[CORE_KEY]).extension.waitMs,
     ...claimer?.claim !== undefined ? {
-      claim: async (ask, userId) => {
-        try {
-          const claim = await claimer.claim?.(ask, userId);
-          return claim === null || claim === undefined ? null : { by: claimer.name, claim };
-        } catch (error) {
-          warn(`${claimer.name} gave no answer for chat ${ask.chatId}, so its claim on it isn't known`)(error);
-          return { by: claimer.name, failed: wordsOf(error) };
+      claimer: {
+        name: claimer.name,
+        claim: async (ask, userId) => {
+          try {
+            const claim = await claimer.claim?.(ask, userId);
+            return claim === null || claim === undefined ? null : { claim };
+          } catch (error) {
+            warn(`${claimer.name} gave no answer for chat ${ask.chatId}, so its claim on it isn't known`)(error);
+            return { failed: wordsOf(error) };
+          }
         }
       }
     } : {}
@@ -11990,9 +12102,9 @@ function createSpindleHost(identifier = EXTENSION_IDENTIFIER) {
 }
 
 // src/extension/backend/main.ts
-var BUILD = "37c8906d";
-var RUNTIME_SHA256 = "f0851f0ba88537da2d6edeb05ebeda94d56449ac009fcf77b1f96558686ceb58";
-var RUNTIME_SIZE = "4648892";
+var BUILD = "389672bf";
+var RUNTIME_SHA256 = "77eab036b9a97e34d0b7aa787d071bbf242075c05b9454b9f71c20cb86e1a276";
+var RUNTIME_SIZE = "4655179";
 var TICK_MS = 1000;
 var host = createSpindleHost();
 var backend = createBackend(host, {
