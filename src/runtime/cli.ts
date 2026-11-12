@@ -5,7 +5,9 @@
 //           keeps the registration of the runtime it sets up again), puts its address in the
 //           account's scheduler exclusions, writes its config, makes the loopback connection when
 //           the user has none, and serves; with --systemd it installs a stable copy of itself and a
-//           user unit that runs it instead, restarted once the replies under way have ended
+//           user unit that runs it instead, restarted once the replies under way have ended. It
+//           keeps the memory limit the runtime had (--memory changes it), records the file it was
+//           run from (the only one the runtime later updates itself from) and the unit it installed
 //   serve   what the unit runs: the runtime from its config, until stopped
 //   login   a new session for the runtime when its own ended (the Runtime page says so)
 //   status  the runtime's config, unit, link and session
@@ -23,8 +25,8 @@ import { EXTENSION_IDENTIFIER, RUNTIME_NAME, loopbackModel, runtimeBase, shellWo
 import { linkedBackendOf } from "../link/frames";
 import { isRecord } from "../link/json";
 import { RUNTIME_DEFAULTS } from "../link/settings";
-import type { RuntimeConfig } from "./config";
-import { configDir, configOf, configPathOf, configText } from "./config";
+import type { RuntimeConfig, SavedConfig, SystemdService } from "./config";
+import { SETUP_DEFAULTS, configDir, configOf, configPathOf, configText, dataDir, installedPath } from "./config";
 import type { OpenSocket } from "./connection";
 import { HostConnection, LinkError } from "./connection";
 import type { Http, StoredLogin } from "./lumiverse";
@@ -32,6 +34,8 @@ import { addConnectionProfile, connectionProfiles, editAndSendPrefersActive, exc
 import { healthProof } from "./relay";
 import { createRuntime } from "./runtime";
 import type { Harness } from "./turn";
+import { DEFAULT_MEMORY, memoryRefusal } from "./update/memory";
+import { systemctlOf, unitPath, unitRunning, unitText } from "./update/service";
 
 export interface ServeOptions {
   hostname: string;
@@ -117,8 +121,6 @@ const FLAGS: Readonly<Record<string, true>> = { "--systemd": true, "--allow-http
 const DEFAULT_PORT = 7871;
 const LAST_PORT = 7899;
 const LISTEN = "127.0.0.1";
-/** The memory a unit's runtime may hold before systemd stops and restarts it, unless `--memory` says otherwise. */
-const DEFAULT_MEMORY = "1G";
 /** A directory's sticky bit: no one but an entry's owner, the directory's or root may rename or remove the entry (/tmp). */
 const STICKY = 0o1000;
 /** Write bits for the entry's group, and for everyone else. */
@@ -131,9 +133,10 @@ export const USAGE = `lumiah: LumiAH's runtime, which answers Lumiverse's loopba
                         Sign in, register with LumiAH, and serve on 127.0.0.1. --systemd installs it as
                         a service of your account instead, so it survives logout and reboot.
                         More: --listen <host>, --username <name>, --allow-http, --memory <size> (the
-                        service's memory cap, ${DEFAULT_MEMORY} by default), --bun <path>, --extension
-                        <identifier> (the extension LumiAH is built into, when it isn't LumiAH's own:
-                        that runtime gets a name, a config, a service and a connection of its own)
+                        service's memory cap: ${DEFAULT_MEMORY} until you give one, then kept), --bun
+                        <path>, --extension <identifier> (the extension LumiAH is built into, when it
+                        isn't LumiAH's own: that runtime gets a name, a config, a service and a
+                        connection of its own)
   lumiah serve --config <file> | --name <name>
                         Run the runtime from its config (what the service runs)
   lumiah login | status | down [--name <name>]
@@ -215,12 +218,6 @@ export async function lumiah(argv: readonly string[], io: RuntimeIO): Promise<nu
 
 // ---------------------------------------------------------------- where things go
 
-/** One of the account's XDG directories: the variable's when it is set and absolute (the spec says to ignore a relative one), else its fallback under home. */
-function xdgDir(io: RuntimeIO, variable: string, fallback: string): string {
-  const v = io.env[variable];
-  return v !== undefined && v.startsWith("/") ? v : `${io.home}/${fallback}`;
-}
-
 /** Where a runtime's files go by its name: its config and its unit. Both the account's own (the XDG directories). */
 interface Place {
   config: string;
@@ -230,24 +227,7 @@ interface Place {
 
 function placeOf(name: string, io: RuntimeIO): Place {
   const name_ = unitName(name);
-  return { config: configPathOf(configDir(io.env, io.home), name), unit: `${xdgDir(io, "XDG_CONFIG_HOME", ".config")}/systemd/user/${name_}`, unitName: name_ };
-}
-
-/**
- * Where the stable copy a unit runs is kept. Each extension ships its own build of the runtime, so
- * each has a copy of its own: LumiAH's in the account's data directory, and that of an extension
- * LumiAH is built into in a directory there named for the extension. Updating one extension never
- * changes the file the other's service runs.
- */
-function installDir(extension: string, io: RuntimeIO): string {
-  const own = `${xdgDir(io, "XDG_DATA_HOME", ".local/share")}/lumiah`;
-  return extension === EXTENSION_IDENTIFIER ? own : `${own}/${extension}`;
-}
-
-/** How systemctl reaches the account's units: `--user`, whose manager it finds by XDG_RUNTIME_DIR, which `sudo -u <account>` leaves unset (the account's is /run/user/<uid>). */
-function ctlOf(io: RuntimeIO): { args: string[]; env: Record<string, string> } {
-  const runtime = io.env.XDG_RUNTIME_DIR ?? (io.uid !== null ? `/run/user/${io.uid}` : undefined);
-  return { args: ["--user"], env: runtime !== undefined ? { XDG_RUNTIME_DIR: runtime } : {} };
+  return { config: configPathOf(configDir(io.env, io.home), name), unit: unitPath(io.env, io.home, name_), unitName: name_ };
 }
 
 // ---------------------------------------------------------------- whose files it runs
@@ -402,7 +382,7 @@ function configured(io: RuntimeIO): string[] {
 }
 
 /** A runtime's config by its name; null when there is none here that this build reads. */
-function configNamed(name: string, io: RuntimeIO): RuntimeConfig | null {
+function configNamed(name: string, io: RuntimeIO): SavedConfig | null {
   try {
     const path = configPathOf(configDir(io.env, io.home), name);
     return configOf(io.files.read(path), path);
@@ -412,7 +392,7 @@ function configNamed(name: string, io: RuntimeIO): RuntimeConfig | null {
 }
 
 /** The one runtime set up here for an extension; null when there is none, or several. */
-function onlyOf(extension: string, io: RuntimeIO): RuntimeConfig | null {
+function onlyOf(extension: string, io: RuntimeIO): SavedConfig | null {
   const found = configured(io).flatMap((name) => {
     const config = configNamed(name, io);
     return config !== null && config.extension === extension ? [config] : [];
@@ -442,7 +422,7 @@ function configPath(a: Args, io: RuntimeIO): string {
   throw new UsageError(found.length === 0 ? `No runtime is set up here (${dir}). Start one with: lumiah up --url <the address you open Lumiverse at>` : `Several runtimes are set up here (${found.join(", ")}): pick one with --name.`);
 }
 
-function writeConfig(path: string, config: RuntimeConfig, io: RuntimeIO): void {
+function writeConfig(path: string, config: SavedConfig, io: RuntimeIO): void {
   io.files.write(path, configText(config), 0o600, 0o700);
 }
 
@@ -534,37 +514,6 @@ function containerGuide(bun: string, self: string, config: string, base: string,
   ].join("\n");
 }
 
-/** A word of a unit's ExecStart: quoted when it must be, `%` and `$` escaped (systemd.service(5)). */
-function unitWord(word: string): string {
-  const escaped = word.replace(/%/g, "%%").replace(/\$/g, "$$$$");
-  return /^[A-Za-z0-9_@%+=:,./$-]+$/.test(escaped) ? escaped : `"${escaped.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-}
-
-/** A memory size as systemd reads one: a number of bytes, or one with K, M, G or T. */
-const MEMORY = /^[1-9][0-9]*[KMGT]?$/;
-
-export function unitText(u: { name: string; bun: string; script: string; config: string; memory: string }): string {
-  return [
-    `# Written by \`lumiah up --systemd\`: LumiAH's runtime. \`lumiah down --name ${u.name}\` removes it.`,
-    "[Unit]",
-    `Description=LumiAH runtime (${u.name})`,
-    // It reconnects until Lumiverse answers, however long Lumiverse takes to start: never give up on it.
-    "StartLimitIntervalSec=0",
-    "",
-    "[Service]",
-    "Type=simple",
-    `ExecStart=${[u.bun, u.script, "serve", "--config", u.config].map(unitWord).join(" ")}`,
-    "Restart=always",
-    "RestartSec=2",
-    // The cap: past it systemd stops the runtime (and starts it again) rather than let it take the machine's memory from Lumiverse.
-    `MemoryMax=${u.memory}`,
-    "",
-    "[Install]",
-    "WantedBy=default.target",
-    "",
-  ].join("\n");
-}
-
 async function must(io: RuntimeIO, command: string, args: readonly string[], env?: Readonly<Record<string, string>>): Promise<string> {
   const r = await io.run(command, args, env);
   if (r.code !== 0) throw new Error(`${command} ${args.join(" ")} failed (${r.code}): ${(r.err || r.out).trim()}`);
@@ -597,8 +546,9 @@ async function up(a: Args, io: RuntimeIO): Promise<number> {
   if (listen !== LISTEN && listen !== "localhost") io.err(`Warning: the runtime will listen on ${listen}, where other machines can reach it, not only this one. Your loopback key and every prompt cross to it in clear http, so keep it behind something that encrypts (a tunnel, a reverse proxy with HTTPS) or on a private network. Every call still needs the key and must be addressed to ${listen} itself, unless that is a wildcard address (0.0.0.0, ::), which answers any name; nothing else stands between them and it.`);
   const bun = a.values["--bun"] ?? io.bun;
   if (!bun.startsWith("/")) throw new UsageError(`--bun must be an absolute path (systemd searches no PATH that has Bun): ${bun}`);
-  const memory = a.values["--memory"] ?? DEFAULT_MEMORY;
-  if (!MEMORY.test(memory)) throw new UsageError(`--memory is "${memory}": give a size as systemd reads one, such as 768M or 2G.`);
+  const memoryAsked = a.values["--memory"];
+  const memoryWhy = memoryAsked === undefined ? null : memoryRefusal(memoryAsked);
+  if (memoryWhy !== null) throw new UsageError(`--memory is "${memoryAsked}": ${memoryWhy}.`);
   if (systemd && io.platform !== "linux") throw new Error(`--systemd installs a systemd service, and this is ${io.platform}. Leave out --systemd: the runtime then runs in the foreground, and ${io.platform === "darwin" ? "launchd" : io.platform === "win32" ? "Task Scheduler" : "your system's service manager"} keeps it running (LumiAH's docs/RUNTIME.md, "Keep it running", has the steps).`);
   if (systemd && io.uid === 0) throw new Error("--systemd installs a service of your own account, and root's account has none on most systems. Run the runtime as the account Lumiverse runs as (sudo -u <account> …): it needs no more rights than that.");
   if (systemd && inContainer(io)) throw new Error(containerGuide(bun, io.self, placeOf(named ?? "runtime", io).config, base, extension));
@@ -645,7 +595,8 @@ async function up(a: Args, io: RuntimeIO): Promise<number> {
   else if (scheduler === "unavailable") io.out("This Lumiverse has no local-inference scheduler: nothing to exclude.");
   else io.err(`Couldn't put ${origins.join(" and ")} in ${who}'s local-inference scheduler exclusions. Before turning the scheduler on, add them under Settings → Inference scheduler → Excluded origins: a turn would otherwise wait on its own calls.`);
 
-  const config: RuntimeConfig = { name, base, extension, listen, port, relay: registered.relay, secret: registered.secret, session, tuning };
+  // How it is kept: the limit it had (unless --memory gives another), its own choice of updating by itself, and the file this line runs, which it later takes its updates from. The unit it had stays its until `down` removes it; a unit installed below is recorded there instead.
+  const config: SavedConfig = { name, base, extension, listen, port, relay: registered.relay, secret: registered.secret, session, tuning, memory: memoryAsked ?? previous?.memory ?? SETUP_DEFAULTS.memory, autoUpdate: previous?.autoUpdate ?? SETUP_DEFAULTS.autoUpdate, source: io.self, service: previous?.service ?? null };
   const connection = await loopbackConnection(io, base, session.token, runtimeBase(listen, port), registered.model || loopbackModel(extension), config.tuning.connectionsRead, linked);
   // Lumiverse's "always use the active connection" acts on Edit and Send only: there it overrides a chat's pin to the loopback.
   if ((await editAndSendPrefersActive(io.http, base, session.token)) === true) io.err(`${who} has "always use the active connection" on for Edit and Send: a message sent with Edit and Send goes on the active connection, not a chat's pin to the loopback, and ${linked.name} answers it only when the active connection is the loopback.`);
@@ -659,11 +610,12 @@ async function up(a: Args, io: RuntimeIO): Promise<number> {
   }
 
   // A stable copy the unit owns: an update of the extension removes and replaces its install.
-  const installed = installDir(extension, io);
-  const script = `${installed}/${io.self.slice(io.self.lastIndexOf("/") + 1)}`;
+  const script = installedPath(dataDir(io.env, io.home), extension);
   io.files.copy(io.self, script, 0o644);
-  io.files.write(place.unit, unitText({ name, bun, script, config: place.config, memory }), 0o644, 0o755);
-  const ctl = ctlOf(io);
+  // The limit is the config's, so setting the runtime up again keeps the one it had.
+  io.files.write(place.unit, unitText({ name, bun, script, config: place.config, memory: config.memory }), 0o644, 0o755);
+  const service: SystemdService = { manager: "systemd", unit: place.unitName, file: place.unit, bun, script };
+  const ctl = systemctlOf(io.env, io.uid);
   // Before the unit starts: lingering also starts the user's service manager, which `systemctl --user` needs.
   const user = await must(io, "id", ["-nu"]);
   const lingering = await linger(io, user);
@@ -678,10 +630,11 @@ async function up(a: Args, io: RuntimeIO): Promise<number> {
   if (previous !== null) await drain(previous, io, "restarting it");
   // Written only now: until it is restarted, the runtime that ran through the wait writes its own config (the limits it reads, a secret rotated on the Runtime page), over whatever is there. A secret it was handed meanwhile is the registration's now.
   const latest = kept ? configNamed(name, io) : null;
-  writeConfig(place.config, latest !== null && latest.relay === config.relay ? { ...config, secret: latest.secret } : config, io);
+  const installed: SavedConfig = { ...config, service };
+  writeConfig(place.config, latest !== null && latest.relay === config.relay ? { ...installed, secret: latest.secret } : installed, io);
   await must(io, "systemctl", [...ctl.args, "restart", place.unitName], ctl.env);
   const when = lingering ? "it is started, and starts at boot and keeps running when you log out" : "it is started, but only runs while you are logged in (see above)";
-  io.out(`Installed the runtime in ${installed} and the unit ${place.unitName} (memory cap ${memory}); ${when}.`);
+  io.out(`Installed the runtime as ${script} and the unit ${place.unitName} (memory cap ${config.memory}); ${when}.`);
   io.out(connection);
   return 0;
 }
@@ -725,11 +678,11 @@ async function loopbackConnection(io: RuntimeIO, base: string, token: string, ur
 // ---------------------------------------------------------------- serve
 
 /** Runs the runtime until the process is asked to stop. `path` is its config, read again for the session whenever the link opens, so `lumiah login` takes effect without a restart. */
-export async function serve(config: RuntimeConfig, path: string, io: RuntimeIO): Promise<number> {
+export async function serve(config: SavedConfig, path: string, io: RuntimeIO): Promise<number> {
   const start = io.serve;
   if (start === null) throw new UsageError("LumiAH's runtime runs on Bun (Bun.serve, idleTimeout 0): run it with Bun.");
   const log = (text: string): void => io.err(`[lumiah ${config.name}] ${text}`);
-  // The session is read from the file again whenever it is needed; the secret and the limits are this process's own to change.
+  // The session is read from the file again whenever it is needed; the secret, the limits and how the runtime is kept are this process's own to change.
   let current = config;
   const session = (): StoredLogin => {
     try {
@@ -739,7 +692,7 @@ export async function serve(config: RuntimeConfig, path: string, io: RuntimeIO):
     }
     return current.session;
   };
-  const keep = (change: Partial<RuntimeConfig>): void => {
+  const keep = (change: Partial<SavedConfig>): void => {
     session();
     current = { ...current, ...change };
     try {
@@ -748,8 +701,8 @@ export async function serve(config: RuntimeConfig, path: string, io: RuntimeIO):
       log(`couldn't write ${path}: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
-  // systemd marks what it runs with INVOCATION_ID: then the unit is the one `up` names for this runtime.
-  const unit = io.env.INVOCATION_ID !== undefined ? unitName(config.name) : null;
+  // The unit that runs it, for the Runtime page's lines: the one `up --systemd` installed, when this process is that unit's.
+  const unit = unitRunning(config, { env: io.env, home: io.home, bun: io.bun, self: io.self, real: (file) => io.files.real(file) })?.unit ?? null;
   const runtime = createRuntime(config, {
     http: io.http,
     openSocket: io.openSocket,
@@ -829,7 +782,7 @@ async function login(a: Args, io: RuntimeIO): Promise<number> {
   const place = placeOf(config.name, io);
   if (!io.files.exists(place.unit)) io.out("A runtime running in the foreground takes the new sign-in when it next connects.");
   else {
-    const ctl = ctlOf(io);
+    const ctl = systemctlOf(io.env, io.uid);
     await must(io, "systemctl", [...ctl.args, "restart", place.unitName], ctl.env);
     io.out(`Restarted ${place.unitName}.`);
   }
@@ -842,7 +795,7 @@ async function status(a: Args, io: RuntimeIO): Promise<number> {
   const place = placeOf(config.name, io);
   io.out(`Runtime "${config.name}" for ${config.base} as ${config.session.username}, at ${runtimeBase(config.listen, config.port)}.`);
   if (io.files.exists(place.unit)) {
-    const ctl = ctlOf(io);
+    const ctl = systemctlOf(io.env, io.uid);
     const active = await io.run("systemctl", [...ctl.args, "is-active", place.unitName], ctl.env);
     io.out(`Service ${place.unitName}: ${active.out.trim() || "unknown"}.`);
   } else io.out("No systemd unit here: it runs while `lumiah up` or `lumiah serve` runs, or under the service you made for it (launchd on macOS, Task Scheduler on Windows).");
@@ -870,14 +823,16 @@ async function down(a: Args, io: RuntimeIO): Promise<number> {
   const path = configPath(a, io);
   const name = givenName(a) ?? configOf(io.files.read(path), path).name;
   const place = placeOf(name, io);
-  if (!io.files.exists(place.unit)) {
-    io.out(`There is no unit ${place.unitName}: nothing to stop.`);
-    return 0;
+  const installed = io.files.exists(place.unit);
+  if (installed) {
+    const ctl = systemctlOf(io.env, io.uid);
+    await must(io, "systemctl", [...ctl.args, "disable", "--now", place.unitName], ctl.env);
+    io.files.remove(place.unit);
+    await must(io, "systemctl", [...ctl.args, "daemon-reload"], ctl.env);
   }
-  const ctl = ctlOf(io);
-  await must(io, "systemctl", [...ctl.args, "disable", "--now", place.unitName], ctl.env);
-  io.files.remove(place.unit);
-  await must(io, "systemctl", [...ctl.args, "daemon-reload"], ctl.env);
-  io.out(`Stopped and removed ${place.unitName}. Its config, with the runtime's session, stays in ${place.config}: delete it to forget the runtime here.`);
+  // The config stays, and names no unit that keeps the runtime running any more.
+  const config = configNamed(name, io);
+  if (config !== null && config.service !== null) writeConfig(place.config, { ...config, service: null }, io);
+  io.out(installed ? `Stopped and removed ${place.unitName}. Its config, with the runtime's session, stays in ${place.config}: delete it to forget the runtime here.` : `There is no unit ${place.unitName}: nothing to stop.`);
   return 0;
 }

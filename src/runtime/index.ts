@@ -5,7 +5,7 @@
 export type { RuntimeConfig } from "./config";
 export { configDir, configOf, configPathOf, configText } from "./config";
 export type { OwnedEntry, RuntimeFiles, RuntimeIO, ServeOptions, Served } from "./cli";
-export { USAGE, lumiah, serve, unitText } from "./cli";
+export { USAGE, lumiah, serve } from "./cli";
 export type { OpenSocket, Socket, SocketEvents } from "./connection";
 export { HostConnection, LinkError } from "./connection";
 export { ModelCallError, linkHost } from "./host";
@@ -16,3 +16,5 @@ export { LiveError } from "./lumiverse";
 export type { Runtime, RuntimeDeps } from "./runtime";
 export { createRuntime } from "./runtime";
 export type { Harness } from "./turn";
+export type { OfferOutcome, ProcessControl, SetOutcome, Successor, ThisProcess, Update, UpdateDeps, UpdateFiles, UpdateOffer, UpdateView } from "./update";
+export { DEFAULT_MEMORY, MEMORY_FLOOR, createUpdate, handOver, installedCopy, memoryBytes, memoryRefusal, nodeFiles, nodeProcess, systemctlOf, unitPath, unitRunning, unitText } from "./update";

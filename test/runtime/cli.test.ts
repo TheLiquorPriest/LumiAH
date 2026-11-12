@@ -8,8 +8,9 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentUsage } from "../../src/core/ports";
 import { createBackend } from "../../src/extension/backend/backend";
-import { lumiah, type RuntimeIO, unitText } from "../../src/runtime/cli";
-import { configOf, configText } from "../../src/runtime/config";
+import { lumiah, type RuntimeIO } from "../../src/runtime/cli";
+import { configOf, configText, dataDir, installedPath, runtimeDir, SETUP_DEFAULTS } from "../../src/runtime/config";
+import { unitText } from "../../src/runtime/update/service";
 import { FakeHost } from "../support/fake-host";
 import { FakeLumiverse } from "../support/fake-lumiverse";
 import { BUN, HOME, type Machine, type MachineChange, machine as machineOn, SELF } from "../support/machine";
@@ -53,7 +54,9 @@ describe("lumiah's command line", () => {
     expect(await lumiah([...UP, "--name", "Mara's Box"], m.io)).toBe(2);
     expect(m.err.at(-1)).toBe(`--name is "Mara's Box": use lowercase letters, digits, _ and -, up to 40.`);
     expect(await lumiah([...UP, "--memory", "12Q"], m.io)).toBe(2);
-    expect(m.err.at(-1)).toBe('--memory is "12Q": give a size as systemd reads one, such as 768M or 2G.');
+    expect(m.err.at(-1)).toBe('--memory is "12Q": give a size as systemd reads one, such as 768M or 2G, or infinity for no limit.');
+    expect(await lumiah([...UP, "--memory", "128M"], m.io)).toBe(2);
+    expect(m.err.at(-1)).toBe('--memory is "128M": the runtime needs at least 256M to start: give 256M or more.');
     // Nothing was served, written or run for any of them.
     expect(m.served).toEqual([]);
     expect([...m.files.keys()]).toEqual([]);
@@ -158,6 +161,76 @@ describe("lumiah up", () => {
     expect(m.served.filter((s) => s.port === 7871)).toHaveLength(1);
     expect(m.out.join("\n")).toContain("the unit lumiah-mara.service (memory cap 768M)");
   });
+
+  test("records the file it runs from, which the runtime later takes its updates from, and keeps how the runtime is kept from one up to the next", async () => {
+    const m = machine();
+    const copy = `${HOME}/.local/share/lumiah/lumiah.js`;
+    const unitFile = `${HOME}/.config/systemd/user/lumiah-mara.service`;
+    const saved = () => configOf(m.files.get(CONFIG)?.text ?? null, CONFIG);
+    expect(await lumiah(UP, m.io)).toBe(0);
+    expect(saved()).toMatchObject({ memory: "1G", autoUpdate: true, source: SELF, service: null });
+
+    expect(await lumiah([...UP, "--systemd", "--memory", "768M"], m.io)).toBe(0);
+    const service = { manager: "systemd", unit: "lumiah-mara.service", file: unitFile, bun: BUN, script: copy };
+    expect(saved()).toMatchObject({ memory: "768M", source: SELF, service });
+
+    // Set up again without --memory: the limit it had stays, in its config and in its unit.
+    expect(await lumiah(["up", "--systemd"], m.io)).toBe(0);
+    expect(saved().memory).toBe("768M");
+    expect(m.files.get(unitFile)?.text).toBe(unitText({ name: "mara", bun: BUN, script: copy, config: CONFIG, memory: "768M" }));
+
+    // As the Runtime page leaves it: a limit changed there, updates taken only from its button.
+    m.files.set(CONFIG, { text: configText({ ...saved(), memory: "2G", autoUpdate: false }), mode: 0o600, dirMode: 0o700 });
+    expect(await lumiah(["up", "--systemd"], m.io)).toBe(0);
+    expect(saved()).toMatchObject({ memory: "2G", autoUpdate: false, service });
+    expect(m.files.get(unitFile)?.text).toContain("MemoryMax=2G");
+
+    // In the foreground: the unit installed is still the runtime's until `lumiah down` removes it.
+    expect(await lumiah(["up"], m.io)).toBe(0);
+    expect(saved()).toMatchObject({ memory: "2G", autoUpdate: false, source: SELF, service });
+  });
+});
+
+describe("a runtime's config", () => {
+  const BEFORE = { name: "mara", base: "http://127.0.0.1:7860", listen: "127.0.0.1", port: 7871, relay: "relay-1", secret: "a".repeat(64), session: { username: "mara", token: "session-token-mara", savedAt: 5 }, tuning: {} };
+  const text = (runtime: object): string => JSON.stringify({ lumiah: 1, runtime });
+
+  test("written before this build reads, with how a runtime is kept by default; so does one holding values this build refuses", () => {
+    expect(configOf(text(BEFORE), CONFIG)).toMatchObject({ name: "mara", extension: "lumi_ah", memory: "1G", autoUpdate: true, source: null, service: null });
+    expect(configOf(text({ ...BEFORE, memory: "12Q", autoUpdate: "yes", source: "dist/lumiah.js", service: { manager: "launchd", unit: "lumiah.mara" } }), CONFIG)).toMatchObject({ memory: "1G", autoUpdate: true, source: null, service: null });
+    // What it keeps, it reads back as it was written.
+    const kept = { ...configOf(text(BEFORE), CONFIG), memory: "2G", autoUpdate: false, source: SELF, service: { manager: "systemd" as const, unit: "lumiah-mara.service", file: `${HOME}/.config/systemd/user/lumiah-mara.service`, bun: BUN, script: `${HOME}/.local/share/lumiah/lumiah.js` } };
+    expect(configOf(configText(kept), CONFIG)).toEqual(kept);
+  });
+
+  test("naming its runtime with a name no runtime can have is no config this lumiah reads: its own folder and unit go by that name", () => {
+    expect(() => configOf(text({ ...BEFORE, name: "../../elsewhere" }), CONFIG)).toThrow(`${CONFIG} isn't a runtime config this lumiah reads. Set the runtime up again with: lumiah up`);
+  });
+
+  test("says where a runtime keeps its data: the account's data folder, a folder of its own there, and lumiah's installed copies", () => {
+    expect(dataDir({}, HOME)).toBe(`${HOME}/.local/share/lumiah`);
+    expect(dataDir({ XDG_DATA_HOME: "/data/mara" }, HOME)).toBe("/data/mara/lumiah");
+    // The XDG spec says to ignore a relative one.
+    expect(dataDir({ XDG_DATA_HOME: "data" }, HOME)).toBe(`${HOME}/.local/share/lumiah`);
+    expect(runtimeDir(dataDir({}, HOME), "mara")).toBe(`${HOME}/.local/share/lumiah/runtimes/mara`);
+    expect(installedPath(dataDir({}, HOME), "lumi_ah")).toBe(`${HOME}/.local/share/lumiah/lumiah.js`);
+    expect(installedPath(dataDir({}, HOME), "other_ext")).toBe(`${HOME}/.local/share/lumiah/other_ext/lumiah.js`);
+  });
+});
+
+describe("lumiah down", () => {
+  test("stops and removes the unit; the config stays, and names no unit any more", async () => {
+    const m = machine();
+    expect(await lumiah([...UP, "--systemd"], m.io)).toBe(0);
+    const before = configOf(m.files.get(CONFIG)?.text ?? null, CONFIG);
+    m.ran.length = 0;
+
+    expect(await lumiah(["down"], m.io)).toBe(0);
+    expect(m.files.has(`${HOME}/.config/systemd/user/lumiah-mara.service`)).toBe(false);
+    expect(configOf(m.files.get(CONFIG)?.text ?? null, CONFIG)).toEqual({ ...before, service: null });
+    expect(m.ran.filter((line) => line.startsWith("systemctl"))).toEqual(["systemctl --user disable --now lumiah-mara.service", "systemctl --user daemon-reload"]);
+    expect(m.out.at(-1)).toBe(`Stopped and removed lumiah-mara.service. Its config, with the runtime's session, stays in ${CONFIG}: delete it to forget the runtime here.`);
+  });
 });
 
 describe("lumiah up --extension, for an extension that has LumiAH built in", () => {
@@ -188,7 +261,8 @@ describe("lumiah up --extension, for an extension that has LumiAH built in", () 
 
     expect(await lumiah([...UP, "--extension", "other_ext", "--systemd"], io)).toBe(0);
     // Nothing serves on LumiAH's port while this runs (its service is the fake's to start), and the port is still LumiAH's.
-    expect(configOf(m.files.get(OTHER_CONFIG)?.text ?? null, OTHER_CONFIG)).toMatchObject({ name: "mara-other_ext", extension: "other_ext", port: 7872 });
+    // It takes its updates from that extension's own file, and its unit is its own.
+    expect(configOf(m.files.get(OTHER_CONFIG)?.text ?? null, OTHER_CONFIG)).toMatchObject({ name: "mara-other_ext", extension: "other_ext", port: 7872, source: OTHER_SELF, service: { unit: "lumiah-mara-other_ext.service", script: `${HOME}/.local/share/lumiah/other_ext/lumiah.js` } });
     expect(m.files.get(`${HOME}/.config/systemd/user/lumiah-mara-other_ext.service`)?.text).toBe(unitText({ name: "mara-other_ext", bun: BUN, script: `${HOME}/.local/share/lumiah/other_ext/lumiah.js`, config: OTHER_CONFIG, memory: "1G" }));
     expect(m.files.get(`${HOME}/.local/share/lumiah/other_ext/lumiah.js`)?.text).toBe(`copy of ${OTHER_SELF}`);
     expect(m.ran.filter((line) => line.startsWith("systemctl")).slice(-3)).toEqual(["systemctl --user daemon-reload", "systemctl --user enable lumiah-mara-other_ext.service", "systemctl --user restart lumiah-mara-other_ext.service"]);
@@ -304,7 +378,7 @@ async function answering() {
   it.host.script = ["Okoro keeps it now."];
   // Its config, as `up` wrote it then: the registration the runtime runs with.
   const m = machineOn(it.lumiverse);
-  m.files.set(CONFIG, { text: configText({ name: "mara", base: it.lumiverse.base, extension: it.host.identifier, listen: "127.0.0.1", port: PORT, relay: it.registration.relay, secret: it.registration.secret, session: { username: "mara", token: it.lumiverse.token, savedAt: 0 }, tuning: FAST }), mode: 0o600, dirMode: 0o700 });
+  m.files.set(CONFIG, { text: configText({ name: "mara", base: it.lumiverse.base, extension: it.host.identifier, listen: "127.0.0.1", port: PORT, relay: it.registration.relay, secret: it.registration.secret, session: { username: "mara", token: it.lumiverse.token, savedAt: 0 }, tuning: FAST, ...SETUP_DEFAULTS }), mode: 0o600, dirMode: 0o700 });
   const order: string[] = [];
   const linked: boolean[] = [];
   const generating = it.generate(chatId).then((out) => {

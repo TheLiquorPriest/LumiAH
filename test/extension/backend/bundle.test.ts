@@ -540,8 +540,9 @@ describe("the backend bundle", () => {
   beforeAll(() => {
     dir = mkdtempSync(join(tmpdir(), "lumiah-bundle-"));
     const out = join(dir, "backend.js");
-    // As scripts/build.ts bundles it (`bun run build`), into a folder of its own: the same entry, target and build id's define.
-    const run = Bun.spawnSync([process.execPath, "build", "src/extension/backend/main.ts", "--outfile", out, "--target", "bun", "--define", `process.env.LAH_BUILD_ID=${JSON.stringify("scan-test")}`], { cwd: ROOT, stdout: "pipe", stderr: "pipe" });
+    // As scripts/build.ts bundles it (`bun run build`), into a folder of its own: the same entry, target and defines (the build id, and the hash and size of the runtime it offers).
+    const defines = Object.entries({ LAH_BUILD_ID: "scan-test", LAH_RUNTIME_SHA256: "0".repeat(64), LAH_RUNTIME_SIZE: "1024" }).flatMap(([name, value]) => ["--define", `process.env.${name}=${JSON.stringify(value)}`]);
+    const run = Bun.spawnSync([process.execPath, "build", "src/extension/backend/main.ts", "--outfile", out, "--target", "bun", ...defines], { cwd: ROOT, stdout: "pipe", stderr: "pipe" });
     built = run.exitCode === 0 ? "" : `bun build failed (${run.exitCode}): ${run.stderr.toString()}${run.stdout.toString()}`;
     if (built === "") bundle = readFileSync(out, "utf8");
   }, 120_000);
@@ -553,8 +554,9 @@ describe("the backend bundle", () => {
   test("is built here the way `bun run build` builds it", () => {
     // What this test runs is read off the build script: when that changes, this must change with it.
     const script = readFileSync(join(ROOT, "scripts/build.ts"), "utf8");
-    expect(script).toContain('bundle("src/extension/backend/main.ts", "dist/backend.js", "bun");');
-    expect(script).toContain('[process.execPath, "build", entry, "--outfile", out, "--target", target, ...flags, "--define", `process.env.LAH_BUILD_ID=${JSON.stringify(id)}`]');
+    expect(script).toContain('bundle("src/extension/backend/main.ts", "dist/backend.js", "bun", [], { LAH_RUNTIME_SHA256: built.sha256, LAH_RUNTIME_SIZE: String(built.size) });');
+    expect(script).toContain('Object.entries({ LAH_BUILD_ID: id, ...constants }).flatMap(([name, value]) => ["--define", `process.env.${name}=${JSON.stringify(value)}`])');
+    expect(script).toContain('[process.execPath, "build", entry, "--outfile", out, "--target", target, ...flags, ...defines]');
     expect(built).toBe("");
     expect(bundle).toContain("scan-test");
   });
