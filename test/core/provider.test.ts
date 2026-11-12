@@ -447,6 +447,8 @@ describe("a failure that passes", () => {
       "ConnectionRefused",
       "Connection error.",
       "The operation timed out",
+      "JSON Parse error: Expected ']'",
+      "Unexpected token '<', \"<html>...\" is not valid JSON",
     ];
     for (const words of passing) expect({ words, passes: isTransient(new Error(words)) }).toEqual({ words, passes: true });
     expect(isTransient(new Error("the call failed", { cause: new Error("other side closed") }))).toBe(true);

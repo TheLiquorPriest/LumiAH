@@ -92,7 +92,9 @@ const LASTING: readonly RegExp[] = [/\binsufficient[ _]quota\b/i, /\bcurrent quo
  * timeout; a rate limit or an overloaded provider; a gateway's or a server's own failure; and a
  * connection or a stream that dropped (Node's socket codes and Bun's, which Lumiverse runs on:
  * "The socket connection was closed unexpectedly", "Unable to connect", `ConnectionRefused`;
- * undici's "terminated" and "other side closed"; "fetch failed"). Only an error that says so is made
+ * undici's "terminated" and "other side closed"; "fetch failed"); and an answer that arrived cut
+ * or garbled, as the platform's JSON parser says it (Bun's "JSON Parse error: …", V8's "… is not
+ * valid JSON"): the same call made again usually arrives whole. Only an error that says so is made
  * again: any other failure is the call's own. Not settings: they are the providers' and the
  * platform's own words, and a new one is a fix here.
  */
@@ -106,6 +108,7 @@ const TRANSIENT: readonly RegExp[] = [
   /\b(?:socket|connection)\b[^.\n]{0,30}\b(?:reset|closed|lost|refused|terminated|dropped)\b/i,
   /^\s*terminated\s*$/i,
   /\bstream\b[^.\n]{0,40}\b(?:cut|dropped|ended|closed|interrupted|reset|lost|terminated|broke|broken)\b/i,
+  /\bJSON Parse error\b|\bis not valid JSON\b|\bin JSON at position\b/i,
 ];
 
 /**
