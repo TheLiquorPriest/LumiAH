@@ -22,7 +22,7 @@
 //   the turn's commit take LumiAH's record alone.
 
 import type { AgentDefinition } from "./agents";
-import type { AgentRef, AgentUsage, ChatInfo, ModelEffort, ModelMessage, RunKind, TurnKind, TurnRecord, TurnStatus } from "./ports";
+import type { AgentRef, AgentUsage, ChatInfo, JsonObject, ModelEffort, ModelMessage, RunKind, TurnKind, TurnRecord, TurnStatus } from "./ports";
 import type { Skill } from "./skills";
 import type { StorySetting, StorySource } from "./story";
 
@@ -50,7 +50,8 @@ export type GuidanceLevel = { name: string; path: string } | { name: string; tex
  * given the request): all of it (`whole`, the default), or only the user's newest message
  * (`newest`). `reply: "released"` says the reply is only what the chat's agents release
  * (`reply_write`, `delegate`'s `to_reply`): no writer writes it, and a turn that released nothing
- * fails with a plain reason.
+ * fails with a plain reason. `replyTool` gives `reply_write` a description and arguments of the
+ * extension's own in the chat (`ReplyTool`).
  */
 export interface ChatClaim {
   mainAgent?: string;
@@ -59,6 +60,21 @@ export interface ChatClaim {
   story?: Partial<StorySetting>;
   request?: "whole" | "newest";
   reply?: "released";
+  replyTool?: ReplyTool;
+}
+
+/**
+ * `reply_write` as an extension offers it in the chats it claims (`ChatClaim.replyTool`): its
+ * description, and its arguments as a JSON Schema of type object, in place of the one `text` the
+ * core's own takes. The agent then names what goes out the extension's way (pieces it holds, by
+ * number), and the extension's `releasing` gives the text that goes out: nothing is typed out twice.
+ * Where the extension has no `releasing`, or the tool isn't one a model can be offered (no
+ * description; arguments that aren't such a schema), the core's own `reply_write` stands in the
+ * chat, and the log says why.
+ */
+export interface ReplyTool {
+  description: string;
+  parameters: JsonObject;
 }
 
 /** An extension's own definitions: its defaults, which the user's still override (§13). */
@@ -145,10 +161,13 @@ export interface AgentModelChoice {
 }
 
 /**
- * A passage of a turn's reply an agent releases itself (`reply_write`), or a sub-agent's answer
- * that streamed into it (`delegate`'s `to_reply`): the turn (its generation's id), the agent whose
- * text it is, and the text. Asked about before a `reply_write` passage goes out (`releasing`), and
- * told of once one went out or a stream ended (`released`).
+ * The turn's reply as an agent releases it itself (`reply_write`), or a sub-agent's answer that
+ * streamed into it as the reply (`delegate`'s `to_reply`): the turn (its generation's id), the agent
+ * whose release it is, its text, and the call's arguments as the agent gave them (`args`; none for
+ * a `to_reply` stream). Asked about before a `reply_write` call goes out (`releasing`: `text` is the
+ * text the call carries, empty where the chat's reply tool is the extension's own), and told of once
+ * it went out or a stream ended (`released`: `text` is what reached the user). A turn's reply is
+ * released once, whole.
  */
 export interface ReplyRelease {
   userId: string;
@@ -156,10 +175,16 @@ export interface ReplyRelease {
   turn: string;
   agent: AgentRef;
   text: string;
+  args: Record<string, unknown>;
 }
 
-/** The extension's word on a passage: refused (`refused` is what the agent is told), or null to let it go. */
-export type ReleaseVerdict = { refused: string } | null;
+/**
+ * The extension's word on a release: refused (`refused` is what the agent is told), the text that
+ * goes out in place of what the call carried (`text`), or null to let the call's own text go. Where
+ * the chat's reply tool is the extension's own (`ChatClaim.replyTool`), the call carries no text:
+ * only a text lets anything go.
+ */
+export type ReleaseVerdict = { refused: string } | { text: string } | null;
 
 /** A run ended: how, what it spent, and, for a turn that answered a generation, the reply it sent and the record it leaves. */
 export interface RunEnded {
@@ -191,14 +216,16 @@ export interface HarnessExtension {
   /** Which connection, model and effort an agent runs on, asked as each agent of a run starts. Null: its definition's own, as without this. */
   agentModel?(ask: AgentModelAsk): Promise<AgentModelChoice | null>;
   /**
-   * Whether a passage an agent releases with `reply_write` may go out, asked before it does: a
-   * refusal is the call's answer and nothing streams. Without this member, every passage goes. An
-   * answer that is neither null nor a refusal, or none within Settings' wait, lets nothing go: what
-   * the user reads is held to what the extension let through. A sub-agent's answer streaming into
-   * the reply (`to_reply`) is never asked about, only told.
+   * Whether the turn's reply may go out as an agent releases it with `reply_write`, and what goes
+   * out: asked before it does. A refusal is the call's answer and nothing streams; a text is what
+   * streams. Without this member, the call's text goes. An answer that is none of these (or null,
+   * where the chat's reply tool is the extension's own), or none within Settings' wait, lets nothing
+   * go: what the user reads is held to what the extension let through. A release that sent nothing
+   * leaves the turn's one release still to come. A sub-agent's answer streaming in as the reply
+   * (`to_reply`) is never asked about, only told.
    */
   releasing?(release: ReplyRelease): Promise<ReleaseVerdict>;
-  /** A passage went out (`reply_write`), or a sub-agent's answer finished streaming into the reply (`to_reply`): what reached the user. */
+  /** The turn's reply went out (`reply_write`), or a sub-agent's answer finished streaming in as the reply (`to_reply`): what reached the user, and the call's arguments. Told once a turn at most. */
   released?(release: ReplyRelease): Promise<void>;
   /** A turn's reply has been written and its stream ended. */
   replyWritten?(reply: ReplyWritten): Promise<void>;

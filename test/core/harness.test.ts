@@ -216,11 +216,15 @@ describe("a main agent that stops short", () => {
   const looping: Script = (request, n) => (request.tools ? { toolCalls: [call("chat_search", { query: `try ${n}` })] } : "A reply from the preset alone.");
 
   test("stopped by a budget, the writer writes from the request alone, and the thinking block and the trace both say so and why", async () => {
-    const r = rig(looping, (s) => (s.agents.main!.budget.toolTurns = 2));
+    const r = rig(looping, (s) => {
+      s.agents.main!.budget.toolTurns = 2;
+      // Room for the whole reason in the progress line.
+      s.reply.progressChars = 400;
+    });
     const { result, sink, request } = await r.turn();
     expect(result).toMatchObject({ status: "done", reply: "A reply from the preset alone." });
     expect(r.host.calls.at(-1)?.messages).toEqual(request.messages.map(({ source: _source, ...m }) => m));
-    const why = "the agent has had its 2 rounds of tool calls (Tool rounds per agent)";
+    const why = "the agent has had its 2 rounds of tool calls, all that Tool rounds per agent (Settings → Agents → Main agent → Budget) allows";
     expect(sink.progressLines.at(-1)).toBe(`The main agent stopped before its brief (${why}); the writer writes from your preset alone.`);
     // The trace: the main agent's stop with its reason, then the writer started for a reply without a brief, with the same reason.
     const traced = events(r.host);
@@ -237,8 +241,9 @@ describe("a main agent that stops short", () => {
       s.reply.withoutBrief = "fail";
     });
     const { result, sink } = await r.turn();
-    expect(result).toMatchObject({ status: "failed", reason: "the agent has had its 2 rounds of tool calls (Tool rounds per agent)", record: null, reply: "" });
-    expect(sink.failed).toEqual({ message: "the agent has had its 2 rounds of tool calls (Tool rounds per agent)", code: "failed" });
+    const why = "the agent has had its 2 rounds of tool calls, all that Tool rounds per agent (Settings → Agents → Main agent → Budget) allows";
+    expect(result).toMatchObject({ status: "failed", reason: why, record: null, reply: "" });
+    expect(sink.failed).toEqual({ message: why, code: "failed" });
     expect(sink.ended).toBeNull();
     expect(events(r.host).at(-1)).toMatchObject({ kind: "turn_ended", status: "failed" });
   });
@@ -302,7 +307,7 @@ describe("a main agent that stops short", () => {
     });
     const { result, sink } = await r.turn();
     expect(result).toMatchObject({ status: "failed", record: null, reply: "" });
-    expect(sink.failed?.message).toBe("the agent has had its 1 round of tool calls (Tool rounds per agent)");
+    expect(sink.failed?.message).toBe("the agent has had its 1 round of tool calls, all that Tool rounds per agent (Settings → Agents → Main agent → Budget) allows");
   });
 
   test("the turn's signal stops it before any text: the sink gets one error, and nothing is recorded", async () => {

@@ -26,7 +26,7 @@ import { type RecallPage, recallPage } from "./recall/page";
 import { HarnessRefusal } from "./refusal";
 import { type HarnessOptions, readSetup, type Shared } from "./run";
 import { askCompaction, pathTurns, rollback, Sessions } from "./sessions";
-import { AGENT, type AgentSettings, agentRunSchema, defaultSettings, newAgentSettings, type Settings, type SettingsScope } from "./settings";
+import { AGENT, type AgentSettings, agentRunSchema, defaultSettings, newAgentSettings, type Settings, type SettingsScope, settingPlaceOf } from "./settings";
 import { type SideResult, Sides, type SideTurnView } from "./side";
 import { SkillRegistry } from "./skills";
 import { Spend, type SpendSummary } from "./spend";
@@ -299,7 +299,9 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
     const areas: Record<WorkspaceArea, AreaAccess | null> = chatId === null ? { chat: null, learned: null, user: shared.areas.user() } : { chat: shared.areas.now(chatId, { throughSwipe: true }), learned: await shared.areas.learned(chatId), user: shared.areas.user() };
     return { author: { who: "user" }, role: AGENT.main, areas, guard: () => null };
   };
-  const page = async (chatId: string | null): Promise<PageWorkspace> => pageWorkspace(await userView(chatId), () => shared.latest.workspace);
+  /** Where a setting of the core's is changed, as the user's words of a limit name it on a page (`HarnessOptions.place`). */
+  const place = settingPlaceOf(undefined, options.place);
+  const page = async (chatId: string | null): Promise<PageWorkspace> => pageWorkspace(await userView(chatId), () => shared.latest.workspace, place);
   /** A change the user made on the page: where it was to the chat's own area, the records it went beside carry it (§11), so a branch cut there has it. Gives back what the change gave. */
   const kept = async <T>(input: { chatId: string | null; area: WorkspaceArea }, done: T): Promise<T> => {
     if (input.chatId !== null && input.area === "chat") await shared.jobs.anchorNewest(input.chatId).catch((error: unknown) => host.log("warn", `[LumiAH] a change to the chat's area couldn't be put on the reply's record (${errorText(error)}): a branch cut there won't have it`));
@@ -435,7 +437,7 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
           view = { author: { who: "agent", id: agentId, role }, role, areas: user.areas, guard: guidanceGuard(read, setup.settings, setup.texts) };
           limits = () => setup.settings.workspace;
         }
-        const written = await pageWorkspace(view, limits).write({ area: asked.area, path: asked.path, text: asked.text, base: asked.base } as Parameters<PageWorkspace["write"]>[0]);
+        const written = await pageWorkspace(view, limits, place).write({ area: asked.area, path: asked.path, text: asked.text, base: asked.base } as Parameters<PageWorkspace["write"]>[0]);
         if (run) fileChanges(run.info, callId, written.changes);
         return written;
       },
@@ -448,7 +450,7 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
         const level = read.levels.find((l) => l.id === input.level);
         if (!level) throw new HarnessRefusal("not_found", "There is no such level of guidance here: the middle level needs a chat with a character, and the chat's needs a chat.");
         if (!level.file) throw new HarnessRefusal("forbidden", "This level is kept by the extension that answers this chat: it is edited there.");
-        await pageWorkspace(read.view, () => shared.latest.workspace).write({ area: level.file.area, path: level.file.path, text: input.text, base: input.base });
+        await pageWorkspace(read.view, () => shared.latest.workspace, place).write({ area: level.file.area, path: level.file.path, text: input.text, base: input.base });
         return guidanceView(await levels(input.chatId));
       },
     },
@@ -488,11 +490,11 @@ export function createHarness(host: Shared["host"], options: HarnessOptions): Ha
         const setup = await readSetup(shared, input.chatId);
         // The user's own start: the job belongs to the chat and to no turn (§22).
         const plan = typeof input.plan === "string" && input.plan.trim() !== "" ? input.plan.trim() : null;
-        if (plan !== null && plan.length > setup.settings.workspace.pathChars) throw new HarnessRefusal("invalid", `The plan's path is ${plan.length} characters, and a path may be ${setup.settings.workspace.pathChars} at most (Path length).`);
+        if (plan !== null && plan.length > setup.settings.workspace.pathChars) throw new HarnessRefusal("invalid", `The plan's path is ${plan.length} characters, and ${setup.texts.setting(["workspace", "pathChars"])} lets a path be ${setup.settings.workspace.pathChars} at most.`);
         // Words of a plan its starter keeps stand in place of the ask to write it, so they come with the plan file they are about, and are held to Task length as the task is.
         const planWords = typeof input.planWords === "string" && input.planWords.trim() !== "" ? input.planWords.trim() : null;
         if (planWords !== null && plan === null) throw new HarnessRefusal("invalid", "Words of a plan its starter keeps need the plan file they are about (plan).");
-        if (planWords !== null && planWords.length > setup.settings.jobs.taskChars) throw new HarnessRefusal("invalid", `The plan's words are ${planWords.length} characters, and may be ${setup.settings.jobs.taskChars} at most (Task length).`);
+        if (planWords !== null && planWords.length > setup.settings.jobs.taskChars) throw new HarnessRefusal("invalid", `The plan's words are ${planWords.length} characters, and ${setup.texts.setting(["jobs", "taskChars"])} lets them be ${setup.settings.jobs.taskChars} at most.`);
         const started = await shared.jobs.createJob({ chatId: input.chatId, when: input.when === "now" ? "now" : "after_reply", what: { agent: input.agent, task: input.task }, by: { who: "user" }, basis: null, ...(isRecord(input.allowance) ? { allowance: allowanceOf(input.allowance) } : {}), ...(input.area === "chat" ? { area: "chat" as const } : {}), ...(plan !== null ? { plan } : {}), ...(planWords !== null ? { planWords } : {}) }, setup);
         if ("refused" in started) throw new HarnessRefusal("invalid", started.refused);
         return { job: started };

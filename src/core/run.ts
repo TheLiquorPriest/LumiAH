@@ -18,16 +18,16 @@ import { type Book, readBook } from "./book";
 import type { CompactionMemo } from "./compaction";
 import { type Definitions, mergeDefinitions } from "./definitions";
 import { Delegator } from "./delegation";
-import type { AgentModelAsk, ChatClaim, HarnessExtension } from "./extension";
+import type { AgentModelAsk, ChatClaim, HarnessExtension, ReplyTool } from "./extension";
 import { type GuidanceRead, guidanceGuard, guidancePrefix, readGuidance } from "./guidance";
 import type { Jobs } from "./jobs";
 import { type AgentDeps, type AgentHandle, AgentTurn, type RunWords, startAgent } from "./loop";
-import type { AgentRef, AgentUsage, ChatInfo, FileChange, HarnessHost, ModelDelta, ModelEffort, ModelMessage, RecordJob, RemoteTool, SamplingParams, TraceEvent, TurnRequest, TurnStatus, WorkspaceArea } from "./ports";
+import type { AgentRef, AgentUsage, ChatInfo, FileChange, HarnessHost, JsonObject, ModelDelta, ModelEffort, ModelMessage, RecordJob, RemoteTool, SamplingParams, TraceEvent, TurnRequest, TurnStatus, WorkspaceArea } from "./ports";
 import { isRecord } from "./ports";
 import type { AgentAccounts } from "./provider";
 import { type RecallRun, recallOf } from "./recall/recall";
 import type { Sessions } from "./sessions";
-import { type AgentBudget, isEffort, type Settings, settingsOf, settingTitle, type TurnBudget } from "./settings";
+import { type AgentBudget, isEffort, type SettingPlace, type Settings, settingPlaceOf, settingsOf, type TurnBudget } from "./settings";
 import type { SkillRegistry } from "./skills";
 import type { Spend } from "./spend";
 import { type StoryHolds, storyHolds, storyWordOf } from "./story";
@@ -35,7 +35,7 @@ import { TEXT, TOOL, type Texts, textDef, textsOf } from "./texts";
 import type { AgentTool, ChatView, DelegateChoice, JobStarted, JobTools, LoreView, PastTurn, ReplyStream, RunInfo, ToolEnv, ToolOutcome, ToolRegistry } from "./tools";
 import { TurnTrace } from "./transcript";
 import { addUsage, countedIn, priced } from "./usage";
-import { clip, errorText, type Limit, limitOf, timerMs } from "./util";
+import { clip, errorText, hasOwn, type Limit, limitOf, timerMs } from "./util";
 import { type AreaAccess, pinnedFiles, showPath, versionOf, type Workspace, type WorkspaceView } from "./workspace";
 
 // ---------------------------------------------------------------- what a harness keeps across runs
@@ -63,12 +63,14 @@ export interface HarnessOptions {
    */
   userId?: string;
   /**
-   * Where the user changes one of the core's settings, as the words of a wait of the core's that ran
-   * out name it: its own name (`title`) with where it is shown (`path`: its place in the core's
-   * section, `["extension", "waitMs"]`). The runtime says it as its own waits do: "Wait for the
-   * extension (LumiAH's Settings → Timeouts → Tools and approvals)". Absent: the title alone.
+   * Where the user changes one of the core's settings, as the words of a limit or a wait of the
+   * core's name it: its own name (`title`) with where it is shown (`path`: its place in the core's
+   * section, `["extension", "waitMs"]`; `trail`: the groups that lead to it). The runtime says it as
+   * its own waits do: "Wait for the extension (LumiAH's Settings → Timeouts → Tools and
+   * approvals)", "Tool results clipped past (LumiAH's Settings → The agent loop)". Absent: the title
+   * with Settings and the trail.
    */
-  place?(path: readonly string[], title: string): string;
+  place?: SettingPlace;
 }
 
 /** What a harness keeps across runs. */
@@ -120,7 +122,7 @@ export async function extensionAnswer<T>(shared: Pick<Shared, "host">, waitMs: L
 }
 
 /** Why an ask of the extension has no answer, as the log says it. */
-function unansweredLog(why: Unanswered): string {
+export function unansweredLog(why: Unanswered): string {
   return "ms" in why ? `no answer in ${why.ms} ms (Wait for the extension)` : why.error;
 }
 
@@ -145,9 +147,7 @@ function waitWords(ms: number): string {
 
 /** Wait for the extension, as the user is told where to change it. */
 function extensionWait(options: Pick<HarnessOptions, "place">): string {
-  const path = ["extension", "waitMs"];
-  const title = settingTitle(path);
-  return options.place?.(path, title) ?? title;
+  return settingPlaceOf(undefined, options.place)(["extension", "waitMs"]);
 }
 
 /**
@@ -197,11 +197,17 @@ async function remoteTools(host: Pick<HarnessHost, "tools" | "log">, chatId: str
   });
 }
 
-/** What the extension answered for a chat, read: outside data, so anything that isn't a claim's is left out. Null stays null: the chat isn't claimed. */
-function claimOf(raw: unknown): ChatClaim | null {
+/**
+ * What the extension answered for a chat, read: outside data, so anything that isn't a claim's is
+ * left out. Null stays null: the chat isn't claimed. A `reply_write` of its own that can't be
+ * offered is left out, with why in the log: the core's own then stands in the chat.
+ */
+function claimOf(raw: unknown, extension: HarnessExtension | undefined, host: Pick<HarnessHost, "log">): ChatClaim | null {
   if (!isRecord(raw)) return null;
   const guidance = isRecord(raw.guidance) && typeof raw.guidance.name === "string" ? raw.guidance : null;
   const story = storyWordOf(raw.story);
+  const replyTool = raw.replyTool === undefined || raw.replyTool === null ? null : replyToolOf(raw.replyTool, extension?.releasing !== undefined);
+  if (typeof replyTool === "string") host.log("warn", `[LumiAH] ${extension?.name ?? "the extension"}'s claim gives reply_write a description and arguments of its own that can't be offered (${replyTool}): reply_write takes the reply's text in this chat, as without them`);
   return {
     ...(typeof raw.mainAgent === "string" ? { mainAgent: raw.mainAgent } : {}),
     ...(guidance && typeof guidance.path === "string" ? { guidance: { name: guidance.name as string, path: guidance.path } } : guidance && typeof guidance.text === "string" ? { guidance: { name: guidance.name as string, text: guidance.text } } : {}),
@@ -209,7 +215,33 @@ function claimOf(raw: unknown): ChatClaim | null {
     ...(Object.keys(story).length > 0 ? { story } : {}),
     ...(raw.request === "whole" || raw.request === "newest" ? { request: raw.request } : {}),
     ...(raw.reply === "released" ? { reply: "released" as const } : {}),
+    ...(replyTool !== null && typeof replyTool !== "string" ? { replyTool } : {}),
   };
+}
+
+/**
+ * A claim's own `reply_write` (`ChatClaim.replyTool`), read: outside data a model is offered, so it
+ * stands only where it can't break the call that offers it: a description, and arguments that are
+ * a JSON Schema of type object (each property a schema; only those named required), as JSON says
+ * them. Without the extension's `releasing`, nothing would give the text that goes out. Else why
+ * not, for the log.
+ */
+function replyToolOf(raw: unknown, releases: boolean): ReplyTool | string {
+  if (!releases) return "it has no releasing to give the text that goes out";
+  if (!isRecord(raw) || typeof raw.description !== "string" || raw.description.trim() === "") return "it has no description";
+  let parameters: unknown;
+  try {
+    // Taken as JSON, as the model is sent it: what JSON can't say (a function, a value that holds itself) is no schema.
+    parameters = JSON.parse(JSON.stringify(raw.parameters) ?? "null");
+  } catch (error) {
+    return `its arguments can't be written as JSON (${errorText(error)})`;
+  }
+  if (!isRecord(parameters) || parameters.type !== "object") return "its arguments aren't a JSON Schema of type object";
+  const { properties, required } = parameters;
+  if (properties !== undefined && (!isRecord(properties) || !Object.values(properties).every((schema) => isRecord(schema)))) return "its arguments' properties aren't each a schema";
+  if (required !== undefined && (!Array.isArray(required) || !required.every((name) => typeof name === "string" && isRecord(properties) && hasOwn(properties, name)))) return "it requires an argument it doesn't describe";
+  // What JSON gave back is JSON throughout.
+  return { description: raw.description, parameters: parameters as JsonObject };
 }
 
 // ---------------------------------------------------------------- what a run reads when it starts
@@ -273,7 +305,7 @@ export async function readSetup(shared: Shared, chatId: string, userId: string =
     host.log("warn", `[LumiAH] ${name} gave no answer for the chat ${chatId} (${unansweredLog(claimed.unanswered)}): nobody knows whether it answers the chat itself, so this run doesn't start`);
   }
   const supplied = "answer" in own && isRecord(own.answer) ? own.answer : {};
-  const claim = "answer" in claimed ? claimOf(claimed.answer) : null;
+  const claim = "answer" in claimed ? claimOf(claimed.answer, extension, host) : null;
   const definitions = mergeDefinitions(
     {
       code: { agents: shared.agents.all(), skills: shared.skills.all(), tools: shared.tools.all() },
@@ -288,7 +320,8 @@ export async function readSetup(shared: Shared, chatId: string, userId: string =
   const settings = settingsOf(stored.values, definitions.scope());
   shared.latest = settings;
   const story = claim?.story ? storyHolds({ claim: claim.story, chat: chosen, user: early.story, sovereignHand }) : below;
-  return { userId, settings, texts: textsOf(stored.texts), definitions, chat, claim, story, unanswered };
+  // Every text that tells of a limit names its setting where this run's user changes it: an agent's own budget among this run's agents too.
+  return { userId, settings, texts: textsOf(stored.texts, settingPlaceOf(definitions.scope(), shared.options.place)), definitions, chat, claim, story, unanswered };
 }
 
 /** An agent definition's instructions as they are sent: the user's text for a definition that names one of the core's, else its own. */
@@ -725,7 +758,7 @@ export class Run {
       for (const pin of pins) {
         const path = showPath(pin.area, pin.path);
         const text = pin.entry.chars <= room ? ((await view.areas[pin.area]?.text(pin.entry.hash)) ?? null) : null;
-        if (text === null) files.push(texts.render(TEXT.agents.fileNamed, { path, chars: String(pin.entry.chars) }));
+        if (text === null) files.push(texts.render(TEXT.agents.pinnedNamed, { path, chars: String(pin.entry.chars) }));
         else {
           room -= text.length;
           files.push(texts.render(TEXT.agents.file, { path, chars: String(text.length), version: versionOf(pin.entry.hash), text }));

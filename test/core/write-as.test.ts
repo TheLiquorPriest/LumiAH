@@ -133,7 +133,7 @@ describe("an agent's write through its extension's tool", () => {
     expect(refused).toEqual({
       chatGuidance: { code: "forbidden", message: "Not changed: learned/GUIDANCE.md is this chat's guidance, and Settings don't let agents edit it (Agents may edit the chat's guidance). If it should change, say what and why in your answer." },
       userGuidance: { code: "forbidden", message: "Not changed: ~/GUIDANCE.md is guidance the user writes for you, and an agent can't change it. If it should change, say what and why in your answer." },
-      long: { code: "invalid", message: "The text is 1001 characters, and a file may hold 1000 at most (File length)." },
+      long: { code: "invalid", message: "The text is 1001 characters, and File length (Settings → The workspace) lets a file hold 1000 at most." },
       outside: { code: "bad_request", message: "A path can't leave its area: “..” may climb within it, never out of it." },
       exists: { code: "conflict", message: `There is already a file /log/day.md, at version ${version}.` },
       stale: { code: "conflict", message: `/log/day.md has changed since it was read: it is at version ${version} now. Read it again, then make the change on that.` },

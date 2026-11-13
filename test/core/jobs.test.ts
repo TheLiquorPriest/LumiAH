@@ -298,7 +298,7 @@ describe("limits", () => {
     const one = (task: string, id: string) => call("job_start", { agent: "summarizer", task }, id);
     const r = rig(cast({ main: [{ toolCalls: [one("One.", "a"), one("Two.", "b")] }, { toolCalls: [one("Three.", "c")] }, { toolCalls: [reply] }] }), (s) => (s.jobs.perRun = 1));
     const { result } = await r.turn();
-    const refused = { content: "Not started: this turn has started the 1 job it may (Jobs per turn).", isError: true };
+    const refused = { content: "Not started: this turn has started the 1 job Jobs per turn (Settings → Jobs) allows.", isError: true };
     expect(resultOf(r.host, "a")?.isError).toBe(false);
     expect(resultOf(r.host, "b")).toEqual(refused);
     expect(resultOf(r.host, "c")).toEqual(refused);
@@ -309,7 +309,7 @@ describe("limits", () => {
   test("Task length: a longer task is refused, an agent's and the user's", async () => {
     const r = rig(cast({ main: [{ toolCalls: [call("job_start", { agent: "summarizer", task: "x".repeat(101) }, "a")] }, { toolCalls: [reply] }] }), (s) => (s.jobs.taskChars = 100));
     await r.turn();
-    const words = "Not started: the task is 101 characters, and a task may be 100 at most (Task length). Put the details in a workspace file and name the file in a shorter task.";
+    const words = "Not started: the task is 101 characters, and Task length (Settings → Jobs) lets a task be 100 at most. Put the details in a workspace file and name the file in a shorter task.";
     expect(resultOf(r.host, "a")).toEqual({ content: words, isError: true });
     expect(await refusal(r.harness.jobs.start({ chatId: CHAT, agent: "summarizer", task: "x".repeat(101), when: "now" }))).toEqual({ code: "invalid", message: words });
     expect(r.host.queued).toEqual([]);
@@ -338,7 +338,7 @@ describe("limits", () => {
   test("Jobs at once: at 1 a second job waits until the first ends; at 2 they run together", async () => {
     const start = async (harness: Harness, task: string) => (await harness.jobs.start({ chatId: CHAT, agent: "summarizer", task, when: "now" })).job.id;
     const first = Promise.withResolvers<Answer>();
-    const r = rig(cast({ job: [() => first.promise, "Two is done."] }));
+    const r = rig(cast({ job: [() => first.promise, "Two is done."] }), (s) => (s.jobs.atOnce = 1));
     const [one, two] = [await start(r.harness, "One."), await start(r.harness, "Two.")];
     const a = r.harness.jobs.run({ id: one }, never);
     const b = r.harness.jobs.run({ id: two }, never);
@@ -368,7 +368,7 @@ describe("limits", () => {
     const r = rig(cast({ main: starting, job: Array.from({ length: 3 }, () => () => ({ content: `Looking, ${n}.`, toolCalls: [call("chat_search", { query: `try ${n++}` })] })) }), (s) => (s.jobs.budget.toolTurns = 1));
     await r.turn();
     const job = await r.harness.jobs.run({ id: r.host.queued[0]!.id }, never);
-    const why = "the job's agents have had its 1 round of tool calls (Tool rounds per job)";
+    const why = "the job's agents have had its 1 round of tool calls, all that Tool rounds per job (Settings → Jobs → Each job) allows";
     expect(job).toMatchObject({ state: "spent", reason: why, usage: { calls: 2, toolTurns: 1 } });
     expect(r.host.calls.filter(isJob)).toHaveLength(2);
     // An agent's job was asked for no plan, so its report names none.
@@ -403,7 +403,7 @@ describe("limits", () => {
     expect(made).toBeLessThan(5);
     // What it truly sent is on the job, whatever the limit counted.
     expect(stopped).toMatchObject({ state: "spent", stoppedAt: "allowance", usage: { calls: made, in: made * 10_000, cachedIn: made * 9000 } });
-    expect(stopped.reason).toMatch(/^the call would take the job's prompt tokens past Prompt tokens per job: counted as \d{4,5} of the 8000 allowed \(a cached re-read counts as 0\.1 of a token\)$/);
+    expect(stopped.reason).toMatch(/^the call would take the job's prompt tokens past Prompt tokens per job \(Settings → Jobs → Each job\): counted as \d{4,5} of the 8000 allowed \(a cached re-read counts as 0\.1 of a token\)$/);
     // Counted in full, the same job stops after its first call.
     const full = rig(cast({ job: five }), (s) => {
       s.jobs.budget.tokensIn = 8000;
@@ -416,7 +416,7 @@ describe("limits", () => {
 
 describe("the user's and the agents' controls", () => {
   test("the user cancels a job while it runs, while it waits for its place, and while it waits to be run", async () => {
-    const r = rig(cast({ job: [{ hang: true }] }));
+    const r = rig(cast({ job: [{ hang: true }] }), (s) => (s.jobs.atOnce = 1));
     const start = async (task: string) => (await r.harness.jobs.start({ chatId: CHAT, agent: "summarizer", task, when: "now" })).job.id;
     const [one, two, three] = [await start("One."), await start("Two."), await start("Three.")];
     const running = r.harness.jobs.run({ id: one }, never);
@@ -458,7 +458,7 @@ describe("the user's and the agents' controls", () => {
       const cursor = cursorOf(request.messages.at(-1)?.content);
       return { toolCalls: [cursor === null ? reply : call("job_read", { job: r.host.queued[0]!.id, cursor }, `page-${cursor}`)] };
     };
-    const r = rig(cast({ main: [...starting, () => ({ toolCalls: [call("job_list", {}, "n1"), call("job_read", { job: "job_nope" }, "n3"), call("job_read", { job: r.host.queued[0]!.id }, "n2")] }), next, next, next, next, next], job: [report] }));
+    const r = rig(cast({ main: [...starting, () => ({ toolCalls: [call("job_list", {}, "n1"), call("job_read", { job: "job_nope" }, "n3"), call("job_read", { job: r.host.queued[0]!.id }, "n2")] }), next, next, next, next, next], job: [report] }), (s) => (s.tools.pageChars = 4000));
     await r.turn();
     const { id } = r.host.queued[0]!;
     await r.harness.jobs.run({ id }, never);
@@ -813,7 +813,7 @@ describe("a long objective", () => {
     const r = rig(cast({ job: Array.from({ length: 7 }, () => () => ({ toolCalls: [call("chat_search", { query: `try ${n++}` })] })) }), (s) => (s.jobs.budget.toolTurns = 1));
     const { id } = (await r.harness.jobs.start({ chatId: CHAT, agent: "summarizer", task: TASK, when: "now", allowance: { toolTurns: 5 } })).job;
     const job = await r.harness.jobs.run({ id }, never);
-    expect(job).toMatchObject({ state: "spent", reason: "the job's agents have had its 5 rounds of tool calls (Tool rounds per job)", usage: { calls: 6, toolTurns: 5 } });
+    expect(job).toMatchObject({ state: "spent", reason: "the job's agents have had its 5 rounds of tool calls, all that Tool rounds per job (Settings → Jobs → Each job) allows", usage: { calls: 6, toolTurns: 5 } });
     expect(firstUser(r.host.calls[0]!)).toContain("5 rounds of tool calls, 15 minutes of work.");
   });
 
@@ -830,7 +830,7 @@ describe("a long objective", () => {
       }),
     );
     const { id } = (await r.harness.jobs.start({ chatId: CHAT, agent: "main", task: "Learn the story so far.", when: "now", allowance: { toolTurns: 2 } })).job;
-    const why = "the job's agents have had its 2 rounds of tool calls (Tool rounds per job)";
+    const why = "the job's agents have had its 2 rounds of tool calls, all that Tool rounds per job (Settings → Jobs → Each job) allows";
     const spent = await r.harness.jobs.run({ id }, never);
     expect(spent).toMatchObject({ state: "spent", stoppedAt: "allowance", reason: why, usage: { calls: 3, toolTurns: 2, in: 3700, out: 300 } });
     expect((await r.harness.jobs.read({ id })).report).toBe(`Stopped at its allowance: ${why}.\nIt had last written: Halfway: Brann holds the key.\nFiles it wrote in this run: learned/plans/${id}.md\nIts plan, learned/plans/${id}.md, says what it did and what is left.\nGranted more, it carries on from where it stopped.`);
@@ -948,7 +948,7 @@ describe("a long objective", () => {
     // What was left of its three rounds, its tokens and its time when it started the other is all the other gets.
     const child = r.host.queued[1]!;
     expect(child).toMatchObject({ parent: id, agent: "summarizer", by: { who: "agent", role: "main" }, basis: null, allowance: { tokensIn: 599_000, tokensOut: 59_900, toolTurns: 2, wallMs: 900_000 } });
-    expect(await r.harness.jobs.run({ id: child.id }, never)).toMatchObject({ state: "spent", reason: "the job's agents have had its 2 rounds of tool calls (Tool rounds per job)", usage: { calls: 3, toolTurns: 2, in: 900, out: 120 } });
+    expect(await r.harness.jobs.run({ id: child.id }, never)).toMatchObject({ state: "spent", reason: "the job's agents have had its 2 rounds of tool calls, all that Tool rounds per job (Settings → Jobs → Each job) allows", usage: { calls: 3, toolTurns: 2, in: 900, out: 120 } });
     expect((await r.harness.jobs.read({ id })).job.usage).toMatchObject({ calls: 5, toolTurns: 3, in: 3100, out: 270 });
 
     const off = rig(cast({ job: ["Done."] }), (s) => (s.jobs.chain = false));
@@ -1062,7 +1062,7 @@ describe("a job an agent starts holds no more than its starter and stands one de
     expect(shipped.host.calls.filter(isScout)).toHaveLength(2);
     const tight = await ran((s) => (s.jobs.delegations = 1));
     expect(resultOf(tight.host, "d0")?.isError).toBe(false);
-    expect(resultOf(tight.host, "d1")).toEqual({ content: "Not started: this job has started the 1 sub-agent it may (Delegations per job). Ask one you already have with agent_message, or do it yourself.", isError: true });
+    expect(resultOf(tight.host, "d1")).toEqual({ content: "Not started: this job has started the 1 sub-agent Delegations per job (Settings → Jobs) allows. Ask one you already have with agent_message, or do it yourself.", isError: true });
     expect(tight.host.calls.filter(isScout)).toHaveLength(1);
   });
 });

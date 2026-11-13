@@ -12,12 +12,12 @@
 // view, or Lumiverse's own stop heard there), or when the runtime shuts down; the core hears each
 // as its signal, and its model calls under way are cancelled with it.
 //
-// A reply may come in several pieces: each passage the engine released, one after another, a
-// sub-agent's answer handed on as it is generated. Each goes out as it comes, in the order the core
-// handed it, as the one completion Lumiverse reads; the agents' progress lines go to the reply's
-// thinking block before, between and after them. Once the turn's signal has ended, nothing more
-// goes out but its end: the core counts as released only what it handed before then, so what a
-// stopped turn tells the extension it released is what the user saw.
+// A reply may come in several pieces: the agents release it once, whole, and a sub-agent's answer
+// handed on as the reply goes out as it is generated. Each piece goes out as it comes, in the order
+// the core handed it, as the one completion Lumiverse reads; the agents' progress lines go to the
+// reply's thinking block before, between and after them. Once the turn's signal has ended, nothing
+// more goes out but its end: the core counts as released only what it handed before then, so what
+// a stopped turn tells the extension it released is what the user saw.
 //
 // A reply the user stopped never ends as an error, which Lumiverse would show as a failed
 // generation. Lumiverse knows of its own Stop and has closed the request. It doesn't know of a stop

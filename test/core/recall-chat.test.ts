@@ -123,7 +123,7 @@ describe("chat_read and chat_around", () => {
   });
 
   test("page a long read by a cursor that reads on inside a message", async () => {
-    const text = (i: number): string => Array.from({ length: 40 }, (_, k) => `Line ${k} of message ${i}: Ilse counts the boats as they come in past the quay.`).join("\n");
+    const text = (i: number): string => Array.from({ length: 80 }, (_, k) => `Line ${k} of message ${i}: Ilse counts the boats as they come in past the quay.`).join("\n");
     const host = chatOf(3, text);
     const rig = await rigOf(host);
     const read = await pages(rig, "chat_read", { from: 0, to: 2 });

@@ -239,6 +239,19 @@ describe("the workspace tools", () => {
     expect(await r.run("workspace_read", {})).toEqual({ text: "workspace_read needs path: The file's path, as workspace_list writes it: /notes/plan.md in this chat's own area, learned/… kept with the chat, ~/… the user's own. Call it again with path.", error: true });
   });
 
+  test("a page is never longer than Tool results clipped past, whatever Answer length says, so a long file is paged and never clipped", async () => {
+    const r = rig((s) => {
+      s.tools.pageChars = 8000;
+      s.loop.clipChars = 400;
+    });
+    const long = Array.from({ length: 60 }, (_, i) => `Line ${i}: Okoro trims the lamp.`).join("\n");
+    await r.run("workspace_write", { path: "~/lamp.md", content: long, base: "new" });
+    const all = await pages(r.run, "workspace_read", { path: "~/lamp.md" });
+    expect(all.length).toBeGreaterThan(4);
+    for (const page of all) expect(page.length).toBeLessThanOrEqual(400);
+    expect(all.map((page) => page.split("\n").slice(1).join("\n").replace(/\n\[(There is more|That is the end)[^\]]*\]$/, "")).join("")).toBe(long);
+  });
+
   test("a file whose text the store lost says so, and comes back when the same text is written again", async () => {
     // Nothing kept in memory, so a read goes to the store.
     const r = await stocked((s) => (s.keep.blobChars = 0));
@@ -493,22 +506,22 @@ describe("the workspace tools", () => {
     const r = await stocked((s) => (s.workspace.pathChars = 30));
     expect(await r.run("workspace_read", { path: "/notes/../../plan.md" })).toEqual({ text: "That path climbs out of its area: .. may go up inside an area, never above it. Say which area by how the path starts: / for this chat's own, learned/, or ~/ for the user's.", error: true });
     expect(await r.run("workspace_write", { path: "notes\\plan.md", content: "x", base: "new" })).toEqual({ text: "That path can't be used: a path holds no backslash and no control character. Put / between its folders, as in /notes/plan.md.", error: true });
-    expect(await r.run("workspace_write", { path: `/notes/${"long-".repeat(8)}name.md`, content: "x", base: "new" })).toEqual({ text: "That path is too long: within its area a path may hold 30 characters at most (Path length). Use shorter names or fewer folders.", error: true });
+    expect(await r.run("workspace_write", { path: `/notes/${"long-".repeat(8)}name.md`, content: "x", base: "new" })).toEqual({ text: "That path is too long: within its area Path length (Settings → The workspace) lets a path hold 30 characters at most. Use shorter names or fewer folders.", error: true });
   });
 
   test("each limit refuses in words that name its setting and the numbers", async () => {
     const r = await stocked((s) => (s.workspace = { ...s.workspace, fileChars: 120, files: 4, areaChars: 200 }));
-    expect(await r.run("workspace_write", { path: "/log.md", content: "x".repeat(121), base: await versionFor(LOG) })).toEqual({ text: "Nothing was changed: the file would hold 121 characters, and a file may hold 120 at most (File length). Split it over several files.", error: true });
+    expect(await r.run("workspace_write", { path: "/log.md", content: "x".repeat(121), base: await versionFor(LOG) })).toEqual({ text: "Nothing was changed: the file would hold 121 characters, and File length (Settings → The workspace) lets a file hold 120 at most. Split it over several files.", error: true });
     // The chat's area holds three files; one more of forty characters would take it past Area size.
     const before = PLAN.length + BRANN.length + LOG.length;
     expect(await r.run("workspace_write", { path: "/more.md", content: "x".repeat(40), base: "new" })).toEqual({
-      text: `Nothing was changed: with it this area's files would hold ${before + 40} characters together, and an area may hold 200 at most (Area size). Delete or shorten files nobody needs any more first.`,
+      text: `Nothing was changed: with it this area's files would hold ${before + 40} characters together, and Area size (Settings → The workspace) lets an area hold 200 at most. Delete or shorten files nobody needs any more first.`,
       error: true,
     });
     expect((await r.run("workspace_write", { path: "/more.md", content: "x", base: "new" })).error).toBeUndefined();
-    expect(await r.run("workspace_write", { path: "/fifth.md", content: "x", base: "new" })).toEqual({ text: "Nothing was changed: this area already holds the 4 files it may (Files per area). Delete files nobody needs any more, or add to one there is.", error: true });
+    expect(await r.run("workspace_write", { path: "/fifth.md", content: "x", base: "new" })).toEqual({ text: "Nothing was changed: this area already holds the 4 files Files per area (Settings → The workspace) allows. Delete files nobody needs any more, or add to one there is.", error: true });
     // An edit that would take the file past File length is refused like a write.
-    expect((await r.run("workspace_edit", { path: "/log.md", find: "Day one", replace: "y".repeat(100), base: await versionFor(LOG) })).text).toContain("(File length)");
+    expect((await r.run("workspace_edit", { path: "/log.md", find: "Day one", replace: "y".repeat(100), base: await versionFor(LOG) })).text).toContain("File length (Settings → The workspace)");
     // Each area has its own count and size.
     expect((await r.run("workspace_write", { path: "~/more.md", content: "x".repeat(40), base: "new" })).error).toBeUndefined();
   });
@@ -518,7 +531,7 @@ describe("the workspace tools", () => {
     r.settings.workspace.areaChars = 100;
     const shorter = "Mara wants the lighthouse lit.";
     expect((await r.run("workspace_write", { path: "/notes/plan.md", content: shorter, base: await versionFor(PLAN) })).error).toBeUndefined();
-    expect((await r.run("workspace_write", { path: "/notes/plan.md", content: `${shorter}!`, base: await versionFor(shorter) })).text).toContain("(Area size)");
+    expect((await r.run("workspace_write", { path: "/notes/plan.md", content: `${shorter}!`, base: await versionFor(shorter) })).text).toContain("Area size (Settings → The workspace)");
   });
 
   test("what the agent may not write is refused in its holder's words, before anything is changed", async () => {
@@ -815,7 +828,7 @@ describe("the page", () => {
         row,
       ],
       chars: LOG.length + BRANN.length + PLAN.length,
-      limits: { fileChars: 200_000, files: 400, areaChars: 4_000_000, pinChars: 12_000 },
+      limits: { fileChars: 200_000, files: 400, areaChars: 4_000_000, pinChars: 24_000 },
     });
     expect(await r.page.read({ area: "chat", path: "notes/plan.md" })).toEqual({ file: row, text: PLAN, version: { hash: row.hash, chars: PLAN.length, at: r.host.clock.now(), by: MAIN } });
     r.host.clock.advance(60_000);
@@ -868,14 +881,14 @@ describe("the page", () => {
   test("is refused with invalid for a limit, in words that name its setting", async () => {
     const r = await paged((s) => (s.workspace = { ...s.workspace, fileChars: 120, files: 4, areaChars: 200, pathChars: 30 }));
     const base = await textHash(LOG);
-    expect(await refusal(r.page.write({ area: "chat", path: "log.md", text: "x".repeat(121), base }))).toEqual({ code: "invalid", message: "The text is 121 characters, and a file may hold 120 at most (File length)." });
-    expect(await refusal(r.page.write({ area: "chat", path: "more.md", text: "x".repeat(40), base: null }))).toEqual({ code: "invalid", message: `With this the area's files would hold ${PLAN.length + BRANN.length + LOG.length + 40} characters together, and an area may hold 200 at most (Area size).` });
+    expect(await refusal(r.page.write({ area: "chat", path: "log.md", text: "x".repeat(121), base }))).toEqual({ code: "invalid", message: "The text is 121 characters, and File length (Settings → The workspace) lets a file hold 120 at most." });
+    expect(await refusal(r.page.write({ area: "chat", path: "more.md", text: "x".repeat(40), base: null }))).toEqual({ code: "invalid", message: `With this the area's files would hold ${PLAN.length + BRANN.length + LOG.length + 40} characters together, and Area size (Settings → The workspace) lets an area hold 200 at most.` });
     await r.page.write({ area: "chat", path: "more.md", text: "x", base: null });
-    expect(await refusal(r.page.write({ area: "chat", path: "fifth.md", text: "x", base: null }))).toEqual({ code: "invalid", message: "The area already holds as many files as it may: 4 (Files per area)." });
-    expect(await refusal(r.page.write({ area: "user", path: `notes/${"long-".repeat(8)}name.md`, text: "x", base: null }))).toEqual({ code: "invalid", message: "A path may hold 30 characters at most (Path length)." });
+    expect(await refusal(r.page.write({ area: "chat", path: "fifth.md", text: "x", base: null }))).toEqual({ code: "invalid", message: "The area already holds as many files as Files per area (Settings → The workspace) lets it: 4." });
+    expect(await refusal(r.page.write({ area: "user", path: `notes/${"long-".repeat(8)}name.md`, text: "x", base: null }))).toEqual({ code: "invalid", message: "Path length (Settings → The workspace) lets a path hold 30 characters at most." });
     // The refusal says which value of the request it is about, for the page to show it there.
     const refused = await r.page.write({ area: "chat", path: "log.md", text: "x".repeat(121), base }).catch((error: unknown) => error);
-    expect(refused instanceof HarnessRefusal ? refused.problems : null).toEqual([{ path: ["text"], message: "The text is 121 characters, and a file may hold 120 at most (File length)." }]);
+    expect(refused instanceof HarnessRefusal ? refused.problems : null).toEqual([{ path: ["text"], message: "The text is 121 characters, and File length (Settings → The workspace) lets a file hold 120 at most." }]);
   });
 
   test("is refused with bad_request for a path that can't be one, or a request that isn't one", async () => {

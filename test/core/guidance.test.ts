@@ -115,7 +115,7 @@ describe("Guidance length", () => {
     await r.guide({ user: long, chat: LEARNED });
     expect((await r.harness.guidance.get({ chatId: CHAT })).limit).toBe(100);
     await r.turn();
-    const cut = `${long.slice(0, 100)}\n[Cut here, at 100 of ${long.length} characters. The whole is the workspace file ~/GUIDANCE.md.]`;
+    const cut = `${long.slice(0, 100)}\n[Cut here, at 100 of ${long.length} characters, as far as Guidance length (Settings → Guidance) goes. The whole is the workspace file ~/GUIDANCE.md.]`;
     expect(system(r.host.calls[0])).toStartWith(`${level("from the user, for every chat", cut)}\n\n${LEVELS[2]}\n\n`);
     // The page still holds the whole text: the setting bounds what an agent is given, not the file.
     expect((await r.harness.guidance.get({ chatId: CHAT })).levels.find((l) => l.id === "user")?.text).toBe(long);

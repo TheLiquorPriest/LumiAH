@@ -17,7 +17,12 @@ export interface TextDef {
   note: string;
   text: string;
   vars: TextVar[];
+  /** The setting whose limit the text tells of, by its place in the core's settings: `{{setting}}` (`SETTING_VAR`) is filled with its name and where it is changed, unless whoever renders the text names the setting itself (one of an agent's own). */
+  setting?: readonly string[];
 }
+
+/** The placeholder a text that tells of a limit names its setting with: its name, and where it is changed. */
+export const SETTING_VAR: TextVar = { name: "setting", text: 'the setting, and where it is changed: "Tool results clipped past (LumiAH\'s Settings → The agent loop)"' };
 
 /** The built-in tool that reads the rest of a clipped result. */
 export const SCRATCH_READ = "scratch_read";

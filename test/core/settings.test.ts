@@ -4,7 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import type { JsonObject } from "../../src/core/ports";
 import { isRecord } from "../../src/core/ports";
-import { checkSettings, defaultSettings, SETTINGS_SCHEMA, settingsOf, settingsSchema } from "../../src/core/settings";
+import { checkSettings, defaultSettings, SETTINGS_SCHEMA, type Settings, settingsOf, settingsSchema } from "../../src/core/settings";
 
 /** The keywords the Settings page builds forms from (src/shared/ui.ts), and `default` for a table's new row. */
 const KEYWORDS: readonly string[] = ["title", "description", "type", "properties", "additionalProperties", "enum", "oneOf", "const", "minimum", "maximum", "multipleOf", "x-unit", "x-none", "x-keys", "format", "maxLength", "items", "uniqueItems", "default"];
@@ -48,7 +48,7 @@ describe("the schema and the defaults", () => {
     const s = defaultSettings();
     expect(Object.keys(s.agents.main!.budget).sort()).toEqual(["callMs", "callTokensIn", "callTokensOut", "callTools", "concurrency", "revisions", "tokensIn", "tokensOut", "toolTurns", "wallMs"]);
     expect(Object.keys(s.turn).sort()).toEqual(["tokensIn", "tokensOut", "toolTurns", "wallMs"]);
-    expect(s.loop).toEqual({ repeats: 3, clipChars: 6000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000, answerFloor: 256, warnRounds: 2, cutRoomFactor: 2, cutRoomTokens: 64_000 });
+    expect(s.loop).toEqual({ repeats: 3, clipChars: 12_000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000, answerFloor: 256, warnRounds: 2, cutRoomFactor: 2, cutRoomTokens: 64_000 });
     // Retries can be switched off, and a wait is never longer than a timer can hold.
     expect(checkSettings({ loop: { retries: 0, retryWaitMs: 0 } })).toEqual([]);
     expect(checkSettings({ loop: { retries: -1, retryWaitMs: 3_000_000_000 } }).map((p) => p.path.join("."))).toEqual(["loop.retries", "loop.retryWaitMs"]);
@@ -63,13 +63,13 @@ describe("the schema and the defaults", () => {
   test("every limit of the workspace, guidance, delegation, jobs, approval, spend and upkeep is a setting with a default", () => {
     const s = defaultSettings();
     // Agents pin in the chat's own areas alone: pinning in the user's area, which every chat reads, is the user's unless they give it away.
-    expect(s.workspace).toEqual({ fileChars: 200_000, files: 400, areaChars: 4_000_000, pathChars: 200, versions: 10, pinChars: 12_000, agentsPinUser: false });
+    expect(s.workspace).toEqual({ fileChars: 200_000, files: 400, areaChars: 4_000_000, pathChars: 200, versions: 10, pinChars: 24_000, agentsPinUser: false });
     expect(s.guidance).toEqual({ chars: 8000, agentsEdit: false });
     expect(s.skills).toEqual({ listChars: 4000 });
     // Two deep: the main agent delegates, and so does a job it starts (the job's agent stands at 1); whoever those hand a task to stands at 2 and hands nothing on.
-    expect(s.delegation).toEqual({ depth: 2, atOnce: 3, perRun: 12, grant: "own", fileChars: 12_000, asChars: 200, replyHoldChars: 200 });
+    expect(s.delegation).toEqual({ depth: 2, atOnce: 3, perRun: 24, grant: "own", fileChars: 12_000, asChars: 200, replyHoldChars: 200 });
     // A job's sub-agents have no count of their own, since its allowance bounds them. A turn waits a minute at most for the jobs due by it.
-    expect(s.jobs).toEqual({ enabled: true, atOnce: 1, perRun: 3, budget: { tokensIn: 600_000, tokensOut: 60_000, toolTurns: 60, wallMs: 900_000 }, tokensPerDay: 3_000_000, taskChars: 4000, openingChars: 600, recordWaitMs: 120_000, chain: true, delegations: null, dueWaitMs: 60_000 });
+    expect(s.jobs).toEqual({ enabled: true, atOnce: 2, perRun: 6, budget: { tokensIn: 600_000, tokensOut: 60_000, toolTurns: 60, wallMs: 900_000 }, tokensPerDay: 12_000_000, taskChars: 4000, openingChars: 600, recordWaitMs: 120_000, chain: true, delegations: null, dueWaitMs: 60_000 });
     expect(settingsOf({ jobs: { delegations: 4 } }).jobs.delegations).toBe(4);
     // No tier waits for the user's word as it ships: a tool that acts outside LumiAH is one they set up and switched on. Asking first is theirs to choose, by tier or by tool.
     expect(s.approval).toEqual({ tiers: { read: "allow", write: "allow", external: "allow" }, tools: {}, waitMs: 300_000 });
@@ -86,7 +86,7 @@ describe("the schema and the defaults", () => {
     expect(s.extension).toEqual({ waitMs: 10_000 });
     expect(s.keep).toMatchObject({ promptDays: 30, transcriptDays: 90, spanDays: null, graceHours: 24 });
     // A receipt keeps as much of a call's arguments as of its result.
-    expect(s.session).toMatchObject({ rollbackMarginTokens: 8000, receiptChars: 600, receiptArgChars: 600 });
+    expect(s.session).toMatchObject({ rollbackMarginTokens: 8000, receiptChars: 1500, receiptArgChars: 1500 });
     // Each agent says how its tools are offered, and the summarizer holds read tools only.
     expect(s.agents.main?.toolCalls).toBe("auto");
     expect(s.agents.summarizer?.tools).toEqual(["chat_search", "chat_grep", "chat_read", "book_outline", "book_read", "lore_search", "lore_read", "workspace_list", "workspace_read", "workspace_grep"]);
@@ -105,6 +105,16 @@ describe("the user's own values", () => {
     expect(s.agents.main).toEqual({ ...defaultSettings().agents.main!, connectionId: "conn-1", budget: { ...defaultSettings().agents.main!.budget, toolTurns: null, callMs: 90_000 } });
     expect(s.agents.writer).toEqual(defaultSettings().agents.writer!);
     expect(s.session.summarizeAtTokens).toBeNull();
+  });
+
+  test("sized for long-form work: a user who never set them reads the new defaults, and a value a user set, the old default among them, stays theirs", () => {
+    const LONG_FORM = { clipChars: 12_000, pageChars: 8000, pinChars: 24_000, receiptChars: 1500, receiptArgChars: 1500, summarizeAtTokens: 48_000, keepTurns: 4, jobsPerTurn: 6, jobsAtOnce: 2, jobTokensPerDay: 12_000_000, subAgentsPerTurn: 24 };
+    const read = (s: Settings) => ({ clipChars: s.loop.clipChars, pageChars: s.tools.pageChars, pinChars: s.workspace.pinChars, receiptChars: s.session.receiptChars, receiptArgChars: s.session.receiptArgChars, summarizeAtTokens: s.session.summarizeAtTokens, keepTurns: s.session.keepTurns, jobsPerTurn: s.jobs.perRun, jobsAtOnce: s.jobs.atOnce, jobTokensPerDay: s.jobs.tokensPerDay, subAgentsPerTurn: s.delegation.perRun });
+    // The store keeps only what the user changed, so nothing stored is read as no setting at all.
+    expect(read(settingsOf({}))).toEqual(LONG_FORM);
+    expect(read(settingsOf(null))).toEqual(LONG_FORM);
+    const kept = { loop: { clipChars: 6000 }, tools: { pageChars: 4000 }, workspace: { pinChars: 12_000 }, session: { receiptChars: 600, receiptArgChars: 600, summarizeAtTokens: 32_000, keepTurns: 3 }, jobs: { perRun: 3, atOnce: 1, tokensPerDay: 3_000_000 }, delegation: { perRun: 12 } };
+    expect(read(settingsOf(kept))).toEqual({ clipChars: 6000, pageChars: 4000, pinChars: 12_000, receiptChars: 600, receiptArgChars: 600, summarizeAtTokens: 32_000, keepTurns: 3, jobsPerTurn: 3, jobsAtOnce: 1, jobTokensPerDay: 3_000_000, subAgentsPerTurn: 12 });
   });
 
   test("a value the schema refuses reads as its default, and is named with why", () => {

@@ -141,8 +141,8 @@ describe("a round a stop or a time limit ended begins no further call (H4)", () 
     expect(await sending).toMatchObject({ status: "refused", code: "wall_time" });
     await idle();
     expect(save.runs).toEqual([]);
-    for (const id of ["c3", "c4"]) expect(resultOf(agent, id)).toMatchObject({ text: notRun(r.texts, "save", TEXT.stop.wallTime), error: true });
-    expect(resultOf(agent, "c3")?.text).toBe("Not run: the agent's time ran out (Time per agent), before this call of save began. Nothing of it was started.");
+    const why = "the agent has worked all the time Time per agent (Settings → Agents → Main agent → Budget) allows";
+    for (const id of ["c3", "c4"]) expect(resultOf(agent, id)).toMatchObject({ text: `Not run: ${why}, before this call of save began. Nothing of it was started.`, error: true });
   });
 
   test("a call that still waited for its place when the stop came is not asked about either: nothing of it is started, whatever it would have been told", async () => {

@@ -11,7 +11,7 @@ import { DEFAULT_CACHE_RETENTION } from "../core/ports";
 import type { AskPush, ConnectionPush, ExtensionOffer, UpdatePush } from "../link/contract";
 import { loopbackModel, runtimeBase } from "../link/contract";
 import { linkedBackendOf } from "../link/frames";
-import { timeoutPlace } from "../shared/timeouts";
+import { settingPlace } from "../shared/timeouts";
 import { isRecord } from "../link/json";
 import type { RuntimeTuning } from "../link/settings";
 import { TRANSPORT_KEY, transportOf } from "../link/settings";
@@ -61,9 +61,9 @@ export interface RuntimeDeps {
    * user's settings, their texts and their own definitions as stored, read at the start of every
    * run; `extension` is what the extension LumiAH is built into supplies, each member a request to
    * its backend; `place` says where the user changes one of the core's settings, for the words of a
-   * wait of the core's that ran out (`HarnessOptions.place`).
+   * limit or a wait of the core's that name it (`HarnessOptions.place`).
    */
-  harness(host: HarnessHost, settings: () => Promise<{ values: unknown; texts: unknown; definitions?: unknown }>, extension: HarnessExtension, place: (path: readonly string[], title: string) => string): Harness;
+  harness(host: HarnessHost, settings: () => Promise<{ values: unknown; texts: unknown; definitions?: unknown }>, extension: HarnessExtension, place: (path: readonly string[], title: string, trail: readonly string[]) => string): Harness;
   /** The writer's connection, from the settings' values; null: the user's default. */
   writerConnection(values: JsonObject): string | null;
   /** The runtime's update and the settings of how it is run (`createUpdate`), given what says a reply, a request or a job is under way here: an update waits for none of them to be. */
@@ -276,7 +276,7 @@ export function createRuntime(config: RuntimeConfig, deps: RuntimeDeps): Runtime
     },
     linkExtension({ link, now: deps.now, tuning, offer: () => offer }),
     // The core's settings are under "core", beside the transport's: shown where the extension the runtime links to says its Settings are, as the runtime's own waits name them.
-    (path, title) => timeoutPlace(["core", ...path], title, linkedBackendOf(link.hello?.backend)),
+    (path, title, trail) => settingPlace(["core", ...path], title, trail, linkedBackendOf(link.hello?.backend)),
   );
   const work = new Work(harness, {
     log: deps.log,

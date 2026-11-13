@@ -21,9 +21,10 @@ export interface Pager {
   lineChars: number;
 }
 
+/** A tool's pager. A page is never longer than Tool results clipped past, whatever Answer length says: a page past the clip would reach the model clipped, and paging is there so that none is. A tool that reads more whole (`wholeChars`) is clipped later still, so the clip is the least it may be. */
 export function pagerOf(env: ToolEnv, tool: string): Pager {
   const { pageChars, pageItems, lineChars } = env.settings.tools;
-  return { tool, texts: env.texts, pageChars, pageItems, lineChars };
+  return { tool, texts: env.texts, pageChars: Math.min(pageChars, env.settings.loop.clipChars), pageItems, lineChars };
 }
 
 /** Where a page starts: an item of a list, or a place in a text ("40"); or an item and a place in it ("12:3000"). `given`: the call named one. */

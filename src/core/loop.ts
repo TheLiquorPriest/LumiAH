@@ -412,6 +412,11 @@ class Agent implements AgentHandle {
     return this.deps.texts.render(id, vars);
   }
 
+  /** One of this agent's own budget settings, named with where it is changed: what its stops and cuts say. */
+  private budgetSetting(key: keyof AgentBudget): string {
+    return this.deps.texts.setting(["agents", this.spec.role, "budget", key]);
+  }
+
   send(text: string, signal?: AbortSignal): Promise<AgentReply> {
     return this.work(text, signal);
   }
@@ -747,7 +752,7 @@ class Agent implements AgentHandle {
   /** The agent's or the run's time, run out before a call or a round. */
   private timeUp(): AgentStop | null {
     const now = this.now();
-    if (this.spent(now) >= limitOf(this.spec.budget.wallMs)) return new AgentStop("wall_time", { id: TEXT.stop.wallTime });
+    if (this.spent(now) >= limitOf(this.spec.budget.wallMs)) return new AgentStop("wall_time", { id: TEXT.stop.wallTime, vars: { setting: this.budgetSetting("wallMs") } });
     const turn = this.deps.turn;
     if (turn && now - turn.startedAt - turn.held(now) >= limitOf(turn.budget.wallMs)) return new AgentStop("turn_time", { id: turn.words.time });
     return null;
@@ -762,7 +767,7 @@ class Agent implements AgentHandle {
     const { budget } = this.spec;
     const turn = this.deps.turn;
     const { texts } = this.deps;
-    if (p.estimate > limitOf(budget.callTokensIn)) return new AgentStop("call_tokens_in", { id: TEXT.stop.callTokensIn, vars: { tokens: texts.counted(p.estimate, TEXT.word.token), limit: String(budget.callTokensIn) } });
+    if (p.estimate > limitOf(budget.callTokensIn)) return new AgentStop("call_tokens_in", { id: TEXT.stop.callTokensIn, vars: { tokens: texts.counted(p.estimate, TEXT.word.token), limit: String(budget.callTokensIn), setting: this.budgetSetting("callTokensIn") } });
     // What was read again from a provider's cache counts at its weight; this call's own prompt in full, since what of it will be cached isn't known yet.
     const { cachedWeight } = this.deps.settings.spend;
     const weight = String(cachedWeight);
@@ -799,7 +804,7 @@ class Agent implements AgentHandle {
   /** Why a round of calls isn't run: the agent's or the turn's rounds spent. */
   private roundStop(): AgentStop | null {
     const { turn } = this.deps;
-    if (this.total.toolTurns >= limitOf(this.spec.budget.toolTurns)) return new AgentStop("tool_turns", { id: TEXT.stop.toolTurns, vars: { rounds: this.deps.texts.counted(limitOf(this.spec.budget.toolTurns), TEXT.word.round) } });
+    if (this.total.toolTurns >= limitOf(this.spec.budget.toolTurns)) return new AgentStop("tool_turns", { id: TEXT.stop.toolTurns, vars: { rounds: this.deps.texts.counted(limitOf(this.spec.budget.toolTurns), TEXT.word.round), setting: this.budgetSetting("toolTurns") } });
     if (turn && turn.usage.toolTurns >= limitOf(turn.budget.toolTurns)) return new AgentStop("turn_tool_turns", { id: turn.words.toolTurns, vars: { rounds: this.deps.texts.counted(limitOf(turn.budget.toolTurns), TEXT.word.round) } });
     return null;
   }
@@ -856,7 +861,7 @@ class Agent implements AgentHandle {
       };
       arm();
     };
-    deadline(() => limitOf(this.spec.budget.wallMs) - this.spent(this.now()), new AgentStop("wall_time", { id: TEXT.stop.wallTime }));
+    deadline(() => limitOf(this.spec.budget.wallMs) - this.spent(this.now()), new AgentStop("wall_time", { id: TEXT.stop.wallTime, vars: { setting: this.budgetSetting("wallMs") } }));
     if (turn) {
       deadline(() => {
         const now = this.now();
@@ -1080,8 +1085,10 @@ class Agent implements AgentHandle {
       return null;
     }
     const total = String(text.length);
+    // What each cut's words say beside the sizes: a clip, how much one scratch_read gives of this result (its own length, `per` below); a cut to the room, the agent's own Prompt per call.
+    const said = (id: string): Record<string, string> => (id === TEXT.runtime.clipped ? { per: String(max) } : { setting: this.budgetSetting("callTokensIn") });
     // The words after the start take room too: measured as long as they can be, with a handle longer than any.
-    const words = (id: string): number => this.text(id, { shown: total, total, handle: "s000000" }).length + 1;
+    const words = (id: string): number => this.text(id, { shown: total, total, handle: "s000000", ...said(id) }).length + 1;
     // Clipped at its own length where that and its words fit the room; else cut to the room, with the words that say so.
     const fits = text.length > max && max + words(TEXT.runtime.clipped) <= room;
     const id = fits ? TEXT.runtime.clipped : TEXT.runtime.windowCut;
@@ -1104,16 +1111,16 @@ class Agent implements AgentHandle {
     // The handle is taken in the same step as its whole is kept, after the store answered: two results clipped at once never share one.
     const handle = `s${this.scratch.size + 1}`;
     this.scratch.set(handle, { whole, per: max });
-    return { text: `${start}${this.text(id, { ...sizes, handle })}`, whole, scratch: "hash" in whole ? whole.hash : handle };
+    return { text: `${start}${this.text(id, { ...sizes, handle, ...said(id) })}`, whole, scratch: "hash" in whole ? whole.hash : handle };
   }
 
   /**
    * The built-in `scratch_read`: the next part of a clipped or cut result, at most as much at a time
    * as the tool it came from gives whole (Tool results clipped past, for most), and never more than
-   * the room the round's results have left.
+   * the room the round's results have left. That most is each result's own, so its clipped words say
+   * it (`per`); the tool states no maximum of its own, since none would hold for every result.
    */
   private scratchRead(): AgentTool {
-    const max = Math.max(this.deps.settings.loop.clipChars, ...[...this.tools.values()].map((tool) => tool.wholeChars ?? 0));
     return {
       name: SCRATCH_READ,
       description: this.text(TEXT.runtime.scratchRead),
@@ -1122,7 +1129,7 @@ class Agent implements AgentHandle {
         properties: {
           handle: { type: "string", description: this.text(TEXT.runtime.scratchHandle) },
           offset: { type: "integer", minimum: 0, description: this.text(TEXT.runtime.scratchOffset) },
-          length: { type: "integer", minimum: 1, maximum: max, description: this.text(TEXT.runtime.scratchLength, { max: String(max) }) },
+          length: { type: "integer", minimum: 1, description: this.text(TEXT.runtime.scratchLength, { max: String(this.deps.settings.loop.clipChars) }) },
         },
         required: ["handle"],
       },
@@ -1137,7 +1144,7 @@ class Agent implements AgentHandle {
         const from = Math.min(Math.max(0, wholeArg(args.offset) ?? 0), whole.length);
         const total = String(whole.length);
         const room = this.room - this.text(TEXT.runtime.scratchPart, { handle, from: total, to: total, total, text: "" }).length;
-        if (room < 1 && from < whole.length) return { text: this.text(TEXT.runtime.scratchFull, { handle }) };
+        if (room < 1 && from < whole.length) return { text: this.text(TEXT.runtime.scratchFull, { handle, setting: this.budgetSetting("callTokensIn") }) };
         const length = Math.min(Math.max(1, wholeArg(args.length) ?? kept.per), kept.per, room);
         const to = cutAt(whole, Math.min(whole.length, from + length));
         return { text: this.text(TEXT.runtime.scratchPart, { handle, from: String(from), to: String(to), total, text: whole.slice(from, to) }) };

@@ -1,12 +1,13 @@
 // What LumiAH gives an extension that writes its own story engine on it (DESIGN §3.4, §14, §15,
-// §21): the reply released a passage at a time, a sub-agent's answer handed the reply's stream, the
-// extension's word on each agent's model and on each passage, jobs in lanes and due by the next
-// turn, and a claim that shows the main agent only the user's newest message and lets nothing but
+// §21): the reply released once, whole, by the agents themselves (by a reply_write of the
+// extension's own where its claim gives one), a sub-agent's answer handed the reply's stream, the
+// extension's word on each agent's model and on the reply, jobs in lanes and due by the next turn,
+// and a claim that shows the main agent only the user's newest message and lets nothing but
 // released text be the reply.
 
 import { describe, expect, test } from "bun:test";
 import type { AgentDefinition } from "../../src/core/agents";
-import type { AgentModelAsk, ChatClaim, HarnessExtension, ReplyRelease } from "../../src/core/extension";
+import type { AgentModelAsk, ChatClaim, HarnessExtension, ReplyRelease, ReplyTool } from "../../src/core/extension";
 import { Gate } from "../../src/core/gate";
 import { createHarness } from "../../src/core/harness";
 import type { ModelRequest } from "../../src/core/ports";
@@ -27,6 +28,8 @@ const voice = def("voice", VOICE, ["reply_write", "job_list"]);
 const system = (request: ModelRequest): string => (request.messages[0]?.role === "system" ? request.messages[0].content : "");
 /** Every message of a call, as one text: what the agent was sent, its own calls and their results. */
 const seen = (request: ModelRequest | undefined): string => JSON.stringify(request?.messages ?? []);
+/** What one call came back with, as the agent's next call carried it. */
+const resultOf = (request: ModelRequest | undefined, callId: string) => request?.messages.flatMap((m) => m.parts ?? []).find((part) => part.type === "tool_result" && part.toolUseId === callId);
 
 /** Answers each agent's calls in turn, by whose instructions the call carries. */
 function lines(parts: { author?: Answer[]; voice?: Answer[] }): Script {
@@ -39,7 +42,7 @@ function lines(parts: { author?: Answer[]; voice?: Answer[] }): Script {
   };
 }
 
-/** A chat an extension claims for its author, the extension hearing every passage released. */
+/** A chat an extension claims for its author, the extension hearing each release. */
 function rig(script: Script, options: { claim?: ChatClaim | null; extension?: Partial<HarnessExtension>; change?: (s: Settings) => void } = {}) {
   const host = new MemoryHost();
   host.script = script;
@@ -62,43 +65,74 @@ function rig(script: Script, options: { claim?: ChatClaim | null; extension?: Pa
 }
 
 describe("the reply, released by the agents (§3.4)", () => {
-  test("several reply_write calls make one reply, in order; the turn needs no write_reply, and write_reply is refused after", async () => {
+  test("is released once: the first reply_write goes out, and every one after it is refused with nothing more reaching the stream; write_reply is refused after it too", async () => {
     const r = rig(
       lines({
         author: [
-          // Two in one answer go out in the order they were called.
-          { toolCalls: [call("reply_write", { text: "The lamp gutters. " }), call("reply_write", { text: "Mara looks up." })] },
-          { toolCalls: [call("reply_write", { text: ' "I saw the boat."' })] },
-          { toolCalls: [call("write_reply", { brief: "Mara saw the boat." })] },
+          // Two in one answer: the first goes out, and the second, asked about after it, is refused.
+          { toolCalls: [call("reply_write", { text: "The lamp gutters. Mara looks up." }, "w1"), call("reply_write", { text: " She says nothing." }, "w2")] },
+          { toolCalls: [call("reply_write", { text: ' "I saw the boat."' }, "w3")] },
+          { toolCalls: [call("write_reply", { brief: "Mara saw the boat." }, "b1")] },
           "That is the moment.",
         ],
       }),
     );
     const { result, sink } = await runTurn(r.host, r.harness, CHAT);
-    const reply = 'The lamp gutters. Mara looks up. "I saw the boat."';
+    const reply = "The lamp gutters. Mara looks up.";
     expect(result).toMatchObject({ status: "done", reply });
     expect(sink.text).toBe(reply);
-    expect(sink.order.filter((kind) => kind === "content")).toHaveLength(3);
+    expect(sink.order.filter((kind) => kind === "content")).toHaveLength(1);
     // The record holds the turn, and the main agent's last answer is no part of the reply.
     expect(result.record).not.toBeNull();
-    // No writer was called: the author's four calls are all there were, and write_reply was refused in words.
+    // Each release after the first was refused in words that say the reply went out already, and no writer was called: the author's four calls are all there were.
+    const again = { content: renderDefault(TEXT.answer.releaseAgain), isError: true };
+    expect(resultOf(r.host.calls[1], "w2")).toMatchObject(again);
+    expect(resultOf(r.host.calls[2], "w3")).toMatchObject(again);
     expect(r.host.calls).toHaveLength(4);
-    expect(seen(r.host.calls[3])).toContain(renderDefault(TEXT.answer.replyReleased));
-    // The extension heard each passage, from the author.
-    expect(r.released.map((release) => [release.agent.role, release.text])).toEqual([
-      ["author", "The lamp gutters. "],
-      ["author", "Mara looks up."],
-      ["author", ' "I saw the boat."'],
-    ]);
+    expect(resultOf(r.host.calls[3], "b1")).toMatchObject({ content: renderDefault(TEXT.answer.replyReleased), isError: true });
+    // The extension heard the one release, from the author.
+    expect(r.released.map((release) => [release.agent.role, release.text, release.args])).toEqual([["author", reply, { text: reply }]]);
   });
 
-  test("the extension's check: a refusal is the call's answer and nothing streams; a check that fails lets nothing go", async () => {
+  test("a hand-on after reply_write is refused before its agent starts, and a release after a handed-on answer is refused: the turn's reply is the first release alone", async () => {
+    const refused = { content: renderDefault(TEXT.answer.releaseAgain), isError: true };
+    const released = rig(lines({ author: [{ toolCalls: [call("reply_write", { text: "The lamp gutters." }, "w1")] }, { toolCalls: [call("delegate", { agent: "voice", task: "Answer the user as Mara.", to_reply: true }, "d1")] }, "Done."] }));
+    const first = await runTurn(released.host, released.harness, CHAT);
+    expect(first.result).toMatchObject({ status: "done", reply: "The lamp gutters." });
+    expect(first.sink.text).toBe("The lamp gutters.");
+    expect(resultOf(released.callsOf(AUTHOR)[2], "d1")).toMatchObject(refused);
+    expect(released.callsOf(VOICE)).toHaveLength(0);
+
+    const answer = "I saw the boat go out at dawn.";
+    const handed = rig(
+      lines({
+        author: [
+          { toolCalls: [call("delegate", { agent: "voice", task: "Answer the user as Mara.", to_reply: true }, "d1")] },
+          { toolCalls: [call("reply_write", { text: "The lamp gutters." }, "w1"), call("delegate", { agent: "voice", task: "Say more.", to_reply: true }, "d2")] },
+          "Done.",
+        ],
+        voice: [answer],
+      }),
+    );
+    const second = await runTurn(handed.host, handed.harness, CHAT);
+    expect(second.result).toMatchObject({ status: "done", reply: answer });
+    expect(second.sink.text).toBe(answer);
+    expect(resultOf(handed.callsOf(AUTHOR)[2], "w1")).toMatchObject(refused);
+    expect(resultOf(handed.callsOf(AUTHOR)[2], "d2")).toMatchObject(refused);
+    expect(handed.callsOf(VOICE)).toHaveLength(1);
+    expect(handed.released.map((release) => [release.agent.role, release.text, release.args])).toEqual([["voice", answer, {}]]);
+  });
+
+  test("the extension's check: a refusal, a check that fails, and none in time each let nothing go and leave the turn's release to come; the release after them is the one, and one after that is refused", async () => {
+    let hung = false;
     const r = rig(
       lines({
         author: [
-          { toolCalls: [call("reply_write", { text: "The vault code is 4471." })] },
-          { toolCalls: [call("reply_write", { text: "boom" })] },
-          { toolCalls: [call("reply_write", { text: "Mara shrugs." })] },
+          { toolCalls: [call("reply_write", { text: "The vault code is 4471." }, "w1")] },
+          { toolCalls: [call("reply_write", { text: "boom" }, "w2")] },
+          { toolCalls: [call("reply_write", { text: "Mara waits." }, "w3")] },
+          { toolCalls: [call("reply_write", { text: "Mara shrugs." }, "w4")] },
+          { toolCalls: [call("reply_write", { text: "Mara smiles." }, "w5")] },
           "Done.",
         ],
       }),
@@ -106,15 +140,27 @@ describe("the reply, released by the agents (§3.4)", () => {
         extension: {
           releasing: async (release) => {
             if (release.text === "boom") throw new Error("the checker broke");
+            if (release.text === "Mara waits.") {
+              hung = true;
+              return new Promise<null>(() => undefined);
+            }
             return release.text.includes("vault") ? { refused: "That names the vault's code: keep it hidden." } : null;
           },
         },
       },
     );
-    const { result } = await runTurn(r.host, r.harness, CHAT);
+    const turn = runTurn(r.host, r.harness, CHAT);
+    await until(() => hung);
+    r.host.clock.advance(10_000);
+    const { result } = await turn;
     expect(result).toMatchObject({ status: "done", reply: "Mara shrugs." });
-    expect(seen(r.host.calls[1])).toContain("That names the vault's code: keep it hidden.");
-    expect(seen(r.host.calls[2])).toContain(renderDefault(TEXT.answer.releaseUnchecked));
+    expect(resultOf(r.host.calls[1], "w1")).toMatchObject({ content: "That names the vault's code: keep it hidden.", isError: true });
+    expect(resultOf(r.host.calls[2], "w2")).toMatchObject({ content: renderDefault(TEXT.answer.releaseFailed, { extension: "Depth", error: "the checker broke" }), isError: true });
+    // No word within Wait for the extension: the words name the setting.
+    const late = resultOf(r.host.calls[3], "w3");
+    expect(late).toMatchObject({ isError: true });
+    expect(late?.type === "tool_result" ? late.content : "").toContain("Wait for the extension");
+    expect(resultOf(r.host.calls[5], "w5")).toMatchObject({ content: renderDefault(TEXT.answer.releaseAgain), isError: true });
     expect(r.released.map((release) => release.text)).toEqual(["Mara shrugs."]);
   });
 
@@ -127,7 +173,77 @@ describe("the reply, released by the agents (§3.4)", () => {
     expect(r.host.calls).toHaveLength(1);
     // write_reply isn't offered, and the author is asked to release the reply.
     expect(r.host.calls[0]?.tools?.map((tool) => tool.name)).not.toContain("write_reply");
-    expect(seen(r.host.calls[0])).toContain(renderDefault(TEXT.main.askReleases));
+    expect(seen(r.host.calls[0])).toContain(renderDefault(TEXT.main.askRelease));
+  });
+});
+
+describe("a reply_write of the extension's own (§21: replyTool)", () => {
+  const PIECES: Readonly<Record<number, string>> = { 1: "The lamp gutters. ", 2: "Mara looks up." };
+  const replyTool: ReplyTool = { description: "Release the reply: the pieces you name, in order.", parameters: { type: "object", properties: { pieces: { type: "array", items: { type: "integer" }, description: "The pieces, in order." } }, required: ["pieces"] } };
+  /** The extension's word: the pieces the call names, joined in order. */
+  const joined = async (release: ReplyRelease) => {
+    const { pieces } = release.args;
+    return Array.isArray(pieces) ? { text: pieces.map((n) => PIECES[n as number] ?? "").join("") } : { refused: "Name the pieces." };
+  };
+
+  test("the lead is offered its description and arguments; releasing is asked with the call's arguments, and the text it gives is what streams and what released hears", async () => {
+    const asked: ReplyRelease[] = [];
+    const r = rig(lines({ author: [{ toolCalls: [call("reply_write", { pieces: [1, 2] }, "w1")] }, "Done."] }), {
+      claim: { reply: "released", replyTool },
+      extension: { releasing: async (release) => (asked.push(structuredClone(release)), joined(release)) },
+    });
+    const { result, sink } = await runTurn(r.host, r.harness, CHAT);
+    expect(r.host.calls[0]?.tools?.find((tool) => tool.name === "reply_write")).toMatchObject({ description: replyTool.description, parameters: replyTool.parameters });
+    expect(asked).toEqual([expect.objectContaining({ text: "", args: { pieces: [1, 2] }, agent: expect.objectContaining({ role: "author" }) })]);
+    const whole = "The lamp gutters. Mara looks up.";
+    expect(result).toMatchObject({ status: "done", reply: whole });
+    expect(sink.text).toBe(whole);
+    expect(r.released).toEqual([expect.objectContaining({ text: whole, args: { pieces: [1, 2] } })]);
+  });
+
+  test("no text in its answer, or no answer within Wait for the extension, lets nothing go; the release is still to come", async () => {
+    let asked = 0;
+    const r = rig(lines({ author: [{ toolCalls: [call("reply_write", { pieces: [1] }, "w1")] }, { toolCalls: [call("reply_write", { pieces: [1] }, "w2")] }, { toolCalls: [call("reply_write", { pieces: [2] }, "w3")] }, "Done."] }), {
+      claim: { reply: "released", replyTool },
+      extension: {
+        releasing: (release) => {
+          asked++;
+          // Null lets the call's own text go, and this tool's calls carry none; then no answer at all.
+          if (asked === 1) return Promise.resolve(null);
+          if (asked === 2) return new Promise(() => undefined);
+          return joined(release);
+        },
+      },
+    });
+    const turn = runTurn(r.host, r.harness, CHAT);
+    await until(() => asked === 2);
+    r.host.clock.advance(10_000);
+    const { result, sink } = await turn;
+    expect(resultOf(r.host.calls[1], "w1")).toMatchObject({ content: renderDefault(TEXT.answer.releaseUnchecked, { extension: "Depth" }), isError: true });
+    const late = resultOf(r.host.calls[2], "w2");
+    expect(late).toMatchObject({ isError: true });
+    expect(late?.type === "tool_result" ? late.content : "").toContain("Wait for the extension");
+    expect(result).toMatchObject({ status: "done", reply: "Mara looks up." });
+    expect(sink.text).toBe("Mara looks up.");
+    expect(r.released.map((release) => release.text)).toEqual(["Mara looks up."]);
+  });
+
+  test("one a model can't be offered, or without releasing to give the text, isn't: reply_write takes the reply's text, and the log says why", async () => {
+    const malformed: ReplyTool = { description: "Release the reply.", parameters: { type: "object", properties: { pieces: "a list" }, required: ["pieces"] } };
+    // The extension lets the call's own text go: only the tool it is offered as is in question here.
+    const letGo: Partial<HarnessExtension> = { releasing: async () => null };
+    for (const [claim, extension] of [
+      [{ replyTool: malformed }, letGo],
+      [{ replyTool: { ...replyTool, parameters: { type: "array" } } }, letGo],
+      [{ replyTool }, {}],
+    ] as [ChatClaim, Partial<HarnessExtension>][]) {
+      const r = rig(lines({ author: [{ toolCalls: [call("reply_write", { text: "Mara looks up." }, "w1")] }, "Done."] }), { claim, extension });
+      const { result } = await runTurn(r.host, r.harness, CHAT);
+      const offered = r.host.calls[0]?.tools?.find((tool) => tool.name === "reply_write");
+      expect(Object.keys((offered?.parameters.properties ?? {}) as object)).toEqual(["text"]);
+      expect(r.host.logs.some((log) => log.level === "warn" && log.message.includes("reply_write"))).toBe(true);
+      expect(result).toMatchObject({ status: "done", reply: "Mara looks up." });
+    }
   });
 });
 
@@ -337,7 +453,7 @@ describe("a job the user starts that writes the chat's own area (the prepared st
 
     // The words come with the plan file they are about, and are held to Task length as the task is.
     await expect(r.harness.jobs.start({ chatId: CHAT, agent: "keeper", task: "Prepare the story.", when: "now", planWords: WORDS })).rejects.toMatchObject({ code: "invalid" });
-    await expect(r.harness.jobs.start({ ...start, planWords: "x ".repeat(2001) })).rejects.toMatchObject({ code: "invalid", message: "The plan's words are 4001 characters, and may be 4000 at most (Task length)." });
+    await expect(r.harness.jobs.start({ ...start, planWords: "x ".repeat(2001) })).rejects.toMatchObject({ code: "invalid", message: "The plan's words are 4001 characters, and Task length (Settings → Jobs) lets them be 4000 at most." });
   });
 
   /** A chat whose main agent writes its replies, `replies` of them already played, and a job of the user's that writes two files to the chat's own area. Every model call is answered in turn from `script`. */

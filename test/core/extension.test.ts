@@ -12,7 +12,7 @@ import { recordOf } from "../../src/core/sessions";
 import { defaultSettings, type Settings } from "../../src/core/settings";
 import { renderDefault, TEXT, Texts } from "../../src/core/texts";
 import { directedNote } from "../../src/core/turn";
-import { timeoutPlace } from "../../src/shared/timeouts";
+import { settingPlace } from "../../src/shared/timeouts";
 import { call, idle, MemoryHost, runTurn, type Script, until } from "./support/host";
 import { HARBOUR, KEEPER, LOG_SKILL, READER, type SampleOptions, SEARCH, sampleExtension, TIDES } from "./support/sample-extension";
 
@@ -33,8 +33,8 @@ function rig(script: Script, change: (s: Settings) => void = () => undefined, op
   }
   const stored: { values: Settings; texts: Record<string, string>; definitions?: StoredDefinitions } = { values: defaultSettings(), texts: {} };
   change(stored.values);
-  // Where the user changes a wait of the core's, as the runtime says it for an extension that names no place of its own.
-  const harness = createHarness(host, { settings: async () => structuredClone(stored), extension: sample.extension, place: (path, title) => timeoutPlace(["core", ...path], title, { name: HARBOUR.name }), ...(options.userId !== undefined ? { userId: options.userId } : {}) });
+  // Where the user changes a setting of the core's, as the runtime says it for an extension that names no place of its own.
+  const harness = createHarness(host, { settings: async () => structuredClone(stored), extension: sample.extension, place: (path, title, trail) => settingPlace(["core", ...path], title, trail, { name: HARBOUR.name }), ...(options.userId !== undefined ? { userId: options.userId } : {}) });
   return { host, harness, stored, sample, turn: (chatId = CLAIMED) => runTurn(host, harness, chatId) };
 }
 
@@ -245,7 +245,7 @@ describe("a chat the extension claims: one of each thing it supplies", () => {
     const r = rig(quick, (s) => (s.guidance.chars = 100));
     r.sample.extension.claim = async () => ({ guidance: { name: HARBOUR.guidance.name, text: long } });
     await r.turn(CLAIMED);
-    expect(system(r.host.calls[0])).toStartWith(`[Guidance ${HARBOUR.guidance.name}. Follow it.]\n${long.slice(0, 100)}\n[Cut here, at 100 of ${long.length} characters. The rest is in no workspace file, so it can't be read from here: work from what is above.]\n\n`);
+    expect(system(r.host.calls[0])).toStartWith(`[Guidance ${HARBOUR.guidance.name}. Follow it.]\n${long.slice(0, 100)}\n[Cut here, at 100 of ${long.length} characters, as far as Guidance length (${HARBOUR.name}'s Settings → Guidance) goes. The rest is in no workspace file, so it can't be read from here: work from what is above.]\n\n`);
   });
 
   test("a chat it doesn't claim is answered by LumiAH's own main agent, with none of the extension's guidance, and the writer's request as the core built it is still the extension's to rewrite", async () => {
@@ -720,7 +720,7 @@ describe("what the extension lists and answers is outside data", () => {
       expect(content === long).toBe(whole);
       if (whole) continue;
       // Still offered, and clipped as any tool's answer is.
-      expect(content).toContain(`[Clipped: the first 6000 of ${long.length} characters.`);
+      expect(content).toContain(`[Clipped: the first 12000 of ${long.length} characters;`);
       expect(logged(r.host, HARBOUR.tides, "reads whole")).toBeDefined();
     }
   });

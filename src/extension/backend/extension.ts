@@ -32,9 +32,9 @@ export interface BackendExtension {
   runBegan?(run: RunBegan, userId: string): Promise<void>;
   /** Which connection, model and effort an agent of a run runs on (its definition, which instance it is, who started it); null: the definition's own. */
   agentModel?(ask: AgentModelAsk, userId: string): Promise<AgentModelChoice | null>;
-  /** A passage an agent is about to release into the reply (`reply_write`): `{ refused }` keeps it back, and the agent is told why; null lets it go. */
+  /** The turn's reply, about to go out as an agent releases it (`reply_write`): `{ refused }` keeps it back, and the agent is told why; `{ text }` is what goes out; null lets the call's own text go. */
   releasing?(release: ReplyRelease, userId: string): Promise<ReleaseVerdict>;
-  /** A passage went out, or a sub-agent's answer finished streaming into the reply: what reached the user. */
+  /** The turn's reply went out, or a sub-agent's answer finished streaming in as the reply: what reached the user. */
   released?(release: ReplyRelease, userId: string): Promise<void>;
   replyWritten?(reply: ReplyWritten, userId: string): Promise<void>;
   runEnded?(run: RunEnded, userId: string): Promise<void>;
@@ -131,9 +131,10 @@ export async function callExtension(extension: BackendExtension | undefined, mem
     case "releasing": {
       if (core.releasing === undefined) return none;
       await ownChat();
-      const verdict = await core.releasing(given);
-      // Only a refusal in words keeps a passage back; anything else lets it go.
-      return { supplied: true, value: isRecord(verdict) && typeof verdict.refused === "string" ? { refused: verdict.refused } : null };
+      // Read as outside data: a refusal in words keeps the reply back, and a text is what goes out; anything else lets the call's own text go.
+      const verdict: unknown = await core.releasing(given);
+      if (isRecord(verdict) && typeof verdict.refused === "string") return { supplied: true, value: { refused: verdict.refused } };
+      return { supplied: true, value: isRecord(verdict) && typeof verdict.text === "string" ? { text: verdict.text } : null };
     }
     case "released":
       if (core.released === undefined) return none;

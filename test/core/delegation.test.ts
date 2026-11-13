@@ -32,8 +32,8 @@ const BRANN = "Brann mends nets by the quay and trusts nobody.";
 /** What ends the first message of an agent that has `n` rounds of tool calls. */
 const rounds = (n: number): string => `\n\n[You have ${n} rounds of tool calls for this. A round is one answer of yours that calls tools, however many. An answer that calls a tool after your last round isn't run and your work stops there, so keep a round for what must come last.]`;
 
-/** What a delegating agent is told of an agent that answered, and of one that stopped short. */
-const answered = (answer: string, handle: string, agent = "summarizer"): string => `${answer}\n\n[From ${agent}, handle ${handle}. agent_message with this handle asks it more.]`;
+/** What a delegating agent is told of an agent that answered (the line that names its handle, then its answer), and of one that stopped short. */
+const answered = (answer: string, handle: string, agent = "summarizer"): string => `${renderDefault(TEXT.agents.from, { agent, handle })}\n\n${answer}`;
 const stopped = (handle: string, why: string, agent = "summarizer"): string => `${agent} (handle ${handle}) stopped before it answered: ${why}\nagent_message with this handle has it go on, if it still may; or go on without it.`;
 
 const version = async (text: string): Promise<string> => versionOf(await textHash(text));
@@ -337,6 +337,27 @@ describe("a sub-agent's handle", () => {
     expect(callsOf(r.host, SUMMARIZER)).toHaveLength(1);
   });
 
+  test("survives a long answer: the line that names it comes before the answer, so a result clipped for its length keeps it, and agent_message goes on with it", async () => {
+    const long = `Okoro keeps it. ${"The keeper's log runs on, night after night, in a cramped hand. ".repeat(40)}`;
+    const r = rig(
+      cast(
+        main([{ toolCalls: [delegate("Say who keeps the lighthouse.", "d1")] }, (request) => ({ toolCalls: [call("agent_message", { handle: handleIn(results(request)[0]?.content), text: "And who holds the key?" }, "m1")] }), "The reply."]),
+        agent(SUMMARIZER, [long, "Brann holds it."]),
+      ),
+      (s) => (s.loop.clipChars = 400),
+    );
+    await r.turn();
+    const [sub] = started(r.host, "summarizer");
+    const read = results(callsOf(r.host, MAIN)[1])[0]?.content ?? "";
+    // What the main agent read of the answer was clipped, and names the handle all the same.
+    expect(read.length).toBeLessThan(long.length);
+    expect(read).not.toContain(long);
+    expect(handleIn(read)).toBe(sub?.id ?? "none");
+    // The follow-up went to that agent: nobody new was started.
+    expect(started(r.host, "summarizer")).toHaveLength(1);
+    expect(results(callsOf(r.host, MAIN)[2])).toEqual([{ type: "tool_result", toolUseId: "m1", content: answered("Brann holds it.", sub?.id ?? "") }]);
+  });
+
   test("an unknown handle names the ones there are; with nobody started, the result says to delegate first", async () => {
     const r = rig(
       cast(
@@ -365,8 +386,8 @@ describe("a sub-agent's handle", () => {
         main([
           { toolCalls: [delegate("Say who keeps the lighthouse.", "d1")] },
           (request) => ({ toolCalls: [delegate(`Ask ${handleIn(promptText(request))} who holds the key.`, "d2", { agent: "scout" })] }),
-          // The scout's answer names the agent it started itself: the main agent tries that handle.
-          (request) => ({ toolCalls: [call("agent_message", { handle: handleIn(results(request)[0]?.content), text: "Who holds the key?" }, "m3")] }),
+          // The scout's answer names the agent it started itself: the main agent tries that handle, not the one its result is headed with.
+          (request) => ({ toolCalls: [call("agent_message", { handle: /I asked handle (agent_[0-9a-f]{8})/.exec(results(request)[0]?.content ?? "")?.[1] ?? "", text: "Who holds the key?" }, "m3")] }),
           "The reply.",
         ]),
         agent(SCOUT, [ask("m1"), { toolCalls: [delegate("Say who holds the key.", "d3")] }, ask("m2"), (request) => `It wouldn't hear me. I asked handle ${handleIn(promptText(request))} instead.`]),
@@ -585,7 +606,7 @@ describe("a sub-agent's writes", () => {
 
 describe("Sub-agents per turn", () => {
   /** The refusal, with the limit as the answer writes it: the count and its noun, in the number the count takes. */
-  const refusal = (limit: string): string => `Not started: this turn has started the ${limit} it may (Sub-agents per turn). Ask one you already have with agent_message, or do it yourself.`;
+  const refusal = (limit: string): string => `Not started: this turn has started the ${limit} Sub-agents per turn (Settings → Delegation) allows. Ask one you already have with agent_message, or do it yourself.`;
 
   test("one past it is refused in words that name the setting, and what it already started can still be asked more", async () => {
     const r = rig(
@@ -636,12 +657,12 @@ describe("Sub-agents per turn", () => {
     const script = (): Script => cast(main([{ toolCalls: [delegate("Read the first day.", "d1"), delegate("Read the second day.", "d2")] }, "The reply."]), agent(SUMMARIZER, () => "Read."));
     const one = rig(script(), (s) => (s.delegation.perRun = 1));
     await one.turn();
-    expect(results(callsOf(one.host, MAIN)[1])[1]).toEqual({ type: "tool_result", toolUseId: "d2", content: "Not started: this turn has started the 1 sub-agent it may (Sub-agents per turn). Ask one you already have with agent_message, or do it yourself.", isError: true });
+    expect(results(callsOf(one.host, MAIN)[1])[1]).toEqual({ type: "tool_result", toolUseId: "d2", content: refusal("1 sub-agent"), isError: true });
 
     const worded = rig(script(), (s) => (s.delegation.perRun = 1));
     worded.stored.texts["word.sub_agent"] = "helper|helpers";
     await worded.turn();
-    expect(results(callsOf(worded.host, MAIN)[1])[1]?.content).toStartWith("Not started: this turn has started the 1 helper it may (Sub-agents per turn).");
+    expect(results(callsOf(worded.host, MAIN)[1])[1]?.content).toStartWith("Not started: this turn has started the 1 helper Sub-agents per turn (Settings → Delegation) allows.");
   });
 
   test("with no limit a turn starts as many as it asks for", async () => {
@@ -745,7 +766,7 @@ describe("a sub-agent that stops short", () => {
 
   test("at its budget: an error result with why and what it had last written, and the main agent goes on", async () => {
     const r = await delegated([{ content: "First the chat.", toolCalls: [call("chat_search", { query: "lighthouse" }, "s1")] }, { content: "Now the lore.", toolCalls: [call("lore_search", { query: "lighthouse" }, "s2")] }], (s) => (s.agents.summarizer!.budget.toolTurns = 1));
-    expect(r.told).toEqual([{ type: "tool_result", toolUseId: "d1", content: stopped(r.handle, "the agent has had its 1 round of tool calls (Tool rounds per agent). It had last written: Now the lore."), isError: true }]);
+    expect(r.told).toEqual([{ type: "tool_result", toolUseId: "d1", content: stopped(r.handle, "the agent has had its 1 round of tool calls, all that Tool rounds per agent (Settings → Agents → Summarizer → Budget) allows. It had last written: Now the lore."), isError: true }]);
     expect(r.result).toMatchObject({ status: "done", reply: "The reply." });
   });
 

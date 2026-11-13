@@ -30,13 +30,13 @@ import { foldKey, foldOf, summaryOf } from "./compaction";
 import { mergeDefinitions } from "./definitions";
 import { jobNews, jobState } from "./job-words";
 import { type AgentReply, cutShort } from "./loop";
-import { type AgentRef, type AgentUsage, type HarnessHost, isRecord, type JobView, type ModelDelta, modelMessages, type PathMessage, type PresetBlock, type ReplySink, type RequestMessage, type TraceEvent, type TranscriptEntry, type TurnRecord, type TurnRequest, type TurnResult, type TurnStatus } from "./ports";
+import { type AgentRef, type AgentUsage, type HarnessHost, isRecord, type JobView, type JsonObject, type ModelDelta, modelMessages, type PathMessage, type PresetBlock, type ReplySink, type RequestMessage, type TraceEvent, type TranscriptEntry, type TurnRecord, type TurnRequest, type TurnResult, type TurnStatus } from "./ports";
 import { chronicleRefusal } from "./recall/definitions";
 import { recallTold } from "./recall/turn";
 import { writerLore } from "./recall/writer";
 import { carriedOf, receiptOf } from "./receipts";
 import { briefedRequest, requestDocument, sentMessage } from "./request";
-import { askExtension, claimMissing, readSetup, Run, type Setup, type Shared, unansweredWords } from "./run";
+import { askExtension, claimMissing, extensionAnswer, readSetup, Run, type Setup, type Shared, unansweredLog, unansweredWords } from "./run";
 import { type Compaction, compactionAsked, compactionDue, type ResumedSession, type SegmentStep, type SessionSegment } from "./sessions";
 import { AGENT, type Settings, settingsOf } from "./settings";
 import { leftOutWhy, type StorySource, storyHolds } from "./story";
@@ -98,11 +98,11 @@ export class Turn {
   private broken: string | null = null;
   /** The main agent's id, once it started: its tool calls are the turn's progress lines. */
   private mainId: string | null = null;
-  /** Text of the reply was released by the turn's agents themselves (`reply_write`, `to_reply`): the reply is what they released, and no writer writes it. */
+  /** The turn's reply went out as its agents released it (`reply_write`, `to_reply`): the reply is what they released, and no writer writes it. A turn's reply is released once: after it, nothing more goes in. */
   private streamed = false;
-  /** A sub-agent's answer is streaming into the reply (`to_reply`): nothing else goes in meanwhile. */
+  /** A sub-agent's answer is streaming in as the turn's reply (`to_reply`): the turn's one release is under way, so nothing else goes in. */
   private holder = false;
-  /** What `reply_write` releases, one passage after another in the order the calls came. */
+  /** The `reply_write` calls, asked about one after another in the order they came: the first that goes out is the turn's release, and each after it is refused. */
   private releasing: Promise<unknown> = Promise.resolve();
 
   constructor(
@@ -342,7 +342,7 @@ export class Turn {
       ...(directed !== null ? [directed] : []),
     ];
     const kinds = { new: TEXT.main.kindNew, regenerate: TEXT.main.kindRegenerate, swipe: TEXT.main.kindSwipe, continue: TEXT.main.kindContinue } as const;
-    const ask = texts.render(releasedOnly ? TEXT.main.askReleases : writes ? TEXT.main.askWrites : TEXT.main.ask);
+    const ask = texts.render(releasedOnly ? TEXT.main.askRelease : writes ? TEXT.main.askWrites : TEXT.main.ask);
     const noted = notes.map((note) => `${note}\n\n`).join("");
     const asked = newestOnly ? texts.render(TEXT.main.turnNewest, { kind: texts.render(kinds[turn.kind]), notes: noted, message: newest, ask }) : texts.render(TEXT.main.turn, { kind: texts.render(kinds[turn.kind]), notes: noted, count: run.request.count, request: document.text, ask });
     const { agent, lead: pinned } = await run.agent(main, {
@@ -466,7 +466,7 @@ export class Turn {
     if (this.signal.aborted) return { status: "stopped", reason: this.stoppedWhy() };
     // What the agents released stands as the reply: the log keeps what broke after it.
     if (this.streamed) {
-      this.host.log("warn", `[LumiAH] the turn's work failed after part of its reply was released (${reason}): what was released stands`);
+      this.host.log("warn", `[LumiAH] the turn's work failed after its reply was released (${reason}): what was released stands`);
       return this.released();
     }
     // Where only what is released is the reply, no writer writes in the agents' place.
@@ -534,9 +534,8 @@ export class Turn {
 
   /** `write_reply`: the writer writes from the main agent's brief, and its reply ends the main agent's send. */
   private async writeReply(brief: string, mainId: string, run: Run): Promise<ToolOutcome> {
-    // Once the agents released part of the reply, it is theirs to finish: a writer would write a second reply after it.
-    if (this.streamed) return { text: this.text(TEXT.answer.replyReleased), error: true };
-    if (this.holder) return { text: this.text(TEXT.answer.releaseHeld), error: true };
+    // Once the agents released the reply, or while an agent's answer goes out as it, the reply is theirs: a writer would write a second reply after it.
+    if (this.streamed || this.holder) return { text: this.text(TEXT.answer.replyReleased), error: true };
     if (this.writing || this.written || this.broken !== null) return { text: this.text(TEXT.answer.replyBusy), error: true };
     this.progress(TEXT.progress.writing);
     const wrote = await this.write(brief, "call", mainId, run);
@@ -646,20 +645,27 @@ export class Turn {
 
   /**
    * The reply as the turn's agents may write it themselves (`reply_write`, `delegate`'s
-   * `to_reply`): a passage goes out once nothing else holds the reply and the extension lets it
-   * (§21 `releasing`), in the order the calls came.
+   * `to_reply`): released once, whole. It goes out once nothing else holds the reply and the
+   * extension lets it (§21 `releasing`), and `reply_write` calls are asked about in the order they
+   * came. Once text of it went out, or while a sub-agent's answer streams in as it, every other
+   * release is refused in words that say a turn's reply is written once. One that sent nothing (the
+   * extension refused it or gave no usable word, or a sub-agent's answer ended before any of it
+   * streamed) leaves the turn's release still to come. The turn's stop ends it where it is: what
+   * went out before stands as the reply, and nothing more goes.
    */
   private replyStream(run: Run): ReplyStream {
     const shut = (): string | null => {
       if (this.closed || this.signal.aborted) return this.text(TEXT.answer.releaseEnded);
       if (this.writing || this.written || this.broken !== null) return this.text(TEXT.answer.releaseWriter);
-      if (this.holder) return this.text(TEXT.answer.releaseHeld);
+      if (this.streamed || this.holder) return this.text(TEXT.answer.releaseAgain);
       return null;
     };
     return {
+      // Checked when the claim was read (`readSetup`): one a model can't be offered never gets this far.
+      tool: run.claim?.replyTool ?? null,
       refused: shut,
-      write: (text, ctx) => {
-        const next = this.releasing.then(() => this.release(text, ctx, run, shut));
+      write: (args, ctx) => {
+        const next = this.releasing.then(() => this.release(args, ctx, run, shut));
         this.releasing = next.catch(() => undefined);
         return next;
       },
@@ -670,33 +676,57 @@ export class Turn {
           if (given) return;
           given = true;
           this.holder = false;
-          if (released !== "") this.tellReleased(run, agent, released);
+          // A stream is no call of its agent's: it carries no arguments.
+          if (released !== "") this.tellReleased(run, agent, released, {});
         };
       },
       stream: (text) => this.streamOut(text),
-      length: () => this.reply.length,
     };
   }
 
-  /** One `reply_write` passage: asked about (§21 `releasing`), then sent. Null once it went out; else why not, in words for the model. A check that fails or gives no word in time lets nothing go: the passage is held to what the extension let through. */
-  private async release(text: string, ctx: ToolCtx, run: Run, shut: () => string | null): Promise<string | null> {
+  /**
+   * One `reply_write` call: asked about (§21 `releasing`), then sent. The text that went out, once
+   * it did; else why nothing did, in words for the model. The core's own tool carries the reply's
+   * text, which goes unless the extension gives another; with the extension's own
+   * (`ChatClaim.replyTool`) the call names what goes out, and only a text the extension gives can.
+   * A check that fails, gives no usable word, or none in time, lets nothing go: the reply is held to
+   * what the extension let through, and the turn's release is still to come.
+   */
+  private async release(args: JsonObject, ctx: ToolCtx, run: Run, shut: () => string | null): Promise<{ released: string } | { refused: string }> {
     const first = shut();
-    if (first !== null) return first;
-    const { turn, shared } = this;
+    if (first !== null) return { refused: first };
+    const { turn, shared, texts } = this;
     const agent: AgentRef = run.ref(ctx.agentId) ?? { agentId: ctx.agentId, role: ctx.role, ...(ctx.as !== undefined ? { as: ctx.as } : {}) };
+    const own = run.claim?.replyTool !== undefined;
+    // What the call carries of the reply: the core's tool's text (the tool saw that it gives one), nothing with the extension's own.
+    const carried = !own && typeof args.text === "string" ? args.text : "";
+    let text = carried;
     const extension = shared.options.extension;
     if (extension?.releasing) {
-      const lost = {};
-      const verdict: unknown = await askExtension<unknown>(shared, "word on a passage of the reply", this.settings.extension.waitMs, () => extension.releasing?.({ userId: run.userId, chatId: turn.chatId, turn: turn.generationId, agent, text }) ?? Promise.resolve(null), lost);
-      if (verdict === lost) return this.text(TEXT.answer.releaseUnchecked);
-      if (verdict !== null && verdict !== undefined) return isRecord(verdict) && typeof verdict.refused === "string" && verdict.refused.trim() !== "" ? clip(verdict.refused, this.settings.tools.pageChars) : this.text(TEXT.answer.releaseUnchecked);
-      // Asked again: the reply may have ended, or another agent's answer begun streaming into it, while the extension looked.
+      const asked = await extensionAnswer<unknown>(shared, this.settings.extension.waitMs, () => extension.releasing?.({ userId: run.userId, chatId: turn.chatId, turn: turn.generationId, agent, text: carried, args }) ?? Promise.resolve(null));
+      if ("unanswered" in asked) {
+        this.host.log("warn", `[LumiAH] ${extension.name} gave no word on the turn's reply (${unansweredLog(asked.unanswered)}): none of it was released`);
+        return { refused: unansweredWords({ why: asked.unanswered, late: TEXT.answer.releaseLate, failed: TEXT.answer.releaseFailed, texts, options: shared.options }) };
+      }
+      const verdict = asked.answer;
+      /** A member of the verdict that says something: a string with more than spaces in it. */
+      const said = (key: string): string | null => {
+        const value = isRecord(verdict) ? verdict[key] : undefined;
+        return typeof value === "string" && value.trim() !== "" ? value : null;
+      };
+      const refused = said("refused");
+      if (refused !== null) return { refused: clip(refused, this.settings.tools.pageChars) };
+      const given = said("text");
+      // A text given goes in place of the call's. Null lets the call's own go, where it carries one: the extension's own tool carries none. Anything else is no word the reply can go out on.
+      if (given !== null) text = given;
+      else if (own || (verdict !== null && verdict !== undefined)) return { refused: this.text(TEXT.answer.releaseUnchecked, { extension: extension.name }) };
+      // Asked again: the reply may have ended, or another agent's answer begun streaming in as it, while the extension looked.
       const late = shut();
-      if (late !== null) return late;
+      if (late !== null) return { refused: late };
     }
-    if (!this.streamOut(text)) return this.text(TEXT.answer.releaseEnded);
-    this.tellReleased(run, agent, text);
-    return null;
+    if (!this.streamOut(text)) return { refused: this.text(TEXT.answer.releaseEnded) };
+    this.tellReleased(run, agent, text, args);
+    return { released: text };
   }
 
   /** Text the agents release goes to the reply, unless the turn was stopped or its reply ended: false where it went nowhere. */
@@ -707,11 +737,11 @@ export class Turn {
     return true;
   }
 
-  /** The extension hears what reached the user (§21 `released`); nothing waits on it. */
-  private tellReleased(run: Run, agent: AgentRef, text: string): void {
+  /** The extension hears what reached the user (§21 `released`), with the call's arguments; nothing waits on it. */
+  private tellReleased(run: Run, agent: AgentRef, text: string, args: Record<string, unknown>): void {
     const { turn } = this;
     const extension = this.shared.options.extension;
-    run.hook("answer to a passage released", extension?.released ? () => extension.released?.({ userId: run.userId, chatId: turn.chatId, turn: turn.generationId, agent, text }) ?? Promise.resolve() : undefined);
+    run.hook("answer to the reply released", extension?.released ? () => extension.released?.({ userId: run.userId, chatId: turn.chatId, turn: turn.generationId, agent, text, args }) ?? Promise.resolve() : undefined);
   }
 
   /** The turn ends with the reply its agents released: whole, however the main agent's own work ended. */
@@ -772,7 +802,7 @@ export class Turn {
     const { entry } = event;
     if (entry.kind === "retry") this.progress(TEXT.progress.retry, { reason: entry.reason, attempt: String(entry.attempt), retries: String(entry.of) });
     if (event.agentId !== this.mainId || entry.kind !== "answer") return;
-    // A passage the main agent releases is in the reply itself: the thinking block isn't given it again.
+    // The reply the main agent releases is in the reply itself: the thinking block isn't given the call again.
     for (const call of entry.calls) if (call.name !== TOOL.replyWrite) this.progress(TEXT.progress.call, { tool: call.name, args: JSON.stringify(call.args) });
   }
 

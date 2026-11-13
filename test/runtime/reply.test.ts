@@ -1,11 +1,12 @@
-// The runtime, which every chat needs (DESIGN §6, §21): the engine writes the reply itself, so each
-// released passage and a character's answer handed on reach Lumiverse as one reply, in order, each
-// as it is released; Stop ends the turn wherever it is and tells the extension what had been
-// released; with no runtime linked a chat's reply fails in plain words and nothing answers in the
-// runtime's place; a restart mid-turn ends the reply in plain words and the chat goes on; a dropped
-// link comes back by itself; and a refused link version says which side to update and how. Each
-// test runs the real runtime, the real backend and the core's own harness over the fake Lumiverse,
-// with a scripted model behind the backend.
+// The runtime, which every chat needs (DESIGN §6, §21): the engine writes the reply itself, in one
+// release a turn: the text its own reply_write names, given by its check over the link, or a
+// character's answer handed on, reaching Lumiverse as one reply (the answer piece by piece as he
+// gives it), and a second release refused; Stop ends the turn wherever it is and tells the
+// extension what had been released; with no runtime linked a chat's reply fails in plain words and
+// nothing answers in the runtime's place; a restart mid-turn ends the reply in plain words and the
+// chat goes on; a dropped link comes back by itself; and a refused link version says which side to
+// update and how. Each test runs the real runtime, the real backend and the core's own harness over
+// the fake Lumiverse, with a scripted model behind the backend.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import type { AgentDefinition } from "../../src/core/agents";
@@ -29,10 +30,14 @@ afterEach(async () => {
   r = null;
 });
 
-const AUTHOR = "You are the harbour's author. Release the reply yourself, a passage at a time.";
+const AUTHOR = "You are the harbour's author. Release the reply yourself, once, whole.";
 const OKORO = "You are Okoro, who keeps the harbour light. Answer as Okoro, in his own words.";
 const LOG = "Okoro lit the lamp at dusk.";
 const KEPT_BACK = "That passage tells what Mara can't know.";
+const FIRST = "The lamp room is cold. ";
+const SECOND = "Okoro looks up from the log. ";
+/** The pieces the extension holds of the scene, by number, as its own reply_write names them: the third tells what Mara can't know. */
+const PIECES: Readonly<Record<number, string>> = { 1: FIRST, 2: SECOND, 3: "Mara knows the keeper lies." };
 
 /** What the sample extension heard. */
 interface Heard {
@@ -45,11 +50,12 @@ interface Heard {
 
 /**
  * An extension that plays the harbour's chats itself, as LumiRPEngine does: its author is the main
- * agent of every chat it claims and releases the reply passage by passage, and Okoro is a character
- * the author hands the reply to. It keeps back a passage that says "[kept back]", and hears each
- * release, each agent's start, each call of its tool and each turn's end.
+ * agent of every chat it claims and releases the reply once, whole, and Okoro is a character the
+ * author may hand the reply to. With `own`, its claim gives reply_write its own arguments (the pieces
+ * it holds, by number), and its check answers with their text. It keeps back what tells what Mara
+ * can't know, and hears each release, each agent's start, each call of its tool and each turn's end.
  */
-function harbourPlay(): { options: BackendOptions; heard: Heard } {
+function harbourPlay(own = false): { options: BackendOptions; heard: Heard } {
   const heard: Heard = { ended: [], asked: [], released: [], models: [], tools: [] };
   const base = defaultSettings().agents.main as AgentDefinition;
   // A sub-agent is handed only tools its delegator holds (Settings' delegation grant), so the author holds the lamp log it lets Okoro read.
@@ -62,14 +68,16 @@ function harbourPlay(): { options: BackendOptions; heard: Heard } {
       extension: {
         name: "Harbour Play",
         definitions: async () => ({ agents: [author, okoro] }),
-        claim: async () => ({ mainAgent: "author", reply: "released" as const }),
+        claim: async () => ({ mainAgent: "author", reply: "released" as const, ...(own ? { replyTool: { description: "Release the reply: the pieces you name, in order.", parameters: { type: "object", properties: { pieces: { type: "array", items: { type: "integer" } } }, required: ["pieces"] } } } : {}) }),
         agentModel: async (ask) => {
           heard.models.push(ask);
           return null;
         },
         releasing: async (release) => {
           heard.asked.push(release);
-          return release.text.includes("[kept back]") ? { refused: KEPT_BACK } : null;
+          const named = Array.isArray(release.args.pieces) ? release.args.pieces.map((n) => PIECES[Number(n)] ?? "") : [release.text];
+          if (named.some((text) => text.includes("Mara knows"))) return { refused: KEPT_BACK };
+          return own ? { text: named.join("") } : null;
         },
         released: async (release) => void heard.released.push(release),
         runEnded: async (run) => void heard.ended.push(run),
@@ -86,14 +94,53 @@ function harbourPlay(): { options: BackendOptions; heard: Heard } {
 }
 
 describe("the reply a runtime streams", () => {
-  test("is two released pieces and a character's answer handed on, reaching Lumiverse as one reply, in order, each as it is released", async () => {
+  test("is one release: the text the extension's check gives for its own reply_write reaches Lumiverse whole, and released hears it; the release it kept back and a hand-on after it never go out", async () => {
+    const sample = harbourPlay(true);
+    const it = (r = await rig({ backend: sample.options }));
+    const chatId = await it.setUp();
+    const pieces: string[] = [];
+    const play = cast(
+      { name: "okoro", is: told(OKORO), lines: [] },
+      {
+        name: "author",
+        is: told(AUTHOR),
+        lines: [
+          { toolCalls: [toolCall("reply_write", { pieces: [1, 3] }, "w1")] },
+          { toolCalls: [toolCall("reply_write", { pieces: [1, 2] }, "w2")] },
+          { toolCalls: [toolCall("delegate", { agent: "okoro", task: "Mara asks who lit the lamp. Answer her.", as: "okoro", to_reply: true }, "d1")] },
+          "The scene rests with Mara.",
+        ],
+      },
+    );
+    it.host.script = play.script;
+
+    const out = await it.generate(chatId, { onPiece: (text) => void pieces.push(text) });
+
+    expect(out.error).toBeNull();
+    expect(out.finish).toBe("stop");
+    // One reply, in one piece: the two pieces the second call named, in its order. What was kept back, the hand-on and the author's last answer are no part of it.
+    expect(out.content).toBe(`${FIRST}${SECOND}`);
+    expect(pieces).toEqual([`${FIRST}${SECOND}`]);
+    // The author was told why the first call sent nothing, and that the hand-on came after the reply went out; Okoro was never started.
+    expect(JSON.stringify(play.calls("author")[1]?.messages ?? [])).toContain(KEPT_BACK);
+    expect(JSON.stringify(play.calls("author")[3]?.messages ?? [])).toContain("Not released");
+    expect(play.calls("okoro")).toHaveLength(0);
+    // Over the link, the check was asked with each call's arguments, and the extension heard the one release, with the text that went out and the call's arguments.
+    expect(sample.heard.asked.map((a) => [a.text, a.args])).toEqual([
+      ["", { pieces: [1, 3] }],
+      ["", { pieces: [1, 2] }],
+    ]);
+    await until(() => sample.heard.ended.length === 1, "the turn's end");
+    expect(sample.heard.released.map((a) => [a.text, a.args])).toEqual([[`${FIRST}${SECOND}`, { pieces: [1, 2] }]]);
+    expect(sample.heard.ended[0]).toMatchObject({ userId: USER, chatId, status: "done", reply: out.content });
+  });
+
+  test("is one release when a character's answer is handed on: it reaches Lumiverse piece by piece as he gives it, and a release after it is refused", async () => {
     const sample = harbourPlay();
     const it = (r = await rig({ backend: sample.options }));
     const chatId = await it.setUp();
     // A handed-on answer streams as it is generated: nothing of it is held back first.
     await it.page.request("lah.settings.set", { set: [{ path: ["core", "delegation", "replyHoldChars"], value: 0 }], reset: [] });
-    const FIRST = "The lamp room is cold. ";
-    const SECOND = "Okoro looks up from the log. ";
     const SAYS = ["“I lit it ", "at dusk, ", "as always.”"];
     const pieces: string[] = [];
     /** What had reached Lumiverse of the reply when Okoro was first asked. */
@@ -113,13 +160,7 @@ describe("the reply a runtime streams", () => {
       {
         name: "author",
         is: told(AUTHOR),
-        lines: [
-          { toolCalls: [toolCall("reply_write", { text: FIRST }, "w1")] },
-          { toolCalls: [toolCall("reply_write", { text: "Mara knows the keeper lies. [kept back]" }, "w2")] },
-          { toolCalls: [toolCall("reply_write", { text: SECOND }, "w3")] },
-          { toolCalls: [toolCall("delegate", { agent: "okoro", task: "Mara asks who lit the lamp. Answer her.", as: "okoro", to_reply: true }, "d1")] },
-          "The scene rests with Mara.",
-        ],
+        lines: [{ toolCalls: [toolCall("delegate", { agent: "okoro", task: "Mara asks who lit the lamp. Answer her.", as: "okoro", to_reply: true }, "d1")] }, { toolCalls: [toolCall("reply_write", { text: FIRST }, "w1")] }, "The scene rests with Mara."],
       },
     );
     it.host.script = play.script;
@@ -128,21 +169,18 @@ describe("the reply a runtime streams", () => {
 
     expect(out.error).toBeNull();
     expect(out.finish).toBe("stop");
-    // One reply: the first passage, the second, then Okoro's words, in that order. The passage the extension kept back and the author's last answer are no part of it.
-    expect(out.content).toBe(`${FIRST}${SECOND}${SAYS.join("")}`);
-    expect(pieces.join("")).toBe(out.content);
-    // Each passage went out as it was released: both had reached Lumiverse before Okoro was asked, and his answer came piece by piece as he gave it.
-    expect(seen.before).toBe(`${FIRST}${SECOND}`);
-    expect(pieces.slice(-SAYS.length)).toEqual(SAYS);
+    // One reply: Okoro's words, piece by piece as he gave them, and nothing before them. The author's later release is no part of it.
+    expect(seen.before).toBe("");
+    expect(out.content).toBe(SAYS.join(""));
+    expect(pieces).toEqual(SAYS);
     // The thinking block said what the agents were doing.
     expect(out.reasoning).toContain("delegate");
-
-    // The author was told why one passage didn't go, the extension was asked about each passage, and it heard each release in order, and the turn's end with the reply whole.
-    // Its third call is the first to hold the second passage's answer.
-    expect(JSON.stringify(play.calls("author")[2]?.messages ?? [])).toContain(KEPT_BACK);
-    expect(sample.heard.asked.map((a) => a.text)).toEqual([FIRST, "Mara knows the keeper lies. [kept back]", SECOND]);
+    // The author was told its release came after the reply went out, and the check was never asked about it.
+    expect(JSON.stringify(play.calls("author")[2]?.messages ?? [])).toContain("Not released");
+    expect(sample.heard.asked).toEqual([]);
+    // The extension heard the one release, Okoro's, which carries no call's arguments, and the turn's end with the reply whole.
     await until(() => sample.heard.ended.length === 1, "the turn's end");
-    expect(sample.heard.released.map((a) => a.text)).toEqual([FIRST, SECOND, SAYS.join("")]);
+    expect(sample.heard.released.map((a) => [a.agent.role, a.text, a.args])).toEqual([["okoro", SAYS.join(""), {}]]);
     expect(sample.heard.ended[0]).toMatchObject({ userId: USER, chatId, status: "done", reply: out.content });
 
     // Over the link, the extension's backend was asked which model each agent runs on, and its tool was told which character called it.
@@ -162,7 +200,7 @@ describe("the reply a runtime streams", () => {
     const pieces: string[] = [];
     const generating = it.generate(chatId, { signal: stop.signal, onPiece: (text) => void pieces.push(text) });
     await until(() => pieces.join("") === PASSAGE && play.calls("author").length === 2, "the passage to reach Lumiverse, and the author to work on");
-    // Lumiverse's own Stop, while the author works on the next passage.
+    // Lumiverse's own Stop, while the author works on after its release.
     stop.abort();
     const out = await generating;
 

@@ -553,7 +553,7 @@ export type LinkPush = ChunkPush | StopPush | SettingsPush | SecretPush | Connec
 /**
  * The members of what an extension supplies to the core (`HarnessExtension`), each a request over
  * the link (`extension.call`). What reads is asked again after a socket that closed under it; a hook
- * and `releasing` (a check before a passage goes out, which may do work in the extension) are sent
+ * and `releasing` (a check before the turn's reply goes out, which may do work in the extension) are sent
  * once, and a lost answer is the core's to take as none.
  */
 export type ExtensionMember = "definitions" | "claim" | "writerRequest" | "runBegan" | "agentModel" | "releasing" | "released" | "replyWritten" | "runEnded";

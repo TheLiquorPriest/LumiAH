@@ -113,3 +113,14 @@ export function timeoutPlace(path: readonly string[], title: string, owner: Sett
   const settings = owner.settingsAt ?? `${owner.name}'s Settings`;
   return `${title} (${settings} → Timeouts${group !== null ? ` → ${group.label}` : ""})`;
 }
+
+/**
+ * Where any setting is changed, for the words of a limit or a wait that name it: a wait the Timeouts
+ * page lists as `timeoutPlace` says it, any other as `<its name> (<owner's Settings> → <trail>)`,
+ * `trail` being the groups that lead to it on the Settings page ("The agent loop"; "Agents → Main
+ * agent → Budget"). `path` is its place from the settings' root.
+ */
+export function settingPlace(path: readonly string[], title: string, trail: readonly string[], owner: SettingsOwner): string {
+  if (timeoutGroupOf(path) !== null) return timeoutPlace(path, title, owner);
+  return `${title} (${[owner.settingsAt ?? `${owner.name}'s Settings`, ...trail].join(" → ")})`;
+}

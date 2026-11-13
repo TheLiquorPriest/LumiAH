@@ -455,7 +455,8 @@ describe("web_search", () => {
   test("keeps every result's address when the pages are long, the best result's page first", async () => {
     const { host, web } = shore();
     web.results = web.results.map((result, i): WebResult => ({ ...result, content: `Page ${i} begins. ${"The tide turns and turns again. ".repeat(900)}` }));
-    const rig = await toolRig(host, SOURCES);
+    // A page with room for two of the long pages, not three.
+    const rig = await toolRig(host, SOURCES, { settings: (s) => (s.tools.pageChars = 4000) });
     const out = await rig.run("web_search", { query: "spring tides", pages: true });
     expect(out.text.length).toBeLessThanOrEqual(rig.settings.tools.pageChars);
     for (const result of web.results) expect(out.text).toContain(result.url);

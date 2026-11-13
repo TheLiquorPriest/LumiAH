@@ -18,7 +18,7 @@ import { isHash, textHash } from "./hash";
 import type { FileAuthor, FileChange, HarnessHost, JsonObject, WorkspaceArea } from "./ports";
 import { isRecord } from "./ports";
 import { HarnessRefusal } from "./refusal";
-import { AGENT, type Settings } from "./settings";
+import { AGENT, type Settings, settingPlaceOf } from "./settings";
 import { hasOwn, parseJson } from "./util";
 
 // ---------------------------------------------------------------- what is stored
@@ -653,7 +653,8 @@ function invalid(field: string, message: string): HarnessRefusal {
 
 /**
  * What the page is told when the workspace refuses it, in words for the user. Each message is built
- * here and nowhere else; a limit is named as the Settings page titles it.
+ * here and nowhere else; a limit is named as the Settings page titles it, with where it is changed
+ * (`setting`, from `settingPlaceOf`).
  */
 const REFUSED = {
   field: (field: string, what: string) => new HarnessRefusal("bad_request", `A workspace request's ${field} must be ${what}.`),
@@ -662,20 +663,20 @@ const REFUSED = {
   outside: () => new HarnessRefusal("bad_request", "A path can't leave its area: “..” may climb within it, never out of it."),
   otherArea: () => new HarnessRefusal("bad_request", "In the chat's own area a path can't start with learned: learned/ is an area of its own."),
   noName: () => new HarnessRefusal("bad_request", "A file's path needs a name."),
-  longPath: (field: string, limit: number) => invalid(field, `A path may hold ${limit} characters at most (Path length).`),
+  longPath: (field: string, limit: number, setting: string) => invalid(field, `${setting} lets a path hold ${limit} characters at most.`),
   missing: (file: string) => new HarnessRefusal("not_found", `There is no file ${file}: it may have been moved or deleted since the page read it.`),
   noVersion: (file: string, kept: number) => new HarnessRefusal("not_found", `${file} has no such version among the ${kept} it keeps (Versions kept): it may have been dropped since the page listed them.`),
   gone: (file: string) => new HarnessRefusal("not_found", `The store no longer has the text of ${file}.`),
   exists: (file: string, hash: string) => new HarnessRefusal("conflict", `There is already a file ${file}, at version ${versionOf(hash)}.`),
   stale: (file: string, hash: string) => new HarnessRefusal("conflict", `${file} has changed since it was read: it is at version ${versionOf(hash)} now. Read it again, then make the change on that.`),
-  fileChars: (chars: number, limit: number) => invalid("text", `The text is ${chars} characters, and a file may hold ${limit} at most (File length).`),
-  files: (limit: number) => invalid("path", `The area already holds as many files as it may: ${limit} (Files per area).`),
-  areaChars: (chars: number, limit: number) => invalid("text", `With this the area's files would hold ${chars} characters together, and an area may hold ${limit} at most (Area size).`),
+  fileChars: (chars: number, limit: number, setting: string) => invalid("text", `The text is ${chars} characters, and ${setting} lets a file hold ${limit} at most.`),
+  files: (limit: number, setting: string) => invalid("path", `The area already holds as many files as ${setting} lets it: ${limit}.`),
+  areaChars: (chars: number, limit: number, setting: string) => invalid("text", `With this the area's files would hold ${chars} characters together, and ${setting} lets an area hold ${limit} at most.`),
   forbidden: (reason: string) => new HarnessRefusal("forbidden", reason),
 } as const;
 
-/** An area's refusal, as the page is told it. */
-function areaRefusal(area: WorkspaceArea, why: AreaRefusal): HarnessRefusal {
+/** An area's refusal, as the page is told it; `setting` names a workspace setting with where it is changed. */
+function areaRefusal(area: WorkspaceArea, why: AreaRefusal, setting: (key: keyof Settings["workspace"]) => string): HarnessRefusal {
   switch (why.code) {
     case "missing":
       return REFUSED.missing(showPath(area, why.path));
@@ -684,11 +685,11 @@ function areaRefusal(area: WorkspaceArea, why: AreaRefusal): HarnessRefusal {
     case "stale":
       return REFUSED.stale(showPath(area, why.path), why.version);
     case "file_chars":
-      return REFUSED.fileChars(why.chars, why.limit);
+      return REFUSED.fileChars(why.chars, why.limit, setting("fileChars"));
     case "files":
-      return REFUSED.files(why.limit);
+      return REFUSED.files(why.limit, setting("files"));
     case "area_chars":
-      return REFUSED.areaChars(why.chars, why.limit);
+      return REFUSED.areaChars(why.chars, why.limit, setting("areaChars"));
     case "refused":
       return REFUSED.forbidden(why.reason);
   }
@@ -701,8 +702,9 @@ function rowOf(path: string, entry: FileEntry): FileRow {
 /** What a request's `base` must be, for the page's refusal. */
 const A_VERSION = "the version the change was based on";
 
-/** The page's side of one view of the workspace. `limits` is read at each request. */
-export function pageWorkspace(view: WorkspaceView, limits: () => Settings["workspace"]): PageWorkspace {
+/** The page's side of one view of the workspace. `limits` is read at each request; `place` names a setting with where it is changed, for the words of a limit (`settingPlaceOf`). */
+export function pageWorkspace(view: WorkspaceView, limits: () => Settings["workspace"], place: (path: readonly string[]) => string = settingPlaceOf()): PageWorkspace {
+  const setting = (key: keyof Settings["workspace"]): string => place(["workspace", key]);
   /** A request comes from a page, so nothing in it is taken on trust: every value is checked before it is used. */
   type Asked = Readonly<Record<string, unknown>>;
   /** The area a request names, as the view holds it. */
@@ -721,7 +723,7 @@ export function pageWorkspace(view: WorkspaceView, limits: () => Settings["works
     const { pathChars } = limits();
     // Read from its area's root, as an agent would write it: one set of rules says what a path may be.
     const at = resolvePath(`${ROOT[kind]}${raw}`, pathChars);
-    if ("refused" in at) throw at.refused === "long" ? REFUSED.longPath(field, pathChars) : at.refused === "bad" ? REFUSED.badPath() : REFUSED.outside();
+    if ("refused" in at) throw at.refused === "long" ? REFUSED.longPath(field, pathChars, setting("pathChars")) : at.refused === "bad" ? REFUSED.badPath() : REFUSED.outside();
     if (at.area !== kind) throw REFUSED.otherArea();
     if (at.path === "") throw REFUSED.noName();
     return { kind, area, path: at.path, shown: showPath(kind, at.path) };
@@ -735,7 +737,7 @@ export function pageWorkspace(view: WorkspaceView, limits: () => Settings["works
   };
   /** The file a change left, as the page lists it; its refusal, thrown, when the area refused it. */
   const left = (at: { kind: WorkspaceArea; shown: string }, path: string, result: AreaResult): FileRow => {
-    if (!result.ok) throw areaRefusal(at.kind, result.why);
+    if (!result.ok) throw areaRefusal(at.kind, result.why, setting);
     if (!result.entry) throw REFUSED.missing(at.shown);
     return rowOf(path, result.entry);
   };
@@ -784,7 +786,7 @@ export function pageWorkspace(view: WorkspaceView, limits: () => Settings["works
       if (typeof input.base !== "string") throw REFUSED.field("base", A_VERSION);
       allowed(at.kind, at.path);
       const result = await at.area.remove({ path: at.path, base: input.base, by: view.author });
-      if (!result.ok) throw areaRefusal(at.kind, result.why);
+      if (!result.ok) throw areaRefusal(at.kind, result.why, setting);
       return { deleted: true };
     },
     async pin(input) {

@@ -1,8 +1,9 @@
 // Delegation (DESIGN §14): an agent hands a task to another, which works in a session of its own
 // and answers; the handle its answer names lives until the run ends, and `agent_message` goes on
 // with that agent under its own revision cap. An agent that may write the reply itself may hand it
-// on (`to_reply`): the sub-agent's answer then streams into the reply as it is written, and is the
-// call's result too.
+// on (`to_reply`): the sub-agent's answer is then the turn's reply, streaming as it is written, and
+// the call's result too. A turn's reply is released once, so it is handed on only while it is still
+// to be released.
 //
 // Every limit is a setting: how deep delegation goes, how many sub-agents work at once in a run,
 // how many a run may start, what a sub-agent may be given (never more than the agent that started
@@ -119,7 +120,7 @@ export class Delegator {
     const resolved = workers.some((d) => d.id === input.agent) ? run.resolve(input.agent) : undefined;
     if (!resolved) return run.definitions.without.has(input.agent) ? run.refusal(TEXT.agents.notOffered, { agent: clip(input.agent, settings.tools.lineChars) }) : run.refusal(TEXT.agents.noAgent, { agent: clip(input.agent, settings.tools.lineChars), agents: workers.map((d) => d.id).join(", ") });
     if (input.as !== undefined && input.as.length > settings.delegation.asChars) return run.refusal(TEXT.agents.asLong, { chars: String(input.as.length), limit: String(settings.delegation.asChars) });
-    // Only an agent that may write the reply hands it on, and only while the reply can take text: never while the writer or another agent's answer is at it.
+    // Only an agent that may write the reply hands it on, and only while the turn's one release is still to come: never once the reply went out, nor while the writer or another agent's answer is at it.
     const reply = input.toReply === true ? from.reply : undefined;
     if (input.toReply === true && !reply) return run.refusal(TEXT.agents.noReply);
     const shut = reply?.refused() ?? null;
@@ -170,7 +171,7 @@ export class Delegator {
         });
         const sent = lead === "" ? task : `${lead}\n\n${task}`;
         if (!reply || !hold) return this.answered(resolved.definition.id, agent.id, await agent.send(sent, ctx.signal));
-        // Asked again at the last moment, and the reply held in the same step: two agents' answers released at once would interleave.
+        // Asked again at the last moment, and the reply held in the same step: two agents' answers let in at once would both be the turn's one release.
         const late = reply.refused();
         if (late !== null) return { text: late, error: true };
         const letGo = reply.hold(run.ref(agent.id) ?? { agentId: agent.id, role: resolved.definition.id, ...(input.as !== undefined ? { as: input.as } : {}) });
@@ -205,11 +206,17 @@ export class Delegator {
     }
   }
 
-  /** What the delegating agent is told: the sub-agent's answer with its handle, or that it stopped short, why, and what it had last written. An answer cut at its length is told as one that stopped short: it isn't the whole of what the agent meant to say. */
+  /**
+   * What the delegating agent is told: the sub-agent's answer under a line that says whose it is and
+   * its handle, or that it stopped short, why, and what it had last written. The handle's line comes
+   * first, where a result clipped for its length keeps it: agent_message can't go on without it. An
+   * answer cut at its length is told as one that stopped short: it isn't the whole of what the agent
+   * meant to say.
+   */
   private answered(definition: string, handle: string, reply: AgentReply): ToolOutcome {
     const { texts } = this.run;
     const cut = reply.status === "answered" && cutShort(reply.finish);
-    if (reply.status === "answered" && !cut && reply.text.trim() !== "") return { text: texts.render(TEXT.agents.answer, { answer: reply.text, agent: definition, handle }) };
+    if (reply.status === "answered" && !cut && reply.text.trim() !== "") return { text: `${texts.render(TEXT.agents.from, { agent: definition, handle })}\n\n${reply.text}` };
     const reason = cut ? texts.render(TEXT.agents.cut) : (reply.reason ?? texts.render(TEXT.answer.replyEmpty));
     return { text: texts.render(TEXT.agents.stopped, { agent: definition, handle, reason, said: reply.text.trim() === "" ? "" : texts.render(TEXT.agents.stoppedSaid, { text: reply.text }) }), error: true };
   }

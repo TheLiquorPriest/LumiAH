@@ -12,7 +12,8 @@
 // under texts/, which this one gathers: `TEXT` names every id, `TEXT_DEFS` lists every text.
 
 import { isRecord } from "./ports";
-import { CURSOR_ARG as CURSOR, GROUP, stopText as stop, type TextDef, TOOL, toolArgId, toolId, toolTexts as tool, v, word } from "./text-def";
+import { settingPlaceOf } from "./settings";
+import { CURSOR_ARG as CURSOR, GROUP, SETTING_VAR, stopText as stop, type TextDef, TOOL, toolArgId, toolId, toolTexts as tool, v, word } from "./text-def";
 import { AGENTS_TEXT, AGENTS_TEXTS } from "./texts/agents";
 import { APPROVAL_TEXT, APPROVAL_TEXTS } from "./texts/approval";
 import { BOOK_TEXT, BOOK_TEXTS } from "./texts/book";
@@ -99,7 +100,7 @@ export const TEXT = {
     noDirection: "main.turn.directed.none",
     turnNewest: "main.turn.newest",
     noNewest: "main.turn.newest.none",
-    askReleases: "main.turn.ask.releases",
+    askRelease: "main.turn.ask.release_whole",
   },
   request: {
     message: "request.message",
@@ -169,10 +170,12 @@ export const TEXT = {
     replyFailed: "tool.answer.reply_failed",
     replyNoBrief: "tool.answer.reply_no_brief",
     replyEmpty: "tool.answer.reply_empty",
-    replyReleased: "tool.answer.reply_released",
-    released: "tool.answer.released",
+    replyReleased: "tool.answer.reply_after_release",
+    released: "tool.answer.released_whole",
     releaseWriter: "tool.answer.release_writer",
-    releaseHeld: "tool.answer.release_held",
+    releaseAgain: "tool.answer.release_again",
+    releaseLate: "tool.answer.release_late",
+    releaseFailed: "tool.answer.release_failed",
     releaseUnchecked: "tool.answer.release_unchecked",
     releaseEnded: "tool.answer.release_ended",
   },
@@ -256,7 +259,7 @@ const RUNTIME_TEXTS: TextDef[] = [
   { id: TEXT.runtime.scratchRead, group: RUNTIME, label: "scratch_read: what it does", note: "The description of the built-in tool that reads the rest of a clipped tool result.", text: "Read more of a tool result that came back clipped. Give the scratch handle the clipped result names and where to start; you get the next part.", vars: [] },
   { id: TEXT.runtime.scratchHandle, group: RUNTIME, label: "scratch_read: handle", note: "The description of scratch_read's handle argument.", text: "The scratch handle the clipped result names, such as s1.", vars: [] },
   { id: TEXT.runtime.scratchOffset, group: RUNTIME, label: "scratch_read: offset", note: "The description of scratch_read's offset argument.", text: "The character to start from; 0 is the start.", vars: [] },
-  { id: TEXT.runtime.scratchLength, group: RUNTIME, label: "scratch_read: length", note: "The description of scratch_read's length argument.", text: "How many characters to read, at most {{max}}.", vars: [v("max", "the most one read returns: Tool results clipped past, or the most any of the agent's tools gives whole, where that is more")] },
+  { id: TEXT.runtime.scratchLength, group: RUNTIME, label: "scratch_read: length", note: "The description of scratch_read's length argument.", text: "How many characters to read. One read gives at most as many as the clipped result says; left out, that many.", vars: [v("max", "the most one read gives of a result clipped at Tool results clipped past; a result a tool gives more of whole says its own")] },
   {
     id: TEXT.runtime.scratchPart,
     group: RUNTIME,
@@ -271,8 +274,9 @@ const RUNTIME_TEXTS: TextDef[] = [
     group: RUNTIME,
     label: "A clipped tool result",
     note: "Follows the part of a long tool result that reaches the model.",
-    text: "[Clipped: the first {{shown}} of {{total}} characters. The rest is in scratch {{handle}}; read it with scratch_read from offset {{shown}}.]",
-    vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("handle", "where the whole result waits", true)],
+    text: "[Clipped: the first {{shown}} of {{total}} characters; {{setting}} says where a result is clipped. The rest is in scratch {{handle}}: scratch_read gives it from offset {{shown}}, {{per}} characters a read at most.]",
+    vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("handle", "where the whole result waits", true), v("per", "the most characters one scratch_read gives of this result"), SETTING_VAR],
+    setting: ["loop", "clipChars"],
   },
   { id: TEXT.runtime.unknownTool, group: RUNTIME, label: "A tool that doesn't exist", note: "The result of a call to a tool the agent wasn't given.", text: "There's no tool {{name}}. The tools are: {{tools}}. Call one of those.", vars: [v("name", "the name the model called"), v("tools", "the agent's tools")] },
   { id: TEXT.runtime.toolFailed, group: RUNTIME, label: "A tool that failed", note: "The result of a tool call that failed.", text: "{{name}} failed: {{error}}", vars: [v("name", "the tool"), v("error", "why", true)] },
@@ -302,34 +306,34 @@ const RUNTIME_TEXTS: TextDef[] = [
   { id: TEXT.runtime.roundsSpent, group: RUNTIME, label: "Rounds spent", note: "Follows the tool results of an agent's last round.", text: "[That was your last round of tool calls. Answer now with what you have: a tool call in your next answer isn't run, and your work stops without an answer.]", vars: [] },
   { id: TEXT.runtime.notRun, group: RUNTIME, label: "A tool call that never began", note: "The result of a tool call its round's end overtook before it began: the turn was stopped or a time limit passed while the call still waited for its place among the calls at once, or for your word.", text: "Not run: {{reason}}, before this call of {{name}} began. Nothing of it was started.", vars: [v("name", "the tool"), v("reason", "what ended the round, as the agent's stop says it", true)] },
   { id: TEXT.runtime.oneEnding, group: RUNTIME, label: "A second call that would end the work", note: "The result of a call to a tool whose result ends the agent's work (write_reply), where an earlier call of the same answer already does: only that first one is run.", text: "Not run: one answer may make one call that ends your work, and this answer's earlier call of {{first}} is that one. It stands, with what it was given. If its result says it failed, call {{name}} again in your next answer.", vars: [v("name", "the tool whose call wasn't run", true), v("first", "the tool whose earlier call stands")] },
-  { id: TEXT.runtime.clippedLost, group: RUNTIME, label: "A clipped tool result whose rest couldn't be kept", note: "Follows the part of a long tool result that reaches the model when the whole couldn't be stored for scratch_read.", text: "[Clipped: the first {{shown}} of {{total}} characters. The rest couldn't be kept ({{error}}), so scratch_read can't give it. Call the tool again and ask for less at a time.]", vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("error", "why the whole couldn't be stored")] },
+  { id: TEXT.runtime.clippedLost, group: RUNTIME, label: "A clipped tool result whose rest couldn't be kept", note: "Follows the part of a long tool result that reaches the model when the whole couldn't be stored for scratch_read.", text: "[Clipped: the first {{shown}} of {{total}} characters; {{setting}} says where a result is clipped. The rest couldn't be kept ({{error}}), so scratch_read can't give it. Call the tool again and ask for less at a time.]", vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("error", "why the whole couldn't be stored"), SETTING_VAR], setting: ["loop", "clipChars"] },
   { id: TEXT.runtime.scratchLost, group: RUNTIME, label: "scratch_read: the result is no longer stored", note: "scratch_read's answer to a handle whose whole result is gone from storage.", text: "Scratch {{handle}} is no longer stored, so it can't be read. Call the tool that gave it again for what you need.", vars: [v("handle", "the handle asked for")] },
   {
     id: TEXT.runtime.windowCut,
     group: RUNTIME,
     label: "A tool result cut to the room left",
     note: "Follows the part of a tool result that reaches the model when the whole would take the agent's next call past Prompt per call.",
-    text: "[Cut to fit: your prompt has room for only the first {{shown}} of {{total}} characters of this result (Prompt per call). The rest is in scratch {{handle}}; scratch_read gives it from offset {{shown}}, as much as your prompt still has room for. Once there is no room left, answer with what you have.]",
-    vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("handle", "where the whole result waits", true)],
+    text: "[Cut to fit: your prompt has room for only the first {{shown}} of {{total}} characters of this result, under {{setting}}. The rest is in scratch {{handle}}; scratch_read gives it from offset {{shown}}, as much as your prompt still has room for. Once there is no room left, answer with what you have.]",
+    vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("handle", "where the whole result waits", true), { ...SETTING_VAR, text: "Prompt per call, the agent's, and where it is changed" }],
   },
-  { id: TEXT.runtime.scratchFull, group: RUNTIME, label: "scratch_read: no room left", note: "scratch_read's answer when the agent's prompt has no room left for any more of a result (Prompt per call).", text: "Your prompt has no room left for more of scratch {{handle}} (Prompt per call). Answer with what you have.", vars: [v("handle", "the handle asked for", true)] },
+  { id: TEXT.runtime.scratchFull, group: RUNTIME, label: "scratch_read: no room left", note: "scratch_read's answer when the agent's prompt has no room left for any more of a result (Prompt per call).", text: "Your prompt has no room left for more of scratch {{handle}}, under {{setting}}. Answer with what you have.", vars: [v("handle", "the handle asked for", true), { ...SETTING_VAR, text: "Prompt per call, the agent's, and where it is changed" }] },
 ];
 
 const STOP_TEXTS: TextDef[] = [
   stop(TEXT.stop.cancelled, "Cancelled", "The agent was cancelled: the turn was stopped, or whoever started it stopped it.", "the agent was cancelled"),
   stop(TEXT.stop.busy, "Still working", "A message sent while the agent still works on its last one.", "the agent is still working on its last message"),
   stop(TEXT.stop.revisions, "Out of revisions", "A message after its first answer, once it has had every revision its budget allows (Revisions).", "it has had the {{revisions}} it may have after its first answer (Revisions)", [v("revisions", 'the revisions it may have, with the word: "2 revisions"', true)]),
-  stop(TEXT.stop.wallTime, "Out of time", "The agent's own time ran out (Time per agent).", "the agent's time ran out (Time per agent)"),
-  stop(TEXT.stop.turnTime, "The turn out of time", "The turn's time ran out (Time per turn).", "the turn's time ran out (Time per turn)"),
+  stop(TEXT.stop.wallTime, "Out of time", "The agent's own time ran out (Time per agent).", "the agent has worked all the time {{setting}} allows", [{ ...SETTING_VAR, text: "Time per agent, the agent's, and where it is changed" }]),
+  { ...stop(TEXT.stop.turnTime, "The turn out of time", "The turn's time ran out (Time per turn).", "the turn's agents have worked all the time {{setting}} allows", [SETTING_VAR]), setting: ["turn", "wallMs"] },
   stop(TEXT.stop.callTime, "A call too slow", "One call took longer than Time per call.", "the call took longer than Time per call"),
-  stop(TEXT.stop.callTokensIn, "A prompt too long", "A call whose prompt, as estimated, is past Prompt per call.", "the call's prompt, about {{tokens}}, is past Prompt per call ({{limit}})", [v("tokens", 'the prompt\'s estimate, with the word: "9000 tokens"', true), v("limit", "Prompt per call", true)]),
+  stop(TEXT.stop.callTokensIn, "A prompt too long", "A call whose prompt, as estimated, is past Prompt per call.", "the call's prompt, about {{tokens}}, is past the {{limit}} tokens {{setting}} allows", [v("tokens", 'the prompt\'s estimate, with the word: "9000 tokens"', true), v("limit", "Prompt per call", true), { ...SETTING_VAR, text: "Prompt per call, the agent's, and where it is changed" }]),
   stop(TEXT.stop.tokensIn, "The agent's prompt tokens spent", "A call that would take the agent's prompt tokens past Prompt tokens per agent.", "the call would take the agent's prompt tokens past Prompt tokens per agent: counted as {{counted}} of the {{limit}} allowed (a cached re-read counts as {{weight}} of a token)", [v("counted", "the prompt tokens with this call, as the limit counts them"), v("weight", "What a cached re-read counts as"), v("limit", "Prompt tokens per agent", true)]),
   stop(TEXT.stop.tokensOut, "The agent's answer tokens spent", "The agent has written all Answer tokens per agent allows.", "the agent has written its {{tokens}} (Answer tokens per agent)", [v("tokens", 'Answer tokens per agent, with the word: "4000 tokens"', true)]),
-  stop(TEXT.stop.turnTokensIn, "The turn's prompt tokens spent", "A call that would take the turn's prompt tokens past Prompt tokens per turn.", "the call would take the turn's prompt tokens past Prompt tokens per turn: counted as {{counted}} of the {{limit}} allowed (a cached re-read counts as {{weight}} of a token)", [v("counted", "the prompt tokens with this call, as the limit counts them"), v("weight", "What a cached re-read counts as"), v("limit", "Prompt tokens per turn", true)]),
-  stop(TEXT.stop.turnTokensOut, "The turn's answer tokens spent", "The turn's agents have written all Answer tokens per turn allows.", "the turn's agents have written its {{tokens}} (Answer tokens per turn)", [v("tokens", 'Answer tokens per turn, with the word: "20000 tokens"', true)]),
-  stop(TEXT.stop.loop, "The loop detector", "The agent called one tool with the same arguments, and got the same result, as many times in a row as the loop detector allows.", "the agent called {{tool}} with the same arguments {{times}} in a row and got the same result each time (Loop detector)", [v("tool", "the tool's name", true), v("times", 'how many times, with the word: "3 times"', true)]),
-  stop(TEXT.stop.toolTurns, "The agent's tool rounds spent", "The agent has had every round of tool calls Tool rounds per agent allows.", "the agent has had its {{rounds}} of tool calls (Tool rounds per agent)", [v("rounds", 'Tool rounds per agent, with the word: "8 rounds"', true)]),
-  stop(TEXT.stop.turnToolTurns, "The turn's tool rounds spent", "The turn's agents have had every round of tool calls Tool rounds per turn allows.", "the turn's agents have had its {{rounds}} of tool calls (Tool rounds per turn)", [v("rounds", 'Tool rounds per turn, with the word: "40 rounds"', true)]),
+  { ...stop(TEXT.stop.turnTokensIn, "The turn's prompt tokens spent", "A call that would take the turn's prompt tokens past Prompt tokens per turn.", "the call would take the turn's prompt tokens past {{setting}}: counted as {{counted}} of the {{limit}} allowed (a cached re-read counts as {{weight}} of a token)", [v("counted", "the prompt tokens with this call, as the limit counts them"), v("weight", "What a cached re-read counts as"), v("limit", "Prompt tokens per turn", true), SETTING_VAR]), setting: ["turn", "tokensIn"] },
+  { ...stop(TEXT.stop.turnTokensOut, "The turn's answer tokens spent", "The turn's agents have written all Answer tokens per turn allows.", "the turn's agents have written its {{tokens}}, all that {{setting}} allows", [v("tokens", 'Answer tokens per turn, with the word: "20000 tokens"', true), SETTING_VAR]), setting: ["turn", "tokensOut"] },
+  { ...stop(TEXT.stop.loop, "The loop detector", "The agent called one tool with the same arguments, and got the same result, as many times in a row as the loop detector allows.", "the agent called {{tool}} with the same arguments {{times}} in a row and got the same result each time, as many as {{setting}} allows", [v("tool", "the tool's name", true), v("times", 'how many times, with the word: "3 times"', true), SETTING_VAR]), setting: ["loop", "repeats"] },
+  stop(TEXT.stop.toolTurns, "The agent's tool rounds spent", "The agent has had every round of tool calls Tool rounds per agent allows.", "the agent has had its {{rounds}} of tool calls, all that {{setting}} allows", [v("rounds", 'Tool rounds per agent, with the word: "8 rounds"', true), { ...SETTING_VAR, text: "Tool rounds per agent, the agent's, and where it is changed" }]),
+  { ...stop(TEXT.stop.turnToolTurns, "The turn's tool rounds spent", "The turn's agents have had every round of tool calls Tool rounds per turn allows.", "the turn's agents have had its {{rounds}} of tool calls, all that {{setting}} allows", [v("rounds", 'Tool rounds per turn, with the word: "40 rounds"', true), SETTING_VAR]), setting: ["turn", "toolTurns"] },
   stop(TEXT.stop.failed, "A call failed", "A call that failed: the provider's error, as it gave it; words of your own may go around it.", "{{error}}", [v("error", "the error, as the provider gave it", true)]),
   stop(TEXT.stop.throttle, "Past a connection's throttle", "A call that needs more tokens than its connection's throttle lets through in a minute.", "the call needs {{tokens}}, more than this connection's throttle lets through in a minute ({{limit}})", [v("tokens", 'the tokens the call needs, with the word: "9000 tokens"', true), v("limit", "the tokens the throttle lets through in a minute", true)]),
   stop(TEXT.stop.connectionUnread, "A connection that couldn't be read", "The runtime couldn't read its connections to find the agent's.", "the connection {{connection}} couldn't be read ({{error}})", [v("connection", "the connection's id; empty for the default connection"), v("error", "why", true)]),
@@ -409,7 +413,7 @@ const MAIN_TEXTS: TextDef[] = [
     vars: [v("kind", "why a reply is needed, in the words above", true), v("notes", "what changed about its notes since its last turn, each ending in a blank line; nothing when there is none of it. Required: a summary of its notes reaches the agent only here when no later turn follows it", true), v("message", "the user's newest message, framed as a message of the request is, or that there is none", true), v("ask", "what to do, in the words above", true)],
   },
   { id: TEXT.main.noNewest, group: MAIN, label: "No newest message", note: "Fills {{message}} where the request holds no message from the user.", text: "The request holds no message from the user: carry the story on from where it stands.", vars: [] },
-  { id: TEXT.main.askReleases, group: MAIN, label: "What to do: release the reply", note: "Fills {{ask}} in a chat whose reply is only what its agents release: no writer writes it.", text: "Work out what this reply needs, then release it with reply_write, a passage at a time, or hand it to an agent with delegate and to_reply. Nothing else reaches the user.", vars: [] },
+  { id: TEXT.main.askRelease, group: MAIN, label: "What to do: release the reply", note: "Fills {{ask}} in a chat whose reply is only what its agents release: no writer writes it. A turn's reply is released once, whole.", text: "Work out everything this reply needs, then release it once, whole: with one reply_write call, or by handing it to one agent with delegate and to_reply. A turn's reply is released once and nothing can follow it, so never release part of it. Nothing else reaches the user.", vars: [] },
 ];
 
 const REQUEST_TEXTS: TextDef[] = [
@@ -468,7 +472,7 @@ const TOOL_TEXTS: TextDef[] = [
   ...tool(TOOL.presetInstructions, "List the active preset's instruction blocks in order, those switched off marked: what the preset's author tells the model, as written in the preset, before Lumiverse fills in its macros. Give block to read one whole.", { block: "A block's id or name, to read that block whole.", cursor: CURSOR }),
   ...tool(TOOL.pastTurn, "Read or search an earlier turn of yours in full: every tool call you made with what came back, and your brief, where your notes keep only a receipt. Without arguments it lists your turns. Give reply to list that turn's steps; add step to read one whole; give grep to find the lines that hold some text, in that turn or, without reply, in your latest turns.", { reply: "The reply's number in the chat, as your receipts name it (reply #12).", step: "Which of the turn's steps to read whole, by its number in the turn's list.", grep: "Text to find, in any letter case: every line that holds it, with its reply, step and line.", cursor: CURSOR }),
   ...tool(TOOL.writeReply, "Hand the writer your brief and have it write the reply, which goes to the user. This ends your turn: call it once, when you have what the reply needs, and call nothing else beside it.", { brief: "What the writer needs that the prompt doesn't already give it: facts to keep straight, lore that bears on this moment, the thread to pick up. Short and specific; no prose for the reply itself." }),
-  ...tool(TOOL.replyWrite, "Release a passage of the reply: it streams to the user at once, after what was released before. Call it again for the next passage; the reply is everything released, in order. Released text can't be taken back. Your turn ends when you answer.", { text: "The passage, exactly as the user should read it." }),
+  ...tool(TOOL.replyWrite, "Release this turn's reply: it streams to the user at once. A turn's reply is released once, whole: call this once, when the whole reply is ready, never for part of it, since nothing more can go into the reply after it. Released text can't be taken back. Your turn ends when you answer.", { text: "The whole reply, exactly as the user should read it." }),
 ];
 
 const ANSWER_TEXTS: TextDef[] = [
@@ -504,11 +508,13 @@ const ANSWER_TEXTS: TextDef[] = [
   { id: TEXT.answer.replyFailed, group: ANSWERS, label: "write_reply: the writer failed", note: "write_reply's answer when the writer's call failed before any of the reply was sent.", text: "The writer couldn't write the reply: {{reason}}. Nothing was sent to the user. Call write_reply again to try once more.", vars: [v("reason", "why", true)] },
   { id: TEXT.answer.replyNoBrief, group: ANSWERS, label: "write_reply: no brief", note: "write_reply's answer to a call without a brief.", text: "write_reply needs brief: what the writer needs that the prompt doesn't already give it. When the prompt holds everything, say that in a line. Call write_reply again with brief.", vars: [] },
   { id: TEXT.answer.replyEmpty, group: ANSWERS, label: "write_reply: an empty reply", note: "Fills {{reason}} in The writer failed, and the turn's error, when the writer's model answered with nothing.", text: "its model answered with nothing", vars: [] },
-  { id: TEXT.answer.replyReleased, group: ANSWERS, label: "write_reply: the reply was released already", note: "write_reply's answer once part of the reply was released with reply_write: no writer writes after it.", text: "Not handed to the writer: you released part of this reply with reply_write, so the reply is yours to finish. Go on with reply_write, or end your turn.", vars: [] },
-  { id: TEXT.answer.released, group: ANSWERS, label: "reply_write: released", note: "reply_write's answer once its passage reached the user.", text: "Released: {{chars}} characters reached the user. The reply holds {{total}} characters now. Release the next passage, or end your turn.", vars: [v("chars", "the passage's length", true), v("total", "the reply's length so far")] },
+  { id: TEXT.answer.replyReleased, group: ANSWERS, label: "write_reply: the reply was released already", note: "write_reply's answer once the turn's reply was released with reply_write, or while an agent's answer goes out as it (delegate with to_reply): no writer writes after it.", text: "Not handed to the writer: this turn's reply went out already, or is going out now as another agent's answer, and a turn's reply is written once. Nothing more goes into it: finish your turn.", vars: [] },
+  { id: TEXT.answer.released, group: ANSWERS, label: "reply_write: released", note: "reply_write's answer once the turn's reply reached the user. A turn's reply is released once, whole.", text: "Released: the reply, {{chars}} characters, reached the user. A turn's reply is released once, so nothing more goes into it. Finish your turn: call what else you still need, then answer.", vars: [v("chars", "the reply's length", true)] },
   { id: TEXT.answer.releaseWriter, group: ANSWERS, label: "reply_write: the writer has the reply", note: "The answer of reply_write, and of delegate with to_reply, once the writer is writing the reply or has written it.", text: "Not released: the writer is writing this reply, or has written it, so nothing more can go into it.", vars: [] },
-  { id: TEXT.answer.releaseHeld, group: ANSWERS, label: "reply_write: another agent's answer is streaming", note: "The answer of reply_write, and of delegate with to_reply, while a sub-agent's answer streams into the reply.", text: "Not released: another agent's answer is streaming into the reply now. Wait for that call to end, then release yours.", vars: [] },
-  { id: TEXT.answer.releaseUnchecked, group: ANSWERS, label: "reply_write: the extension didn't say", note: "reply_write's answer when the extension that checks each passage gave no word on it in time, or gave one that isn't a word: nothing goes out unchecked.", text: "Not released: the check on each passage didn't answer, so nothing was sent. Try again.", vars: [] },
+  { id: TEXT.answer.releaseAgain, group: ANSWERS, label: "reply_write and to_reply: the reply was released already", note: "The answer of reply_write, and of delegate with to_reply, once the turn's reply went out, or while another agent's answer goes out as it: a turn's reply is released once, whole.", text: "Not released: this turn's reply went out already, or is going out now as another agent's answer, and a turn's reply is written once, whole. Nothing more goes into it: finish your turn.", vars: [] },
+  { id: TEXT.answer.releaseLate, group: ANSWERS, label: "reply_write: the extension didn't answer in time", note: "reply_write's answer when the extension that checks the reply gave no word on it within Wait for the extension: nothing goes out unchecked, and the reply is still to be released.", text: "Not released: {{extension}} gave no word on the reply within {{wait}} ({{setting}}), so nothing was sent and the reply is still yours to release. Try again.", vars: [v("extension", "the extension's name"), v("wait", 'how long it was waited for: "10 seconds"'), v("setting", "Wait for the extension, with where it is changed", true)] },
+  { id: TEXT.answer.releaseFailed, group: ANSWERS, label: "reply_write: the extension's check failed", note: "reply_write's answer when asking the extension that checks the reply failed: nothing goes out unchecked, and the reply is still to be released.", text: "Not released: {{extension}}'s check on the reply failed ({{error}}), so nothing was sent and the reply is still yours to release. Try again.", vars: [v("extension", "the extension's name"), v("error", "why it failed", true)] },
+  { id: TEXT.answer.releaseUnchecked, group: ANSWERS, label: "reply_write: the extension gave no text", note: "reply_write's answer when the extension that checks the reply answered with neither a reason to keep it back nor a text that can go out (where the chat's reply_write is the extension's own, only a text lets anything go): nothing goes out, and the reply is still to be released.", text: "Not released: {{extension}} gave neither the reply's text nor a reason to keep it back, so nothing was sent and the reply is still yours to release. Try again.", vars: [v("extension", "the extension's name")] },
   { id: TEXT.answer.releaseEnded, group: ANSWERS, label: "reply_write: the reply has ended", note: "The answer of reply_write, and of delegate with to_reply, once the turn's reply has ended or the turn was stopped.", text: "Not released: this reply has ended.", vars: [] },
 ];
 
@@ -616,19 +622,22 @@ function defOf(id: string): TextDef {
 
 /** The shipped text for `id`, filled: for logs, which never read the user's texts. */
 export function renderDefault(id: string, vars: Readonly<Record<string, string>> = {}): string {
-  const def = defOf(id);
-  return fill(def, def.text, vars);
+  return new Texts().render(id, vars);
 }
 
 /**
  * The texts as one user has them: each is their own where they replaced it and it can be sent
  * (`checkText`), else the shipped one. Made once per turn from the user's texts as stored, so a text
- * replaced takes effect on the next turn.
+ * replaced takes effect on the next turn. `place` says where a setting is changed (`settingPlaceOf`):
+ * a text that tells of a limit names its setting with it.
  */
 export class Texts {
   private readonly own: ReadonlyMap<string, string>;
 
-  constructor(own: Readonly<Record<string, string>> = {}) {
+  constructor(
+    own: Readonly<Record<string, string>> = {},
+    private readonly place: (path: readonly string[]) => string = settingPlaceOf(),
+  ) {
     const kept = new Map<string, string>();
     for (const [id, text] of Object.entries(own)) if (typeof text === "string" && checkText(id, text) === null) kept.set(id, text);
     this.own = kept;
@@ -639,9 +648,15 @@ export class Texts {
     return this.own.get(id) ?? defOf(id).text;
   }
 
-  /** The text for `id`, filled. */
+  /** The text for `id`, filled; a text that tells of a limit names its setting and where it is changed, where `vars` don't name it. */
   render(id: string, vars: Readonly<Record<string, string>> = {}): string {
-    return fill(defOf(id), this.text(id), vars);
+    const def = defOf(id);
+    return fill(def, this.text(id), def.setting !== undefined && !hasOwn(vars, SETTING_VAR.name) ? { ...vars, [SETTING_VAR.name]: this.place(def.setting) } : vars);
+  }
+
+  /** The setting at `path` (its place in the core's settings), named with where it is changed: what fills `{{setting}}`. */
+  setting(path: readonly string[]): string {
+    return this.place(path);
   }
 
   /** A noun in the number a count takes, from its word text (`TEXT.word`): the word for one, else the word for several. A text with one form is used for both. */
@@ -661,9 +676,9 @@ export class Texts {
   }
 }
 
-/** The user's texts as stored (an object of texts by id), read: anything that isn't one is left out. */
-export function textsOf(own: unknown): Texts {
+/** The user's texts as stored (an object of texts by id), read: anything that isn't one is left out. `place`: where a setting is changed, as `Texts` takes it. */
+export function textsOf(own: unknown, place?: (path: readonly string[]) => string): Texts {
   const texts: Record<string, string> = {};
   if (isRecord(own)) for (const [id, text] of Object.entries(own)) if (typeof text === "string") texts[id] = text;
-  return new Texts(texts);
+  return new Texts(texts, place);
 }

@@ -8,6 +8,7 @@
 // environment (`ToolEnv`).
 
 import type { ActivatedLore, AgentRef, ChatMessage, FileChange, HarnessHost, JobDue, JobLane, JobView, JobWhen, JsonObject, LoreBook, LoreEntry, PathMessage, RunKind, ToolTier, TurnRequest } from "./ports";
+import type { ReplyTool } from "./extension";
 import type { LoreChange } from "./recall/shapes";
 import type { Book } from "./book";
 import type { LexicalIndex } from "./lexical";
@@ -29,27 +30,29 @@ export interface ToolCtx {
 
 /**
  * The reply as a turn lets its agents write it themselves (`reply_write`, and `delegate`'s
- * `to_reply`), in place of a writer: what they release streams to the user in the order released,
- * and the reply is all of it.
+ * `to_reply`), in place of a writer: released once, whole, it streams to the user, and the reply is
+ * all of it.
  *
+ * - `tool`: `reply_write` as the extension that claims the chat offers it (`ChatClaim.replyTool`,
+ *   checked); null for the core's own, which takes the reply's text.
  * - `refused`: why nothing can be released now, in words for the model (the turn has ended; the
- *   writer is at work on it; another agent's answer is streaming into it); null where something
- *   can.
- * - `write`: one passage from the agent `ctx` names, once the extension lets it go (§21
- *   `releasing`), in the order the calls came: null once it went out, else why not. The extension
- *   is told of what went out (`released`).
+ *   writer is at work on it; the turn's reply went out already, or is going out as another agent's
+ *   answer); null where it can.
+ * - `write`: one `reply_write` call from the agent `ctx` names, with its arguments, once the
+ *   extension lets it go (§21 `releasing`, which gives the text where the tool is the extension's),
+ *   in the order the calls came: the text that went out, else why nothing did. The extension is told
+ *   of what went out (`released`).
  * - `hold`: the reply held for one sub-agent's answer as it streams (`agent`), never asked about,
  *   so `refused` says so to every other agent meanwhile; `stream` appends what it brings (false
  *   where it went nowhere: the turn was stopped). What `hold` gives back lets the reply go, with
  *   all the stream released, which the extension is told of.
  */
 export interface ReplyStream {
+  tool: ReplyTool | null;
   refused(): string | null;
-  write(text: string, ctx: ToolCtx): Promise<string | null>;
+  write(args: JsonObject, ctx: ToolCtx): Promise<{ released: string } | { refused: string }>;
   hold(agent: AgentRef): (released: string) => void;
   stream(text: string): boolean;
-  /** The reply's length so far, in characters. */
-  length(): number;
 }
 
 /**

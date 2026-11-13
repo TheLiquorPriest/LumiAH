@@ -13,8 +13,9 @@ import { describe, expect, test } from "bun:test";
 import { type AgentDeps, type AgentSpec, type AgentTrace, AgentTurn, type ApprovalGate, startAgent } from "../../src/core/loop";
 import type { AgentStarted, ApprovalAnswer, ApprovalAsk, FileChange, JsonObject, ModelMessage, ModelRequest, TranscriptEntry } from "../../src/core/ports";
 import { AgentAccounts, AgentStop } from "../../src/core/provider";
-import { defaultSettings, type Settings } from "../../src/core/settings";
+import { defaultSettings, type Settings, settingPlaceOf } from "../../src/core/settings";
 import { SCRATCH_READ, TEXT, Texts } from "../../src/core/texts";
+import { settingPlace } from "../../src/shared/timeouts";
 import type { AgentTool } from "../../src/core/tools";
 import { call, idle, MAIN, MemoryHost, type Script, settle, until, WRITER } from "./support/host";
 
@@ -33,12 +34,12 @@ function tool(name: string, answer: (args: JsonObject) => string | Promise<strin
   };
 }
 
-function rig(script: Script, change: (s: Settings) => void = () => undefined, options: { texts?: Record<string, string>; turn?: (s: Settings, host: MemoryHost) => AgentTurn; approval?: ApprovalGate } = {}) {
+function rig(script: Script, change: (s: Settings) => void = () => undefined, options: { texts?: Record<string, string>; turn?: (s: Settings, host: MemoryHost) => AgentTurn; approval?: ApprovalGate; place?: (path: readonly string[]) => string } = {}) {
   const host = new MemoryHost();
   host.script = script;
   const settings = defaultSettings();
   change(settings);
-  const deps: AgentDeps = { host, settings, texts: new Texts(options.texts ?? {}), accounts: new AgentAccounts(host), turn: options.turn?.(settings, host) ?? null, ...(options.approval ? { approval: options.approval } : {}) };
+  const deps: AgentDeps = { host, settings, texts: new Texts(options.texts ?? {}, options.place), accounts: new AgentAccounts(host), turn: options.turn?.(settings, host) ?? null, ...(options.approval ? { approval: options.approval } : {}) };
   const budget = { ...defaultSettings().agents.main!.budget };
   const spec = (over: Partial<AgentSpec> = {}): AgentSpec => ({ role: "main", connectionId: MAIN, model: null, effort: "medium", system: "You look things up.", prefix: [], tools: [], budget, ...over });
   return { host, deps, settings, spec, start: (over: Partial<AgentSpec> = {}) => startAgent(spec(over), deps) };
@@ -187,7 +188,7 @@ describe("the loop detector", () => {
     const again = { toolCalls: [call("lookup", { q: "same" })] };
     const r = rig([again, again, again, "never reached"]);
     const reply = await r.start({ tools: [lookup] }).send("go");
-    expect(reply).toMatchObject({ status: "stopped", code: "loop", reason: "the agent called lookup with the same arguments 3 times in a row and got the same result each time (Loop detector)" });
+    expect(reply).toMatchObject({ status: "stopped", code: "loop", reason: "the agent called lookup with the same arguments 3 times in a row and got the same result each time, as many as Loop detector (Settings → The agent loop) allows" });
     // The detector reads each call's result, so the third is run before the agent stops; no fourth call of the model is made.
     expect(lookup.runs).toHaveLength(3);
     expect(r.host.calls).toHaveLength(3);
@@ -217,7 +218,7 @@ describe("budgets", () => {
   test("Tool rounds per agent stops an agent that keeps calling tools", async () => {
     const r = rig(looping(10));
     const reply = await r.start({ tools: [tool("lookup")], budget: { ...r.spec().budget, toolTurns: 2 } }).send("go");
-    expect(reply).toMatchObject({ status: "refused", code: "tool_turns", reason: "the agent has had its 2 rounds of tool calls (Tool rounds per agent)" });
+    expect(reply).toMatchObject({ status: "refused", code: "tool_turns", reason: "the agent has had its 2 rounds of tool calls, all that Tool rounds per agent (Settings → Agents → Main agent → Budget) allows" });
     expect(r.host.calls).toHaveLength(3);
     expect(reply.usage.toolTurns).toBe(2);
   });
@@ -276,7 +277,7 @@ describe("budgets", () => {
     const second = await r.start({ tools: [tool("lookup")] }).send("go");
     expect(r.host.calls).toHaveLength(3);
     expect(second).toMatchObject({ status: "refused", code: "turn_tokens_in" });
-    expect(second.reason).toMatch(/^the call would take the turn's prompt tokens past Prompt tokens per turn: counted as (5[7-9]|6\d)\d\d of the 5000 allowed \(a cached re-read counts as 0\.1 of a token\)$/);
+    expect(second.reason).toMatch(/^the call would take the turn's prompt tokens past Prompt tokens per turn \(Settings → The turn\): counted as (5[7-9]|6\d)\d\d of the 5000 allowed \(a cached re-read counts as 0\.1 of a token\)$/);
     expect(r.deps.turn?.usage).toMatchObject({ in: 30_000, cachedIn: 27_000 });
   });
 
@@ -352,7 +353,7 @@ describe("clipping and scratch_read", () => {
     const clipped = lastMessage(r.host.calls[1])?.parts?.[0];
     const text = clipped?.type === "tool_result" ? clipped.content : "";
     expect(text.startsWith(long.slice(0, 6000))).toBe(true);
-    expect(text).toContain(`[Clipped: the first 6000 of ${long.length} characters. The rest is in scratch s1; read it with scratch_read from offset 6000.]`);
+    expect(text).toContain(`[Clipped: the first 6000 of ${long.length} characters; Tool results clipped past (Settings → The agent loop) says where a result is clipped. The rest is in scratch s1: scratch_read gives it from offset 6000, 6000 characters a read at most.]`);
     const rest = lastMessage(r.host.calls[2])?.parts?.[0];
     expect(rest?.type === "tool_result" ? rest.content : "").toBe(`[Scratch s1, characters 6000 to ${long.length} of ${long.length}.]\n${long.slice(6000)}`);
     const missing = lastMessage(r.host.calls[3])?.parts?.[0];
@@ -368,22 +369,27 @@ describe("clipping and scratch_read", () => {
     expect((part?.type === "tool_result" ? part.content : "").split("\n")[0]).toBe("a".repeat(299));
   });
 
-  test("a tool that names the length it gives whole is given it whole up to there and clipped past it; one that names none is clipped at the setting as before", async () => {
+  test("a tool that names the length it gives whole is given it whole up to there and clipped past it; one that names none is clipped at the setting as before; each clip says what one scratch_read gives of it, and that is what it gives", async () => {
     const reading = { ...tool("reading", (a) => (a.q === "short" ? "r".repeat(15_000) : `${"r".repeat(20_000)}TAIL${"t".repeat(4996)}`)), wholeChars: 20_000 };
-    const lookup = tool("lookup", () => "l".repeat(15_000));
-    const script: Script = [{ toolCalls: [call("reading", { q: "short" }, "c1")] }, { toolCalls: [call("reading", { q: "long" }, "c2")] }, { toolCalls: [call("lookup", {}, "c3")] }, { toolCalls: [call(SCRATCH_READ, { handle: "s1", offset: 20_000 }, "c4")] }, "done"];
+    const lookup = tool("lookup", () => `${"l".repeat(6000)}${"m".repeat(6000)}${"n".repeat(3000)}`);
+    const script: Script = [{ toolCalls: [call("reading", { q: "short" }, "c1")] }, { toolCalls: [call("reading", { q: "long" }, "c2")] }, { toolCalls: [call("lookup", {}, "c3")] }, { toolCalls: [call(SCRATCH_READ, { handle: "s1", offset: 20_000 }, "c4")] }, { toolCalls: [call(SCRATCH_READ, { handle: "s2", offset: 6000, length: 20_000 }, "c5")] }, "done"];
     const r = rig(script, (s) => (s.loop.clipChars = 6000));
     expect(await r.start({ tools: [reading, lookup] }).send("go")).toMatchObject({ status: "answered", text: "done" });
     const content = (at: number): string => {
       const part = lastMessage(r.host.calls[at])?.parts?.[0];
       return part?.type === "tool_result" ? part.content : "";
     };
+    const clip = "Tool results clipped past (Settings → The agent loop) says where a result is clipped";
     expect(content(1)).toBe("r".repeat(15_000));
-    expect(content(2)).toBe(`${"r".repeat(20_000)}\n[Clipped: the first 20000 of 25000 characters. The rest is in scratch s1; read it with scratch_read from offset 20000.]`);
-    expect(content(3)).toBe(`${"l".repeat(6000)}\n[Clipped: the first 6000 of 15000 characters. The rest is in scratch s2; read it with scratch_read from offset 6000.]`);
+    expect(content(2)).toBe(`${"r".repeat(20_000)}\n[Clipped: the first 20000 of 25000 characters; ${clip}. The rest is in scratch s1: scratch_read gives it from offset 20000, 20000 characters a read at most.]`);
+    expect(content(3)).toBe(`${"l".repeat(6000)}\n[Clipped: the first 6000 of 15000 characters; ${clip}. The rest is in scratch s2: scratch_read gives it from offset 6000, 6000 characters a read at most.]`);
     // The rest of the long read comes in one read, as much as its tool gives whole.
     expect(content(4)).toBe(`[Scratch s1, characters 20000 to 25000 of 25000.]\nTAIL${"t".repeat(4996)}`);
-    expect(r.host.calls[0]?.tools?.find((t) => t.name === SCRATCH_READ)?.parameters).toMatchObject({ properties: { length: { maximum: 20_000 } } });
+    // The other's read gives the 6000 its clip said, however much more is asked: scratch_read itself states no maximum that a result can't give.
+    expect(content(5)).toBe(`[Scratch s2, characters 6000 to 12000 of 15000.]\n${"m".repeat(6000)}`);
+    const scratch = r.host.calls[0]?.tools?.find((t) => t.name === SCRATCH_READ)?.parameters;
+    expect(scratch).toMatchObject({ properties: { length: { type: "integer", minimum: 1 } } });
+    expect(JSON.stringify(scratch)).not.toContain("maximum");
   });
 
   test("a result the room left under Prompt per call can't hold reaches the model cut to it, in plain words, and the next call is still made", async () => {
@@ -398,7 +404,7 @@ describe("clipping and scratch_read", () => {
     const shown = Number(/room for only the first (\d+) of 30000 characters/.exec(text)?.[1] ?? 0);
     // Most of the room is given to the result, and none of it past what the prompt holds.
     expect(shown).toBeGreaterThan(5000);
-    expect(text.startsWith(`${book.slice(0, shown)}\n[Cut to fit: your prompt has room for only the first ${shown} of 30000 characters of this result (Prompt per call). The rest is in scratch s1; scratch_read gives it from offset ${shown}`)).toBe(true);
+    expect(text.startsWith(`${book.slice(0, shown)}\n[Cut to fit: your prompt has room for only the first ${shown} of 30000 characters of this result, under Prompt per call (Settings → Agents → Main agent → Budget). The rest is in scratch s1; scratch_read gives it from offset ${shown}`)).toBe(true);
     expect(part).not.toMatchObject({ isError: true });
     expect(agent.transcript().entries.find((e) => e.kind === "result")).toMatchObject({ scratch: "s1", error: false });
     // Without Prompt per call nothing is measured: the same result reaches the model whole.
@@ -796,8 +802,9 @@ describe("a stop reaches a round's tools", () => {
     await idle();
     expect(own.done).toBe(false);
     r.host.clock.advance(1);
-    expect(await sending).toMatchObject({ status: "refused", code: "wall_time", reason: "the agent's time ran out (Time per agent)" });
-    expect(agent.transcript().entries.find((e) => e.kind === "result")).toMatchObject({ callId: "c1", text: "stuck failed: the agent's time ran out (Time per agent)", error: true });
+    const why = "the agent has worked all the time Time per agent (Settings → Agents → Main agent → Budget) allows";
+    expect(await sending).toMatchObject({ status: "refused", code: "wall_time", reason: why });
+    expect(agent.transcript().entries.find((e) => e.kind === "result")).toMatchObject({ callId: "c1", text: `stuck failed: ${why}`, error: true });
     expect(r.host.calls).toHaveLength(1);
 
     const stalled = stuck();
@@ -805,8 +812,47 @@ describe("a stop reaches a round's tools", () => {
     const running = t.start({ tools: [stalled] }).send("go");
     await until(() => stalled.runs.length === 1);
     t.host.clock.advance(3000);
-    expect(await running).toMatchObject({ status: "refused", code: "turn_time", reason: "the turn's time ran out (Time per turn)" });
+    expect(await running).toMatchObject({ status: "refused", code: "turn_time", reason: "the turn's agents have worked all the time Time per turn (Settings → The turn) allows" });
     expect(t.host.calls).toHaveLength(1);
+  });
+});
+
+describe("a limit's words name its setting where the user changes it", () => {
+  /** Where an extension that builds LumiAH in shows its settings, as the runtime says it (`settingPlace`). */
+  const OWNER = { name: "LumiRPEngine", settingsAt: "LumiRPEngine's Harness tab → System → Settings" };
+  const place = settingPlaceOf(undefined, (path, title, trail) => settingPlace(["core", ...path], title, trail, OWNER));
+
+  test("the clip, the rounds and the loop detector say their setting and the extension's page for it; a wait says its place on the Timeouts page", async () => {
+    const lookup = tool("lookup", () => "x".repeat(500));
+    const clipped = rig([{ toolCalls: [call("lookup", { q: "a" }, "c1")] }, "done"], (s) => (s.loop.clipChars = 200), { place });
+    await clipped.start({ tools: [lookup] }).send("go");
+    const part = lastMessage(clipped.host.calls[1])?.parts?.[0];
+    expect(part?.type === "tool_result" ? part.content : "").toContain("Tool results clipped past (LumiRPEngine's Harness tab → System → Settings → The agent loop)");
+
+    const rounds = rig((_request, i) => (i < 10 ? { toolCalls: [call("lookup", { q: `q${i}` })] } : "done"), undefined, { place });
+    const spent = await rounds.start({ tools: [tool("lookup")], budget: { ...rounds.spec().budget, toolTurns: 2 } }).send("go");
+    expect(spent.reason).toContain("Tool rounds per agent (LumiRPEngine's Harness tab → System → Settings → Agents → Main agent → Budget)");
+
+    const again = { toolCalls: [call("lookup", { q: "same" })] };
+    const looped = await rig([again, again, again, "never"], undefined, { place }).start({ tools: [tool("lookup")] }).send("go");
+    expect(looped.reason).toContain("Loop detector (LumiRPEngine's Harness tab → System → Settings → The agent loop)");
+
+    const hung = stuck();
+    const timed = rig([{ toolCalls: [call("stuck", {}, "c1")] }, "never"], undefined, { place });
+    const sending = timed.start({ tools: [hung], budget: { ...timed.spec().budget, wallMs: 3000 } }).send("go");
+    await until(() => hung.runs.length === 1);
+    timed.host.clock.advance(3000);
+    expect((await sending).reason).toContain("Time per agent (LumiRPEngine's Harness tab → System → Settings → Timeouts → A model call)");
+  });
+
+  test("a turn's own limits stop its agents in words that name the turn's setting and where it is changed, with the place a plain run says too", async () => {
+    const looping: Script = (_request, i) => (i < 10 ? { toolCalls: [call("lookup", { q: `q${i}` })] } : "done");
+    const turn = (s: Settings, host: MemoryHost) => new AgentTurn({ ...s.turn, toolTurns: 2 }, host.clock.now());
+    const placed = await rig(looping, undefined, { place, turn }).start({ tools: [tool("lookup")] }).send("go");
+    expect(placed).toMatchObject({ code: "turn_tool_turns" });
+    expect(placed.reason).toBe("the turn's agents have had its 2 rounds of tool calls, all that Tool rounds per turn (LumiRPEngine's Harness tab → System → Settings → The turn) allows");
+    const plain = await rig(looping, undefined, { turn }).start({ tools: [tool("lookup")] }).send("go");
+    expect(plain.reason).toContain("Tool rounds per turn (Settings → The turn)");
   });
 });
 

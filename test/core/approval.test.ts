@@ -153,17 +153,16 @@ describe("Settings decide for each tier, with a rule of its own for a tool", () 
     expect(resultOf(r.host, "c2")?.failed).toBe(true);
   });
 
-  test("write_reply and scratch_read are never held by a tier's rule: with every tier asking, only the tool that reads the chat is asked about", async () => {
+  test("write_reply and scratch_read are never held by a tier's rule: with every tier asking, only the tool that hands work on is asked about", async () => {
+    // A sub-agent's answer is not paged, so one this long reaches the main agent clipped, with the rest in scratch.
     const log = `Ilse copied the keeper's log out by hand: ${"the lamp was lit at dusk and trimmed at midnight; ".repeat(14)}and the last line names Mara.`;
-    const r = rig(cast({ main: [{ toolCalls: [call("chat_read", { from: 2 }, "c1")] }, { toolCalls: [call("scratch_read", { handle: "s1", offset: 700 }, "c2")] }, brief] }), (s) => {
+    const r = rig(cast({ main: [{ toolCalls: [call("delegate", { agent: "summarizer", task: "Copy out the keeper's log." }, "c1")] }, { toolCalls: [call("scratch_read", { handle: "s1", offset: 700 }, "c2")] }, brief], sub: [log] }), (s) => {
       s.approval.tiers = { read: "ask", write: "ask", external: "ask" };
-      // A result this long reaches the model clipped, with the rest in scratch.
       s.loop.clipChars = 200;
     });
-    r.host.say(CHAT, "user", log);
     const asked = user(r.host, () => ({ decision: "once" }));
     const { result } = await r.turn();
-    expect(asked.asks.map((ask) => ask.tool)).toEqual(["chat_read"]);
+    expect(asked.asks.map((ask) => ask.tool)).toEqual(["delegate"]);
     expect(resultOf(r.host, "c2")).toMatchObject({ failed: false, content: expect.stringContaining("and the last line names Mara.") as unknown as string });
     expect(result).toMatchObject({ status: "done", reply: REPLY });
   });
@@ -378,7 +377,7 @@ describe("a sub-agent's call and a job's call", () => {
     expect(sub?.parent).toBe(started(r.host, "main")[0]?.id);
     expect(asked.asks).toMatchObject([{ turn: request.generationId, chatId: CHAT, agentId: sub?.id ?? "", role: "summarizer", callId: "s1", tool: "chat_read", tier: "read", args: { from: 1 } }]);
     expect(resultOf(r.host, "s1")?.failed).toBe(false);
-    expect(resultOf(r.host, "d1")?.content).toStartWith("Mara knocks.");
+    expect(resultOf(r.host, "d1")?.content).toEndWith("\n\nMara knocks.");
     expect(result.status).toBe("done");
   });
 

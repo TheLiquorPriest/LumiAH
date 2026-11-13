@@ -382,31 +382,36 @@ export function defaultSettings(): Settings {
     turn: { tokensIn: null, tokensOut: null, toolTurns: null, wallMs: null },
     // An answer of fewer tokens than the floor is cut before it says anything; two rounds' warning is one to finish reading and one to answer.
     // An answer cut while it was all thinking gets one more go with twice the room: enough for a strong reasoning model that thought at length, at most 64,000 tokens so one call never runs away.
-    loop: { repeats: 3, clipChars: 6000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000, answerFloor: 256, warnRounds: 2, cutRoomFactor: 2, cutRoomTokens: 64_000 },
+    // A result is clipped past 12,000 characters: one long message of a story, or a lore entry, runs from 6,000 to 12,000, and an agent should read it in one go; a tool whose answers must be read whole says how much itself (`wholeChars`).
+    loop: { repeats: 3, clipChars: 12_000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000, answerFloor: 256, warnRounds: 2, cutRoomFactor: 2, cutRoomTokens: 64_000 },
     cache: { retention: DEFAULT_CACHE_RETENTION, key: "" },
     // An hour is long enough not to pay for a refused call on every turn, and short enough that a connection whose model changed gets its native tools back.
     connections: { atOnce: null, throttles: {}, toolRefusalMinutes: 60 },
     prices: {},
     // A quarter of Summarize past: a rollback holds for several turns, and the notes still don't grow without end.
     // A call's arguments are kept as long as its result: a written file or a long brief is then in the notes by its start, and past_turn reads it whole.
-    session: { summarizeAtTokens: 32_000, keepTurns: 3, summaryTokens: 6000, receiptChars: 600, receiptArgChars: 600, rollbackMarginTokens: 8000 },
-    // A page fits under Tool results clipped past with its framing, so a tool's answer is paged, not clipped.
-    tools: { pageChars: 4000, pageItems: 10, lineChars: 300, excerptChars: 400, pieceChars: 600, chatBatch: 200, grepTurns: 40 },
+    // Long-form play leans on the turns before: 48,000 tokens with four turns whole summarizes less often (each summary costs a call and loses detail; the notes are mostly read from the cache), and 1,500 characters of a receipt keep a paragraph of what was written, not a sentence.
+    session: { summarizeAtTokens: 48_000, keepTurns: 4, summaryTokens: 6000, receiptChars: 1500, receiptArgChars: 1500, rollbackMarginTokens: 8000 },
+    // A page fits under Tool results clipped past with its framing, so a tool's answer is paged, not clipped (and is cut there whatever this says: `pagerOf`). 8,000 characters holds a long message of a story in one page, and halves the rounds a long file costs.
+    tools: { pageChars: 8000, pageItems: 10, lineChars: 300, excerptChars: 400, pieceChars: 600, chatBatch: 200, grepTurns: 40 },
     // Prompts are most of what is stored, and are read only while a turn is fresh; transcripts longer; the turns a summary replaced for good, so a rollback always works.
     keep: { prompts: true, transcripts: true, blobChars: 4_000_000, summaries: 32, promptDays: 30, transcriptDays: 90, spanDays: null, graceHours: 24 },
     // Five times a second reads as writing, and is few enough frames for the link.
     trace: { deltaMs: 200 },
     // Room for notes and reference files, small enough that an index is cheap to write on every change.
     // A pin in ~/ reaches every chat, so it is the user's to set unless they say otherwise.
-    workspace: { fileChars: 200_000, files: 400, areaChars: 4_000_000, pathChars: 200, versions: 10, pinChars: 12_000, agentsPinUser: false },
+    // 24,000 characters of pins: a long story's agent keeps a notebook and a scene pinned together, and a file that doesn't fit beside the others is only named.
+    workspace: { fileChars: 200_000, files: 400, areaChars: 4_000_000, pathChars: 200, versions: 10, pinChars: 24_000, agentsPinUser: false },
     guidance: { chars: 8000, agentsEdit: false },
     skills: { listChars: 4000 },
     // Two deep: the agent a run starts with, and the agents it starts. So a job the main agent starts (the chronicler's) may hand parts of its work on, and whoever takes them hands nothing further. A few at a time, and nobody gives away what it doesn't hold.
     // `as` names an instance (an entity's id), so 200 characters is room to spare. A sub-agent's text is held for its first 200 characters: what a model writes before a tool call is a line or two, and past that it is the answer.
-    delegation: { depth: 2, atOnce: 3, perRun: 12, grant: "own", fileChars: 12_000, asChars: 200, replyHoldChars: 200 },
+    // 24 sub-agents a turn: a told turn of a story, with its pieces checked and several people in the scene, already starts eight to ten.
+    delegation: { depth: 2, atOnce: 3, perRun: 24, grant: "own", fileChars: 12_000, asChars: 200, replyHoldChars: 200 },
     // A job runs unattended, so each has a ceiling of its own: enough for a long look through a chat, not for running away. Its sub-agents are bounded by that ceiling, not counted.
     // A turn waits a minute at most for the jobs due by it: long enough for a digest, short enough that the user isn't left waiting on one that has stalled.
-    jobs: { enabled: true, atOnce: 1, perRun: 3, budget: { tokensIn: 600_000, tokensOut: 60_000, toolTurns: 60, wallMs: 900_000 }, tokensPerDay: 3_000_000, taskChars: 4000, openingChars: 600, recordWaitMs: 120_000, chain: true, delegations: null, dueWaitMs: 60_000 },
+    // Six jobs a turn, two at once: after a reply each person it reached may take it in as a job, and a scene holds several. 12,000,000 tokens a day: a day of light play reached 3,000,000, and a cap still stops a job that runs away.
+    jobs: { enabled: true, atOnce: 2, perRun: 6, budget: { tokensIn: 600_000, tokensOut: 60_000, toolTurns: 60, wallMs: 900_000 }, tokensPerDay: 12_000_000, taskChars: 4000, openingChars: 600, recordWaitMs: 120_000, chain: true, delegations: null, dueWaitMs: 60_000 },
     // Every tier runs without a word. A tool that acts outside LumiAH is one the user set up in Lumiverse and switched on for agents, or installed with an extension: that was their word, and Lumiverse's own tool calling asks no more. Asking first is one switch, by tier or by tool.
     approval: { tiers: { read: "allow", write: "allow", external: "allow" }, tools: {}, waitMs: 300_000 },
     // A cached re-read at a tenth of a token: about what providers bill it at.
@@ -677,7 +682,7 @@ export const SETTINGS_SCHEMA: JsonObject = {
       description: "How much one tool answer holds. A longer one comes in pages, each naming the cursor for the next.",
       type: "object",
       properties: {
-        pageChars: whole("Answer length", "The most characters one tool answer holds. Keep it under Tool results clipped past, so answers are paged and not clipped.", 200, "characters"),
+        pageChars: whole("Answer length", "The most characters one tool answer holds. A longer answer comes in pages. It is never more than Tool results clipped past: a larger value reads as that, so an answer is paged and never clipped.", 200, "characters"),
         pageItems: whole("Hits per page", "The most hits or lines one page of a search or a listing shows.", 1, "items"),
         lineChars: whole("Line length", "A line a grep found is shown at most this long, around what it found.", 40, "characters"),
         excerptChars: whole("Excerpt length", "A search hit's excerpt, at most.", 40, "characters"),
@@ -930,6 +935,35 @@ export function settingTitle(path: readonly string[]): string {
   let at: unknown = SETTINGS_SCHEMA;
   for (const key of path) at = isRecord(at) && isRecord(at.properties) ? at.properties[key] : undefined;
   return isRecord(at) && typeof at.title === "string" ? at.title : path.join(".");
+}
+
+/**
+ * Where the user changes one of the core's settings, in the words of a limit that names it: its own
+ * name (`title`), with where it is shown. `path` is its place in the core's section and `trail` the
+ * names of the groups that lead to it there, as the Settings page shows them. The runtime gives it,
+ * since it knows whose Settings show the core's (an extension that builds LumiAH in may show them in
+ * a page of its own) and which settings are waits, shown on the Timeouts page.
+ */
+export type SettingPlace = (path: readonly string[], title: string, trail: readonly string[]) => string;
+
+/**
+ * Words that name the setting at `path` and where it is changed, for the words of a limit:
+ * "Tool results clipped past (LumiAH's Settings → The agent loop)". `scope` holds the run's agents,
+ * for a setting of one of theirs; `place` says it as the runtime does, and without it the words say
+ * Settings and the groups that lead to the setting.
+ */
+export function settingPlaceOf(scope?: SettingsScope, place?: SettingPlace): (path: readonly string[]) => string {
+  const schema = scope ? settingsSchema(scope) : SETTINGS_SCHEMA;
+  return (path) => {
+    const titles: string[] = [];
+    let at: unknown = schema;
+    for (const key of path) {
+      at = isRecord(at) && isRecord(at.properties) ? at.properties[key] : undefined;
+      titles.push(isRecord(at) && typeof at.title === "string" ? at.title : key);
+    }
+    const title = titles.pop() ?? "";
+    return place?.(path, title, titles) ?? `${title} (Settings → ${titles.join(" → ")})`;
+  };
 }
 
 /** The schema and the defaults `scope` gives: the core's own for none. */

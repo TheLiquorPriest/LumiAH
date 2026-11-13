@@ -150,7 +150,7 @@ describe("definitions, on the page", () => {
     expect(listed[0]).toEndWith("…");
     // The one that didn't fit is counted, and skill_load without a skill lists them all.
     expect(system).not.toContain("- lamps");
-    expect(system).toContain("(1 more aren't listed here: skill_load with no skill lists them all.)");
+    expect(system).toContain("(1 more aren't listed here, past Skill list length (Settings → Skills): skill_load with no skill lists them all.)");
   });
 });
 
@@ -219,7 +219,7 @@ describe("spend, on the page", () => {
     expect(spend.caps.map((cap) => [cap.setting.join("."), cap.limit, cap.reached])).toEqual([
       ["spend.tokensPerDay", null, false],
       ["spend.costPerDay", null, false],
-      ["jobs.tokensPerDay", 3_000_000, false],
+      ["jobs.tokensPerDay", 12_000_000, false],
     ]);
   });
 

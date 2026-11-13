@@ -81,7 +81,7 @@ describe("the notes of the turns after a long write", () => {
     const next = host.calls.findLast(isMain);
     const sent = (next?.messages ?? []).map((m) => m.content).join("\n");
     const { receiptArgChars } = stored.values.session;
-    expect(receiptArgChars).toBe(600);
+    expect(receiptArgChars).toBe(1500);
     expect(sent).toContain('- workspace_write {"path":"/tides.md","content":"The tide table for the season');
     expect(sent).toContain(`(arguments of ${JSON.stringify({ path: "/tides.md", content: TIDES, base: "new" }).length} characters in all; past_turn with reply 2 and step 1 reads them whole)`);
     expect(sent).not.toContain(TIDES.slice(0, receiptArgChars + 100));

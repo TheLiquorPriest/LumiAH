@@ -384,12 +384,12 @@ function messagesOf(value: JsonValue | undefined): ModelMessage[] | null {
 /**
  * What the extension LumiAH is built into supplies to the core, over the link. A member the
  * extension said it doesn't have is answered here as the core takes "not supplied" (no definitions,
- * no claim, the request as the core built it, the definition's own model, a passage let go, nothing
- * for a hook), without a request. What reads (its definitions, a claim, the writer's request, an
- * agent's model) is asked again after a socket that closed under it. A hook, and the check before a
- * passage goes out (`releasing`, which may do work in the extension), are sent once, so the
- * extension never hears one twice: one whose answer is lost fails, as the core takes a check that
- * failed.
+ * no claim, the request as the core built it, the definition's own model, a reply let go as the
+ * call gave it, nothing for a hook), without a request. What reads (its definitions, a claim, the
+ * writer's request, an agent's model) is asked again after a socket that closed under it. A hook,
+ * and the check before the reply goes out (`releasing`, which may do work in the extension), are
+ * sent once, so the extension never hears one twice: one whose answer is lost fails, as the core
+ * takes a check that failed.
  */
 export function linkExtension(deps: ExtensionDeps): HarnessExtension {
   const has = (member: ExtensionMember): boolean => deps.offer()?.members.includes(member) === true;
@@ -439,7 +439,9 @@ export function linkExtension(deps: ExtensionDeps): HarnessExtension {
     runBegan: (run) => tell("runBegan", json(run)),
     releasing: async (release) => {
       const value = await once("releasing", json(release));
-      return isRecord(value) && typeof value.refused === "string" ? { refused: value.refused } : null;
+      // Its word as the core reads one: a refusal, or the text that goes out; anything else is none.
+      if (isRecord(value) && typeof value.refused === "string") return { refused: value.refused };
+      return isRecord(value) && typeof value.text === "string" ? { text: value.text } : null;
     },
     released: (release) => tell("released", json(release)),
     replyWritten: (reply) => tell("replyWritten", json(reply)),
