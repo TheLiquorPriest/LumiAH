@@ -844,7 +844,7 @@ describe("a limit's words name its setting where the user changes it", () => {
     const sending = timed.start({ tools: [hung], budget: { ...timed.spec().budget, wallMs: 3000 } }).send("go");
     await until(() => hung.runs.length === 1);
     timed.host.clock.advance(3000);
-    expect((await sending).reason).toContain("Time per agent (LumiRPEngine's Harness tab → System → Settings → Timeouts → A model call)");
+    expect((await sending).reason).toContain("Time per agent (LumiRPEngine's Harness tab → System → Settings → Timeouts → A model call → Main agent)");
   });
 
   test("a turn's own limits stop its agents in words that name the turn's setting and where it is changed, with the place a plain run says too", async () => {

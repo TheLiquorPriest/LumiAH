@@ -104,10 +104,10 @@ describe("a joiner", () => {
 });
 
 /** The extension backend over a fake Lumiverse, with a clock the test moves and no timers. */
-async function backendOf(link: Partial<(typeof TRANSPORT_DEFAULTS)["link"]>) {
+async function backendOf(link: Partial<(typeof TRANSPORT_DEFAULTS)["link"]>, identity?: { name: string; settingsAt: string }) {
   const host = new FakeHost();
   const clock = { now: 1_000_000 };
-  const backend = createBackend(host, { now: () => clock.now, later: () => () => undefined, build: "test-build" });
+  const backend = createBackend(host, { now: () => clock.now, later: () => () => undefined, build: "test-build" }, identity !== undefined ? { identity } : {});
   await backend.settings.change(USER, Object.entries(link).map(([key, value]) => ({ path: ["transport", "link", key], value })), []);
   /** The error frames sent back so far, by the id they answer. */
   const refusals = (): { id: unknown; code: unknown; message: string; session: string | undefined }[] =>
@@ -147,7 +147,7 @@ describe("the extension, sent frames in parts", () => {
     const words = refusals()[0]?.message ?? "";
     expect(words).toContain("already putting together 2 frames");
     expect(words).toContain("send this one again once they are done");
-    expect(words).toContain('raise "Frames joined at once" (LumiAH → Settings → Transport → Link)');
+    expect(words).toContain("raise Frames joined at once (LumiAH's Settings → Transport → Link)");
 
     // Another account has its own room.
     await backend.server.frame(part("a", 0, 2, "Brann's "), "user-brann", SESSION);
@@ -164,7 +164,7 @@ describe("the extension, sent frames in parts", () => {
 
     expect(backend.server.joining(USER)).toEqual({ frames: 2, units: 2 * piece.length });
     expect(refusals()).toMatchObject([{ id: "c", code: "unavailable", session: SESSION }]);
-    expect(refusals()[0]?.message).toContain('raise "Characters held while joining" (LumiAH → Settings → Transport → Link)');
+    expect(refusals()[0]?.message).toContain("raise Characters held while joining (LumiAH's Settings → Transport → Link)");
   });
 
   test("refuses a frame larger than the largest it joins as too large, whatever else is under way, and says which setting that is", async () => {
@@ -175,7 +175,11 @@ describe("the extension, sent frames in parts", () => {
     expect(backend.server.joining(USER)).toEqual({ frames: 0, units: 0 });
     expect(refusals()).toMatchObject([{ id: "a", code: "too_large", session: SESSION }]);
     expect(refusals()[0]?.message).toContain("That frame is over 1 million characters");
-    expect(refusals()[0]?.message).toContain('Raise "Largest frame the extension joins" (LumiAH → Settings → Transport → Link)');
+    expect(refusals()[0]?.message).toContain("Raise Largest frame the extension joins (LumiAH's Settings → Transport → Link)");
+    // Built into another extension, the words send the user where that extension shows LumiAH's settings.
+    const built = await backendOf({ joinMaxUnits: 1024 * 1024 }, { name: "LumiRPEngine", settingsAt: "LumiRPEngine's Harness tab → System → Settings" });
+    await built.backend.server.frame(part("a", 0, 3, "x".repeat(512 * 1024)), USER, SESSION);
+    expect(built.refusals()[0]?.message).toContain("Raise Largest frame the extension joins (LumiRPEngine's Harness tab → System → Settings → Transport → Link)");
   });
 
   test("lets go of the parts whose rest never came on its tick, for every session", async () => {

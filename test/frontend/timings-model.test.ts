@@ -3,11 +3,11 @@
 // can meet gathered from the settings' own form, each with its own controls and its default.
 
 import { describe, expect, test } from "bun:test";
-import { defaultSettings, SETTINGS_SCHEMA } from "../../src/core/settings";
+import { defaultSettings, SETTINGS_SCHEMA, settingPlaceOf } from "../../src/core/settings";
 import { Timings } from "../../src/link/timings";
 import { TRANSPORT_SCHEMA, transportDefaults } from "../../src/link/settings";
-import { transportWait } from "../../src/link/waits";
-import { TIMEOUT_GROUPS, timeoutPlace } from "../../src/shared/timeouts";
+import { transportPlace, transportWait } from "../../src/link/waits";
+import { settingPlace, TIMEOUT_GROUPS, timeoutPlace } from "../../src/shared/timeouts";
 import type { JsonObject } from "../../src/shared/ui";
 import { formOf } from "../../src/extension/frontend/settings-model";
 import { keptWords, opRows, roadLine, sizeWords, slowLine } from "../../src/extension/frontend/timings-model";
@@ -73,10 +73,16 @@ describe("Settings → Timeouts", () => {
     expect(timeoutPlace(["transport", "pages", "askMs"], "Runtime wait", { name: "LumiRPEngine", settingsAt: "LumiRPEngine's Harness tab → System → Settings" })).toBe("Runtime wait (LumiRPEngine's Harness tab → System → Settings → Timeouts → Waiting for the runtime)");
   });
 
-  test("two waits of the same group never read alike in a timeout's words: each end of the link names its own row", () => {
+  test("two waits of the same group never read alike in a timeout's words: each end of the link and each agent names its own row", () => {
     const owner = { name: "LumiAH" };
-    const words = TIMEOUT_GROUPS.flatMap((group) => group.rows.filter((row) => row[0] === "transport").map((row) => transportWait(row.slice(1), owner)));
-    expect(new Set(words).size).toBe(words.length);
+    const core = settingPlaceOf(undefined, (path, title, trail) => settingPlace(["core", ...path], title, trail, owner));
+    for (const group of TIMEOUT_GROUPS) {
+      const words = group.rows.map((row) => (row[0] === "transport" ? transportWait(row.slice(1), owner) : core(row.slice(1))));
+      expect({ group: group.id, alike: words.filter((said, i) => words.indexOf(said) !== i) }).toEqual({ group: group.id, alike: [] });
+    }
     expect(transportWait(["link", "partStaleMs"], owner)).toBe("Parts the extension keeps (LumiAH's Settings → Timeouts → The link)");
+    expect(core(["agents", "writer", "budget", "callMs"])).toBe("Time per call (LumiAH's Settings → Timeouts → A model call → Writer)");
+    // A transport limit that isn't a wait is named where Settings show it, under an extension's own page too.
+    expect(transportPlace(["runtime", "joinMaxUnits"], { name: "LumiRPEngine", settingsAt: "LumiRPEngine's Harness tab → System → Settings" })).toBe("Largest frame the runtime joins (LumiRPEngine's Harness tab → System → Settings → Transport → Runtime)");
   });
 });

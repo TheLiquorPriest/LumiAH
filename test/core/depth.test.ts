@@ -14,7 +14,7 @@ import type { ModelRequest } from "../../src/core/ports";
 import { HarnessRefusal } from "../../src/core/refusal";
 import { defaultSettings, newAgentSettings, type Settings } from "../../src/core/settings";
 import { renderDefault, TEXT } from "../../src/core/texts";
-import { type Answer, call, MemoryHost, runTurn, type Script, until, WRITER } from "./support/host";
+import { type Answer, call, idle, MemoryHost, runTurn, type Script, until, WRITER } from "./support/host";
 
 const CHAT = "chat-depth";
 const never = new AbortController().signal;
@@ -70,7 +70,7 @@ function rig(script: Script, options: { claim?: ChatClaim | null; extension?: Pa
   const harness = createHarness(host, { settings: async () => structuredClone(stored), extension });
   /** The calls one agent made, in order. */
   const callsOf = (instructions: string): ModelRequest[] => host.calls.filter((request) => system(request).includes(instructions));
-  return { host, harness, released, callsOf };
+  return { host, harness, released, callsOf, extension };
 }
 
 describe("the reply, released by the agents (§3.4)", () => {
@@ -237,6 +237,24 @@ describe("a reply_write of the extension's own (§21: replyTool)", () => {
     expect(r.released.map((release) => release.text)).toEqual(["Mara looks up."]);
   });
 
+  test("its check left out by a later hello while the run goes on: a release is told no text came, and the reply is still the agent's to release", async () => {
+    const r = rig(
+      lines({
+        author: [
+          () => {
+            // A later hello offers no check: from here on the member is gone.
+            delete r.extension.releasing;
+            return { toolCalls: [call("reply_write", { pieces: [1] }, "w1")] };
+          },
+          "Done.",
+        ],
+      }),
+      { claim: { reply: "released", replyTool }, extension: { releasing: joined } },
+    );
+    await runTurn(r.host, r.harness, CHAT);
+    expect(resultOf(r.host.calls[1], "w1")).toMatchObject({ content: renderDefault(TEXT.answer.releaseUnchecked, { extension: "Depth" }), isError: true });
+  });
+
   test("one a model can't be offered, or without releasing to give the text, isn't: reply_write takes the reply's text, and the log says why", async () => {
     const malformed: ReplyTool = { description: "Release the reply.", parameters: { type: "object", properties: { pieces: "a list" }, required: ["pieces"] } };
     // The extension lets the call's own text go: only the tool it is offered as is in question here.
@@ -330,6 +348,20 @@ describe("handing the reply on (§14: to_reply)", () => {
     expect(r.released.map((release) => [release.agent.role, release.text])).toEqual([["author", "Mara looks up."]]);
   });
 
+  test("an agent whose hand-on has ended is retried like any other: a follow-up's call that fails after streaming some of its text is made again", async () => {
+    const r = rig(
+      lines({
+        author: [{ toolCalls: [call("delegate", { agent: "voice", task: "Answer the user as Mara.", to_reply: true }, "d1")] }, follow("d1", "Who was aboard?", "m1"), "Done."],
+        voice: ["I saw the boat.", { deltas: ["Okoro was "], error: "503: overloaded" }, "Okoro was aboard."],
+      }),
+      { change: (s) => (s.loop.retryWaitMs = 0) },
+    );
+    const { result } = await runTurn(r.host, r.harness, CHAT);
+    expect(r.callsOf(VOICE)).toHaveLength(3);
+    expect(resultOf(r.callsOf(AUTHOR)[2], "m1")).toMatchObject({ content: expect.stringContaining("Okoro was aboard.") });
+    expect(result).toMatchObject({ status: "done", reply: "I saw the boat." });
+  });
+
   test("a release asked for while another agent's answer holds the reply, none of it out yet, is told to wait for it; that answer sending nothing, the release is still the author's", async () => {
     let voiceAsked = false;
     let checked = false;
@@ -415,6 +447,65 @@ describe("what the agents had ready, where the lead released none of the reply (
     expect(result.status).toBe("failed");
     expect(result.reason).toStartWith(renderDefault(TEXT.progress.nothingReleased));
     expect(result.reason).toContain("Wait for the extension");
+  });
+
+  test("a lead stopped while a hand-on that sent nothing is still ending: the hand-on is let end, then the extension is asked, and what is ready is the reply", async () => {
+    let asked = 0;
+    let voiceCalled = false;
+    const keeping = Promise.withResolvers<void>();
+    const r = rig(
+      lines({
+        author: [{ toolCalls: [call("delegate", { agent: "voice", task: "Answer the user as Mara.", to_reply: true }, "d1")] }],
+        voice: [() => ((voiceCalled = true), { hang: true })],
+      }),
+      { claim: { reply: "released" }, change: (s) => (s.turn.wallMs = 60_000), extension: { unreleased: async () => (asked++, { text: READY }) } },
+    );
+    // Keeping Mara's prompt takes a while: her call, stopped with the turn, ends only once it is kept.
+    const put = r.host.blobs.put;
+    r.host.blobs.put = async (hash, text) => {
+      if (text.includes(VOICE)) await keeping.promise;
+      return put(hash, text);
+    };
+    const turn = runTurn(r.host, r.harness, CHAT);
+    await until(() => voiceCalled);
+    r.host.clock.advance(60_000);
+    await idle();
+    keeping.resolve();
+    const { result, sink } = await turn;
+    expect(asked).toBe(1);
+    expect(result).toMatchObject({ status: "done", reply: READY });
+    expect(sink.text).toBe(READY);
+  });
+
+  test("a lead whose answer was cut at its length: the words say so, naming Answer per call and where it is changed", async () => {
+    const r = rig(lines({ author: [{ content: "Mara looks", finishReason: "length" }] }), { claim: { reply: "released" }, extension: { unreleased: async () => ({ text: READY }) } });
+    const { result } = await runTurn(r.host, r.harness, CHAT);
+    expect(result).toMatchObject({ status: "done", reply: READY });
+    const notices = r.host.traced.flatMap(({ event }) => (event.kind === "notice" ? [event.text] : []));
+    expect(notices.some((text) => text.includes("Answer per call (Settings → Agents → author"))).toBe(true);
+  });
+
+  test("a hand-on that never ends holds the turn for no longer than Wait for the extension; what it held is then taken as nothing released", async () => {
+    let asked = 0;
+    let voiceCalled = false;
+    const r = rig(
+      lines({
+        author: [{ toolCalls: [call("delegate", { agent: "voice", task: "Answer the user as Mara.", to_reply: true }, "d1")] }],
+        voice: [() => ((voiceCalled = true), { hang: true })],
+      }),
+      { claim: { reply: "released" }, change: (s) => (s.turn.wallMs = 60_000), extension: { unreleased: async () => (asked++, { text: READY }) } },
+    );
+    // Mara's prompt is never kept: her call, stopped with the turn, never ends.
+    const put = r.host.blobs.put;
+    r.host.blobs.put = async (hash, text) => (text.includes(VOICE) ? new Promise<never>(() => {}) : put(hash, text));
+    const turn = runTurn(r.host, r.harness, CHAT);
+    await until(() => voiceCalled);
+    r.host.clock.advance(60_000);
+    await idle();
+    r.host.clock.advance(10_000);
+    const { result } = await turn;
+    expect(asked).toBe(0);
+    expect(result.status).toBe("failed");
   });
 
   test("isn't asked once the user stopped the turn, nor once the reply went out", async () => {

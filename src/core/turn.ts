@@ -105,6 +105,8 @@ export class Turn {
   private streamed = false;
   /** A sub-agent's answer is streaming in as the turn's reply (`to_reply`): the turn's one release is under way, so nothing else goes in. */
   private holder = false;
+  /** Settles once the hand-on that holds the reply (`holder`) has ended. */
+  private handing: Promise<void> = Promise.resolve();
   /** The `reply_write` calls, asked about one after another in the order they came: the first that goes out is the turn's release, and each after it is refused. */
   private releasing: Promise<unknown> = Promise.resolve();
 
@@ -156,7 +158,7 @@ export class Turn {
         // Where the extension says only what is released is the reply, nothing else stands in for it.
         if (run.claim?.reply === "released") {
           if (main.reply.status === "cancelled" || this.signal.aborted) return { status: "stopped", reason: this.stoppedWhy() };
-          const { ended, why } = this.leadEnded(main.reply);
+          const { ended, why } = this.leadEnded(main.reply, lead.definition.id);
           return await this.unreleased(run, work, ended, why, this.text(TEXT.progress.nothingReleased));
         }
         return main.writes ? this.ownReply(main.reply) : await this.briefed(main.reply, main.id, run, work);
@@ -675,6 +677,8 @@ export class Turn {
       },
       hold: (agent) => {
         this.holder = true;
+        const ended = Promise.withResolvers<void>();
+        this.handing = ended.promise;
         let open = true;
         let out = "";
         return {
@@ -687,6 +691,7 @@ export class Turn {
             if (!open) return;
             open = false;
             this.holder = false;
+            ended.resolve();
             // A stream is no call of its agent's: it carries no arguments.
             if (out !== "") this.tellReleased(run, agent, out, {});
           },
@@ -744,6 +749,9 @@ export class Turn {
       // Asked again: the reply may have ended, or another agent's answer begun streaming in as it, while the extension looked.
       const late = this.shut();
       if (late !== null) return { refused: late };
+    } else if (own) {
+      // The extension's own reply_write was taken when the run began, and a later hello left its check out: nothing gives the text, so nothing goes, and the reply is still the agent's.
+      return { refused: this.text(TEXT.answer.releaseUnchecked, { extension: extension?.name ?? "The extension" }) };
     }
     if (!this.streamOut(text)) return { refused: this.text(TEXT.answer.releaseEnded) };
     this.tellReleased(run, agent, text, args);
@@ -774,8 +782,8 @@ export class Turn {
   }
 
   /** How the agent that leads ended, for an extension asked what its agents had ready (`unreleased`): in a word, and in words. */
-  private leadEnded(reply: AgentReply): { ended: ReplyUnreleased["ended"]; why: string } {
-    if (reply.status === "answered") return cutShort(reply.finish) ? { ended: "limit", why: this.text(TEXT.agents.cut) } : { ended: "done", why: this.text(TEXT.progress.unreleasedAnswered) };
+  private leadEnded(reply: AgentReply, definition: string): { ended: ReplyUnreleased["ended"]; why: string } {
+    if (reply.status === "answered") return cutShort(reply.finish) ? { ended: "limit", why: this.text(TEXT.agents.cut, { setting: this.texts.setting(["agents", definition, "budget", "callTokensOut"]) }) } : { ended: "done", why: this.text(TEXT.progress.unreleasedAnswered) };
     return { ended: reply.status === "failed" || reply.code === "connection" ? "failed" : "limit", why: reply.reason ?? this.text(TEXT.answer.replyEmpty) };
   }
 
@@ -794,7 +802,12 @@ export class Turn {
     const extension = shared.options.extension;
     const lead = this.mainId === null ? undefined : run.ref(this.mainId);
     if (this.signal.aborted) return { status: "stopped", reason: this.stoppedWhy() };
-    if (!extension?.unreleased || lead === undefined || this.shut() !== null) return { status: "failed", reason: failure };
+    if (!extension?.unreleased || lead === undefined) return { status: "failed", reason: failure };
+    // A hand-on the lead's end cut short may still be ending, its answer in or not: let it end, for no longer than Wait for the extension, so what is ready never goes missing for having been asked too soon.
+    if (this.holder) await extensionAnswer(shared, this.settings.extension.waitMs, () => this.handing);
+    if (this.signal.aborted) return { status: "stopped", reason: this.stoppedWhy() };
+    if (this.streamed) return this.released();
+    if (this.shut() !== null) return { status: "failed", reason: failure };
     const asked = await extensionAnswer<unknown>(shared, this.settings.extension.waitMs, () => extension.unreleased?.({ userId: run.userId, chatId: turn.chatId, turn: turn.generationId, ended }) ?? Promise.resolve(null));
     if (this.signal.aborted) return { status: "stopped", reason: this.stoppedWhy() };
     if ("unanswered" in asked) {

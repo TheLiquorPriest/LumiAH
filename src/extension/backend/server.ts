@@ -10,6 +10,8 @@ import { isLinkFrame, noticeOf, requestOf } from "../../link/frames";
 import { isRecord } from "../../link/json";
 import { type Joined, PartJoiner, needsParts, partOf, splitFrame } from "../../link/parts";
 import { CEILINGS, TRANSPORT_DEFAULTS, type TransportSettings } from "../../link/settings";
+import { transportPlace } from "../../link/waits";
+import type { SettingsOwner } from "../../shared/timeouts";
 import { type Approvals, holdCall } from "./approvals";
 import type { Asks } from "./asks";
 import type { ProxyRoad } from "./proxy";
@@ -128,12 +130,11 @@ function openOf(v: unknown): OpenStream[] {
   return v.flatMap((o): OpenStream[] => (isRecord(o) && typeof o.stream === "string" && typeof o.seq === "number" && Number.isSafeInteger(o.seq) && o.seq >= 0 ? [{ stream: o.stream, seq: o.seq }] : []));
 }
 
-/** What to do about a frame the joiner refused, by the limit it passed: each is a setting of the link's, but the bound all accounts share, which is nobody's to raise. */
-function joinAdvice(over: Extract<Joined, { refused: string }>["over"], name: string): string {
-  const setting = (title: string): string => `"${title}" (${name} → Settings → Transport → Link)`;
+/** What to do about a frame the joiner refused, by the limit it passed: each is a setting of the link's, named where `owner` shows it, but the bound all accounts share, which is nobody's to raise. */
+function joinAdvice(over: Extract<Joined, { refused: string }>["over"], owner: SettingsOwner): string {
   if (over === "shared") return "Send this one again in a moment.";
-  if (over === "frame") return `Raise ${setting("Largest frame the extension joins")} to send one that large.`;
-  return `Those frames are this account's own: send this one again once they are done, or raise ${setting(over === "frames" ? "Frames joined at once" : "Characters held while joining")}.`;
+  if (over === "frame") return `Raise ${transportPlace(["link", "joinMaxUnits"], owner)} to send one that large.`;
+  return `Those frames are this account's own: send this one again once they are done, or raise ${transportPlace(["link", over === "frames" ? "joinFrames" : "joinHeldUnits"], owner)}.`;
 }
 
 export class LinkServer {
@@ -244,7 +245,7 @@ export class LinkServer {
       if ("waiting" in joined) return true;
       if ("refused" in joined) {
         // Only a frame larger than the largest joined is too large, however often it is sent. Past what the account's other frames under way, or every account's, leave room for, the extension has no room just now: that passes once they are done, and the sender may send it again.
-        this.refuse(joined.id, userId, session, joined.over === "frame" ? "too_large" : "unavailable", `${joined.refused} ${joinAdvice(joined.over, this.deps.identity.name)}`);
+        this.refuse(joined.id, userId, session, joined.over === "frame" ? "too_large" : "unavailable", `${joined.refused} ${joinAdvice(joined.over, this.deps.identity)}`);
         return true;
       }
       try {

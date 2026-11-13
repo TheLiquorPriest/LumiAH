@@ -61,11 +61,13 @@ class ReplyHold {
     this.sent = 0;
   }
 
-  /** A piece of a call's answer as it arrives. Its reasoning stays the agent's own: the reply's thinking block is the user's to read, and an agent's thoughts may hold what the user's character doesn't know. */
-  delta(delta: ModelDelta): void {
-    if (this.hand === null || delta.content === undefined || delta.content === "") return;
+  /** A piece of a call's answer as it arrives; false once the hand-on has ended, when it goes nowhere. Its reasoning stays the agent's own: the reply's thinking block is the user's to read, and an agent's thoughts may hold what the user's character doesn't know. */
+  delta(delta: ModelDelta): boolean {
+    if (this.hand === null) return false;
+    if (delta.content === undefined || delta.content === "") return true;
     this.seen += delta.content;
     if (this.seen.length >= this.hold) this.out(this.seen.slice(this.sent));
+    return true;
   }
 
   /** A call came back: with no tool call it is the answer, all of it out (a host that streams nothing gives it whole here); with tool calls, what it held is let go. */

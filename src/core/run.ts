@@ -21,7 +21,7 @@ import { Delegator } from "./delegation";
 import type { AgentModelAsk, ChatClaim, HarnessExtension, ReplyTool } from "./extension";
 import { type GuidanceRead, guidanceGuard, guidancePrefix, readGuidance } from "./guidance";
 import type { Jobs } from "./jobs";
-import { type AgentDeps, type AgentHandle, AgentTurn, type RunWords, startAgent } from "./loop";
+import { type AgentDeps, type AgentHandle, type AgentSpec, AgentTurn, type RunWords, startAgent } from "./loop";
 import type { AgentRef, AgentUsage, ChatInfo, FileChange, HarnessHost, JsonObject, ModelDelta, ModelEffort, ModelMessage, RecordJob, RemoteTool, SamplingParams, TraceEvent, TurnRequest, TurnStatus, WorkspaceArea } from "./ports";
 import { isRecord } from "./ports";
 import type { AgentAccounts } from "./provider";
@@ -379,7 +379,7 @@ export interface AgentStart {
   about?: string;
   history?: readonly ModelMessage[];
   params?: SamplingParams;
-  onDelta?: (delta: ModelDelta) => void;
+  onDelta?: AgentSpec["onDelta"];
   budget?: AgentBudget;
   /** The earlier turns `past_turn` reads, where they aren't the run's own. */
   past?: readonly PastTurn[];

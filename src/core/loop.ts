@@ -64,8 +64,8 @@ export interface AgentSpec {
   history?: readonly ModelMessage[];
   /** The sampling parameters its calls send; absent: the connection's own. */
   params?: SamplingParams;
-  /** Where a streamed answer's text and reasoning go as they arrive; with it, its calls stream whatever Settings say. */
-  onDelta?: (delta: ModelDelta) => void;
+  /** Where a streamed answer's text and reasoning go as they arrive; with it, its calls stream whatever Settings say. It answers false for text that went nowhere (a hand-on that has ended): that is no text sent on, and the call may be made again. */
+  onDelta?: (delta: ModelDelta) => boolean | void;
   /** Told as each of its model calls comes back: the answer's text, and how many tool calls it made (none: it is the agent's answer). */
   onCall?: (answer: { text: string; calls: number }) => void;
   /** The agent that started it, and what for, as the trace tells it. */
@@ -373,10 +373,7 @@ class Agent implements AgentHandle {
     const streamed =
       onDelta || this.watched
         ? (delta: ModelDelta): void => {
-            if (onDelta) {
-              if (delta.content !== undefined && delta.content !== "") this.sentOn = true;
-              onDelta(delta);
-            }
+            if (onDelta && onDelta(delta) !== false && delta.content !== undefined && delta.content !== "") this.sentOn = true;
             this.brought.text += delta.content?.length ?? 0;
             this.brought.reasoning += delta.reasoning?.length ?? 0;
             this.piece(delta);

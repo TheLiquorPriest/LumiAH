@@ -13,7 +13,7 @@ import { answerOf, isLinkFrame } from "../link/frames";
 import { isRecord } from "../link/json";
 import { PartJoiner, needsParts, partOf, splitFrame } from "../link/parts";
 import type { Outcome, Timings } from "../link/timings";
-import { transportWait } from "../link/waits";
+import { transportPlace, transportWait } from "../link/waits";
 import type { SettingsOwner } from "../shared/timeouts";
 import type { Http, StoredLogin } from "./lumiverse";
 import { exchange, inClear, LiveError, loginAgain, refused, WaitError } from "./lumiverse";
@@ -357,7 +357,8 @@ export class HostConnection {
           this.pending.delete(joined.id);
           clearTimeout(waiting.timer);
           this.timed(waiting, 0, null, "failed");
-          waiting.reject(new LiveError("too_large", `LumiAH's answer to ${waiting.type} was too large for the runtime: ${joined.refused} Raise "Largest frame the runtime joins" in LumiAH's settings (Transport → Runtime).`));
+          const owner = this.options.owner?.() ?? OWN_BACKEND;
+          waiting.reject(new LiveError("too_large", `${owner.name}'s answer to ${waiting.type} was too large for the runtime: ${joined.refused} Raise ${transportPlace(["runtime", "joinMaxUnits"], owner)}.`));
         }
       }
       return;
