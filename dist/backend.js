@@ -231,6 +231,7 @@ function storyHolds(words) {
 }
 
 // src/core/text-def.ts
+var SETTING_VAR = { name: "setting", text: `the setting, and where it is changed: "Tool results clipped past (LumiAH's Settings \u2192 The agent loop)"` };
 var TOOL = {
   chatSearch: "chat_search",
   chatGrep: "chat_grep",
@@ -383,19 +384,19 @@ function defaultSettings() {
       [AGENT.summarizer]: { connectionId: null, model: null, effort: "inherit", tools: [...SUMMARIZER_TOOLS], toolCalls: "auto", budget: { ...unlimited, callTokensOut: 16000, toolTurns: 12, revisions: 1, concurrency: 4 } }
     },
     turn: { tokensIn: null, tokensOut: null, toolTurns: null, wallMs: null },
-    loop: { repeats: 3, clipChars: 6000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000, answerFloor: 256, warnRounds: 2, cutRoomFactor: 2, cutRoomTokens: 64000 },
+    loop: { repeats: 3, clipChars: 12000, thinkingInToolLoops: true, stream: true, charsPerToken: 3.2, retries: 2, retryWaitMs: 2000, answerFloor: 256, warnRounds: 2, cutRoomFactor: 2, cutRoomTokens: 64000 },
     cache: { retention: DEFAULT_CACHE_RETENTION, key: "" },
     connections: { atOnce: null, throttles: {}, toolRefusalMinutes: 60 },
     prices: {},
-    session: { summarizeAtTokens: 32000, keepTurns: 3, summaryTokens: 6000, receiptChars: 600, receiptArgChars: 600, rollbackMarginTokens: 8000 },
-    tools: { pageChars: 4000, pageItems: 10, lineChars: 300, excerptChars: 400, pieceChars: 600, chatBatch: 200, grepTurns: 40 },
+    session: { summarizeAtTokens: 48000, keepTurns: 4, summaryTokens: 6000, receiptChars: 1500, receiptArgChars: 1500, rollbackMarginTokens: 8000 },
+    tools: { pageChars: 8000, pageItems: 10, lineChars: 300, excerptChars: 400, pieceChars: 600, chatBatch: 200, grepTurns: 40 },
     keep: { prompts: true, transcripts: true, blobChars: 4000000, summaries: 32, promptDays: 30, transcriptDays: 90, spanDays: null, graceHours: 24 },
     trace: { deltaMs: 200 },
-    workspace: { fileChars: 200000, files: 400, areaChars: 4000000, pathChars: 200, versions: 10, pinChars: 12000, agentsPinUser: false },
+    workspace: { fileChars: 200000, files: 400, areaChars: 4000000, pathChars: 200, versions: 10, pinChars: 24000, agentsPinUser: false },
     guidance: { chars: 8000, agentsEdit: false },
     skills: { listChars: 4000 },
-    delegation: { depth: 2, atOnce: 3, perRun: 12, grant: "own", fileChars: 12000, asChars: 200, replyHoldChars: 200 },
-    jobs: { enabled: true, atOnce: 1, perRun: 3, budget: { tokensIn: 600000, tokensOut: 60000, toolTurns: 60, wallMs: 900000 }, tokensPerDay: 3000000, taskChars: 4000, openingChars: 600, recordWaitMs: 120000, chain: true, delegations: null, dueWaitMs: 60000 },
+    delegation: { depth: 2, atOnce: 3, perRun: 24, grant: "own", fileChars: 12000, asChars: 200, replyHoldChars: 200 },
+    jobs: { enabled: true, atOnce: 2, perRun: 6, budget: { tokensIn: 600000, tokensOut: 60000, toolTurns: 60, wallMs: 900000 }, tokensPerDay: 12000000, taskChars: 4000, openingChars: 600, recordWaitMs: 120000, chain: true, delegations: null, dueWaitMs: 60000 },
     approval: { tiers: { read: "allow", write: "allow", external: "allow" }, tools: {}, waitMs: 300000 },
     spend: { tokensPerDay: null, costPerDay: null, cachedWeight: 0.1 },
     extension: { waitMs: 1e4 },
@@ -623,7 +624,7 @@ var SETTINGS_SCHEMA = {
       description: "How much one tool answer holds. A longer one comes in pages, each naming the cursor for the next.",
       type: "object",
       properties: {
-        pageChars: whole2("Answer length", "The most characters one tool answer holds. Keep it under Tool results clipped past, so answers are paged and not clipped.", 200, "characters"),
+        pageChars: whole2("Answer length", "The most characters one tool answer holds. A longer answer comes in pages. It is never more than Tool results clipped past: a larger value reads as that, so an answer is paged and never clipped.", 200, "characters"),
         pageItems: whole2("Hits per page", "The most hits or lines one page of a search or a listing shows.", 1, "items"),
         lineChars: whole2("Line length", "A line a grep found is shown at most this long, around what it found.", 40, "characters"),
         excerptChars: whole2("Excerpt length", "A search hit's excerpt, at most.", 40, "characters"),
@@ -872,6 +873,19 @@ function settingTitle(path) {
     at = isRecord(at) && isRecord(at.properties) ? at.properties[key] : undefined;
   return isRecord(at) && typeof at.title === "string" ? at.title : path.join(".");
 }
+function settingPlaceOf(scope, place) {
+  const schema = scope ? settingsSchema(scope) : SETTINGS_SCHEMA;
+  return (path) => {
+    const titles = [];
+    let at = schema;
+    for (const key of path) {
+      at = isRecord(at) && isRecord(at.properties) ? at.properties[key] : undefined;
+      titles.push(isRecord(at) && typeof at.title === "string" ? at.title : key);
+    }
+    const title = titles.pop() ?? "";
+    return place?.(path, title, titles) ?? `${title} (Settings \u2192 ${titles.join(" \u2192 ")})`;
+  };
+}
 function shapeOf(scope) {
   const defaults = defaultSettings();
   if (!scope)
@@ -927,8 +941,9 @@ var AGENTS_TEXT = {
   noReply: "agents.delegate.no_reply",
   file: "agents.file",
   fileNamed: "agents.file.named",
+  pinnedNamed: "agents.pinned.named",
   pinned: "agents.pinned",
-  answer: "agents.delegate.answer",
+  from: "agents.delegate.from",
   stopped: "agents.delegate.stopped",
   noAgent: "agents.delegate.no_agent",
   notOffered: "agents.not_offered",
@@ -965,16 +980,16 @@ var AGENTS_TEXTS = [
   { id: AGENTS_TEXT.guidanceCharacter, group: AGENTS, label: "Guidance: the character's level", note: "Fills {{whose}} for the character's guidance file.", text: "from the user, for every chat with {{character}}", vars: [v("character", "the character's name", true)] },
   { id: AGENTS_TEXT.guidanceChat, group: AGENTS, label: "Guidance: the chat's level", note: "Fills {{whose}} for learned/GUIDANCE.md.", text: "for this chat", vars: [] },
   { id: AGENTS_TEXT.guidanceCut, group: AGENTS, label: "Guidance: cut", note: "Stands for a guidance file longer than Guidance length: its start, and where the whole is.", text: `{{text}}
-[Cut here, at {{shown}} of {{chars}} characters. The whole is the workspace file {{path}}.]`, vars: [v("text", "the start of the file", true), v("shown", "the characters given"), v("chars", "the file's length"), v("path", "the file's path", true)] },
+[Cut here, at {{shown}} of {{chars}} characters, as far as {{setting}} goes. The whole is the workspace file {{path}}.]`, vars: [v("text", "the start of the file", true), v("shown", "the characters given"), v("chars", "the file's length"), v("path", "the file's path", true), SETTING_VAR], setting: ["guidance", "chars"] },
   { id: AGENTS_TEXT.guidanceCutOwn, group: AGENTS, label: "Guidance: cut, where it is no file", note: "Stands for a level an extension keeps as a text of its own, when that is longer than Guidance length: its start. The rest is in no workspace file.", text: `{{text}}
-[Cut here, at {{shown}} of {{chars}} characters. The rest is in no workspace file, so it can't be read from here: work from what is above.]`, vars: [v("text", "the start of the level's text", true), v("shown", "the characters given"), v("chars", "the text's length")] },
+[Cut here, at {{shown}} of {{chars}} characters, as far as {{setting}} goes. The rest is in no workspace file, so it can't be read from here: work from what is above.]`, vars: [v("text", "the start of the level's text", true), v("shown", "the characters given"), v("chars", "the text's length"), SETTING_VAR], setting: ["guidance", "chars"] },
   { id: AGENTS_TEXT.guardUser, group: ANSWERS, label: "Guidance an agent can't change", note: "A workspace tool's answer to a change of the user's guidance, or of the middle level's.", text: "Not changed: {{path}} is guidance the user writes for you, and an agent can't change it. If it should change, say what and why in your answer.", vars: [v("path", "the file's path", true)] },
   { id: AGENTS_TEXT.guardChat, group: ANSWERS, label: "The chat's guidance, while agents may not edit it", note: "A workspace tool's answer to a change of the chat's guidance while Settings don't let agents edit it.", text: "Not changed: {{path}} is this chat's guidance, and Settings don't let agents edit it (Agents may edit the chat's guidance). If it should change, say what and why in your answer.", vars: [v("path", "the file's path", true)] },
   { id: AGENTS_TEXT.skills, group: AGENTS, label: "Skills: the list", note: "Follows the instructions of an agent that holds skill_load: the skills it may load.", text: `Skills you can load with skill_load. Each is a procedure written for you: load one when what you are doing is what it is for, and follow it.
 {{skills}}{{more}}`, vars: [v("skills", "each skill, as Skills: one skill writes it", true), v("more", "how many more there are, when the list was cut")] },
   { id: AGENTS_TEXT.skill, group: AGENTS, label: "Skills: one skill", note: "One skill in the list, and in skill_load's own list.", text: "- {{id}}: {{name}}. {{description}}", vars: [v("id", "the skill's id, which skill_load takes", true), v("name", "its name"), v("description", "what it is for")] },
   { id: AGENTS_TEXT.skillsMore, group: AGENTS, label: "Skills: more than fit", note: "Ends a list of skills cut at Skill list length.", text: `
-({{count}} more aren't listed here: skill_load with no skill lists them all.)`, vars: [v("count", "how many skills were left out", true)] },
+({{count}} more aren't listed here, past {{setting}}: skill_load with no skill lists them all.)`, vars: [v("count", "how many skills were left out", true), SETTING_VAR], setting: ["skills", "listChars"] },
   ...toolTexts(TOOL.skillLoad, "Load a skill: a procedure written for you to follow. Give the id of one your instructions list; leave skill out to list every skill there is.", {
     skill: "The skill's id. Leave it out to list the skills.",
     cursor: CURSOR_ARG
@@ -998,7 +1013,7 @@ The agents you can delegate to:
   { id: toolArgId(TOOL.delegate, "task"), group: GROUP.tools, label: "delegate: task", note: "The description of delegate's task argument.", text: "What it is to do and what you want back, in full. It knows nothing you don't write here.", vars: [] },
   { id: toolArgId(TOOL.delegate, "files"), group: GROUP.tools, label: "delegate: files", note: "The description of delegate's files argument.", text: "Workspace files to give it with the task, by path. Leave it out for none.", vars: [] },
   { id: toolArgId(TOOL.delegate, "as"), group: GROUP.tools, label: "delegate: as", note: "The description of delegate's as argument, offered where an extension builds LumiAH in.", text: "Which one this agent is to be, where its kind stands for many (a character's id, for one): what it may read and the model it runs on follow from it. Leave it out for none.", vars: [] },
-  { id: toolArgId(TOOL.delegate, "to_reply"), group: GROUP.tools, label: "delegate: to_reply", note: "The description of delegate's to_reply argument, offered to an agent that may write the reply itself.", text: "true: its answer is part of the reply, streaming to the user as it is written, after what was released before; this call's result is that answer too. Leave it out for an answer only you read.", vars: [] },
+  { id: toolArgId(TOOL.delegate, "to_reply"), group: GROUP.tools, label: "delegate: to_reply", note: "The description of delegate's to_reply argument, offered to an agent that may write the reply itself. A turn's reply is released once, whole.", text: "true: its answer is this turn's whole reply, streaming to the user as it is written; this call's result is that answer too. A turn's reply is released once: hand it on only for an answer that is the whole reply, and never after reply_write. Leave it out for an answer only you read.", vars: [] },
   ...toolTexts(TOOL.agentMessage, "Send a follow-up to an agent you delegated to this turn. It goes on from where it left off, with everything it had read, and its answer is this tool's result.", {
     handle: "The handle that agent's answer named, such as agent_1a2b3c4d.",
     text: "What you want of it now."
@@ -1022,20 +1037,19 @@ For reference, the user's newest message:
 {{request}}`, vars: [v("request", "the user's newest message, as the main agent reads it", true)] },
   { id: AGENTS_TEXT.file, group: AGENTS, label: "A file in context", note: "One workspace file put in an agent's context whole: given with a task, or pinned.", text: `[{{path}}: {{chars}} characters, version {{version}}]
 {{text}}`, vars: [v("path", "the file's path", true), v("chars", "its length"), v("version", "its version, which a write or an edit of it names"), v("text", "its text", true)] },
-  { id: AGENTS_TEXT.fileNamed, group: AGENTS, label: "A file named, not included", note: "Stands for a file that didn't fit the room its setting gives (Files given with a task, Pinned files in context).", text: "[{{path}}: {{chars}} characters, not included here. workspace_read reads it.]", vars: [v("path", "the file's path", true), v("chars", "its length")] },
+  { id: AGENTS_TEXT.fileNamed, group: AGENTS, label: "A file named, not included", note: "Stands for a file given with a task that didn't fit the room Files given with a task leaves.", text: "[{{path}}: {{chars}} characters, not included here. workspace_read reads it.]", vars: [v("path", "the file's path", true), v("chars", "its length")] },
+  { id: AGENTS_TEXT.pinnedNamed, group: AGENTS, label: "A pinned file named, not included", note: "Stands for a pinned file that didn't fit the room Pinned files in context leaves.", text: "[{{path}}: {{chars}} characters, not included here: past the room {{setting}} leaves. workspace_read reads it.]", vars: [v("path", "the file's path", true), v("chars", "its length"), SETTING_VAR], setting: ["workspace", "pinChars"] },
   { id: AGENTS_TEXT.pinned, group: AGENTS, label: "Pinned files", note: "Leads what an agent is sent first with the workspace files pinned for it.", text: `Your pinned workspace files, as they stand now:
 
 {{files}}`, vars: [v("files", "each file, as A file in context writes it", true)] },
-  { id: AGENTS_TEXT.answer, group: ANSWERS, label: "delegate: the agent's answer", note: "What delegate and agent_message return when the agent answered.", text: `{{answer}}
-
-[From {{agent}}, handle {{handle}}. agent_message with this handle asks it more.]`, vars: [v("answer", "the agent's answer", true), v("agent", "the agent's id"), v("handle", "the handle agent_message takes", true)] },
+  { id: AGENTS_TEXT.from, group: ANSWERS, label: "delegate: whose answer it is", note: "Heads what delegate and agent_message return when the agent answered, with its answer after it: at the head, the handle stays when a long answer is clipped.", text: "[From {{agent}}, handle {{handle}}. agent_message with this handle asks it more. Its answer:]", vars: [v("agent", "the agent's id"), v("handle", "the handle agent_message takes", true)] },
   { id: AGENTS_TEXT.stopped, group: ANSWERS, label: "delegate: the agent stopped short", note: "What delegate and agent_message return when the agent stopped before an answer.", text: `{{agent}} (handle {{handle}}) stopped before it answered: {{reason}}.{{said}}
 agent_message with this handle has it go on, if it still may; or go on without it.`, vars: [v("agent", "the agent's id"), v("handle", "the handle agent_message takes", true), v("reason", "why it stopped", true), v("said", "what it had last written, if anything")] },
   { id: AGENTS_TEXT.noAgent, group: ANSWERS, label: "delegate: no such agent", note: "delegate's answer to an id that names no agent it may delegate to.", text: "There's no agent {{agent}} to delegate to. You can delegate to: {{agents}}.", vars: [v("agent", "the id asked for"), v("agents", "the ids there are", true)] },
   { id: AGENTS_TEXT.notOffered, group: ANSWERS, label: "delegate and job_start: an agent left out here", note: "The answer of delegate and job_start, and of a job you start, to a built-in agent the extension LumiAH is built into leaves out.", text: "Not started: {{agent}} isn't offered here, since the extension LumiAH is built into leaves it out. Do the work with the agents there are, or yourself.", vars: [v("agent", "the id asked for")] },
-  { id: AGENTS_TEXT.tooMany, group: ANSWERS, label: "delegate: too many sub-agents", note: "delegate's answer once the turn has started every sub-agent Sub-agents per turn allows.", text: "Not started: this turn has started the {{limit}} it may (Sub-agents per turn). Ask one you already have with agent_message, or do it yourself.", vars: [v("limit", 'Sub-agents per turn, with the word: "3 sub-agents"', true)] },
+  { id: AGENTS_TEXT.tooMany, group: ANSWERS, label: "delegate: too many sub-agents", note: "delegate's answer once the turn has started every sub-agent Sub-agents per turn allows.", text: "Not started: this turn has started the {{limit}} {{setting}} allows. Ask one you already have with agent_message, or do it yourself.", vars: [v("limit", 'Sub-agents per turn, with the word: "3 sub-agents"', true), SETTING_VAR], setting: ["delegation", "perRun"] },
   { id: AGENTS_TEXT.noFile, group: ANSWERS, label: "delegate: no such file", note: "delegate's answer to a file that isn't in the workspace.", text: "Not started: there's no workspace file {{path}}. workspace_list shows what there is. Call delegate again with the right path, or without it.", vars: [v("path", "the path asked for", true)] },
-  { id: AGENTS_TEXT.asLong, group: ANSWERS, label: "delegate and job_start: as too long", note: "The answer of delegate and job_start to an as past Instance name length.", text: "Not started: as is {{chars}} characters, and it may be {{limit}} at most (Instance name length). Give the short id.", vars: [v("chars", "its length"), v("limit", "Instance name length", true)] },
+  { id: AGENTS_TEXT.asLong, group: ANSWERS, label: "delegate and job_start: as too long", note: "The answer of delegate and job_start to an as past Instance name length.", text: "Not started: as is {{chars}} characters, and {{setting}} lets it be {{limit}} at most. Give the short id.", vars: [v("chars", "its length"), v("limit", "Instance name length", true), SETTING_VAR], setting: ["delegation", "asChars"] },
   { id: AGENTS_TEXT.noReply, group: ANSWERS, label: "delegate: to_reply without the reply", note: "delegate's answer to to_reply from an agent that doesn't write the reply.", text: "Not started: you don't write this reply, so you can't hand it on. Call delegate without to_reply.", vars: [] },
   { id: AGENTS_TEXT.noHandle, group: ANSWERS, label: "agent_message: no such handle", note: "agent_message's answer to a handle that names none of this turn's agents it started.", text: "There's no agent with the handle {{handle}} among those you started this turn. Your handles: {{handles}}.", vars: [v("handle", "the handle asked for"), v("handles", "the handles there are", true)] },
   { id: AGENTS_TEXT.noHandles, group: ANSWERS, label: "agent_message: nobody to message", note: "agent_message's answer when the agent has delegated to nobody this turn.", text: "You haven't delegated to anyone this turn, so there is nobody to message. delegate starts an agent.", vars: [] },
@@ -1378,10 +1392,10 @@ The agents a job can run as:
   { id: JOBS_TEXT.whenAfter, group: ANSWERS3, label: "job_start: runs after the reply", note: "Fills {{when}} for a job that waits for the reply.", text: "it runs once this turn's reply is written", vars: [] },
   { id: JOBS_TEXT.off, group: ANSWERS3, label: "job_start: jobs are off", note: "job_start's answer while Settings switch jobs off.", text: "Not started: jobs are switched off in Settings (Jobs). Do the work in this turn, or leave it.", vars: [] },
   { id: JOBS_TEXT.noAgent, group: ANSWERS3, label: "job_start: no such agent", note: "job_start's answer to an id that names no agent a job may run as.", text: "Not started: there's no agent {{agent}} a job can run as. A job can run as: {{agents}}.", vars: [v("agent", "the id asked for"), v("agents", "the ids there are", true)] },
-  { id: JOBS_TEXT.taskLong, group: ANSWERS3, label: "job_start: the task is too long", note: "job_start's answer to a task past Task length.", text: "Not started: the task is {{chars}} characters, and a task may be {{limit}} at most (Task length). Put the details in a workspace file and name the file in a shorter task.", vars: [v("chars", "the task's length"), v("limit", "Task length", true)] },
+  { id: JOBS_TEXT.taskLong, group: ANSWERS3, label: "job_start: the task is too long", note: "job_start's answer to a task past Task length.", text: "Not started: the task is {{chars}} characters, and {{setting}} lets a task be {{limit}} at most. Put the details in a workspace file and name the file in a shorter task.", vars: [v("chars", "the task's length"), v("limit", "Task length", true), SETTING_VAR], setting: ["jobs", "taskChars"] },
   { id: JOBS_TEXT.noTask, group: ANSWERS3, label: "job_start: nothing to start", note: "job_start's answer to a call with neither an agent and a task nor a job to start again.", text: "Not started: give agent and task, or again with the id of a job to start again.", vars: [] },
-  { id: JOBS_TEXT.tooMany, group: ANSWERS3, label: "job_start: too many jobs", note: "job_start's answer once the turn has started every job Jobs per turn allows.", text: "Not started: this turn has started the {{limit}} it may (Jobs per turn).", vars: [v("limit", 'Jobs per turn, with the word: "3 jobs"', true)] },
-  { id: JOBS_TEXT.tooManyDelegated, group: ANSWERS3, label: "delegate: too many sub-agents in a job", note: "delegate's answer once a job has started every sub-agent Delegations per job allows.", text: "Not started: this job has started the {{limit}} it may (Delegations per job). Ask one you already have with agent_message, or do it yourself.", vars: [v("limit", 'Delegations per job, with the word: "3 sub-agents"', true)] },
+  { id: JOBS_TEXT.tooMany, group: ANSWERS3, label: "job_start: too many jobs", note: "job_start's answer once the turn has started every job Jobs per turn allows.", text: "Not started: this turn has started the {{limit}} {{setting}} allows.", vars: [v("limit", 'Jobs per turn, with the word: "3 jobs"', true), SETTING_VAR], setting: ["jobs", "perRun"] },
+  { id: JOBS_TEXT.tooManyDelegated, group: ANSWERS3, label: "delegate: too many sub-agents in a job", note: "delegate's answer once a job has started every sub-agent Delegations per job allows.", text: "Not started: this job has started the {{limit}} {{setting}} allows. Ask one you already have with agent_message, or do it yourself.", vars: [v("limit", 'Delegations per job, with the word: "3 sub-agents"', true), SETTING_VAR], setting: ["jobs", "delegations"] },
   { id: JOBS_TEXT.noJob, group: ANSWERS3, label: "No such job", note: "The answer of job_read, job_cancel and job_start to an id that names no job of this chat.", text: "There's no job {{id}} in this chat. job_list lists the jobs there are.", vars: [v("id", "the id asked for", true)] },
   { id: JOBS_TEXT.notAgain, group: ANSWERS3, label: "job_start: a job that can't be started again", note: "job_start's answer to again naming a job that is still waiting, running or paused, or that ended with its report.", text: "Not started: job {{id}} is {{state}}. Only a job that was interrupted, failed, was cancelled, left the chat's path or stopped at its allowance can be started again.", vars: [v("id", "the job's id", true), v("state", "where it stands")] },
   { id: JOBS_TEXT.line, group: ANSWERS3, label: "job_list: one job", note: "One job in job_list's answer.", text: "- {{id}}: {{agent}}, {{state}}, started by {{by}}. Task: {{task}}{{report}}", vars: [v("id", "the job's id", true), v("agent", "the agent it runs as"), v("state", "where it stands"), v("by", "who started it"), v("task", "how its task opens"), v("report", "how its report opens, or why it has none")] },
@@ -1423,10 +1437,10 @@ It has no report.`, vars: [v("head", "the heading, as job_read: a job writes it"
   stopText(JOBS_TEXT.stopOffPath, "A job off the path", "The turn a job belongs to left the chat's active path, so the job stopped.", "the turn this job belongs to is no longer on the chat's active path"),
   stopText(JOBS_TEXT.stopJobTokens, "Job tokens per day spent", "A job's call once the jobs' calls together have sent and written all Job tokens per day allows.", "what jobs sent and wrote in the last 24 hours is counted as {{tokens}} of the {{limit}} Job tokens per day allows (a cached re-read counts as {{weight}} of a token)", [v("tokens", 'what jobs spent in the last 24 hours as the limit counts it, with the word: "3000000 tokens"', true), v("limit", "Job tokens per day", true), v("weight", "What a cached re-read counts as")]),
   stopText(JOBS_TEXT.stopJobTokensCall, "Job tokens per day: the call would pass it", "A job's call whose own prompt would take the jobs' calls past Job tokens per day, though they are under it so far.", "the call would take what jobs sent and wrote in the last 24 hours past Job tokens per day: counted as {{counted}} with it, of the {{limit}} allowed (a cached re-read counts as {{weight}} of a token)", [v("counted", `what jobs spent in the last 24 hours as the limit counts it, with this call's prompt as estimated and the calls under way, with the word: "3004000 tokens"`, true), v("limit", "Job tokens per day", true), v("weight", "What a cached re-read counts as")]),
-  stopText(JOBS_TEXT.stopIn, "The job's prompt tokens spent", "A call that would take the job's prompt tokens past Prompt tokens per job.", "the call would take the job's prompt tokens past Prompt tokens per job: counted as {{counted}} of the {{limit}} allowed (a cached re-read counts as {{weight}} of a token)", [v("counted", "the prompt tokens with this call, as the limit counts them"), v("weight", "What a cached re-read counts as"), v("limit", "Prompt tokens per job", true)]),
-  stopText(JOBS_TEXT.stopOut, "The job's answer tokens spent", "The job's agents have written all Answer tokens per job allows.", "the job's agents have written its {{tokens}} (Answer tokens per job)", [v("tokens", 'Answer tokens per job, with the word: "60000 tokens"', true)]),
-  stopText(JOBS_TEXT.stopRounds, "The job's tool rounds spent", "The job's agents have had every round of tool calls Tool rounds per job allows.", "the job's agents have had its {{rounds}} of tool calls (Tool rounds per job)", [v("rounds", 'Tool rounds per job, with the word: "60 rounds"', true)]),
-  stopText(JOBS_TEXT.stopTime, "The job out of time", "The job's time ran out (Time per job).", "the job's time ran out (Time per job)"),
+  { ...stopText(JOBS_TEXT.stopIn, "The job's prompt tokens spent", "A call that would take the job's prompt tokens past Prompt tokens per job.", "the call would take the job's prompt tokens past {{setting}}: counted as {{counted}} of the {{limit}} allowed (a cached re-read counts as {{weight}} of a token)", [v("counted", "the prompt tokens with this call, as the limit counts them"), v("weight", "What a cached re-read counts as"), v("limit", "Prompt tokens per job", true), SETTING_VAR]), setting: ["jobs", "budget", "tokensIn"] },
+  { ...stopText(JOBS_TEXT.stopOut, "The job's answer tokens spent", "The job's agents have written all Answer tokens per job allows.", "the job's agents have written its {{tokens}}, all that {{setting}} allows", [v("tokens", 'Answer tokens per job, with the word: "60000 tokens"', true), SETTING_VAR]), setting: ["jobs", "budget", "tokensOut"] },
+  { ...stopText(JOBS_TEXT.stopRounds, "The job's tool rounds spent", "The job's agents have had every round of tool calls Tool rounds per job allows.", "the job's agents have had its {{rounds}} of tool calls, all that {{setting}} allows", [v("rounds", 'Tool rounds per job, with the word: "60 rounds"', true), SETTING_VAR]), setting: ["jobs", "budget", "toolTurns"] },
+  { ...stopText(JOBS_TEXT.stopTime, "The job out of time", "The job's time ran out (Time per job).", "the job's agents have worked all the time {{setting}} allows", [SETTING_VAR]), setting: ["jobs", "budget", "wallMs"] },
   word(JOBS_TEXT.word, "job", "jobs"),
   word(JOBS_TEXT.wordCall, "call", "calls")
 ];
@@ -2331,7 +2345,7 @@ var WORKSPACE_TEXTS = [
   { id: WORKSPACE_TEXT.noArea, group: ANSWERS5, label: "An area this run doesn't have", note: "A workspace tool's answer to a path in an area the run has none of: a side session about no chat has the user's files alone.", text: "Your workspace has no {{area}} here. It has: {{areas}}. Give a path in one of those.", vars: [v("area", "the area asked for, by how its paths start"), v("areas", "the areas there are, each as the three texts above name it", true)] },
   { id: WORKSPACE_TEXT.pathBad, group: ANSWERS5, label: "A path that can't be one", note: "A workspace tool's answer to a path that holds a backslash or a control character.", text: "That path can't be used: a path holds no backslash and no control character. Put / between its folders, as in /notes/plan.md.", vars: [] },
   { id: WORKSPACE_TEXT.pathOutside, group: ANSWERS5, label: "A path that leaves its area", note: "A workspace tool's answer to a path that climbs out of its area.", text: "That path climbs out of its area: .. may go up inside an area, never above it. Say which area by how the path starts: / for this chat's own, learned/, or ~/ for the user's.", vars: [] },
-  { id: WORKSPACE_TEXT.pathLong, group: ANSWERS5, label: "A path too long", note: "A workspace tool's answer to a path past Path length.", text: "That path is too long: within its area a path may hold {{limit}} characters at most (Path length). Use shorter names or fewer folders.", vars: [v("limit", "Path length", true)] },
+  { id: WORKSPACE_TEXT.pathLong, group: ANSWERS5, label: "A path too long", note: "A workspace tool's answer to a path past Path length.", text: "That path is too long: within its area {{setting}} lets a path hold {{limit}} characters at most. Use shorter names or fewer folders.", vars: [v("limit", "Path length", true), SETTING_VAR], setting: ["workspace", "pathChars"] },
   { id: WORKSPACE_TEXT.listLead, group: ANSWERS5, label: "workspace_list: the chat's area", note: "Leads workspace_list's answer when it lists the chat's own area from the top.", text: "This is /, the chat's own area. ~/ is the user's own area, shared by all their chats: list it with path ~/.", vars: [] },
   { id: WORKSPACE_TEXT.listFolder, group: ANSWERS5, label: "workspace_list: a folder", note: "One folder in workspace_list's answer.", text: "- {{path}} (folder, {{files}})", vars: [v("path", "the folder's path, closed with a slash", true), v("files", 'how many files it holds, at any depth, with the word: "3 files"')] },
   { id: WORKSPACE_TEXT.listFile, group: ANSWERS5, label: "workspace_list: a file", note: "One file in workspace_list's answer.", text: "- {{path}} ({{chars}} characters, version {{version}}{{pinned}})", vars: [v("path", "the file's path", true), v("chars", "its length"), v("version", "its version, which a change to it names as base"), v("pinned", "that it is pinned for the agent that asks, in the words below; nothing when it isn't")] },
@@ -2371,9 +2385,9 @@ var WORKSPACE_TEXTS = [
   { id: WORKSPACE_TEXT.isFolder, group: ANSWERS5, label: "A folder where a file is needed", note: "A workspace tool's answer to a path that names a folder where it takes one file.", text: "{{path}} is a folder, and this takes one file. workspace_list with that path lists the files in it.", vars: [v("path", "the folder's path", true)] },
   { id: WORKSPACE_TEXT.exists, group: ANSWERS5, label: "A file already there", note: "The answer to a write that said the file was new, or a move to a path, where there is a file already.", text: "Nothing was changed: there is already a file {{path}}, at version {{version}}. To replace its text, read it with workspace_read and write with that version as base; else choose another path.", vars: [v("path", "the file's path", true), v("version", "the version it has", true)] },
   { id: WORKSPACE_TEXT.stale, group: ANSWERS5, label: "A change based on another version", note: "The answer to a write, an edit, a move or a delete whose base isn't the version the file has now.", text: "Nothing was changed: {{path}} is at version {{version}} now, and that isn't the version you gave as base: it was changed since you read it, or the base was miscopied. Read it again with workspace_read and make your change on what it holds now.", vars: [v("path", "the file's path", true), v("version", "the version it has now", true)] },
-  { id: WORKSPACE_TEXT.fileChars, group: ANSWERS5, label: "A file too long", note: "The answer to a write or an edit that would take a file past File length.", text: "Nothing was changed: the file would hold {{chars}} characters, and a file may hold {{limit}} at most (File length). Split it over several files.", vars: [v("chars", "the length it would have"), v("limit", "File length", true)] },
-  { id: WORKSPACE_TEXT.files, group: ANSWERS5, label: "Too many files", note: "The answer to a write of a new file into an area that holds as many as Files per area allows.", text: "Nothing was changed: this area already holds the {{limit}} it may (Files per area). Delete files nobody needs any more, or add to one there is.", vars: [v("limit", 'Files per area, with the word: "400 files"', true)] },
-  { id: WORKSPACE_TEXT.areaChars, group: ANSWERS5, label: "An area too big", note: "The answer to a write or an edit that would take an area's files past Area size.", text: "Nothing was changed: with it this area's files would hold {{chars}} characters together, and an area may hold {{limit}} at most (Area size). Delete or shorten files nobody needs any more first.", vars: [v("chars", "the length the area's files would have together"), v("limit", "Area size", true)] },
+  { id: WORKSPACE_TEXT.fileChars, group: ANSWERS5, label: "A file too long", note: "The answer to a write or an edit that would take a file past File length.", text: "Nothing was changed: the file would hold {{chars}} characters, and {{setting}} lets a file hold {{limit}} at most. Split it over several files.", vars: [v("chars", "the length it would have"), v("limit", "File length", true), SETTING_VAR], setting: ["workspace", "fileChars"] },
+  { id: WORKSPACE_TEXT.files, group: ANSWERS5, label: "Too many files", note: "The answer to a write of a new file into an area that holds as many as Files per area allows.", text: "Nothing was changed: this area already holds the {{limit}} {{setting}} allows. Delete files nobody needs any more, or add to one there is.", vars: [v("limit", 'Files per area, with the word: "400 files"', true), SETTING_VAR], setting: ["workspace", "files"] },
+  { id: WORKSPACE_TEXT.areaChars, group: ANSWERS5, label: "An area too big", note: "The answer to a write or an edit that would take an area's files past Area size.", text: "Nothing was changed: with it this area's files would hold {{chars}} characters together, and {{setting}} lets an area hold {{limit}} at most. Delete or shorten files nobody needs any more first.", vars: [v("chars", "the length the area's files would have together"), v("limit", "Area size", true), SETTING_VAR], setting: ["workspace", "areaChars"] },
   { id: WORKSPACE_TEXT.editNotFound, group: ANSWERS5, label: "workspace_edit: nothing to replace", note: "workspace_edit's answer when the file doesn't hold the text to replace.", text: "Nothing was changed: {{path}} (version {{version}}) doesn't hold that text, character for character. Read the file again with workspace_read and copy the text to replace from what it gives.", vars: [v("path", "the file's path", true), v("version", "its version")] },
   { id: WORKSPACE_TEXT.editSeveral, group: ANSWERS5, label: "workspace_edit: several matches", note: "workspace_edit's answer when the text to replace is in the file more than once and all wasn't asked for.", text: "Nothing was changed: that text is in {{path}} {{count}}. Give more of the text around the one you mean, until find matches once, or pass all: true to replace every one.", vars: [v("path", "the file's path", true), v("count", 'how many times, with the word: "3 times"', true)] },
   { id: WORKSPACE_TEXT.moveAcross, group: ANSWERS5, label: "workspace_move: across areas", note: "workspace_move's answer to a move from one area to another.", text: "Nothing was moved: a move stays inside one area, and {{from}} and {{to}} are in two. To take the file across, read it, write it there with workspace_write and base new, then delete it here with workspace_delete.", vars: [v("from", "the path it has"), v("to", "the path asked for")] },
@@ -2456,7 +2470,7 @@ var TEXT = {
     noDirection: "main.turn.directed.none",
     turnNewest: "main.turn.newest",
     noNewest: "main.turn.newest.none",
-    askReleases: "main.turn.ask.releases"
+    askRelease: "main.turn.ask.release_whole"
   },
   request: {
     message: "request.message",
@@ -2526,10 +2540,12 @@ var TEXT = {
     replyFailed: "tool.answer.reply_failed",
     replyNoBrief: "tool.answer.reply_no_brief",
     replyEmpty: "tool.answer.reply_empty",
-    replyReleased: "tool.answer.reply_released",
-    released: "tool.answer.released",
+    replyReleased: "tool.answer.reply_after_release",
+    released: "tool.answer.released_whole",
     releaseWriter: "tool.answer.release_writer",
-    releaseHeld: "tool.answer.release_held",
+    releaseAgain: "tool.answer.release_again",
+    releaseLate: "tool.answer.release_late",
+    releaseFailed: "tool.answer.release_failed",
     releaseUnchecked: "tool.answer.release_unchecked",
     releaseEnded: "tool.answer.release_ended"
   },
@@ -2600,7 +2616,7 @@ var RUNTIME_TEXTS = [
   { id: TEXT.runtime.scratchRead, group: RUNTIME, label: "scratch_read: what it does", note: "The description of the built-in tool that reads the rest of a clipped tool result.", text: "Read more of a tool result that came back clipped. Give the scratch handle the clipped result names and where to start; you get the next part.", vars: [] },
   { id: TEXT.runtime.scratchHandle, group: RUNTIME, label: "scratch_read: handle", note: "The description of scratch_read's handle argument.", text: "The scratch handle the clipped result names, such as s1.", vars: [] },
   { id: TEXT.runtime.scratchOffset, group: RUNTIME, label: "scratch_read: offset", note: "The description of scratch_read's offset argument.", text: "The character to start from; 0 is the start.", vars: [] },
-  { id: TEXT.runtime.scratchLength, group: RUNTIME, label: "scratch_read: length", note: "The description of scratch_read's length argument.", text: "How many characters to read, at most {{max}}.", vars: [v("max", "the most one read returns: Tool results clipped past, or the most any of the agent's tools gives whole, where that is more")] },
+  { id: TEXT.runtime.scratchLength, group: RUNTIME, label: "scratch_read: length", note: "The description of scratch_read's length argument.", text: "How many characters to read. One read gives at most as many as the clipped result says; left out, that many.", vars: [v("max", "the most one read gives of a result clipped at Tool results clipped past; a result a tool gives more of whole says its own")] },
   {
     id: TEXT.runtime.scratchPart,
     group: RUNTIME,
@@ -2616,8 +2632,9 @@ var RUNTIME_TEXTS = [
     group: RUNTIME,
     label: "A clipped tool result",
     note: "Follows the part of a long tool result that reaches the model.",
-    text: "[Clipped: the first {{shown}} of {{total}} characters. The rest is in scratch {{handle}}; read it with scratch_read from offset {{shown}}.]",
-    vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("handle", "where the whole result waits", true)]
+    text: "[Clipped: the first {{shown}} of {{total}} characters; {{setting}} says where a result is clipped. The rest is in scratch {{handle}}: scratch_read gives it from offset {{shown}}, {{per}} characters a read at most.]",
+    vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("handle", "where the whole result waits", true), v("per", "the most characters one scratch_read gives of this result"), SETTING_VAR],
+    setting: ["loop", "clipChars"]
   },
   { id: TEXT.runtime.unknownTool, group: RUNTIME, label: "A tool that doesn't exist", note: "The result of a call to a tool the agent wasn't given.", text: "There's no tool {{name}}. The tools are: {{tools}}. Call one of those.", vars: [v("name", "the name the model called"), v("tools", "the agent's tools")] },
   { id: TEXT.runtime.toolFailed, group: RUNTIME, label: "A tool that failed", note: "The result of a tool call that failed.", text: "{{name}} failed: {{error}}", vars: [v("name", "the tool"), v("error", "why", true)] },
@@ -2659,33 +2676,33 @@ Arguments (JSON Schema): {{parameters}}`, vars: [v("name", "the tool's name", tr
   { id: TEXT.runtime.roundsSpent, group: RUNTIME, label: "Rounds spent", note: "Follows the tool results of an agent's last round.", text: "[That was your last round of tool calls. Answer now with what you have: a tool call in your next answer isn't run, and your work stops without an answer.]", vars: [] },
   { id: TEXT.runtime.notRun, group: RUNTIME, label: "A tool call that never began", note: "The result of a tool call its round's end overtook before it began: the turn was stopped or a time limit passed while the call still waited for its place among the calls at once, or for your word.", text: "Not run: {{reason}}, before this call of {{name}} began. Nothing of it was started.", vars: [v("name", "the tool"), v("reason", "what ended the round, as the agent's stop says it", true)] },
   { id: TEXT.runtime.oneEnding, group: RUNTIME, label: "A second call that would end the work", note: "The result of a call to a tool whose result ends the agent's work (write_reply), where an earlier call of the same answer already does: only that first one is run.", text: "Not run: one answer may make one call that ends your work, and this answer's earlier call of {{first}} is that one. It stands, with what it was given. If its result says it failed, call {{name}} again in your next answer.", vars: [v("name", "the tool whose call wasn't run", true), v("first", "the tool whose earlier call stands")] },
-  { id: TEXT.runtime.clippedLost, group: RUNTIME, label: "A clipped tool result whose rest couldn't be kept", note: "Follows the part of a long tool result that reaches the model when the whole couldn't be stored for scratch_read.", text: "[Clipped: the first {{shown}} of {{total}} characters. The rest couldn't be kept ({{error}}), so scratch_read can't give it. Call the tool again and ask for less at a time.]", vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("error", "why the whole couldn't be stored")] },
+  { id: TEXT.runtime.clippedLost, group: RUNTIME, label: "A clipped tool result whose rest couldn't be kept", note: "Follows the part of a long tool result that reaches the model when the whole couldn't be stored for scratch_read.", text: "[Clipped: the first {{shown}} of {{total}} characters; {{setting}} says where a result is clipped. The rest couldn't be kept ({{error}}), so scratch_read can't give it. Call the tool again and ask for less at a time.]", vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("error", "why the whole couldn't be stored"), SETTING_VAR], setting: ["loop", "clipChars"] },
   { id: TEXT.runtime.scratchLost, group: RUNTIME, label: "scratch_read: the result is no longer stored", note: "scratch_read's answer to a handle whose whole result is gone from storage.", text: "Scratch {{handle}} is no longer stored, so it can't be read. Call the tool that gave it again for what you need.", vars: [v("handle", "the handle asked for")] },
   {
     id: TEXT.runtime.windowCut,
     group: RUNTIME,
     label: "A tool result cut to the room left",
     note: "Follows the part of a tool result that reaches the model when the whole would take the agent's next call past Prompt per call.",
-    text: "[Cut to fit: your prompt has room for only the first {{shown}} of {{total}} characters of this result (Prompt per call). The rest is in scratch {{handle}}; scratch_read gives it from offset {{shown}}, as much as your prompt still has room for. Once there is no room left, answer with what you have.]",
-    vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("handle", "where the whole result waits", true)]
+    text: "[Cut to fit: your prompt has room for only the first {{shown}} of {{total}} characters of this result, under {{setting}}. The rest is in scratch {{handle}}; scratch_read gives it from offset {{shown}}, as much as your prompt still has room for. Once there is no room left, answer with what you have.]",
+    vars: [v("shown", "the characters shown"), v("total", "the result's length"), v("handle", "where the whole result waits", true), { ...SETTING_VAR, text: "Prompt per call, the agent's, and where it is changed" }]
   },
-  { id: TEXT.runtime.scratchFull, group: RUNTIME, label: "scratch_read: no room left", note: "scratch_read's answer when the agent's prompt has no room left for any more of a result (Prompt per call).", text: "Your prompt has no room left for more of scratch {{handle}} (Prompt per call). Answer with what you have.", vars: [v("handle", "the handle asked for", true)] }
+  { id: TEXT.runtime.scratchFull, group: RUNTIME, label: "scratch_read: no room left", note: "scratch_read's answer when the agent's prompt has no room left for any more of a result (Prompt per call).", text: "Your prompt has no room left for more of scratch {{handle}}, under {{setting}}. Answer with what you have.", vars: [v("handle", "the handle asked for", true), { ...SETTING_VAR, text: "Prompt per call, the agent's, and where it is changed" }] }
 ];
 var STOP_TEXTS = [
   stopText(TEXT.stop.cancelled, "Cancelled", "The agent was cancelled: the turn was stopped, or whoever started it stopped it.", "the agent was cancelled"),
   stopText(TEXT.stop.busy, "Still working", "A message sent while the agent still works on its last one.", "the agent is still working on its last message"),
   stopText(TEXT.stop.revisions, "Out of revisions", "A message after its first answer, once it has had every revision its budget allows (Revisions).", "it has had the {{revisions}} it may have after its first answer (Revisions)", [v("revisions", 'the revisions it may have, with the word: "2 revisions"', true)]),
-  stopText(TEXT.stop.wallTime, "Out of time", "The agent's own time ran out (Time per agent).", "the agent's time ran out (Time per agent)"),
-  stopText(TEXT.stop.turnTime, "The turn out of time", "The turn's time ran out (Time per turn).", "the turn's time ran out (Time per turn)"),
+  stopText(TEXT.stop.wallTime, "Out of time", "The agent's own time ran out (Time per agent).", "the agent has worked all the time {{setting}} allows", [{ ...SETTING_VAR, text: "Time per agent, the agent's, and where it is changed" }]),
+  { ...stopText(TEXT.stop.turnTime, "The turn out of time", "The turn's time ran out (Time per turn).", "the turn's agents have worked all the time {{setting}} allows", [SETTING_VAR]), setting: ["turn", "wallMs"] },
   stopText(TEXT.stop.callTime, "A call too slow", "One call took longer than Time per call.", "the call took longer than Time per call"),
-  stopText(TEXT.stop.callTokensIn, "A prompt too long", "A call whose prompt, as estimated, is past Prompt per call.", "the call's prompt, about {{tokens}}, is past Prompt per call ({{limit}})", [v("tokens", `the prompt's estimate, with the word: "9000 tokens"`, true), v("limit", "Prompt per call", true)]),
+  stopText(TEXT.stop.callTokensIn, "A prompt too long", "A call whose prompt, as estimated, is past Prompt per call.", "the call's prompt, about {{tokens}}, is past the {{limit}} tokens {{setting}} allows", [v("tokens", `the prompt's estimate, with the word: "9000 tokens"`, true), v("limit", "Prompt per call", true), { ...SETTING_VAR, text: "Prompt per call, the agent's, and where it is changed" }]),
   stopText(TEXT.stop.tokensIn, "The agent's prompt tokens spent", "A call that would take the agent's prompt tokens past Prompt tokens per agent.", "the call would take the agent's prompt tokens past Prompt tokens per agent: counted as {{counted}} of the {{limit}} allowed (a cached re-read counts as {{weight}} of a token)", [v("counted", "the prompt tokens with this call, as the limit counts them"), v("weight", "What a cached re-read counts as"), v("limit", "Prompt tokens per agent", true)]),
   stopText(TEXT.stop.tokensOut, "The agent's answer tokens spent", "The agent has written all Answer tokens per agent allows.", "the agent has written its {{tokens}} (Answer tokens per agent)", [v("tokens", 'Answer tokens per agent, with the word: "4000 tokens"', true)]),
-  stopText(TEXT.stop.turnTokensIn, "The turn's prompt tokens spent", "A call that would take the turn's prompt tokens past Prompt tokens per turn.", "the call would take the turn's prompt tokens past Prompt tokens per turn: counted as {{counted}} of the {{limit}} allowed (a cached re-read counts as {{weight}} of a token)", [v("counted", "the prompt tokens with this call, as the limit counts them"), v("weight", "What a cached re-read counts as"), v("limit", "Prompt tokens per turn", true)]),
-  stopText(TEXT.stop.turnTokensOut, "The turn's answer tokens spent", "The turn's agents have written all Answer tokens per turn allows.", "the turn's agents have written its {{tokens}} (Answer tokens per turn)", [v("tokens", 'Answer tokens per turn, with the word: "20000 tokens"', true)]),
-  stopText(TEXT.stop.loop, "The loop detector", "The agent called one tool with the same arguments, and got the same result, as many times in a row as the loop detector allows.", "the agent called {{tool}} with the same arguments {{times}} in a row and got the same result each time (Loop detector)", [v("tool", "the tool's name", true), v("times", 'how many times, with the word: "3 times"', true)]),
-  stopText(TEXT.stop.toolTurns, "The agent's tool rounds spent", "The agent has had every round of tool calls Tool rounds per agent allows.", "the agent has had its {{rounds}} of tool calls (Tool rounds per agent)", [v("rounds", 'Tool rounds per agent, with the word: "8 rounds"', true)]),
-  stopText(TEXT.stop.turnToolTurns, "The turn's tool rounds spent", "The turn's agents have had every round of tool calls Tool rounds per turn allows.", "the turn's agents have had its {{rounds}} of tool calls (Tool rounds per turn)", [v("rounds", 'Tool rounds per turn, with the word: "40 rounds"', true)]),
+  { ...stopText(TEXT.stop.turnTokensIn, "The turn's prompt tokens spent", "A call that would take the turn's prompt tokens past Prompt tokens per turn.", "the call would take the turn's prompt tokens past {{setting}}: counted as {{counted}} of the {{limit}} allowed (a cached re-read counts as {{weight}} of a token)", [v("counted", "the prompt tokens with this call, as the limit counts them"), v("weight", "What a cached re-read counts as"), v("limit", "Prompt tokens per turn", true), SETTING_VAR]), setting: ["turn", "tokensIn"] },
+  { ...stopText(TEXT.stop.turnTokensOut, "The turn's answer tokens spent", "The turn's agents have written all Answer tokens per turn allows.", "the turn's agents have written its {{tokens}}, all that {{setting}} allows", [v("tokens", 'Answer tokens per turn, with the word: "20000 tokens"', true), SETTING_VAR]), setting: ["turn", "tokensOut"] },
+  { ...stopText(TEXT.stop.loop, "The loop detector", "The agent called one tool with the same arguments, and got the same result, as many times in a row as the loop detector allows.", "the agent called {{tool}} with the same arguments {{times}} in a row and got the same result each time, as many as {{setting}} allows", [v("tool", "the tool's name", true), v("times", 'how many times, with the word: "3 times"', true), SETTING_VAR]), setting: ["loop", "repeats"] },
+  stopText(TEXT.stop.toolTurns, "The agent's tool rounds spent", "The agent has had every round of tool calls Tool rounds per agent allows.", "the agent has had its {{rounds}} of tool calls, all that {{setting}} allows", [v("rounds", 'Tool rounds per agent, with the word: "8 rounds"', true), { ...SETTING_VAR, text: "Tool rounds per agent, the agent's, and where it is changed" }]),
+  { ...stopText(TEXT.stop.turnToolTurns, "The turn's tool rounds spent", "The turn's agents have had every round of tool calls Tool rounds per turn allows.", "the turn's agents have had its {{rounds}} of tool calls, all that {{setting}} allows", [v("rounds", 'Tool rounds per turn, with the word: "40 rounds"', true), SETTING_VAR]), setting: ["turn", "toolTurns"] },
   stopText(TEXT.stop.failed, "A call failed", "A call that failed: the provider's error, as it gave it; words of your own may go around it.", "{{error}}", [v("error", "the error, as the provider gave it", true)]),
   stopText(TEXT.stop.throttle, "Past a connection's throttle", "A call that needs more tokens than its connection's throttle lets through in a minute.", "the call needs {{tokens}}, more than this connection's throttle lets through in a minute ({{limit}})", [v("tokens", 'the tokens the call needs, with the word: "9000 tokens"', true), v("limit", "the tokens the throttle lets through in a minute", true)]),
   stopText(TEXT.stop.connectionUnread, "A connection that couldn't be read", "The runtime couldn't read its connections to find the agent's.", "the connection {{connection}} couldn't be read ({{error}})", [v("connection", "the connection's id; empty for the default connection"), v("error", "why", true)]),
@@ -2798,7 +2815,7 @@ The user gave no direction for this reply: carry the story on from where it stan
     vars: [v("kind", "why a reply is needed, in the words above", true), v("notes", "what changed about its notes since its last turn, each ending in a blank line; nothing when there is none of it. Required: a summary of its notes reaches the agent only here when no later turn follows it", true), v("message", "the user's newest message, framed as a message of the request is, or that there is none", true), v("ask", "what to do, in the words above", true)]
   },
   { id: TEXT.main.noNewest, group: MAIN, label: "No newest message", note: "Fills {{message}} where the request holds no message from the user.", text: "The request holds no message from the user: carry the story on from where it stands.", vars: [] },
-  { id: TEXT.main.askReleases, group: MAIN, label: "What to do: release the reply", note: "Fills {{ask}} in a chat whose reply is only what its agents release: no writer writes it.", text: "Work out what this reply needs, then release it with reply_write, a passage at a time, or hand it to an agent with delegate and to_reply. Nothing else reaches the user.", vars: [] }
+  { id: TEXT.main.askRelease, group: MAIN, label: "What to do: release the reply", note: "Fills {{ask}} in a chat whose reply is only what its agents release: no writer writes it. A turn's reply is released once, whole.", text: "Work out everything this reply needs, then release it once, whole: with one reply_write call, or by handing it to one agent with delegate and to_reply. A turn's reply is released once and nothing can follow it, so never release part of it. Nothing else reaches the user.", vars: [] }
 ];
 var REQUEST_TEXTS = [
   { id: TEXT.request.message, group: REQUEST, label: "A message", note: "One message of the request that isn't a preset instruction.", text: `[{{n}}] {{role}}{{from}}
@@ -2866,7 +2883,7 @@ var TOOL_TEXTS = [
   ...toolTexts(TOOL.presetInstructions, "List the active preset's instruction blocks in order, those switched off marked: what the preset's author tells the model, as written in the preset, before Lumiverse fills in its macros. Give block to read one whole.", { block: "A block's id or name, to read that block whole.", cursor: CURSOR_ARG }),
   ...toolTexts(TOOL.pastTurn, "Read or search an earlier turn of yours in full: every tool call you made with what came back, and your brief, where your notes keep only a receipt. Without arguments it lists your turns. Give reply to list that turn's steps; add step to read one whole; give grep to find the lines that hold some text, in that turn or, without reply, in your latest turns.", { reply: "The reply's number in the chat, as your receipts name it (reply #12).", step: "Which of the turn's steps to read whole, by its number in the turn's list.", grep: "Text to find, in any letter case: every line that holds it, with its reply, step and line.", cursor: CURSOR_ARG }),
   ...toolTexts(TOOL.writeReply, "Hand the writer your brief and have it write the reply, which goes to the user. This ends your turn: call it once, when you have what the reply needs, and call nothing else beside it.", { brief: "What the writer needs that the prompt doesn't already give it: facts to keep straight, lore that bears on this moment, the thread to pick up. Short and specific; no prose for the reply itself." }),
-  ...toolTexts(TOOL.replyWrite, "Release a passage of the reply: it streams to the user at once, after what was released before. Call it again for the next passage; the reply is everything released, in order. Released text can't be taken back. Your turn ends when you answer.", { text: "The passage, exactly as the user should read it." })
+  ...toolTexts(TOOL.replyWrite, "Release this turn's reply: it streams to the user at once. A turn's reply is released once, whole: call this once, when the whole reply is ready, never for part of it, since nothing more can go into the reply after it. Released text can't be taken back. Your turn ends when you answer.", { text: "The whole reply, exactly as the user should read it." })
 ];
 var ANSWER_TEXTS = [
   { id: TEXT.answer.more, group: ANSWERS6, label: "There is more", note: "Ends a tool's answer that has more to give.", text: '[There is more: call {{tool}} again with the same arguments and cursor "{{cursor}}".]', vars: [v("tool", "the tool"), v("cursor", "where the next page starts", true)] },
@@ -2904,11 +2921,13 @@ Its steps, in full as they were; read one whole with step:`, vars: [v("told", "w
   { id: TEXT.answer.replyFailed, group: ANSWERS6, label: "write_reply: the writer failed", note: "write_reply's answer when the writer's call failed before any of the reply was sent.", text: "The writer couldn't write the reply: {{reason}}. Nothing was sent to the user. Call write_reply again to try once more.", vars: [v("reason", "why", true)] },
   { id: TEXT.answer.replyNoBrief, group: ANSWERS6, label: "write_reply: no brief", note: "write_reply's answer to a call without a brief.", text: "write_reply needs brief: what the writer needs that the prompt doesn't already give it. When the prompt holds everything, say that in a line. Call write_reply again with brief.", vars: [] },
   { id: TEXT.answer.replyEmpty, group: ANSWERS6, label: "write_reply: an empty reply", note: "Fills {{reason}} in The writer failed, and the turn's error, when the writer's model answered with nothing.", text: "its model answered with nothing", vars: [] },
-  { id: TEXT.answer.replyReleased, group: ANSWERS6, label: "write_reply: the reply was released already", note: "write_reply's answer once part of the reply was released with reply_write: no writer writes after it.", text: "Not handed to the writer: you released part of this reply with reply_write, so the reply is yours to finish. Go on with reply_write, or end your turn.", vars: [] },
-  { id: TEXT.answer.released, group: ANSWERS6, label: "reply_write: released", note: "reply_write's answer once its passage reached the user.", text: "Released: {{chars}} characters reached the user. The reply holds {{total}} characters now. Release the next passage, or end your turn.", vars: [v("chars", "the passage's length", true), v("total", "the reply's length so far")] },
+  { id: TEXT.answer.replyReleased, group: ANSWERS6, label: "write_reply: the reply was released already", note: "write_reply's answer once the turn's reply was released with reply_write, or while an agent's answer goes out as it (delegate with to_reply): no writer writes after it.", text: "Not handed to the writer: this turn's reply went out already, or is going out now as another agent's answer, and a turn's reply is written once. Nothing more goes into it: finish your turn.", vars: [] },
+  { id: TEXT.answer.released, group: ANSWERS6, label: "reply_write: released", note: "reply_write's answer once the turn's reply reached the user. A turn's reply is released once, whole.", text: "Released: the reply, {{chars}} characters, reached the user. A turn's reply is released once, so nothing more goes into it. Finish your turn: call what else you still need, then answer.", vars: [v("chars", "the reply's length", true)] },
   { id: TEXT.answer.releaseWriter, group: ANSWERS6, label: "reply_write: the writer has the reply", note: "The answer of reply_write, and of delegate with to_reply, once the writer is writing the reply or has written it.", text: "Not released: the writer is writing this reply, or has written it, so nothing more can go into it.", vars: [] },
-  { id: TEXT.answer.releaseHeld, group: ANSWERS6, label: "reply_write: another agent's answer is streaming", note: "The answer of reply_write, and of delegate with to_reply, while a sub-agent's answer streams into the reply.", text: "Not released: another agent's answer is streaming into the reply now. Wait for that call to end, then release yours.", vars: [] },
-  { id: TEXT.answer.releaseUnchecked, group: ANSWERS6, label: "reply_write: the extension didn't say", note: "reply_write's answer when the extension that checks each passage gave no word on it in time, or gave one that isn't a word: nothing goes out unchecked.", text: "Not released: the check on each passage didn't answer, so nothing was sent. Try again.", vars: [] },
+  { id: TEXT.answer.releaseAgain, group: ANSWERS6, label: "reply_write and to_reply: the reply was released already", note: "The answer of reply_write, and of delegate with to_reply, once the turn's reply went out, or while another agent's answer goes out as it: a turn's reply is released once, whole.", text: "Not released: this turn's reply went out already, or is going out now as another agent's answer, and a turn's reply is written once, whole. Nothing more goes into it: finish your turn.", vars: [] },
+  { id: TEXT.answer.releaseLate, group: ANSWERS6, label: "reply_write: the extension didn't answer in time", note: "reply_write's answer when the extension that checks the reply gave no word on it within Wait for the extension: nothing goes out unchecked, and the reply is still to be released.", text: "Not released: {{extension}} gave no word on the reply within {{wait}} ({{setting}}), so nothing was sent and the reply is still yours to release. Try again.", vars: [v("extension", "the extension's name"), v("wait", 'how long it was waited for: "10 seconds"'), v("setting", "Wait for the extension, with where it is changed", true)] },
+  { id: TEXT.answer.releaseFailed, group: ANSWERS6, label: "reply_write: the extension's check failed", note: "reply_write's answer when asking the extension that checks the reply failed: nothing goes out unchecked, and the reply is still to be released.", text: "Not released: {{extension}}'s check on the reply failed ({{error}}), so nothing was sent and the reply is still yours to release. Try again.", vars: [v("extension", "the extension's name"), v("error", "why it failed", true)] },
+  { id: TEXT.answer.releaseUnchecked, group: ANSWERS6, label: "reply_write: the extension gave no text", note: "reply_write's answer when the extension that checks the reply answered with neither a reason to keep it back nor a text that can go out (where the chat's reply_write is the extension's own, only a text lets anything go): nothing goes out, and the reply is still to be released.", text: "Not released: {{extension}} gave neither the reply's text nor a reason to keep it back, so nothing was sent and the reply is still yours to release. Try again.", vars: [v("extension", "the extension's name")] },
   { id: TEXT.answer.releaseEnded, group: ANSWERS6, label: "reply_write: the reply has ended", note: "The answer of reply_write, and of delegate with to_reply, once the turn's reply has ended or the turn was stopped.", text: "Not released: this reply has ended.", vars: [] }
 ];
 var PROGRESS_TEXTS = [
@@ -2988,8 +3007,10 @@ function defOf(id) {
   return def;
 }
 class Texts {
+  place;
   own;
-  constructor(own = {}) {
+  constructor(own = {}, place = settingPlaceOf()) {
+    this.place = place;
     const kept = new Map;
     for (const [id, text] of Object.entries(own))
       if (typeof text === "string" && checkText(id, text) === null)
@@ -3000,7 +3021,11 @@ class Texts {
     return this.own.get(id) ?? defOf(id).text;
   }
   render(id, vars = {}) {
-    return fill(defOf(id), this.text(id), vars);
+    const def = defOf(id);
+    return fill(def, this.text(id), def.setting !== undefined && !hasOwn(vars, SETTING_VAR.name) ? { ...vars, [SETTING_VAR.name]: this.place(def.setting) } : vars);
+  }
+  setting(path) {
+    return this.place(path);
   }
   noun(n, id) {
     const [one = "", many = one] = this.text(id).split("|");
@@ -3013,14 +3038,14 @@ class Texts {
     return this.own.has(id);
   }
 }
-function textsOf(own) {
+function textsOf(own, place) {
   const texts = {};
   if (isRecord(own)) {
     for (const [id, text] of Object.entries(own))
       if (typeof text === "string")
         texts[id] = text;
   }
-  return new Texts(texts);
+  return new Texts(texts, place);
 }
 
 // src/link/contract.ts
@@ -5852,7 +5877,9 @@ async function callExtension(extension, member, arg2, userId, chats) {
         return none;
       await ownChat();
       const verdict = await core.releasing(given);
-      return { supplied: true, value: isRecord2(verdict) && typeof verdict.refused === "string" ? { refused: verdict.refused } : null };
+      if (isRecord2(verdict) && typeof verdict.refused === "string")
+        return { supplied: true, value: { refused: verdict.refused } };
+      return { supplied: true, value: isRecord2(verdict) && typeof verdict.text === "string" ? { text: verdict.text } : null };
     }
     case "released":
       if (core.released === undefined)
@@ -12102,9 +12129,9 @@ function createSpindleHost(identifier = EXTENSION_IDENTIFIER) {
 }
 
 // src/extension/backend/main.ts
-var BUILD = "1f6dfe71";
-var RUNTIME_SHA256 = "ebcb6491bf977b0950c8d218131cf36fd09e6b6ccf41c28b52474264354984d4";
-var RUNTIME_SIZE = "4656631";
+var BUILD = "5eb54157";
+var RUNTIME_SHA256 = "b5d3f09df67e3c2ecb566208570c1f3ca5c9e3cade64ee7688e3e1cc7ad2aaaa";
+var RUNTIME_SIZE = "4665446";
 var TICK_MS = 1000;
 var host = createSpindleHost();
 var backend = createBackend(host, {
