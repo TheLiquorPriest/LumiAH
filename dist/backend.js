@@ -388,7 +388,7 @@ function defaultSettings() {
     cache: { retention: DEFAULT_CACHE_RETENTION, key: "" },
     connections: { atOnce: null, throttles: {}, toolRefusalMinutes: 60 },
     prices: {},
-    session: { summarizeAtTokens: 32000, keepTurns: 3, summaryTokens: 6000, receiptChars: 1500, receiptArgChars: 1500, rollbackMarginTokens: 8000 },
+    session: { summarizeAtTokens: 32000, keepTurns: 3, summaryTokens: 6000, receiptChars: 600, receiptArgChars: 600, rollbackMarginTokens: 8000 },
     tools: { pageChars: 8000, pageItems: 10, lineChars: 300, excerptChars: 400, pieceChars: 600, chatBatch: 200, grepTurns: 40 },
     keep: { prompts: true, transcripts: true, blobChars: 4000000, summaries: 32, promptDays: 30, transcriptDays: 90, spanDays: null, graceHours: 24 },
     trace: { deltaMs: 200 },
@@ -3832,14 +3832,31 @@ function timeoutPlace(path, title, owner) {
   const settings = owner.settingsAt ?? `${owner.name}'s Settings`;
   return `${title} (${settings} \u2192 Timeouts${group !== null ? ` \u2192 ${group.label}` : ""})`;
 }
+function settingPlace(path, title, trail, owner) {
+  const settings = owner.settingsAt ?? `${owner.name}'s Settings`;
+  const group = timeoutGroupOf(path);
+  if (group === null)
+    return `${title} (${[settings, ...trail].join(" \u2192 ")})`;
+  const whose = path[1] === "agents" && trail[1] !== undefined ? [trail[1]] : [];
+  return `${title} (${[settings, "Timeouts", group.label, ...whose].join(" \u2192 ")})`;
+}
 
 // src/link/waits.ts
-function transportWait(path, owner) {
+function titlesOf(path) {
+  const titles = [typeof TRANSPORT_SCHEMA.title === "string" ? TRANSPORT_SCHEMA.title : TRANSPORT_KEY];
   let at2 = TRANSPORT_SCHEMA;
-  for (const key of path)
+  for (const key of path) {
     at2 = isRecord2(at2) && isRecord2(at2.properties) ? at2.properties[key] : undefined;
-  const title = isRecord2(at2) && typeof at2.title === "string" ? at2.title : path.join(".");
-  return timeoutPlace([TRANSPORT_KEY, ...path], title, owner);
+    titles.push(isRecord2(at2) && typeof at2.title === "string" ? at2.title : key);
+  }
+  return titles;
+}
+function transportWait(path, owner) {
+  return timeoutPlace([TRANSPORT_KEY, ...path], titlesOf(path).at(-1) ?? path.join("."), owner);
+}
+function transportPlace(path, owner) {
+  const titles = titlesOf(path);
+  return settingPlace([TRANSPORT_KEY, ...path], titles.at(-1) ?? path.join("."), titles.slice(0, -1), owner);
 }
 function spanWords(ms2) {
   if (ms2 < 1000)
@@ -8277,13 +8294,12 @@ function openOf2(v2) {
     return [];
   return v2.flatMap((o) => isRecord2(o) && typeof o.stream === "string" && typeof o.seq === "number" && Number.isSafeInteger(o.seq) && o.seq >= 0 ? [{ stream: o.stream, seq: o.seq }] : []);
 }
-function joinAdvice(over, name) {
-  const setting = (title) => `"${title}" (${name} \u2192 Settings \u2192 Transport \u2192 Link)`;
+function joinAdvice(over, owner) {
   if (over === "shared")
     return "Send this one again in a moment.";
   if (over === "frame")
-    return `Raise ${setting("Largest frame the extension joins")} to send one that large.`;
-  return `Those frames are this account's own: send this one again once they are done, or raise ${setting(over === "frames" ? "Frames joined at once" : "Characters held while joining")}.`;
+    return `Raise ${transportPlace(["link", "joinMaxUnits"], owner)} to send one that large.`;
+  return `Those frames are this account's own: send this one again once they are done, or raise ${transportPlace(["link", over === "frames" ? "joinFrames" : "joinHeldUnits"], owner)}.`;
 }
 
 class LinkServer {
@@ -8370,7 +8386,7 @@ class LinkServer {
       if ("waiting" in joined)
         return true;
       if ("refused" in joined) {
-        this.refuse(joined.id, userId, session, joined.over === "frame" ? "too_large" : "unavailable", `${joined.refused} ${joinAdvice(joined.over, this.deps.identity.name)}`);
+        this.refuse(joined.id, userId, session, joined.over === "frame" ? "too_large" : "unavailable", `${joined.refused} ${joinAdvice(joined.over, this.deps.identity)}`);
         return true;
       }
       try {
@@ -12174,9 +12190,9 @@ function createSpindleHost(identifier = EXTENSION_IDENTIFIER) {
 }
 
 // src/extension/backend/main.ts
-var BUILD = "f0b74320";
-var RUNTIME_SHA256 = "d1bbdff1cad5e245e672b17eed45efc9657fbf74241a56ef86aa7a36848f243d";
-var RUNTIME_SIZE = "4676115";
+var BUILD = "d63ffa90";
+var RUNTIME_SHA256 = "d18f23d45c675f00bb12d6030bed2af48250b1d384a84a0bf5b450567afbc331";
+var RUNTIME_SIZE = "4677442";
 var TICK_MS = 1000;
 var host = createSpindleHost();
 var backend = createBackend(host, {
