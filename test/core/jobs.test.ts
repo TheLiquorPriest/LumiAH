@@ -381,7 +381,7 @@ describe("limits", () => {
     const one = (await r.harness.jobs.start({ chatId: CHAT, agent: "summarizer", task: "One.", when: "now" })).job;
     const two = (await r.harness.jobs.start({ chatId: CHAT, agent: "summarizer", task: "Two.", when: "now" })).job;
     expect((await r.harness.jobs.run({ id: one.id }, never)).state).toBe("done");
-    const why = "what jobs sent and wrote in the last 24 hours is counted as 10100 tokens of the 10000 Job tokens per day allows (a cached re-read counts as 0.1 of a token)";
+    const why = "what jobs sent and wrote in the last 24 hours is counted as 10100 tokens of the 10000 Job tokens per day (Settings → Jobs) allows (a cached re-read counts as 0.1 of a token)";
     expect(await r.harness.jobs.run({ id: two.id }, never)).toMatchObject({ state: "spent", stoppedAt: "day", reason: why, usage: { calls: 0 } });
     expect(r.host.calls).toHaveLength(1);
     expect((await r.harness.jobs.read({ id: two.id })).report).toBe(
@@ -813,7 +813,9 @@ describe("a long objective", () => {
     const r = rig(cast({ job: Array.from({ length: 7 }, () => () => ({ toolCalls: [call("chat_search", { query: `try ${n++}` })] })) }), (s) => (s.jobs.budget.toolTurns = 1));
     const { id } = (await r.harness.jobs.start({ chatId: CHAT, agent: "summarizer", task: TASK, when: "now", allowance: { toolTurns: 5 } })).job;
     const job = await r.harness.jobs.run({ id }, never);
-    expect(job).toMatchObject({ state: "spent", reason: "the job's agents have had its 5 rounds of tool calls, all that Tool rounds per job (Settings → Jobs → Each job) allows", usage: { calls: 6, toolTurns: 5 } });
+    // The allowance stopped it, not Tool rounds per job: the words say so, and name no setting that changes nothing.
+    expect(job).toMatchObject({ state: "spent", reason: "the job's agents have had its 5 rounds of tool calls, all that the allowance it was started with allows", usage: { calls: 6, toolTurns: 5 } });
+    expect(job.reason).not.toContain("Tool rounds per job");
     expect(firstUser(r.host.calls[0]!)).toContain("5 rounds of tool calls, 15 minutes of work.");
   });
 
@@ -830,7 +832,7 @@ describe("a long objective", () => {
       }),
     );
     const { id } = (await r.harness.jobs.start({ chatId: CHAT, agent: "main", task: "Learn the story so far.", when: "now", allowance: { toolTurns: 2 } })).job;
-    const why = "the job's agents have had its 2 rounds of tool calls, all that Tool rounds per job (Settings → Jobs → Each job) allows";
+    const why = "the job's agents have had its 2 rounds of tool calls, all that the allowance it was started with allows";
     const spent = await r.harness.jobs.run({ id }, never);
     expect(spent).toMatchObject({ state: "spent", stoppedAt: "allowance", reason: why, usage: { calls: 3, toolTurns: 2, in: 3700, out: 300 } });
     expect((await r.harness.jobs.read({ id })).report).toBe(`Stopped at its allowance: ${why}.\nIt had last written: Halfway: Brann holds the key.\nFiles it wrote in this run: learned/plans/${id}.md\nIts plan, learned/plans/${id}.md, says what it did and what is left.\nGranted more, it carries on from where it stopped.`);
@@ -855,9 +857,9 @@ describe("a long objective", () => {
   test("a job a day's limit stops keeps its session and its work: carried on while the limit stands it stops again without a call, and once the limit is raised it goes on from where it was", async () => {
     // Each limit on a day's spend in turn: the jobs' own, and the user's two caps.
     const limits: [string, (s: Settings, limit: number | null) => void, number, RegExp][] = [
-      ["Job tokens per day", (s, limit) => (s.jobs.tokensPerDay = limit), 10_000, /^what jobs sent and wrote in the last 24 hours is counted as 10100 tokens of the 10000 Job tokens per day allows/],
-      ["Tokens per day", (s, limit) => (s.spend.tokensPerDay = limit), 10_000, /^what every agent's calls sent and wrote in the last 24 hours is counted as 10100 tokens of the 10000 Tokens per day allows/],
-      ["Cost per day", (s, limit) => (s.spend.costPerDay = limit), 0.01, /^every agent's calls together have cost \$0\.02 in the last 24 hours, and Cost per day allows \$0\.01$/],
+      ["Job tokens per day", (s, limit) => (s.jobs.tokensPerDay = limit), 10_000, /^what jobs sent and wrote in the last 24 hours is counted as 10100 tokens of the 10000 Job tokens per day \(Settings → Jobs\) allows/],
+      ["Tokens per day", (s, limit) => (s.spend.tokensPerDay = limit), 10_000, /^what every agent's calls sent and wrote in the last 24 hours is counted as 10100 tokens of the 10000 Tokens per day \(Settings → Spend\) allows/],
+      ["Cost per day", (s, limit) => (s.spend.costPerDay = limit), 0.01, /^every agent's calls together have cost \$0\.02 in the last 24 hours, and Cost per day \(Settings → Spend\) allows \$0\.01$/],
     ];
     for (const [name, set, limit, why] of limits) {
       const r = rig(
@@ -948,7 +950,7 @@ describe("a long objective", () => {
     // What was left of its three rounds, its tokens and its time when it started the other is all the other gets.
     const child = r.host.queued[1]!;
     expect(child).toMatchObject({ parent: id, agent: "summarizer", by: { who: "agent", role: "main" }, basis: null, allowance: { tokensIn: 599_000, tokensOut: 59_900, toolTurns: 2, wallMs: 900_000 } });
-    expect(await r.harness.jobs.run({ id: child.id }, never)).toMatchObject({ state: "spent", reason: "the job's agents have had its 2 rounds of tool calls, all that Tool rounds per job (Settings → Jobs → Each job) allows", usage: { calls: 3, toolTurns: 2, in: 900, out: 120 } });
+    expect(await r.harness.jobs.run({ id: child.id }, never)).toMatchObject({ state: "spent", reason: "the job's agents have had its 2 rounds of tool calls, all that the allowance it was started with allows", usage: { calls: 3, toolTurns: 2, in: 900, out: 120 } });
     expect((await r.harness.jobs.read({ id })).job.usage).toMatchObject({ calls: 5, toolTurns: 3, in: 3100, out: 270 });
 
     const off = rig(cast({ job: ["Done."] }), (s) => (s.jobs.chain = false));

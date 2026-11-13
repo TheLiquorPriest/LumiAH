@@ -198,7 +198,7 @@ describe("a main agent that stops short", () => {
     const { result, sink, request } = await r.turn();
     expect(result).toMatchObject({ status: "done", reply: "A reply from the preset alone." });
     expect(r.host.calls.at(-1)?.messages).toEqual(request.messages.map(({ source: _source, ...m }) => m));
-    expect(sink.progressLines.at(-1)).toStartWith("The main agent stopped before its brief (its answer was cut at its length limit (Answer per call)");
+    expect(sink.progressLines.at(-1)).toStartWith("The main agent stopped before its brief (its answer was cut at its length limit, Answer per call (Settings → Agents → Main agent → Budget)");
     const segment = segmentOf(parseJson(r.host.blobStore.get(result.record?.segment ?? "") ?? ""));
     expect(segment?.steps[0]).toEqual({ kind: "said", text: "I'll check the lore fir" });
   });
@@ -210,7 +210,7 @@ describe("a main agent that stops short", () => {
     // 100 answer tokens were left of 1000, fewer than Least answer room: the main agent's second call was never made, and the writer's was.
     expect(r.host.calls).toHaveLength(2);
     expect(result).toMatchObject({ status: "done", reply: "A reply from the preset alone." });
-    expect(sink.progressLines.some((line) => line.includes("fewer than Least answer room (256)"))).toBe(true);
+    expect(sink.progressLines.some((line) => line.includes("fewer than the 256 Least answer room"))).toBe(true);
   });
 
   const looping: Script = (request, n) => (request.tools ? { toolCalls: [call("chat_search", { query: `try ${n}` })] } : "A reply from the preset alone.");

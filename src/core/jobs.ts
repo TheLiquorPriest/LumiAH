@@ -35,8 +35,17 @@ import { clip, errorText, jsonEqual, type Limit, stopWords } from "./util";
 import { chatView, loreView } from "./views";
 import { showPath } from "./workspace";
 
-/** The words a job's own budget stops its agents with. */
-const JOB_WORDS: RunWords = { tokensIn: TEXT.jobs.stopIn, tokensOut: TEXT.jobs.stopOut, toolTurns: TEXT.jobs.stopRounds, time: TEXT.jobs.stopTime };
+/** The words a job's own budget stops its agents with: where the job was started with an allowance of its own for a limit, the stop says that allowance stopped it, never the setting for each job, which didn't. */
+function jobWords(job: Pick<JobView, "allowance">, texts: Texts): RunWords {
+  const own = job.allowance ?? {};
+  const said = texts.render(TEXT.jobs.stopAllowance);
+  const allowance: NonNullable<RunWords["allowance"]> = {};
+  if (own.tokensIn !== undefined) allowance.tokensIn = said;
+  if (own.tokensOut !== undefined) allowance.tokensOut = said;
+  if (own.toolTurns !== undefined) allowance.toolTurns = said;
+  if (own.wallMs !== undefined) allowance.time = said;
+  return { tokensIn: TEXT.jobs.stopIn, tokensOut: TEXT.jobs.stopOut, toolTurns: TEXT.jobs.stopRounds, time: TEXT.jobs.stopTime, allowance };
+}
 
 /** The stops that are a job's own allowance running out: granted more, it carries on. */
 const ALLOWANCE_STOPS: readonly AgentStopCode[] = ["turn_tokens_in", "turn_tokens_out", "turn_tool_turns", "turn_time"];
@@ -692,7 +701,7 @@ export class Jobs {
       const run = new Run(shared, setup, {
         info: { id: job.id, kind: "job", chatId: job.chatId },
         budget: jobBudget(job, settings),
-        words: JOB_WORDS,
+        words: jobWords(job, texts),
         startedAt,
         messageId: null,
         job: job.id,
@@ -793,7 +802,7 @@ export class Jobs {
           return { state: "spent", ...(reply.reason !== undefined ? { reason: reply.reason } : {}), stoppedAt: day ? "day" : "allowance", report, at };
         }
         // A cut answer is no report. One cut before it said anything ran out while its model was still thinking: the user is told so in those words. One that stopped on what it runs on (no connection to run on, a call its provider refused for its key, its model or its account) would stop the same way run again.
-        if (!whole) return { state: "failed", reason: reply.status === "answered" && cutShort(reply.finish) ? texts.render(said === "" ? TEXT.jobs.whyCutThinking : TEXT.agents.cut) : (reply.reason ?? texts.render(TEXT.jobs.whyNoAnswer)), report: told, at, ...(reply.code === "connection" || (reply.code === "failed" && isLasting(reply.reason ?? "")) ? { lasting: true as const } : {}) };
+        if (!whole) return { state: "failed", reason: reply.status === "answered" && cutShort(reply.finish) ? texts.render(said === "" ? TEXT.jobs.whyCutThinking : TEXT.agents.cut, { setting: texts.setting(["agents", resolved.definition.id, "budget", "callTokensOut"]) }) : (reply.reason ?? texts.render(TEXT.jobs.whyNoAnswer)), report: told, at, ...(reply.code === "connection" || (reply.code === "failed" && isLasting(reply.reason ?? "")) ? { lasting: true as const } : {}) };
         // The moment it would report: its turn must still stand on the path, else the report is marked off the path.
         if (await this.stands(job, settings.jobs.recordWaitMs, hostSignal).catch(() => true)) return { state: "done", report: told, at };
         return { state: "off_path", reason: texts.render(TEXT.jobs.whyOffPath), report: told, at };

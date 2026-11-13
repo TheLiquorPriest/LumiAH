@@ -162,7 +162,7 @@ describe("the caps", () => {
     const stop = r.spend.refusal(turn);
     expect(stop).toBeInstanceOf(AgentStop);
     expect(stop?.code).toBe("spend");
-    expect(stop?.message).toBe("what every agent's calls sent and wrote in the last 24 hours is counted as 3000 tokens of the 3000 Tokens per day allows (a cached re-read counts as 0.1 of a token)");
+    expect(stop?.message).toBe("what every agent's calls sent and wrote in the last 24 hours is counted as 3000 tokens of the 3000 Tokens per day (Settings → Spend) allows (a cached re-read counts as 0.1 of a token)");
     // A job's call is every agent's call too.
     expect(r.spend.refusal(job)?.message).toBe(stop?.message ?? "");
   });
@@ -173,9 +173,9 @@ describe("the caps", () => {
     expect(r.spend.refusal(turn)).toBeNull();
     r.add({});
     expect(r.spend.refusal(turn)?.code).toBe("spend");
-    expect(r.spend.refusal(turn)?.message).toBe("every agent's calls together have cost $0.50 in the last 24 hours, and Cost per day allows $0.50");
+    expect(r.spend.refusal(turn)?.message).toBe("every agent's calls together have cost $0.50 in the last 24 hours, and Cost per day (Settings → Spend) allows $0.50");
     r.add({ cost: 0.0125 });
-    expect(r.spend.refusal(turn)?.message).toBe("every agent's calls together have cost $0.5125 in the last 24 hours, and Cost per day allows $0.50");
+    expect(r.spend.refusal(turn)?.message).toBe("every agent's calls together have cost $0.5125 in the last 24 hours, and Cost per day (Settings → Spend) allows $0.50");
   });
 
   test("Job tokens per day refuses a job's call and not a turn's, and counts the jobs' calls alone", () => {
@@ -186,7 +186,7 @@ describe("the caps", () => {
     r.add({ kind: "job", run: "job-2", job: "job-2", agent: "summarizer" });
     const stop = r.spend.refusal(job);
     expect(stop?.code).toBe("spend");
-    expect(stop?.message).toBe("what jobs sent and wrote in the last 24 hours is counted as 2000 tokens of the 2000 Job tokens per day allows (a cached re-read counts as 0.1 of a token)");
+    expect(stop?.message).toBe("what jobs sent and wrote in the last 24 hours is counted as 2000 tokens of the 2000 Job tokens per day (Settings → Jobs) allows (a cached re-read counts as 0.1 of a token)");
     expect(r.spend.refusal(turn)).toBeNull();
   });
 
@@ -202,15 +202,15 @@ describe("the caps", () => {
     r.add(reread);
     expect([r.spend.refusal(turn), r.spend.refusal(job)]).toEqual([null, null]);
     r.add(reread);
-    expect(r.spend.refusal(turn)?.message).toBe("what every agent's calls sent and wrote in the last 24 hours is counted as 4000 tokens of the 3000 Tokens per day allows (a cached re-read counts as 0.1 of a token)");
+    expect(r.spend.refusal(turn)?.message).toBe("what every agent's calls sent and wrote in the last 24 hours is counted as 4000 tokens of the 3000 Tokens per day (Settings → Spend) allows (a cached re-read counts as 0.1 of a token)");
     // With Tokens per day out of the way, the jobs' own limit counts the same.
     r.settings.spend.tokensPerDay = null;
-    expect(r.spend.refusal(job)?.message).toBe("what jobs sent and wrote in the last 24 hours is counted as 4000 tokens of the 3000 Job tokens per day allows (a cached re-read counts as 0.1 of a token)");
+    expect(r.spend.refusal(job)?.message).toBe("what jobs sent and wrote in the last 24 hours is counted as 4000 tokens of the 3000 Job tokens per day (Settings → Jobs) allows (a cached re-read counts as 0.1 of a token)");
     // The setting is read at each call: at 0 a cached re-read counts as nothing, at 1 in full.
     r.settings.spend.cachedWeight = 0;
     expect(r.spend.refusal(job)).toBeNull();
     r.settings.spend.cachedWeight = 1;
-    expect(r.spend.refusal(job)?.message).toContain("counted as 20200 tokens of the 3000 Job tokens per day allows (a cached re-read counts as 1 of a token)");
+    expect(r.spend.refusal(job)?.message).toContain("counted as 20200 tokens of the 3000 Job tokens per day (Settings → Jobs) allows (a cached re-read counts as 1 of a token)");
   });
 
   test("the page is shown both: what a cap counts, and what was truly sent and written", async () => {
@@ -232,7 +232,7 @@ describe("the caps", () => {
     expect(r.spend.refusal(turn)).toBeNull();
     expect(r.spend.refusal(job)).toBeNull();
     r.settings.spend.costPerDay = 400;
-    expect(r.spend.refusal(turn)?.message).toContain("Cost per day allows $400.00");
+    expect(r.spend.refusal(turn)?.message).toContain("Cost per day (Settings → Spend) allows $400.00");
   });
 
   test("are said in the user's own words where they replaced them", () => {

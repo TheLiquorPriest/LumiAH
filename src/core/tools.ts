@@ -36,23 +36,32 @@ export interface ToolCtx {
  * - `tool`: `reply_write` as the extension that claims the chat offers it (`ChatClaim.replyTool`,
  *   checked); null for the core's own, which takes the reply's text.
  * - `refused`: why nothing can be released now, in words for the model (the turn has ended; the
- *   writer is at work on it; the turn's reply went out already, or is going out as another agent's
- *   answer); null where it can.
+ *   writer is at work on it; the turn's reply went out already; another agent's answer is about to
+ *   go out as it, so wait for that); null where it can.
  * - `write`: one `reply_write` call from the agent `ctx` names, with its arguments, once the
  *   extension lets it go (§21 `releasing`, which gives the text where the tool is the extension's),
  *   in the order the calls came: the text that went out, else why nothing did. The extension is told
  *   of what went out (`released`).
- * - `hold`: the reply held for one sub-agent's answer as it streams (`agent`), never asked about,
- *   so `refused` says so to every other agent meanwhile; `stream` appends what it brings (false
- *   where it went nowhere: the turn was stopped). What `hold` gives back lets the reply go, with
- *   all the stream released, which the extension is told of.
+ * - `hold`: the reply held for one sub-agent's answer (`agent`), never asked about, so `refused`
+ *   says so to every other agent meanwhile (`ReplyHand`).
  */
 export interface ReplyStream {
   tool: ReplyTool | null;
   refused(): string | null;
   write(args: JsonObject, ctx: ToolCtx): Promise<{ released: string } | { refused: string }>;
-  hold(agent: AgentRef): (released: string) => void;
+  hold(agent: AgentRef): ReplyHand;
+}
+
+/**
+ * The turn's reply held for one sub-agent's answer as it streams in (`delegate`'s `to_reply`):
+ * `stream` appends what the answer brings (false where it went nowhere: the turn was stopped, or the
+ * hand-on has ended); `end` lets the reply go once the hand-on's call has ended, and the extension
+ * is told of all that streamed. Nothing streams after `end`: what that agent says later
+ * (`agent_message`) is for the agent that started it to read, never the reply.
+ */
+export interface ReplyHand {
   stream(text: string): boolean;
+  end(): void;
 }
 
 /**

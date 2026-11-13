@@ -16,6 +16,7 @@ import type { AgentModelChoice, ChatClaim, ExtensionDefinitions, HarnessExtensio
 import type { ApprovalAnswer, ConnectionsPort, HarnessHost, JobView, JsonValue, LogLevel, ModelMessage, ModelsPort, TraceDelta, TraceRecord } from "../core/ports";
 import type { ActivatedEntry, LoreBookRead, RecallChatPort, RecallLorePort, RecallPorts, TimedMessage } from "../core/recall/ports";
 import type { ExtensionMember, ExtensionOffer, LinkRequests, StreamChunk } from "../link/contract";
+import { EXTENSION_MEMBERS } from "../link/contract";
 import { isRecord } from "../link/json";
 import type { RuntimeTuning } from "../link/settings";
 import { LinkError } from "./connection";
@@ -382,14 +383,15 @@ function messagesOf(value: JsonValue | undefined): ModelMessage[] | null {
 }
 
 /**
- * What the extension LumiAH is built into supplies to the core, over the link. A member the
- * extension said it doesn't have is answered here as the core takes "not supplied" (no definitions,
- * no claim, the request as the core built it, the definition's own model, a reply let go as the
- * call gave it, nothing for a hook), without a request. What reads (its definitions, a claim, the
- * writer's request, an agent's model) is asked again after a socket that closed under it. A hook,
- * and the check before the reply goes out (`releasing`, which may do work in the extension), are
- * sent once, so the extension never hears one twice: one whose answer is lost fails, as the core
- * takes a check that failed.
+ * What the extension LumiAH is built into supplies to the core, over the link. The core is offered
+ * only the members the extension's last hello named, as an extension in the backend's own process
+ * has only the members it has: one it doesn't have, the core goes on without (a `reply_write` of the
+ * extension's own needs its `releasing`, for one), never as if it had answered. What reads (its
+ * definitions, a claim, the writer's request, an agent's model) is asked again after a socket that
+ * closed under it. A hook, the check before the reply goes out (`releasing`) and the ask for what the
+ * agents had ready (`unreleased`), each of which may do work in the extension, are sent once, so the
+ * extension never hears one twice: one whose answer is lost fails, as the core takes a check that
+ * failed.
  */
 export function linkExtension(deps: ExtensionDeps): HarnessExtension {
   const has = (member: ExtensionMember): boolean => deps.offer()?.members.includes(member) === true;
@@ -418,11 +420,8 @@ export function linkExtension(deps: ExtensionDeps): HarnessExtension {
   // What the core hands a member is JSON by its contract (extension.ts); the cast says so to the link.
   const json = (value: unknown): JsonValue => value as JsonValue;
 
-  return {
-    get name() {
-      return deps.offer()?.name ?? "LumiAH";
-    },
-    // Each ask goes as the core made it; the backend takes the user from the runtime's own registration, whatever an ask names.
+  // Every member the link carries. Each ask goes as the core made it; the backend takes the user from the runtime's own registration, whatever an ask names.
+  const members: { [M in ExtensionMember]-?: NonNullable<HarnessExtension[M]> } = {
     definitions: async (ask) => {
       const value = await read("definitions", json(ask));
       return isRecord(value) ? (value as unknown as ExtensionDefinitions) : {};
@@ -444,7 +443,20 @@ export function linkExtension(deps: ExtensionDeps): HarnessExtension {
       return isRecord(value) && typeof value.text === "string" ? { text: value.text } : null;
     },
     released: (release) => tell("released", json(release)),
+    unreleased: async (turn) => {
+      const value = await once("unreleased", json(turn));
+      // What the agents had ready, as the core reads it: a text; anything else is none.
+      return isRecord(value) && typeof value.text === "string" ? { text: value.text } : null;
+    },
     replyWritten: (reply) => tell("replyWritten", json(reply)),
     runEnded: (run) => tell("runEnded", json(run)),
   };
+  const extension: HarnessExtension = {
+    get name() {
+      return deps.offer()?.name ?? "LumiAH";
+    },
+  };
+  // Read each time the core looks, since a later hello may offer more or less.
+  for (const member of EXTENSION_MEMBERS) Object.defineProperty(extension, member, { get: () => (has(member) ? members[member] : undefined), enumerable: true });
+  return extension;
 }

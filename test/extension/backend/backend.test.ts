@@ -112,6 +112,21 @@ describe("the settings", () => {
     expect((await it.page.request("lah.text.reset", { id: def.id })).texts.own[def.id]).toBeUndefined();
   });
 
+  test("pass over quietly a text of the user's own that this build has no text for: it isn't counted as theirs, every text of theirs resets, and it leaves storage with the next change", async () => {
+    const it = (r = await rig());
+    const def = TEXT_DEFS[0];
+    if (def === undefined) throw new Error("no texts");
+    // As a build before this one kept them: a copy of a text it had and this one doesn't, beside a copy of one it still has.
+    it.host.files.set(`${USER}/settings.json`, JSON.stringify({ v: 1, rev: 1, own: [], texts: { "tool.answer.release_held": "Wait for that call to end, then release yours.", [def.id]: def.text } }));
+    await it.restart();
+    const { texts } = await it.page.request("lah.hello", {});
+    expect(Object.keys(texts.own)).toEqual([def.id]);
+    // As the page's Reset does it: each text of theirs back to its default, none refused.
+    for (const id of Object.keys(texts.own)) await it.page.request("lah.text.reset", { id });
+    await it.backend.settle();
+    expect(it.host.stored(USER, "settings.json")).toEqual(expect.objectContaining({ texts: {} }));
+  });
+
   test("pass over quietly a value kept at a setting this build took away, and leave it out of storage from the next change on", async () => {
     const it = (r = await rig());
     // As a build that could run a chat inside Lumiverse kept them: how near the reply its main agent was warned and how long a turn waited for its reply, and that way's own group of timings; as one whose model calls crossed the link kept them: how long a stream's text was held back and how many chunks went by between acknowledgements; beside them, a setting this build keeps.

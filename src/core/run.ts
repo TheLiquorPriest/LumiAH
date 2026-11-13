@@ -150,15 +150,19 @@ function extensionWait(options: Pick<HarnessOptions, "place">): string {
   return settingPlaceOf(undefined, options.place)(["extension", "waitMs"]);
 }
 
+/** What the user reads of an ask of the extension's whose wait of `ms` ran out, in their text `late`: with how long it was waited for and where that wait is changed. `vars` fill the rest of it. */
+export function lateWords(ms: number, late: string, texts: Texts, options: Pick<HarnessOptions, "extension" | "place">, vars: Readonly<Record<string, string>> = {}): string {
+  return texts.render(late, { extension: options.extension?.name ?? "The extension", ...vars, wait: waitWords(ms), setting: extensionWait(options) });
+}
+
 /**
  * What the user reads of an ask of the extension's that got no answer, in their texts: `late` where
- * its wait ran out (with how long it was and where that wait is changed), `failed` where it failed
- * (with its error). `vars` fill the rest of either.
+ * its wait ran out (`lateWords`), `failed` where it failed (with its error). `vars` fill the rest of
+ * either.
  */
 export function unansweredWords(input: { why: Unanswered; late: string; failed: string; texts: Texts; options: Pick<HarnessOptions, "extension" | "place">; vars?: Readonly<Record<string, string>> }): string {
   const { why, texts, options } = input;
-  const vars = { extension: options.extension?.name ?? "The extension", ...input.vars };
-  return "ms" in why ? texts.render(input.late, { ...vars, wait: waitWords(why.ms), setting: extensionWait(options) }) : texts.render(input.failed, { ...vars, error: why.error });
+  return "ms" in why ? lateWords(why.ms, input.late, texts, options, input.vars) : texts.render(input.failed, { extension: options.extension?.name ?? "The extension", ...input.vars, error: why.error });
 }
 
 /** Why the extension's agents and skills are missing from a run, in the user's words: what a run's live view is told, and why a job or a conversation whose agent is the extension's doesn't start. */

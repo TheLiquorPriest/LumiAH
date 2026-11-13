@@ -14,7 +14,7 @@ export interface TimeoutSection {
 /**
  * The page's groups, each with the settings this build's schema has of it, in the list's order:
  * one the schema doesn't have is left out, and so is a group with none. Where two rows would read
- * the same ("Time per call" of each agent, "Parts kept" at each end), each says whose it is.
+ * the same ("Time per call" of each agent), each says whose it is.
  */
 export function timeoutSections(form: FormNode): TimeoutSection[] {
   const found = TIMEOUT_GROUPS.map((group) => ({ group, nodes: group.rows.flatMap((path) => nodeOf(form, path)) }));

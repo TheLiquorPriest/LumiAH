@@ -91,7 +91,7 @@ describe("a cap is asked about the call about to be made", () => {
     const first = await runTurn(r.host, r.harness, CHAT);
     // The main agent's first prompt alone is far past 50 tokens: it is stopped before anything is sent, in words that say the call would pass the cap.
     expect(r.host.calls.filter((request) => !isWriter(request))).toHaveLength(0);
-    expect(JSON.stringify(r.host.traced)).toContain("the call would take what every agent's calls sent and wrote in the last 24 hours past Tokens per day: counted as ");
+    expect(JSON.stringify(r.host.traced)).toContain("the call would take what every agent's calls sent and wrote in the last 24 hours past Tokens per day (Settings → Spend): counted as ");
     // A cap stops agents' work, never the reply: the writer writes from the request alone, and its call is on the record.
     expect(first.result).toMatchObject({ status: "done", reply: "The door opens." });
     expect(r.host.calls.filter(isWriter)).toHaveLength(1);
@@ -102,7 +102,7 @@ describe("a cap is asked about the call about to be made", () => {
     const second = await runTurn(r.host, r.harness, CHAT);
     expect(second.result).toMatchObject({ status: "done", reply: "The door opens." });
     expect(r.host.calls.every(isWriter)).toBe(true);
-    expect(JSON.stringify(r.host.traced)).toContain("is counted as 620 tokens of the 50 Tokens per day allows");
+    expect(JSON.stringify(r.host.traced)).toContain("is counted as 620 tokens of the 50 Tokens per day (Settings → Spend) allows");
     expect((await r.harness.spend.get({ days: 1 })).total).toMatchObject({ calls: 2, in: 1200 });
   });
 
@@ -119,15 +119,15 @@ describe("a cap is asked about the call about to be made", () => {
     expect(spend.refusal({ job: false, texts, tokens: 1001, cost: 0.2 })?.code).toBe("spend");
     // A second agent asking while the first's call is under way is told what the two would come to.
     const letGo = spend.hold({ job: false, tokens: 600, cost: 0.2 });
-    expect(spend.refusal({ job: false, texts, tokens: 600, cost: 0.2 })?.message).toBe("the call would take what every agent's calls sent and wrote in the last 24 hours past Tokens per day: counted as 1200 tokens with it, of the 1000 allowed (a cached re-read counts as 0.1 of a token)");
-    expect(spend.refusal({ job: false, texts, tokens: 300, cost: 0.4 })?.message).toBe("the call would take what every agent's calls cost in the last 24 hours past Cost per day: about $0.60 with it, and Cost per day allows $0.50");
+    expect(spend.refusal({ job: false, texts, tokens: 600, cost: 0.2 })?.message).toBe("the call would take what every agent's calls sent and wrote in the last 24 hours past Tokens per day (Settings → Spend): counted as 1200 tokens with it, of the 1000 allowed (a cached re-read counts as 0.1 of a token)");
+    expect(spend.refusal({ job: false, texts, tokens: 300, cost: 0.4 })?.message).toBe("the call would take what every agent's calls cost in the last 24 hours past Cost per day (Settings → Spend): about $0.60 with it, and it allows $0.50");
     expect(spend.refusal({ job: false, texts, tokens: 300, cost: 0.2 })).toBeNull();
     // Let go, once or twice over, it holds nothing.
     letGo();
     letGo();
     expect(spend.refusal({ job: false, texts, tokens: 600, cost: 0.2 })).toBeNull();
     // The jobs' own cap is asked about a job's call, and only a job's.
-    expect(spend.refusal({ job: true, texts, tokens: 900 })?.message).toBe("the call would take what jobs sent and wrote in the last 24 hours past Job tokens per day: counted as 900 tokens with it, of the 800 allowed (a cached re-read counts as 0.1 of a token)");
+    expect(spend.refusal({ job: true, texts, tokens: 900 })?.message).toBe("the call would take what jobs sent and wrote in the last 24 hours past Job tokens per day (Settings → Jobs): counted as 900 tokens with it, of the 800 allowed (a cached re-read counts as 0.1 of a token)");
     expect(spend.refusal({ job: false, texts, tokens: 900 })).toBeNull();
     const jobs = spend.hold({ job: true, tokens: 500, cost: 0 });
     expect(spend.refusal({ job: true, texts, tokens: 400 })?.code).toBe("spend");

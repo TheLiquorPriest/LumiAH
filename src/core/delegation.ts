@@ -18,7 +18,7 @@ import { type AgentHandle, type AgentReply, cutShort } from "./loop";
 import type { ModelDelta } from "./ports";
 import type { Run } from "./run";
 import { TEXT } from "./texts";
-import type { DelegateChoice, Delegation, ReplyStream, ToolCtx, ToolOutcome } from "./tools";
+import type { DelegateChoice, Delegation, ReplyHand, ReplyStream, ToolCtx, ToolOutcome } from "./tools";
 import { clip, limitOf } from "./util";
 import { readFile, showPath, versionOf, type WorkspaceView } from "./workspace";
 
@@ -34,38 +34,52 @@ export interface Delegating {
 /**
  * A sub-agent's answer on its way into the reply (`to_reply`): the text of each of its model calls
  * is held until it is `hold` characters long or the call ends without a tool call, then released;
- * what a call that ends in tool calls had held is never released. `released` is all it let out.
+ * what a call that ends in tool calls had held is never released. `released` is all it let out. It
+ * goes out only while the hand-on holds the reply (`begin` to `end`): the agent lives on after its
+ * hand-on, and what it says then (`agent_message`) is for the agent that started it to read.
  */
 class ReplyHold {
   /** The text of the call under way, as it streamed, and how much of it is out. */
   private seen = "";
   private sent = 0;
+  /** Where its answer goes while the hand-on holds the reply; null before that and once it ended. */
+  private hand: ReplyHand | null = null;
   released = "";
 
-  constructor(
-    private readonly reply: ReplyStream,
-    private readonly hold: number,
-  ) {}
+  constructor(private readonly hold: number) {}
+
+  /** The hand-on holds the reply: what the agent writes from now on streams into it. */
+  begin(hand: ReplyHand): void {
+    this.hand = hand;
+  }
+
+  /** The hand-on's call ended: the reply is let go, and nothing the agent writes after reaches it. What a call that failed had held goes with it. */
+  end(): void {
+    this.hand?.end();
+    this.hand = null;
+    this.seen = "";
+    this.sent = 0;
+  }
 
   /** A piece of a call's answer as it arrives. Its reasoning stays the agent's own: the reply's thinking block is the user's to read, and an agent's thoughts may hold what the user's character doesn't know. */
   delta(delta: ModelDelta): void {
-    if (delta.content === undefined || delta.content === "") return;
+    if (this.hand === null || delta.content === undefined || delta.content === "") return;
     this.seen += delta.content;
     if (this.seen.length >= this.hold) this.out(this.seen.slice(this.sent));
   }
 
   /** A call came back: with no tool call it is the answer, all of it out (a host that streams nothing gives it whole here); with tool calls, what it held is let go. */
   call(answer: { text: string; calls: number }): void {
-    if (answer.calls === 0) this.out((answer.text.startsWith(this.seen) ? answer.text : this.seen).slice(this.sent));
+    if (this.hand !== null && answer.calls === 0) this.out((answer.text.startsWith(this.seen) ? answer.text : this.seen).slice(this.sent));
     this.seen = "";
     this.sent = 0;
   }
 
   private out(text: string): void {
-    if (text === "") return;
+    if (text === "" || this.hand === null) return;
     this.sent += text.length;
     // What went nowhere (the turn was stopped) was never released.
-    if (this.reply.stream(text)) this.released += text;
+    if (this.hand.stream(text)) this.released += text;
   }
 }
 
@@ -148,7 +162,7 @@ export class Delegator {
     try {
       const leave = await this.gate.enter(ctx.signal);
       try {
-        const hold = reply ? new ReplyHold(reply, settings.delegation.replyHoldChars) : null;
+        const hold = reply ? new ReplyHold(settings.delegation.replyHoldChars) : null;
         const { agent, lead } = await run.agent(resolved, {
           depth: from.depth + 1,
           parent: ctx.agentId,
@@ -174,13 +188,14 @@ export class Delegator {
         // Asked again at the last moment, and the reply held in the same step: two agents' answers let in at once would both be the turn's one release.
         const late = reply.refused();
         if (late !== null) return { text: late, error: true };
-        const letGo = reply.hold(run.ref(agent.id) ?? { agentId: agent.id, role: resolved.definition.id, ...(input.as !== undefined ? { as: input.as } : {}) });
+        hold.begin(reply.hold(run.ref(agent.id) ?? { agentId: agent.id, role: resolved.definition.id, ...(input.as !== undefined ? { as: input.as } : {}) }));
         try {
           const answer = await agent.send(sent, ctx.signal);
           // Its result is what reached the reply: all of its answers' text that was released, in order.
           return this.answered(resolved.definition.id, agent.id, hold.released === "" ? answer : { ...answer, text: hold.released });
         } finally {
-          letGo(hold.released);
+          // The hand-on is over: the agent stays, for agent_message, and its later answers are only read.
+          hold.end();
         }
       } finally {
         leave();
@@ -217,7 +232,7 @@ export class Delegator {
     const { texts } = this.run;
     const cut = reply.status === "answered" && cutShort(reply.finish);
     if (reply.status === "answered" && !cut && reply.text.trim() !== "") return { text: `${texts.render(TEXT.agents.from, { agent: definition, handle })}\n\n${reply.text}` };
-    const reason = cut ? texts.render(TEXT.agents.cut) : (reply.reason ?? texts.render(TEXT.answer.replyEmpty));
+    const reason = cut ? texts.render(TEXT.agents.cut, { setting: texts.setting(["agents", definition, "budget", "callTokensOut"]) }) : (reply.reason ?? texts.render(TEXT.answer.replyEmpty));
     return { text: texts.render(TEXT.agents.stopped, { agent: definition, handle, reason, said: reply.text.trim() === "" ? "" : texts.render(TEXT.agents.stoppedSaid, { text: reply.text }) }), error: true };
   }
 }

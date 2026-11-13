@@ -236,7 +236,7 @@ describe("budgets", () => {
     const r = rig([{ toolCalls: [call("lookup")], usage }, { toolCalls: [call("lookup", { q: "b" })], usage }, "never"], (s) => (s.loop.answerFloor = 1));
     const reply = await r.start({ tools: [tool("lookup")], budget: { ...r.spec().budget, callTokensOut: 100, tokensOut: 120 } }).send("go");
     expect(r.host.calls.map((c) => c.maxTokens)).toEqual([100, 60]);
-    expect(reply).toMatchObject({ status: "refused", code: "tokens_out", reason: "the agent has written its 120 tokens (Answer tokens per agent)" });
+    expect(reply).toMatchObject({ status: "refused", code: "tokens_out", reason: "the agent has written its 120 tokens, all that Answer tokens per agent (Settings → Agents → Main agent → Budget) allows" });
   });
 
   test("the turn's budget counts every agent of the turn together", async () => {
@@ -259,7 +259,7 @@ describe("budgets", () => {
     expect(r.host.calls).toHaveLength(3);
     expect(reply).toMatchObject({ status: "refused", code: "tokens_in" });
     // The three calls count as 5,700; the call refused is counted with them at its prompt's estimate, in full.
-    expect(reply.reason).toMatch(/^the call would take the agent's prompt tokens past Prompt tokens per agent: counted as (5[7-9]|6\d)\d\d of the 5000 allowed \(a cached re-read counts as 0\.1 of a token\)$/);
+    expect(reply.reason).toMatch(/^the call would take the agent's prompt tokens past Prompt tokens per agent \(Settings → Agents → Main agent → Budget\): counted as (5[7-9]|6\d)\d\d of the 5000 allowed \(a cached re-read counts as 0\.1 of a token\)$/);
     // What it truly sent is on its usage, whatever the limit counted.
     expect(reply.usage).toMatchObject({ in: 30_000, cachedIn: 27_000 });
     // In full, the first call alone is past the limit.
@@ -286,7 +286,7 @@ describe("budgets", () => {
     const sending = r.start({ budget: { ...r.spec().budget, callMs: 1000 } }).send("go");
     await until(() => r.host.calls.length === 1);
     r.host.clock.advance(1500);
-    expect(await sending).toMatchObject({ status: "refused", code: "call_time", reason: "the call took longer than Time per call" });
+    expect(await sending).toMatchObject({ status: "refused", code: "call_time", reason: "the call took longer than Time per call (Settings → Agents → Main agent → Budget) allows" });
 
     const s = rig((_request, i) => {
       s.host.clock.advance(4000);
@@ -381,7 +381,9 @@ describe("clipping and scratch_read", () => {
     };
     const clip = "Tool results clipped past (Settings → The agent loop) says where a result is clipped";
     expect(content(1)).toBe("r".repeat(15_000));
-    expect(content(2)).toBe(`${"r".repeat(20_000)}\n[Clipped: the first 20000 of 25000 characters; ${clip}. The rest is in scratch s1: scratch_read gives it from offset 20000, 20000 characters a read at most.]`);
+    // Clipped at the length its tool gives whole, not at the setting: the words name no setting, which changing would change nothing.
+    expect(content(2)).toBe(`${"r".repeat(20_000)}\n[Clipped: the first 20000 of 25000 characters; this tool gives up to 20000 characters whole. The rest is in scratch s1: scratch_read gives it from offset 20000, 20000 characters a read at most.]`);
+    expect(content(2)).not.toContain("Tool results clipped past");
     expect(content(3)).toBe(`${"l".repeat(6000)}\n[Clipped: the first 6000 of 15000 characters; ${clip}. The rest is in scratch s2: scratch_read gives it from offset 6000, 6000 characters a read at most.]`);
     // The rest of the long read comes in one read, as much as its tool gives whole.
     expect(content(4)).toBe(`[Scratch s1, characters 20000 to 25000 of 25000.]\nTAIL${"t".repeat(4996)}`);
@@ -637,7 +639,7 @@ describe("a streaming answer, for the live view", () => {
 
 describe("least answer room", () => {
   const wrote = (out: number) => ({ prompt_tokens: 10, completion_tokens: out });
-  const ROOM = "only 100 tokens are left of its answer tokens, fewer than Least answer room (256): an answer written in them would be cut";
+  const ROOM = "only 100 tokens are left of its answer tokens, fewer than the 256 Least answer room (Settings → The agent loop) asks for: an answer written in them would be cut";
 
   test("with the agent's answer tokens nearly spent the next call isn't made: it stops, and says how few are left", async () => {
     const r = rig([{ toolCalls: [call("lookup")], usage: wrote(900) }, "never"]);
@@ -668,7 +670,7 @@ describe("least answer room", () => {
     // 150 tokens were left for the second call: fewer than Least answer room, and more than a call of this agent's may write anyway. 50 are too few even for that.
     expect(r.host.calls.map((c) => c.maxTokens)).toEqual([100, 100]);
     expect(reply).toMatchObject({ status: "refused", code: "tokens_out" });
-    expect(reply.reason).toStartWith("only 50 tokens are left of its answer tokens, fewer than Least answer room");
+    expect(reply.reason).toStartWith("only 50 tokens are left of its answer tokens, fewer than the ");
   });
 });
 
@@ -854,6 +856,25 @@ describe("a limit's words name its setting where the user changes it", () => {
     const plain = await rig(looping, undefined, { turn }).start({ tools: [tool("lookup")] }).send("go");
     expect(plain.reason).toContain("Tool rounds per turn (Settings → The turn)");
   });
+
+  test("an agent's own budget limits and the loop's floor name their setting and place: Revisions, Tool calls per answer, Prompt tokens per agent, Least answer room", async () => {
+    const at = "LumiRPEngine's Harness tab → System → Settings";
+    const revised = rig(["one", "two"], undefined, { place });
+    const once = revised.start({ budget: { ...revised.spec().budget, revisions: 0 } });
+    await once.send("go");
+    expect((await once.send("again")).reason).toContain(`Revisions (${at} → Agents → Main agent → Budget)`);
+
+    const many = rig([{ toolCalls: [call("lookup", { q: "a" }, "c1"), call("lookup", { q: "b" }, "c2")] }, "done"], undefined, { place });
+    await many.start({ tools: [tool("lookup")], budget: { ...many.spec().budget, callTools: 1 } }).send("go");
+    const refused = lastMessage(many.host.calls[1])?.parts?.find((part) => part.type === "tool_result" && part.toolUseId === "c2");
+    expect(refused?.type === "tool_result" ? refused.content : "").toContain(`Tool calls per answer (${at} → Agents → Main agent → Budget)`);
+
+    const sent = await rig(["never"], undefined, { place }).start({ budget: { ...many.spec().budget, tokensIn: 5 } }).send("A message long enough to pass five tokens.");
+    expect(sent.reason).toContain(`Prompt tokens per agent (${at} → Agents → Main agent → Budget)`);
+
+    const floor = await rig(["never"], undefined, { place }).start({ budget: { ...many.spec().budget, tokensOut: 100 } }).send("go");
+    expect(floor.reason).toContain(`Least answer room (${at} → The agent loop)`);
+  });
 });
 
 describe("a note from the user", () => {
@@ -1018,7 +1039,7 @@ describe("a cap from outside the run", () => {
       return "found";
     });
     const reply = await r.start({ tools: [lookup] }).send("go");
-    expect(reply).toMatchObject({ status: "refused", code: "spend", reason: "what every agent's calls sent and wrote in the last 24 hours is counted as 5000 tokens of the 4000 Tokens per day allows (a cached re-read counts as 0.1 of a token)" });
+    expect(reply).toMatchObject({ status: "refused", code: "spend", reason: "what every agent's calls sent and wrote in the last 24 hours is counted as 5000 tokens of the 4000 Tokens per day (Settings → Spend) allows (a cached re-read counts as 0.1 of a token)" });
     expect(r.host.calls).toHaveLength(1);
   });
 });

@@ -390,8 +390,8 @@ export function defaultSettings(): Settings {
     prices: {},
     // A quarter of Summarize past: a rollback holds for several turns, and the notes still don't grow without end.
     // A call's arguments are kept as long as its result: a written file or a long brief is then in the notes by its start, and past_turn reads it whole.
-    // Long-form play leans on the turns before: 48,000 tokens with four turns whole summarizes less often (each summary costs a call and loses detail; the notes are mostly read from the cache), and 1,500 characters of a receipt keep a paragraph of what was written, not a sentence.
-    session: { summarizeAtTokens: 48_000, keepTurns: 4, summaryTokens: 6000, receiptChars: 1500, receiptArgChars: 1500, rollbackMarginTokens: 8000 },
+    // The notes ride in every call of the main agent beside its tools, so they stay at 32,000 tokens with three turns whole: at 48,000 and four, a long told turn on the test bed began at 100,000 of its 160,000 tokens and ran out of room mid-turn. 1,500 characters of a receipt keep a paragraph of what was written, not a sentence.
+    session: { summarizeAtTokens: 32_000, keepTurns: 3, summaryTokens: 6000, receiptChars: 1500, receiptArgChars: 1500, rollbackMarginTokens: 8000 },
     // A page fits under Tool results clipped past with its framing, so a tool's answer is paged, not clipped (and is cut there whatever this says: `pagerOf`). 8,000 characters holds a long message of a story in one page, and halves the rounds a long file costs.
     tools: { pageChars: 8000, pageItems: 10, lineChars: 300, excerptChars: 400, pieceChars: 600, chatBatch: 200, grepTurns: 40 },
     // Prompts are most of what is stored, and are read only while a turn is fresh; transcripts longer; the turns a summary replaced for good, so a rollback always works.

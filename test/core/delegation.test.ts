@@ -200,7 +200,7 @@ describe("the files given with a task", () => {
     return r;
   }
   const whole = async (path: string, text: string): Promise<string> => `[${path}: ${text.length} characters, version ${await version(text)}]\n${text}`;
-  const named = (path: string, text: string): string => `[${path}: ${text.length} characters, not included here. workspace_read reads it.]`;
+  const named = (path: string, text: string): string => `[${path}: ${text.length} characters, not included here: past the room Files given with a task (Settings → Delegation) leaves. workspace_read reads it.]`;
 
   test("are in the sub-agent's first message, whole, each under its path, its length and its version", async () => {
     const r = await filed(() => undefined, ["/notes/plan.md", "learned/brann.md"]);
@@ -326,14 +326,14 @@ describe("a sub-agent's handle", () => {
     const calls = callsOf(r.host, MAIN);
     // The summarizer may be sent one message after its first answer.
     expect(results(calls[2])).toEqual([{ type: "tool_result", toolUseId: "m1", content: answered("He has kept it for years.", sub?.id ?? "") }]);
-    expect(results(calls[3])).toEqual([{ type: "tool_result", toolUseId: "m2", content: stopped(sub?.id ?? "", "it has had the 1 revision it may have after its first answer (Revisions)."), isError: true }]);
+    expect(results(calls[3])).toEqual([{ type: "tool_result", toolUseId: "m2", content: stopped(sub?.id ?? "", "it has had the 1 revision it may have after its first answer, all that Revisions (Settings → Agents → Summarizer → Budget) allows."), isError: true }]);
     expect(callsOf(r.host, SUMMARIZER)).toHaveLength(2);
   });
 
   test("the cap is the one Settings give its definition", async () => {
     const r = rig(cast(main([{ toolCalls: [delegate("Say who keeps the lighthouse.", "d1")] }, follow("Say more.", "m1"), "The reply."]), agent(SUMMARIZER, ["Okoro keeps it."])), (s) => (s.agents.summarizer!.budget.revisions = 0));
     await r.turn();
-    expect(results(callsOf(r.host, MAIN)[2])[0]).toMatchObject({ isError: true, content: stopped(started(r.host, "summarizer")[0]?.id ?? "", "it has had the 0 revisions it may have after its first answer (Revisions).") });
+    expect(results(callsOf(r.host, MAIN)[2])[0]).toMatchObject({ isError: true, content: stopped(started(r.host, "summarizer")[0]?.id ?? "", "it has had the 0 revisions it may have after its first answer, all that Revisions (Settings → Agents → Summarizer → Budget) allows.") });
     expect(callsOf(r.host, SUMMARIZER)).toHaveLength(1);
   });
 
@@ -783,7 +783,7 @@ describe("a sub-agent that stops short", () => {
 
   test("an answer cut at its length limit is told as stopped short, with what there is of it", async () => {
     const r = await delegated([{ content: "The lighthouse was li", finishReason: "length" }]);
-    expect(r.told).toEqual([{ type: "tool_result", toolUseId: "d1", content: stopped(r.handle, "its answer was cut at its length limit (Answer per call), so it isn't the whole of what it meant to say. It had last written: The lighthouse was li"), isError: true }]);
+    expect(r.told).toEqual([{ type: "tool_result", toolUseId: "d1", content: stopped(r.handle, "its answer was cut at its length limit, Answer per call (Settings → Agents → Summarizer → Budget), so it isn't the whole of what it meant to say. It had last written: The lighthouse was li"), isError: true }]);
   });
 
   test("an empty answer is no answer", async () => {

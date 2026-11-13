@@ -270,7 +270,7 @@ describe("compaction and rollback", () => {
     const { result, sink } = await r.exchange("I call out.");
     expect(result.record?.summary).toBeUndefined();
     expect(lastSession(r.host)).toMatchObject({ turns: 3, summary: false });
-    expect(sink.progressLines).toContain("Its notes weren't summarized (its summary was cut off at its limit (the summarizer's Answer per call)); they go on whole.");
+    expect(sink.progressLines.some((line) => line.startsWith("Its notes weren't summarized (its summary was cut off at its limit, the summarizer's Answer per call (Settings → Agents → Summarizer → Budget)"))).toBe(true);
     r.summaries.push("Okoro keeps the lighthouse.");
     expect((await r.exchange("I call again.")).result.record?.summary).toBeDefined();
   });

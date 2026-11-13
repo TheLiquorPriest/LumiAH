@@ -8,7 +8,7 @@
 // added last: a backend serves every user, where the core's host serves one. So what a test or a
 // one-user host wrote against the core's shapes fits as it is.
 
-import type { AgentModelAsk, AgentModelChoice, ChatClaim, ClaimAsk, ExtensionDefinitions, HarnessExtension, ReleaseVerdict, ReplyRelease, ReplyWritten, RunBegan, RunEnded, WriterRequest } from "../../core/extension";
+import type { AgentModelAsk, AgentModelChoice, ChatClaim, ClaimAsk, ExtensionDefinitions, HarnessExtension, ReleaseVerdict, ReplyRelease, ReplyUnreleased, ReplyWritten, RunBegan, RunEnded, WriterRequest } from "../../core/extension";
 import type { JsonValue, ModelMessage, RemoteTool, RemoteToolCall } from "../../core/ports";
 import type { ExtensionMember, ExtensionOffer } from "../../link/contract";
 import { EXTENSION_MEMBERS } from "../../link/contract";
@@ -34,8 +34,10 @@ export interface BackendExtension {
   agentModel?(ask: AgentModelAsk, userId: string): Promise<AgentModelChoice | null>;
   /** The turn's reply, about to go out as an agent releases it (`reply_write`): `{ refused }` keeps it back, and the agent is told why; `{ text }` is what goes out; null lets the call's own text go. */
   releasing?(release: ReplyRelease, userId: string): Promise<ReleaseVerdict>;
-  /** The turn's reply went out, or a sub-agent's answer finished streaming in as the reply: what reached the user. */
+  /** The turn's reply went out, a sub-agent's answer finished streaming in as the reply, or what `unreleased` gave went out: what reached the user. */
   released?(release: ReplyRelease, userId: string): Promise<void>;
+  /** The agent that leads ended with none of the reply released, in a chat whose reply is only what its agents release: `{ text }` is what its agents had ready, which goes out as the turn's reply; null leaves the turn failing as it would. */
+  unreleased?(turn: ReplyUnreleased, userId: string): Promise<{ text: string } | null>;
   replyWritten?(reply: ReplyWritten, userId: string): Promise<void>;
   runEnded?(run: RunEnded, userId: string): Promise<void>;
 }
@@ -68,6 +70,7 @@ export function harnessExtension(extension: BackendExtension, userId: string): H
     ...(extension.agentModel ? { agentModel: (ask) => extension.agentModel?.({ ...ask, userId }, userId) ?? Promise.resolve(null) } : {}),
     ...(extension.releasing ? { releasing: (release) => extension.releasing?.({ ...release, userId }, userId) ?? Promise.resolve(null) } : {}),
     ...(extension.released ? { released: (release) => extension.released?.({ ...release, userId }, userId) ?? Promise.resolve() } : {}),
+    ...(extension.unreleased ? { unreleased: (turn) => extension.unreleased?.({ ...turn, userId }, userId) ?? Promise.resolve(null) } : {}),
     ...(extension.replyWritten ? { replyWritten: (reply) => extension.replyWritten?.({ ...reply, userId }, userId) ?? Promise.resolve() } : {}),
     ...(extension.runEnded ? { runEnded: (run) => extension.runEnded?.({ ...run, userId }, userId) ?? Promise.resolve() } : {}),
   };
@@ -141,6 +144,13 @@ export async function callExtension(extension: BackendExtension | undefined, mem
       await ownChat();
       await core.released(given);
       return { supplied: true, value: null };
+    case "unreleased": {
+      if (core.unreleased === undefined) return none;
+      await ownChat();
+      // Read as outside data: a text is what goes out; anything else is none.
+      const ready: unknown = await core.unreleased(given);
+      return { supplied: true, value: isRecord(ready) && typeof ready.text === "string" ? { text: ready.text } : null };
+    }
     case "replyWritten":
       if (core.replyWritten === undefined) return none;
       await ownChat();

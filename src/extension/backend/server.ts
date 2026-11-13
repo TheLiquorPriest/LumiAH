@@ -132,7 +132,7 @@ function openOf(v: unknown): OpenStream[] {
 function joinAdvice(over: Extract<Joined, { refused: string }>["over"], name: string): string {
   const setting = (title: string): string => `"${title}" (${name} → Settings → Transport → Link)`;
   if (over === "shared") return "Send this one again in a moment.";
-  if (over === "frame") return `Raise ${setting("Largest frame joined")} to send one that large.`;
+  if (over === "frame") return `Raise ${setting("Largest frame the extension joins")} to send one that large.`;
   return `Those frames are this account's own: send this one again once they are done, or raise ${setting(over === "frames" ? "Frames joined at once" : "Characters held while joining")}.`;
 }
 

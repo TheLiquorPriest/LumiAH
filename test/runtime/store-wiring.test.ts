@@ -135,7 +135,7 @@ describe("the runtime's working store", () => {
     const it = (r = await rig());
     await it.setUp();
     await it.page.request("lah.settings.set", { set: [{ path: ["transport", "link", "joinMaxUnits"], value: 1024 * 1024 }], reset: [] });
-    // Past "Largest frame joined" (1 Mi characters here), and past what is sent whole, so it crosses in parts and the extension refuses it.
+    // Past "Largest frame the extension joins" (1 Mi characters here), and past what is sent whole, so it crosses in parts and the extension refuses it.
     const big = "x".repeat(5 * 1024 * 1024);
     const hash = await textHash(big);
     await it.runtime.store.blobs.put(hash, big);

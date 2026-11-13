@@ -391,11 +391,8 @@ describe("what an extension that LumiAH is built into supplies", () => {
     // A user an ask names is not taken at its word.
     await supplied.runBegan?.({ userId: "user-joss", chatId, turn: "turn-9", kind: "new", story });
     expect(hooks).toEqual([`new turn-9 for ${USER}`]);
-    // What it doesn't supply is never asked for: the core is told so at once.
-    const before = it.host.sent.length;
-    expect(await supplied.writerRequest?.({ userId: "", chatId, generationId: "turn-9", kind: "new", brief: null, messages: [] })).toBeNull();
-    await supplied.runEnded?.({ userId: "", chatId, turn: "turn-9", kind: "new", status: "done", reply: "", record: null, usage: USAGE });
-    expect(it.host.sent.length).toBe(before);
+    // What it doesn't supply is never asked for: the core isn't offered it, and goes on as without it.
+    expect([supplied.writerRequest, supplied.runEnded, supplied.releasing]).toEqual([undefined, undefined, undefined]);
   });
 });
 

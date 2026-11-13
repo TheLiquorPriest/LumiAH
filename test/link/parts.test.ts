@@ -175,7 +175,7 @@ describe("the extension, sent frames in parts", () => {
     expect(backend.server.joining(USER)).toEqual({ frames: 0, units: 0 });
     expect(refusals()).toMatchObject([{ id: "a", code: "too_large", session: SESSION }]);
     expect(refusals()[0]?.message).toContain("That frame is over 1 million characters");
-    expect(refusals()[0]?.message).toContain('Raise "Largest frame joined" (LumiAH → Settings → Transport → Link)');
+    expect(refusals()[0]?.message).toContain('Raise "Largest frame the extension joins" (LumiAH → Settings → Transport → Link)');
   });
 
   test("lets go of the parts whose rest never came on its tick, for every session", async () => {

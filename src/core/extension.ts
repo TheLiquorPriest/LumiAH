@@ -164,10 +164,10 @@ export interface AgentModelChoice {
  * The turn's reply as an agent releases it itself (`reply_write`), or a sub-agent's answer that
  * streamed into it as the reply (`delegate`'s `to_reply`): the turn (its generation's id), the agent
  * whose release it is, its text, and the call's arguments as the agent gave them (`args`; none for
- * a `to_reply` stream). Asked about before a `reply_write` call goes out (`releasing`: `text` is the
- * text the call carries, empty where the chat's reply tool is the extension's own), and told of once
- * it went out or a stream ended (`released`: `text` is what reached the user). A turn's reply is
- * released once, whole.
+ * a `to_reply` stream, nor for what the extension gave when the lead released nothing). Asked about
+ * before a `reply_write` call goes out (`releasing`: `text` is the text the call carries, empty where
+ * the chat's reply tool is the extension's own), and told of once it went out or a stream ended
+ * (`released`: `text` is what reached the user). A turn's reply is released once, whole.
  */
 export interface ReplyRelease {
   userId: string;
@@ -185,6 +185,20 @@ export interface ReplyRelease {
  * only a text lets anything go.
  */
 export type ReleaseVerdict = { refused: string } | { text: string } | null;
+
+/**
+ * A turn whose agent that leads ended with none of the reply released, in a chat whose reply is
+ * only what its agents release (`unreleased`): the turn (its generation's id), and how the lead
+ * ended: it answered (`done`), one of its limits stopped it (`limit`: a budget, the loop detector, a
+ * throttle, a spend cap, an answer cut at its length), or something failed (`failed`: a model call,
+ * the connection it runs on, LumiAH's own work).
+ */
+export interface ReplyUnreleased {
+  userId: string;
+  chatId: string;
+  turn: string;
+  ended: "done" | "limit" | "failed";
+}
 
 /** A run ended: how, what it spent, and, for a turn that answered a generation, the reply it sent and the record it leaves. */
 export interface RunEnded {
@@ -225,8 +239,19 @@ export interface HarnessExtension {
    * (`to_reply`) is never asked about, only told.
    */
   releasing?(release: ReplyRelease): Promise<ReleaseVerdict>;
-  /** The turn's reply went out (`reply_write`), or a sub-agent's answer finished streaming in as the reply (`to_reply`): what reached the user, and the call's arguments. Told once a turn at most. */
+  /** The turn's reply went out (`reply_write`), or a sub-agent's answer finished streaming in as the reply (`to_reply`), or what the extension gave when the lead released nothing went out (`unreleased`): what reached the user, and the call's arguments (none for the last two). Told once a turn at most. */
   released?(release: ReplyRelease): Promise<void>;
+  /**
+   * The agent that leads ended with none of the reply released, in a chat whose reply is only what
+   * its agents release: what its agents had ready, to go out as the turn's reply, so work that passed
+   * the extension's checks isn't lost when the lead stops short. Asked once, after the lead's run
+   * ended, and never when the user stopped the turn. A text (`{ text }`, not empty) is the turn's one
+   * release: it streams, `released` hears it, and the turn ends as a turn with a reply does, its
+   * thinking block, live view and record saying how the lead ended. Null, an empty text, a failure,
+   * or no answer within Settings' wait: the turn fails as it does without this member, and words
+   * name a wait that ran out.
+   */
+  unreleased?(turn: ReplyUnreleased): Promise<{ text: string } | null>;
   /** A turn's reply has been written and its stream ended. */
   replyWritten?(reply: ReplyWritten): Promise<void>;
   /** A run ended, whichever way. */

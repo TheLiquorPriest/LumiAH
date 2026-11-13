@@ -180,7 +180,7 @@ export class Sides {
           status = "stopped";
           reason = stopWords(signal) ?? texts.render(TEXT.progress.turnStopped);
         } else reason = answered.reason ?? texts.render(TEXT.answer.replyEmpty);
-        if (status === "done" && cutShort(finish)) reason = texts.render(TEXT.agents.cut);
+        if (status === "done" && cutShort(finish)) reason = texts.render(TEXT.agents.cut, { setting: texts.setting(["agents", resolved.definition.id, "budget", "callTokensOut"]) });
       } catch (error) {
         status = signal.aborted ? "stopped" : "failed";
         reason = errorText(error);

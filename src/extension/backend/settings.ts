@@ -99,8 +99,14 @@ function unretired(path: readonly string[], value: JsonValue, retired: readonly 
   return value;
 }
 
-/** A stored document, read: `schema` is the settings' whole, which what it holds is capped by, and `retired` the settings this build took away, which are passed over quietly and go from storage with the next change. */
-function storedOf(raw: unknown, schema: JsonObject, retired: readonly (readonly string[])[]): Stored | null {
+/**
+ * A stored document, read: `schema` is the settings' whole, which what it holds is capped by, and
+ * `retired` the settings this build took away, which are passed over quietly and go from storage
+ * with the next change. So does a text of the user's that has no text of this build's to stand in
+ * for (`texts`: the ids there are): it can't be sent, and kept it would be counted as the user's, with
+ * no default to put it back to.
+ */
+function storedOf(raw: unknown, schema: JsonObject, retired: readonly (readonly string[])[], texts: ReadonlySet<string>): Stored | null {
   if (!isRecord(raw) || raw.v !== 1) return null;
   const own: Own[] = [];
   if (Array.isArray(raw.own))
@@ -112,9 +118,9 @@ function storedOf(raw: unknown, schema: JsonObject, retired: readonly (readonly 
       for (const key of o.path) rule = isRecord(rule) && isRecord(rule.properties) && hasOwn(rule.properties, key) ? rule.properties[key] : undefined;
       own.push({ path: o.path, value: capped(rule, value) });
     }
-  const texts: Record<string, string> = {};
-  if (isRecord(raw.texts)) for (const [id, text] of Object.entries(raw.texts)) if (typeof text === "string") texts[id] = text;
-  return { v: 1, rev: typeof raw.rev === "number" && Number.isSafeInteger(raw.rev) && raw.rev >= 0 ? raw.rev : 0, own, texts, ...(isRecord(raw.definitions) ? { definitions: raw.definitions as JsonObject } : {}) };
+  const kept: Record<string, string> = {};
+  if (isRecord(raw.texts)) for (const [id, text] of Object.entries(raw.texts)) if (typeof text === "string" && texts.has(id)) kept[id] = text;
+  return { v: 1, rev: typeof raw.rev === "number" && Number.isSafeInteger(raw.rev) && raw.rev >= 0 ? raw.rev : 0, own, texts: kept, ...(isRecord(raw.definitions) ? { definitions: raw.definitions as JsonObject } : {}) };
 }
 
 const clone = <T extends JsonValue>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
@@ -160,7 +166,7 @@ export class SettingsStore {
     this.docs = new UserDocs<Stored>(
       host,
       FILE,
-      (raw) => storedOf(raw, this.schema(), this.sections.flatMap((section) => (section.retired ?? []).map((path) => [section.key, ...path]))),
+      (raw) => storedOf(raw, this.schema(), this.sections.flatMap((section) => (section.retired ?? []).map((path) => [section.key, ...path])), new Set(this.textsDef.defs.map((d) => d.id))),
       () => ({ v: 1, rev: 0, own: [], texts: {} }),
     );
   }

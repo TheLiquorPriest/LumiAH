@@ -146,6 +146,14 @@ export interface RunWords {
   tokensOut: string;
   toolTurns: string;
   time: string;
+  /** Where a limit is the run's own allowance and not a setting (a job started with one): the words that stand for the setting in its stop, which would otherwise name a setting that didn't stop it. */
+  allowance?: Partial<Record<"tokensIn" | "tokensOut" | "toolTurns" | "time", string>>;
+}
+
+/** What fills a run stop's `{{setting}}` where the run's own allowance set that limit; nothing where a setting did, so the texts name it. */
+function allowanceSaid(words: RunWords, key: keyof NonNullable<RunWords["allowance"]>): { setting?: string } {
+  const said = words.allowance?.[key];
+  return said !== undefined ? { setting: said } : {};
 }
 
 const TURN_WORDS: RunWords = { tokensIn: TEXT.stop.turnTokensIn, tokensOut: TEXT.stop.turnTokensOut, toolTurns: TEXT.stop.turnToolTurns, time: TEXT.stop.turnTime };
@@ -433,7 +441,7 @@ class Agent implements AgentHandle {
     if (this.controller.signal.aborted) return this.end(used, new AgentStop("cancelled", { id: TEXT.stop.cancelled }));
     if (this.busy) return this.end(used, new AgentStop("busy", { id: TEXT.stop.busy }));
     if (this.answered) {
-      if (this.revisions >= this.spec.budget.revisions) return this.end(used, new AgentStop("revisions", { id: TEXT.stop.revisions, vars: { revisions: this.deps.texts.counted(this.spec.budget.revisions, TEXT.word.revision) } }));
+      if (this.revisions >= this.spec.budget.revisions) return this.end(used, new AgentStop("revisions", { id: TEXT.stop.revisions, vars: { revisions: this.deps.texts.counted(this.spec.budget.revisions, TEXT.word.revision), setting: this.budgetSetting("revisions") } }));
       this.revisions += 1;
     }
     this.busy = true;
@@ -754,7 +762,7 @@ class Agent implements AgentHandle {
     const now = this.now();
     if (this.spent(now) >= limitOf(this.spec.budget.wallMs)) return new AgentStop("wall_time", { id: TEXT.stop.wallTime, vars: { setting: this.budgetSetting("wallMs") } });
     const turn = this.deps.turn;
-    if (turn && now - turn.startedAt - turn.held(now) >= limitOf(turn.budget.wallMs)) return new AgentStop("turn_time", { id: turn.words.time });
+    if (turn && now - turn.startedAt - turn.held(now) >= limitOf(turn.budget.wallMs)) return new AgentStop("turn_time", { id: turn.words.time, vars: allowanceSaid(turn.words, "time") });
     return null;
   }
 
@@ -772,16 +780,16 @@ class Agent implements AgentHandle {
     const { cachedWeight } = this.deps.settings.spend;
     const weight = String(cachedWeight);
     const own = countedIn(this.total, cachedWeight) + p.estimate;
-    if (own > limitOf(budget.tokensIn)) return new AgentStop("tokens_in", { id: TEXT.stop.tokensIn, vars: { limit: String(budget.tokensIn), counted: String(own), weight } });
+    if (own > limitOf(budget.tokensIn)) return new AgentStop("tokens_in", { id: TEXT.stop.tokensIn, vars: { limit: String(budget.tokensIn), counted: String(own), weight, setting: this.budgetSetting("tokensIn") } });
     // An answer written in the last few tokens of a budget would be cut before it said anything: the agent stops here and says why.
     const floor = Math.min(this.deps.settings.loop.answerFloor, budget.callTokensOut);
     const ownLeft = limitOf(budget.tokensOut) - this.total.out;
-    if (ownLeft <= 0) return new AgentStop("tokens_out", { id: TEXT.stop.tokensOut, vars: { tokens: texts.counted(limitOf(budget.tokensOut), TEXT.word.token) } });
+    if (ownLeft <= 0) return new AgentStop("tokens_out", { id: TEXT.stop.tokensOut, vars: { tokens: texts.counted(limitOf(budget.tokensOut), TEXT.word.token), setting: this.budgetSetting("tokensOut") } });
     if (ownLeft < floor) return new AgentStop("tokens_out", { id: TEXT.stop.answerRoom, vars: { left: texts.counted(ownLeft, TEXT.word.token), floor: String(floor) } });
     const all = turn ? countedIn(turn.usage, cachedWeight) + p.estimate : 0;
-    if (turn && all > limitOf(turn.budget.tokensIn)) return new AgentStop("turn_tokens_in", { id: turn.words.tokensIn, vars: { limit: String(turn.budget.tokensIn), counted: String(all), weight } });
+    if (turn && all > limitOf(turn.budget.tokensIn)) return new AgentStop("turn_tokens_in", { id: turn.words.tokensIn, vars: { limit: String(turn.budget.tokensIn), counted: String(all), weight, ...allowanceSaid(turn.words, "tokensIn") } });
     const runLeft = turn ? limitOf(turn.budget.tokensOut) - turn.usage.out : Number.POSITIVE_INFINITY;
-    if (turn && runLeft <= 0) return new AgentStop("turn_tokens_out", { id: turn.words.tokensOut, vars: { tokens: texts.counted(limitOf(turn.budget.tokensOut), TEXT.word.token) } });
+    if (turn && runLeft <= 0) return new AgentStop("turn_tokens_out", { id: turn.words.tokensOut, vars: { tokens: texts.counted(limitOf(turn.budget.tokensOut), TEXT.word.token), ...allowanceSaid(turn.words, "tokensOut") } });
     if (runLeft < floor) return new AgentStop("turn_tokens_out", { id: TEXT.stop.answerRoom, vars: { left: texts.counted(runLeft, TEXT.word.token), floor: String(floor) } });
     return null;
   }
@@ -805,7 +813,7 @@ class Agent implements AgentHandle {
   private roundStop(): AgentStop | null {
     const { turn } = this.deps;
     if (this.total.toolTurns >= limitOf(this.spec.budget.toolTurns)) return new AgentStop("tool_turns", { id: TEXT.stop.toolTurns, vars: { rounds: this.deps.texts.counted(limitOf(this.spec.budget.toolTurns), TEXT.word.round), setting: this.budgetSetting("toolTurns") } });
-    if (turn && turn.usage.toolTurns >= limitOf(turn.budget.toolTurns)) return new AgentStop("turn_tool_turns", { id: turn.words.toolTurns, vars: { rounds: this.deps.texts.counted(limitOf(turn.budget.toolTurns), TEXT.word.round) } });
+    if (turn && turn.usage.toolTurns >= limitOf(turn.budget.toolTurns)) return new AgentStop("turn_tool_turns", { id: turn.words.toolTurns, vars: { rounds: this.deps.texts.counted(limitOf(turn.budget.toolTurns), TEXT.word.round), ...allowanceSaid(turn.words, "toolTurns") } });
     return null;
   }
 
@@ -866,11 +874,11 @@ class Agent implements AgentHandle {
       deadline(() => {
         const now = this.now();
         return limitOf(turn.budget.wallMs) - (now - turn.startedAt - turn.held(now));
-      }, new AgentStop("turn_time", { id: turn.words.time }));
+      }, new AgentStop("turn_time", { id: turn.words.time, vars: allowanceSaid(turn.words, "time") }));
     }
     if (call) {
       const until = this.now() + limitOf(this.spec.budget.callMs);
-      deadline(() => until - this.now(), new AgentStop("call_time", { id: TEXT.stop.callTime }));
+      deadline(() => until - this.now(), new AgentStop("call_time", { id: TEXT.stop.callTime, vars: { setting: this.budgetSetting("callMs") } }));
     }
     return { signal: AbortSignal.any(sources), clear: () => over.abort() };
   }
@@ -976,7 +984,7 @@ class Agent implements AgentHandle {
     let begun = false;
     // The round is over already (the run was stopped, a time limit passed) and this call had not begun, waiting for its place among the calls at once: nothing of it is started.
     if (signal.aborted) outcome = this.notBegun(call, this.why(signal.reason, signal));
-    else if (!how.allowed) outcome = { text: this.text(TEXT.runtime.tooManyCalls, { limit: String(this.spec.budget.callTools), tools: this.deps.texts.noun(limitOf(this.spec.budget.callTools), TEXT.word.tool), name: call.name }), error: true };
+    else if (!how.allowed) outcome = { text: this.text(TEXT.runtime.tooManyCalls, { limit: String(this.spec.budget.callTools), tools: this.deps.texts.noun(limitOf(this.spec.budget.callTools), TEXT.word.tool), name: call.name, setting: this.budgetSetting("callTools") }), error: true };
     else if (!tool) outcome = { text: this.text(TEXT.runtime.unknownTool, { name: call.name, tools: [...this.tools.keys()].join(", ") }), error: true };
     else if (how.ended) outcome = { text: this.text(TEXT.runtime.oneEnding, { name: call.name, first: how.ended.name }), error: true };
     else {
@@ -1085,13 +1093,15 @@ class Agent implements AgentHandle {
       return null;
     }
     const total = String(text.length);
+    // A clip at the length its tool gives whole, past Tool results clipped past, is the tool's own: its words name no setting, since none clipped it.
+    const clipId = (wholeChars ?? 0) > this.deps.settings.loop.clipChars ? TEXT.runtime.clippedWhole : TEXT.runtime.clipped;
     // What each cut's words say beside the sizes: a clip, how much one scratch_read gives of this result (its own length, `per` below); a cut to the room, the agent's own Prompt per call.
-    const said = (id: string): Record<string, string> => (id === TEXT.runtime.clipped ? { per: String(max) } : { setting: this.budgetSetting("callTokensIn") });
+    const said = (id: string): Record<string, string> => (id === clipId ? { per: String(max) } : { setting: this.budgetSetting("callTokensIn") });
     // The words after the start take room too: measured as long as they can be, with a handle longer than any.
     const words = (id: string): number => this.text(id, { shown: total, total, handle: "s000000", ...said(id) }).length + 1;
     // Clipped at its own length where that and its words fit the room; else cut to the room, with the words that say so.
-    const fits = text.length > max && max + words(TEXT.runtime.clipped) <= room;
-    const id = fits ? TEXT.runtime.clipped : TEXT.runtime.windowCut;
+    const fits = text.length > max && max + words(clipId) <= room;
+    const id = fits ? clipId : TEXT.runtime.windowCut;
     const shown = cutAt(text, fits ? max : Math.max(0, room - words(TEXT.runtime.windowCut)));
     this.room = Math.max(0, room - shown - words(id));
     const sizes = { shown: String(shown), total };
@@ -1105,7 +1115,8 @@ class Agent implements AgentHandle {
       } catch (error) {
         const stopped = signal.aborted ? this.why(error, signal) : null;
         if (!stopped) this.deps.host.log("warn", `[LumiAH] the whole of a clipped tool result couldn't be stored (${errorText(error)}): the model has its start alone`);
-        return { text: `${start}${this.text(TEXT.runtime.clippedLost, { ...sizes, error: stopped ? this.text(stopped.text.id, stopped.text.vars) : errorText(error) })}`, whole: null };
+        const lost = { ...sizes, error: stopped ? this.text(stopped.text.id, stopped.text.vars) : errorText(error), ...(clipId === TEXT.runtime.clippedWhole ? { setting: this.text(TEXT.runtime.wholeSize, { per: String(max) }) } : {}) };
+        return { text: `${start}${this.text(TEXT.runtime.clippedLost, lost)}`, whole: null };
       }
     }
     // The handle is taken in the same step as its whole is kept, after the store answered: two results clipped at once never share one.

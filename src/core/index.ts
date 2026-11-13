@@ -3,11 +3,11 @@
 
 export * from "./ports";
 export { type AgentWrite, type ApprovalRow, type AreaView, createHarness, type DefinitionsAnswer, type ForgottenChat, type GuidanceLevelView, type GuidanceView, type Harness, type HarnessOptions, type JobsPage, type StoredState } from "./harness";
-export type { AgentModelAsk, AgentModelChoice, ChatClaim, ClaimAsk, DefinitionsAsk, ExtensionDefinitions, GuidanceLevel, HarnessExtension, ReleaseVerdict, ReplyRelease, ReplyTool, ReplyWritten, RunBegan, RunEnded, WriterRequest } from "./extension";
+export type { AgentModelAsk, AgentModelChoice, ChatClaim, ClaimAsk, DefinitionsAsk, ExtensionDefinitions, GuidanceLevel, HarnessExtension, ReleaseVerdict, ReplyRelease, ReplyTool, ReplyUnreleased, ReplyWritten, RunBegan, RunEnded, WriterRequest } from "./extension";
 export { type LeftOutWhy, leftOutWhy, STORY_DEFAULTS, STORY_MEMBERS, type StoryHolds, storyHolds, type StorySetting, type StorySource, storyValue, type StoryWord, storyWordOf } from "./story";
 export { HarnessRefusal, type RefusalCode, type RefusalProblem } from "./refusal";
 export { type AgentDeps, type AgentHandle, type AgentReply, type AgentSpec, type AgentTrace, type AgentTranscript, AgentTurn, type ApprovalGate, cutShort, type RunWords, startAgent } from "./loop";
-export { type AgentTool, type ChatView, type DelegateChoice, type Delegation, type JobRead, type JobStart, type JobStarted, type JobTools, type LoreItem, type LoreView, type PastTurn, type ReplyStream, type RunInfo, type ToolCtx, type ToolDefinition, type ToolEnv, type ToolOutcome, ToolRegistry } from "./tools";
+export { type AgentTool, type ChatView, type DelegateChoice, type Delegation, type JobRead, type JobStart, type JobStarted, type JobTools, type LoreItem, type LoreView, type PastTurn, type ReplyHand, type ReplyStream, type RunInfo, type ToolCtx, type ToolDefinition, type ToolEnv, type ToolOutcome, ToolRegistry } from "./tools";
 export { BASE_TOOLS } from "./tools/base";
 export { type AgentDefinition, AgentRegistry, baseAgents, type OwnedField, type ResolvedAgent } from "./agents";
 export { type Skill, SkillRegistry } from "./skills";

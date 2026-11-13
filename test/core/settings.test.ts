@@ -108,13 +108,16 @@ describe("the user's own values", () => {
   });
 
   test("sized for long-form work: a user who never set them reads the new defaults, and a value a user set, the old default among them, stays theirs", () => {
-    const LONG_FORM = { clipChars: 12_000, pageChars: 8000, pinChars: 24_000, receiptChars: 1500, receiptArgChars: 1500, summarizeAtTokens: 48_000, keepTurns: 4, jobsPerTurn: 6, jobsAtOnce: 2, jobTokensPerDay: 12_000_000, subAgentsPerTurn: 24 };
+    // The main agent's notes keep their earlier size: they ride in every one of its calls beside its tools.
+    const LONG_FORM = { clipChars: 12_000, pageChars: 8000, pinChars: 24_000, receiptChars: 1500, receiptArgChars: 1500, summarizeAtTokens: 32_000, keepTurns: 3, jobsPerTurn: 6, jobsAtOnce: 2, jobTokensPerDay: 12_000_000, subAgentsPerTurn: 24 };
     const read = (s: Settings) => ({ clipChars: s.loop.clipChars, pageChars: s.tools.pageChars, pinChars: s.workspace.pinChars, receiptChars: s.session.receiptChars, receiptArgChars: s.session.receiptArgChars, summarizeAtTokens: s.session.summarizeAtTokens, keepTurns: s.session.keepTurns, jobsPerTurn: s.jobs.perRun, jobsAtOnce: s.jobs.atOnce, jobTokensPerDay: s.jobs.tokensPerDay, subAgentsPerTurn: s.delegation.perRun });
     // The store keeps only what the user changed, so nothing stored is read as no setting at all.
     expect(read(settingsOf({}))).toEqual(LONG_FORM);
     expect(read(settingsOf(null))).toEqual(LONG_FORM);
-    const kept = { loop: { clipChars: 6000 }, tools: { pageChars: 4000 }, workspace: { pinChars: 12_000 }, session: { receiptChars: 600, receiptArgChars: 600, summarizeAtTokens: 32_000, keepTurns: 3 }, jobs: { perRun: 3, atOnce: 1, tokensPerDay: 3_000_000 }, delegation: { perRun: 12 } };
-    expect(read(settingsOf(kept))).toEqual({ clipChars: 6000, pageChars: 4000, pinChars: 12_000, receiptChars: 600, receiptArgChars: 600, summarizeAtTokens: 32_000, keepTurns: 3, jobsPerTurn: 3, jobsAtOnce: 1, jobTokensPerDay: 3_000_000, subAgentsPerTurn: 12 });
+    const kept = { loop: { clipChars: 6000 }, tools: { pageChars: 4000 }, workspace: { pinChars: 12_000 }, session: { receiptChars: 600, receiptArgChars: 600, summarizeAtTokens: 48_000, keepTurns: 4 }, jobs: { perRun: 3, atOnce: 1, tokensPerDay: 3_000_000 }, delegation: { perRun: 12 } };
+    expect(read(settingsOf(kept))).toEqual({ clipChars: 6000, pageChars: 4000, pinChars: 12_000, receiptChars: 600, receiptArgChars: 600, summarizeAtTokens: 48_000, keepTurns: 4, jobsPerTurn: 3, jobsAtOnce: 1, jobTokensPerDay: 3_000_000, subAgentsPerTurn: 12 });
+    // A rollback's margin is a quarter of Summarize past as shipped.
+    expect(defaultSettings().session.summarizeAtTokens).toBe(defaultSettings().session.rollbackMarginTokens * 4);
   });
 
   test("a value the schema refuses reads as its default, and is named with why", () => {

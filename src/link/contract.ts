@@ -552,13 +552,15 @@ export type LinkPush = ChunkPush | StopPush | SettingsPush | SecretPush | Connec
 
 /**
  * The members of what an extension supplies to the core (`HarnessExtension`), each a request over
- * the link (`extension.call`). What reads is asked again after a socket that closed under it; a hook
- * and `releasing` (a check before the turn's reply goes out, which may do work in the extension) are sent
- * once, and a lost answer is the core's to take as none.
+ * the link (`extension.call`). What reads is asked again after a socket that closed under it; a hook,
+ * `releasing` (a check before the turn's reply goes out) and `unreleased` (what the agents had ready,
+ * where the lead released nothing), each of which may do work in the extension, are sent once, and a
+ * lost answer is the core's to take as none. The runtime offers the core only the members the
+ * extension's offer names: one it doesn't have is one the core goes on without.
  */
-export type ExtensionMember = "definitions" | "claim" | "writerRequest" | "runBegan" | "agentModel" | "releasing" | "released" | "replyWritten" | "runEnded";
+export type ExtensionMember = "definitions" | "claim" | "writerRequest" | "runBegan" | "agentModel" | "releasing" | "released" | "unreleased" | "replyWritten" | "runEnded";
 
-export const EXTENSION_MEMBERS: readonly ExtensionMember[] = ["definitions", "claim", "writerRequest", "runBegan", "agentModel", "releasing", "released", "replyWritten", "runEnded"];
+export const EXTENSION_MEMBERS: readonly ExtensionMember[] = ["definitions", "claim", "writerRequest", "runBegan", "agentModel", "releasing", "released", "unreleased", "replyWritten", "runEnded"];
 
 /** What the backend's extension supplies to the core, as the runtime is told on hello: its name, and which members it has. Null for LumiAH on its own. */
 export interface ExtensionOffer {

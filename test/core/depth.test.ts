@@ -7,7 +7,7 @@
 
 import { describe, expect, test } from "bun:test";
 import type { AgentDefinition } from "../../src/core/agents";
-import type { AgentModelAsk, ChatClaim, HarnessExtension, ReplyRelease, ReplyTool } from "../../src/core/extension";
+import type { AgentModelAsk, ChatClaim, HarnessExtension, ReplyRelease, ReplyTool, ReplyUnreleased } from "../../src/core/extension";
 import { Gate } from "../../src/core/gate";
 import { createHarness } from "../../src/core/harness";
 import type { ModelRequest } from "../../src/core/ports";
@@ -31,16 +31,25 @@ const seen = (request: ModelRequest | undefined): string => JSON.stringify(reque
 /** What one call came back with, as the agent's next call carried it. */
 const resultOf = (request: ModelRequest | undefined, callId: string) => request?.messages.flatMap((m) => m.parts ?? []).find((part) => part.type === "tool_result" && part.toolUseId === callId);
 
+/** One answer of an agent's: as it is, or made from the call it answers. */
+type Line = Answer | ((request: ModelRequest) => Answer | Promise<Answer>);
+
 /** Answers each agent's calls in turn, by whose instructions the call carries. */
-function lines(parts: { author?: Answer[]; voice?: Answer[] }): Script {
+function lines(parts: { author?: Line[]; voice?: Line[] }): Script {
   const at = { author: 0, voice: 0 };
   return (request) => {
     const who = system(request).includes(VOICE) ? "voice" : "author";
     const line = parts[who]?.[at[who]++];
     if (line === undefined) throw new Error(`no line for the ${who}'s call ${at[who]}`);
-    return line;
+    return typeof line === "function" ? line(request) : line;
   };
 }
+
+/** A follow-up to the agent whose handle the result of `callId` names, as a model copies it from there. */
+const follow = (callId: string, text: string, id: string) => (request: ModelRequest): Answer => {
+  const result = resultOf(request, callId);
+  return { toolCalls: [call("agent_message", { handle: /handle (agent_[0-9a-f]{8})/.exec(result?.type === "tool_result" ? result.content : "")?.[1] ?? "", text }, id)] };
+};
 
 /** A chat an extension claims for its author, the extension hearing each release. */
 function rig(script: Script, options: { claim?: ChatClaim | null; extension?: Partial<HarnessExtension>; change?: (s: Settings) => void } = {}) {
@@ -291,6 +300,137 @@ describe("handing the reply on (§14: to_reply)", () => {
     expect(Object.keys((tools.find((tool) => tool.name === "delegate")?.parameters.properties ?? {}) as object)).toEqual(["agent", "task", "files"]);
     expect(Object.keys((tools.find((tool) => tool.name === "job_start")?.parameters.properties ?? {}) as object)).toEqual(["agent", "task", "when", "again"]);
   });
+
+  test("an agent that took the reply, messaged once its answer went out, answers the agent that asked: nothing it says then reaches the reply", async () => {
+    const r = rig(
+      lines({
+        author: [{ toolCalls: [call("delegate", { agent: "voice", task: "Answer the user as Mara.", to_reply: true }, "d1")] }, follow("d1", "Who was aboard? (for me only)", "m1"), "Done."],
+        voice: ["I saw the boat.", " SECRET: Okoro was aboard."],
+      }),
+    );
+    const { result, sink } = await runTurn(r.host, r.harness, CHAT);
+    expect(result).toMatchObject({ status: "done", reply: "I saw the boat." });
+    expect(sink.text).toBe("I saw the boat.");
+    // The author read the follow-up's answer; the extension heard the one release.
+    expect(seen(r.callsOf(AUTHOR)[2])).toContain("SECRET: Okoro was aboard.");
+    expect(r.released.map((release) => [release.agent.role, release.text])).toEqual([["voice", "I saw the boat."]]);
+  });
+
+  test("an agent that took the reply and sent none of it, messaged after, doesn't spend the turn's release: the author's own release is the reply", async () => {
+    const r = rig(
+      lines({
+        author: [{ toolCalls: [call("delegate", { agent: "voice", task: "Answer the user as Mara.", to_reply: true }, "d1")] }, follow("d1", "Who was aboard?", "m1"), { toolCalls: [call("reply_write", { text: "Mara looks up." }, "w1")] }, "Done."],
+        voice: ["", "Okoro was aboard."],
+      }),
+    );
+    const { result, sink } = await runTurn(r.host, r.harness, CHAT);
+    expect(result).toMatchObject({ status: "done", reply: "Mara looks up." });
+    expect(sink.text).toBe("Mara looks up.");
+    expect(seen(r.callsOf(AUTHOR)[2])).toContain("Okoro was aboard.");
+    expect(r.released.map((release) => [release.agent.role, release.text])).toEqual([["author", "Mara looks up."]]);
+  });
+
+  test("a release asked for while another agent's answer holds the reply, none of it out yet, is told to wait for it; that answer sending nothing, the release is still the author's", async () => {
+    let voiceAsked = false;
+    let checked = false;
+    const r = rig(
+      lines({
+        author: [{ toolCalls: [call("reply_write", { text: "Mara looks up first." }, "w1"), call("delegate", { agent: "voice", task: "Answer the user as Mara.", to_reply: true }, "d1")] }, { toolCalls: [call("reply_write", { text: "Mara looks up." }, "w2")] }, "Done."],
+        // Mara is asked while the author's first release waits on its check, and answers with nothing once that check is in.
+        voice: [
+          async () => {
+            voiceAsked = true;
+            await until(() => checked);
+            return "";
+          },
+        ],
+      }),
+      {
+        extension: {
+          releasing: async (release) => {
+            if (release.text === "Mara looks up first.") {
+              await until(() => voiceAsked);
+              checked = true;
+            }
+            return null;
+          },
+        },
+      },
+    );
+    const { result, sink } = await runTurn(r.host, r.harness, CHAT);
+    expect(resultOf(r.callsOf(AUTHOR)[1], "w1")).toMatchObject({ content: renderDefault(TEXT.answer.releaseWait), isError: true });
+    expect(result).toMatchObject({ status: "done", reply: "Mara looks up." });
+    expect(sink.text).toBe("Mara looks up.");
+    expect(r.released.map((release) => [release.agent.role, release.text])).toEqual([["author", "Mara looks up."]]);
+  });
+});
+
+describe("what the agents had ready, where the lead released none of the reply (§21: unreleased)", () => {
+  const READY = "The lamp gutters. Mara looks up from the log.";
+  /** The author, held to one round of tool calls. */
+  const short = { ...author, budget: { ...author.budget, toolTurns: 1 } };
+  const twoRounds: Line[] = [{ toolCalls: [call("job_list", {}, "j1")] }, { toolCalls: [call("job_list", {}, "j2")] }];
+
+  test("a lead that stops at a limit with nothing released: the text the extension gives is the reply, once; released hears it; the turn is done, and says how the lead ended", async () => {
+    const asked: ReplyUnreleased[] = [];
+    const r = rig(lines({ author: [...twoRounds, "Nothing more."] }), {
+      claim: { reply: "released" },
+      extension: { definitions: async () => ({ agents: [short, voice] }), unreleased: async (turn) => (asked.push(structuredClone(turn)), { text: READY }) },
+    });
+    const { result, sink, request } = await runTurn(r.host, r.harness, CHAT);
+    expect(asked).toEqual([{ userId: "user-1", chatId: CHAT, turn: request.generationId, ended: "limit" }]);
+    expect(result).toMatchObject({ status: "done", reply: READY });
+    expect(sink.text).toBe(READY);
+    expect(sink.order.filter((kind) => kind === "content")).toHaveLength(1);
+    expect(sink.failed).toBeNull();
+    expect(r.released).toEqual([expect.objectContaining({ text: READY, args: {}, agent: expect.objectContaining({ role: "author" }) })]);
+    // The live view and the reply's thinking block say how the lead ended, its limit named.
+    const notices = r.host.traced.flatMap(({ event }) => (event.kind === "notice" ? [event.text] : []));
+    expect(notices.some((text) => text.includes("Tool rounds per agent") && text.includes("Depth"))).toBe(true);
+    expect(sink.progressLines.some((line) => line.includes("Depth"))).toBe(true);
+    // So do the author's notes: the next turn's author reads how this one ended, and what went out in its place.
+    r.host.say(CHAT, "user", "And then?");
+    await runTurn(r.host, r.harness, CHAT);
+    expect(seen(r.callsOf(AUTHOR)[2])).toContain("Depth released what its agents had ready as the reply");
+  });
+
+  test("asked once, with how the lead ended; with no text, or no answer in time, the turn fails as it did, a wait that ran out named", async () => {
+    for (const [line, ended] of [
+      ["Nothing to say.", "done"],
+      [{ error: "401: the key was refused" }, "failed"],
+    ] as [Line, ReplyUnreleased["ended"]][]) {
+      const asked: ReplyUnreleased["ended"][] = [];
+      const r = rig(lines({ author: [line] }), { claim: { reply: "released" }, extension: { unreleased: async (turn) => (asked.push(turn.ended), null) } });
+      const { result, sink } = await runTurn(r.host, r.harness, CHAT);
+      expect(asked).toEqual([ended]);
+      expect(result).toMatchObject({ status: "failed", reason: renderDefault(TEXT.progress.nothingReleased), reply: "" });
+      expect(sink.text).toBe("");
+    }
+    let waiting = false;
+    const late = rig(lines({ author: ["Nothing to say."] }), { claim: { reply: "released" }, extension: { unreleased: () => ((waiting = true), new Promise(() => undefined)) } });
+    const turn = runTurn(late.host, late.harness, CHAT);
+    await until(() => waiting);
+    late.host.clock.advance(10_000);
+    const { result } = await turn;
+    expect(result.status).toBe("failed");
+    expect(result.reason).toStartWith(renderDefault(TEXT.progress.nothingReleased));
+    expect(result.reason).toContain("Wait for the extension");
+  });
+
+  test("isn't asked once the user stopped the turn, nor once the reply went out", async () => {
+    let asked = 0;
+    const unreleased = async () => (asked++, { text: READY });
+    const stop = new AbortController();
+    const stopped = rig(lines({ author: [{ hang: true }] }), { claim: { reply: "released" }, extension: { unreleased } });
+    const turn = runTurn(stopped.host, stopped.harness, CHAT, { signal: stop.signal });
+    await until(() => stopped.host.calls.length === 1);
+    stop.abort();
+    expect((await turn).result.status).toBe("stopped");
+
+    const released = rig(lines({ author: [{ toolCalls: [call("reply_write", { text: "Mara looks up." }, "w1")] }, "Done."] }), { claim: { reply: "released" }, extension: { unreleased } });
+    expect((await runTurn(released.host, released.harness, CHAT)).result).toMatchObject({ status: "done", reply: "Mara looks up." });
+    expect(asked).toBe(0);
+  });
 });
 
 describe("the extension's word on an agent's model (§21: agentModel)", () => {
@@ -529,13 +669,15 @@ describe("a job run again, what a job is told, and an answer cut while it though
     const { request } = await runTurn(r.host, r.harness, CHAT);
     // Its answer ran out while it was still thinking: the failure says so.
     const failed = await r.harness.jobs.run({ id: r.host.queued[0]?.id ?? "" }, never);
-    expect(failed).toMatchObject({ state: "failed", reason: renderDefault(TEXT.jobs.whyCutThinking) });
+    // It names the room as the job's own agent's setting, where it is changed.
+    const CUT = renderDefault(TEXT.jobs.whyCutThinking, { setting: "Answer per call (Settings → Agents → voice → Budget)" });
+    expect(failed).toMatchObject({ state: "failed", reason: CUT });
     const { job } = await r.harness.jobs.again({ id: failed.id });
     expect(job).toMatchObject({ again: failed.id, basis: request.generationId, by: { who: "agent", role: "author" }, as: "mara", lane: "soon", due: "next_turn", task: "Digest the beat." });
     expect((await r.harness.jobs.run({ id: job.id }, never)).state).toBe("done");
     const told = r.callsOf(VOICE)[2]?.messages.find((m) => m.role === "user")?.content ?? "";
     expect(told).toContain(renderDefault(TEXT.jobs.task, { task: "Digest the beat." }));
-    expect(told).toContain(renderDefault(TEXT.jobs.againNote, { why: renderDefault(TEXT.jobs.whyCutThinking) }));
+    expect(told).toContain(renderDefault(TEXT.jobs.againNote, { why: CUT }));
     expect(told).not.toContain("write your plan");
     // The reply it was started from is swiped away: it isn't run again, and not as anything else either.
     await runTurn(r.host, r.harness, CHAT, { kind: "swipe" });
@@ -574,7 +716,7 @@ describe("a job run again, what a job is told, and an answer cut while it though
 
   test("cut so again on the second go, the job fails in words that say so, with no third call", async () => {
     const { ended, calls } = await cutRun([thinking, thinking, "Never reached."]);
-    expect(ended).toMatchObject({ state: "failed", reason: renderDefault(TEXT.jobs.whyCutThinking), usage: { calls: 2 } });
+    expect(ended).toMatchObject({ state: "failed", reason: renderDefault(TEXT.jobs.whyCutThinking, { setting: "Answer per call (Settings → Agents → voice → Budget)" }), usage: { calls: 2 } });
     expect(calls).toHaveLength(2);
   });
 

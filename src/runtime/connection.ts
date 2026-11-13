@@ -357,7 +357,7 @@ export class HostConnection {
           this.pending.delete(joined.id);
           clearTimeout(waiting.timer);
           this.timed(waiting, 0, null, "failed");
-          waiting.reject(new LiveError("too_large", `LumiAH's answer to ${waiting.type} was too large for the runtime: ${joined.refused} Raise the runtime's "Largest frame joined" in LumiAH's settings.`));
+          waiting.reject(new LiveError("too_large", `LumiAH's answer to ${waiting.type} was too large for the runtime: ${joined.refused} Raise "Largest frame the runtime joins" in LumiAH's settings (Transport → Runtime).`));
         }
       }
       return;
